@@ -9,6 +9,7 @@
 - 实盘扩展已进入需求冻结：OKX 第一阶段优先实现黄金现货类产品与黄金永续，架构保留后续增加其他品种的能力，不做永久单品种硬编码。官方公开接口已确认 `XAUT-USDT` 为代币化黄金现货、`XAU-USDT-SWAP` 为跟踪现货黄金的 USDT 永续；正等用户确认首期产品组合。
 - OKX API Key/Secret 已按用户授权写入仓库外的 `D:\Desktop\Quant\env`，Passphrase 尚缺，`OKX_LIVE_ENABLED=false`；未连接私有接口、未发单。实盘启用前仍需关闭 API 提币权限并完成账户级只读预检。
 - 已新增 `docs/GPT5_6SOL_HANDOFF.md`，将当前实现、Longbridge/OKX 目标、候选架构、安全不变式与未决业务分叉整理为只读移交材料。功能代码与首版移交说明已随 `3d9353f` 发布；PA_Agent 安全源码 ZIP 将由独立的 `gpt-5.6-sol` 高推理任务只读审查。
+- 用户将手动在网页版 GPT Pro Extended Thinking 模式粘贴 `docs/GPT_WEB_PRO_EXTENDED_TASK.md`，让它通过 GitHub 充当 PA_Agent 总控，输出工单队列与硬验收；`docs/CODEX_PROJECT_RULES.md`、`docs/LOCAL_EXECUTION_CONTEXT.md` 和 `docs/REQUIREMENTS_CHANGELOG.md` 补齐项目规则、本机能力边界、用户问题/需求/修改意见及完成状态。外部模型不直接编码；其工单必须由本地 Codex 结合实时 skills、memory、代码、进程和测试证据修订后才能执行。
 
 ## 当前验证
 
