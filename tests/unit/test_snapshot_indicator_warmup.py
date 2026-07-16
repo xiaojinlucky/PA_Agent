@@ -14,7 +14,6 @@ from pa_agent.indicators.ema import ema_full
 
 
 def _bars_newest_first(closes: list[float]) -> list[KlineBar]:
-    n = len(closes)
     out: list[KlineBar] = []
     for i, close in enumerate(reversed(closes)):
         seq = i + 1

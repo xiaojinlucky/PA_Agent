@@ -15,7 +15,6 @@ from pa_agent.data.ashare_common import (
     ensure_today_forming_daily_bar,
     index_symbol_for_api as _index_symbol_for_api,
     is_index_symbol,
-    merge_ohlcv as _merge_ohlcv,
     normalize_ashare_symbol,
     resample_rows_to_4h as _resample_rows_to_4h,
     row_time_to_ts_ms as _row_time_to_ts_ms,

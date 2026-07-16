@@ -1,4 +1,6 @@
 """Probe QClaw / WorkBuddy thinking control. Run: python tools/probe_thinking_routes.py"""
+# ruff: noqa: E402
+
 from __future__ import annotations
 
 import json
@@ -24,7 +26,7 @@ from pa_agent.ai.workbuddy_connector import (
 )
 from pa_agent.config.settings import AIProviderSettings, load_settings
 
-PROMPT = "只回答一个字：好。不要解释。"
+PROMPT = "只回答一个字: 好。不要解释。"
 
 
 def _banner(title: str) -> None:
@@ -301,7 +303,9 @@ def main() -> int:
                 )
             )
 
-    out_path = ROOT / "thinking_route_probe_result.json"
+    out_dir = ROOT / "scratch"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / "thinking-route-probe-result.json"
     out_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"\nWrote {out_path}")
     return 0

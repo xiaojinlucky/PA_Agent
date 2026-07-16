@@ -1,22 +1,21 @@
 """Unit tests for JSON repair in json_validator."""
+# ruff: noqa: RUF001
+
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-import pytest
-
 from pa_agent.ai.json_validator import (
     JsonValidator,
     Ok,
-    ValidationError,
     _repair_unclosed_string_before_brace,
     _repair_unescaped_quotes,
     _strip_fences,
 )
-
-_SAMPLE = Path(__file__).resolve().parents[2] / "tools" / "stage2_raw_sample.txt"
 from tests.fixtures.validators import schema_test_validator
+
+_SAMPLE = Path(__file__).resolve().parents[1] / "fixtures" / "stage2_raw_sample.txt"
 
 _validator = schema_test_validator()
 

@@ -13,9 +13,8 @@ import pytest
 
 from tests.fixtures.validators import schema_test_validator
 from pa_agent.ai.router import route_strategy_files
-from pa_agent.data.base import KlineFrame
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
-from pa_agent.util.threading import CancelToken, OrchestratorEvent
+from pa_agent.util.threading import CancelToken
 
 from .conftest import (
     VALID_STAGE1,
@@ -169,7 +168,11 @@ def test_short_circuit_emits_unpredictable(
         exp_reader=exp_reader,
     )
 
-    record = orchestrator.submit(frame=frame, cancel_token=CancelToken(), on_event=lambda e: None)
+    record = orchestrator.submit(
+        frame=frame,
+        cancel_token=CancelToken(),
+        on_event=lambda e: None,
+    )
     pred = record.stage2_decision.get("next_bar_prediction")
     assert isinstance(pred, dict)
     assert pred["unpredictable"] is True
@@ -223,7 +226,11 @@ def test_save_full_round_trip(
         exp_reader=exp_reader,
     )
 
-    record = orchestrator.submit(frame=frame, cancel_token=CancelToken(), on_event=lambda e: None)
+    orchestrator.submit(
+        frame=frame,
+        cancel_token=CancelToken(),
+        on_event=lambda e: None,
+    )
 
     # Verify saved record has the prediction
     saved = pending_writer.save_full.call_args[0][0]
@@ -240,7 +247,7 @@ def test_demo_mode_replays_legacy_record(
     from PyQt6.QtWidgets import QApplication
     import sys
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    _app = QApplication.instance() or QApplication(sys.argv)
     panel = DecisionPanel()
 
     # Legacy: no next_bar_prediction key
@@ -272,7 +279,7 @@ def test_cancel_no_prediction_required(
     )
 
     # Should not raise, and client should not be called
-    record = orchestrator.submit(frame=frame, cancel_token=cancel_token, on_event=lambda e: None)
+    orchestrator.submit(frame=frame, cancel_token=cancel_token, on_event=lambda e: None)
     assert client.stream_chat.call_count == 0
 
 

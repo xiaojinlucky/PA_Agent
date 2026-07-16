@@ -118,7 +118,7 @@ def test_free_chat_after_analysis(qtbot, tmp_path):
 
     # Send one message via the session directly (simulating what the UI does)
     cancel_token = CancelToken()
-    reply = session.send("What do you think about the entry?", cancel_token)
+    session.send("What do you think about the entry?", cancel_token)
 
     # FreeChatSession should have completed one turn
     assert session._turn == 1, f"Expected 1 turn, got {session._turn}"
@@ -127,7 +127,6 @@ def test_free_chat_after_analysis(qtbot, tmp_path):
     # pending_writer.append_followup should have been called
     pending_writer.append_followup.assert_called_once()
     call_args = pending_writer.append_followup.call_args
-    record_id_arg = call_args[0][0]
     followup_turn_arg = call_args[0][1]
     assert followup_turn_arg.turn == 1
     assert followup_turn_arg.cancelled is False

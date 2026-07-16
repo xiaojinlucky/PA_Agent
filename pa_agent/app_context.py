@@ -36,9 +36,8 @@ class AppContext:
             PROMPT_DIR,
         )
         from pa_agent.config.settings import load_settings
-        from pa_agent.util.logging import configure_logging, update_api_key
+        from pa_agent.util.logging import configure_logging
         from pa_agent.util.event_bus import EventBus
-        from pa_agent.util.mask_secret import mask_secret
         from pa_agent.data.factory import create_data_source, normalize_data_source_kind
         from pa_agent.ai.client_factory import create_ai_client
         from pa_agent.ai.prompt_assembler import PromptAssembler

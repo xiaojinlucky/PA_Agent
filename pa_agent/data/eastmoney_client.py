@@ -854,7 +854,7 @@ def fetch_stock_tick_details(
     tail: int = 40,
 ) -> list:
     """当日逐笔成交（``/api/qt/stock/details/get``）。"""
-    from pa_agent.data.eastmoney_quote import TickTrade, parse_tick_lines
+    from pa_agent.data.eastmoney_quote import parse_tick_lines
 
     code = symbol[-6:] if len(symbol) > 6 else symbol
     params = {

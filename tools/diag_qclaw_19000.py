@@ -1,9 +1,7 @@
 """Diagnose QClaw internal proxy (19000) vs relay (19004) payloads."""
 from __future__ import annotations
 
-import json
 from qclaw_gateway_token import read_gateway_token
-import sys
 
 import httpx
 

@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from pa_agent.data.bar_close_wait import seconds_until_bar_closes
 def test_countdown_inflates_when_local_lags_server_by_3h() -> None:

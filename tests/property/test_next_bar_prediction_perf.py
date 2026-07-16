@@ -10,7 +10,6 @@ import sys
 import time
 from pathlib import Path
 
-import pytest
 
 from pa_agent.ai.prompt_assembler import PromptAssembler, _NEXT_BAR_PREDICTION_INSTRUCTION
 from pa_agent.data.base import KlineBar, KlineFrame, IndicatorBundle
@@ -93,7 +92,7 @@ def test_panel_render_time():
     from pa_agent.gui.decision_panel import DecisionPanel
     from PyQt6.QtWidgets import QApplication
 
-    app = QApplication.instance() or QApplication(sys.argv)
+    _app = QApplication.instance() or QApplication(sys.argv)
     panel = DecisionPanel()
 
     decision = {

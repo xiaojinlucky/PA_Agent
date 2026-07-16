@@ -1,7 +1,6 @@
 """Prompt assembler for Stage 1 (diagnosis) and Stage 2 (decision)."""
 from __future__ import annotations
 
-import datetime
 import functools
 import json
 import logging

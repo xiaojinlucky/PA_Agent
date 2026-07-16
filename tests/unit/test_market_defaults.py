@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from pa_agent.data.market_defaults import (
     GOLD_MT5_SYMBOL,
-    GOLD_TV_EXCHANGE,
     GOLD_TV_SYMBOL,
     TV_GOLD_SYMBOL_BY_EXCHANGE,
     ashare_tv_probe_order,

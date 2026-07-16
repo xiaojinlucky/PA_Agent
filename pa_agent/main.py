@@ -33,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Update logging with the real API key now that settings are loaded
     if ctx.settings is not None:
-        from pa_agent.util.logging import configure_logging, update_api_key
+        from pa_agent.util.logging import configure_logging
         configure_logging(api_key=ctx.settings.provider.api_key)
         from pa_agent.util.crash_diagnostics import log_startup_diagnostics
         log_startup_diagnostics()

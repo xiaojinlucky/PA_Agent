@@ -328,7 +328,6 @@ def resolve_tv_ashare_pair(
         return None
 
     ex_in = (exchange or "").strip().upper()
-    adjusted = False
     if ex_in in ("SH", "SSE", "SHSE", "SHANGHAI"):
         return "SSE", code, ex_in != "SSE"
     if ex_in in ("SZ", "SZSE", "XSHE", "SHENZHEN"):

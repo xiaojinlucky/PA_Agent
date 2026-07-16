@@ -13,7 +13,6 @@ import http.server
 import json
 import logging
 import socket
-import sys
 import threading
 import time
 import urllib.error
