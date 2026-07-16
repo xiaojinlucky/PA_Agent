@@ -34,7 +34,7 @@ _STYLE_RED = "QProgressBar#tokenProgress::chunk { background-color: #cc0000; }"
 
 
 class _ChatWorker(QThread):
-    finished = pyqtSignal(str, str, float)  # content, reasoning, cache_hit_pct
+    result_ready = pyqtSignal(str, str, float)  # content, reasoning, cache_hit_pct
     error = pyqtSignal(str)
     reasoning_token = pyqtSignal(str)
     content_token = pyqtSignal(str)
@@ -60,7 +60,7 @@ class _ChatWorker(QThread):
                 on_content_token=lambda c: self.content_token.emit(c),
             )
             hit_pct = round(reply.usage.cache_hit_rate * 100, 1) if reply.usage else 0.0
-            self.finished.emit(reply.content, reply.reasoning_content or "", hit_pct)
+            self.result_ready.emit(reply.content, reply.reasoning_content or "", hit_pct)
         except Exception as exc:  # noqa: BLE001
             logger.error("ChatWorker error: %s", exc, exc_info=True)
             self.error.emit(str(exc))
@@ -486,6 +486,27 @@ class AIStreamPanel(QWidget):
         self._session = session
         self._cancel_token = cancel_token
 
+    def reset_provider_session(self) -> None:
+        """切换模型后断开旧自由追问会话并清零当前模型用量。"""
+        self._session = None
+        self._cancel_token = None
+        self._input_edit.clear()
+        self.set_input_enabled(False)
+        self._red_warned = False
+        context_window = 1_000_000
+        if self._settings is not None:
+            context_window = self._settings.provider.context_window
+        self.update_token_display(
+            {
+                "context_used": 0,
+                "context_window": context_window,
+                "total_input": 0,
+                "total_output": 0,
+                "total_cached_input": 0,
+            }
+        )
+        self._refresh_mode_label()
+
     def update_token_display(self, data: dict) -> None:
         context_used = data.get("context_used", 0)
         context_window = data.get("context_window", 1_000_000)
@@ -609,10 +630,9 @@ class AIStreamPanel(QWidget):
         self._worker.content_token.connect(
             lambda chunk: self._append_stream_text_for_stage("chat", chunk, kind="content")
         )
-        self._worker.finished.connect(self._on_reply_done)
+        self._worker.result_ready.connect(self._on_reply_done)
         self._worker.error.connect(self._on_reply_error)
-        self._worker.finished.connect(lambda *_: self._on_worker_done())
-        self._worker.error.connect(lambda *_: self._on_worker_done())
+        self._worker.finished.connect(self._on_worker_done)
         self._worker.start()
 
     def _on_reply_done(self, content: str, reasoning: str, cache_hit_pct: float) -> None:

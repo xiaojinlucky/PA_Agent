@@ -12,9 +12,9 @@
    copy config\settings.example.json config\settings.json
    ```
 
-2. 启动程序，在 **设置** 中填写你的 **API Key**（会加密写入 `api_key_encrypted`）。
+2. 启动程序，在 **AI 模型设置** 中填写连接信息。API Key 输入框默认隐藏；点击“测试并保存”后，配置才会成为可切换档案。
 
-   也可直接编辑 `config/settings.json` 中的 `base_url`、`model` 等字段，Key 仍建议通过 GUI 保存以便自动加密。
+   当前上游存储格式会把 Key 明文写入被 Git 忽略的 `config/settings.json`，并未实现凭据加密。不要共享该文件；若需要更高安全级别，应改用系统密钥库后再保存。
 
 3. `config/exception_state.json` 由程序在需要时自动创建，一般无需手动复制。结构可参考 `exception_state.example.json`。
 
@@ -24,31 +24,54 @@
    copy config\tv_symbol_aliases.example.json config\tv_symbol_aliases.json
    ```
 
+5. 如需使用 Longbridge，在 PA_Agent 的父目录（即 `Quant\env`）配置完整三项凭据：
+
+   ```text
+   LONGBRIDGE_APP_KEY=...
+   LONGBRIDGE_APP_SECRET=...
+   LONGBRIDGE_ACCESS_TOKEN=...
+   ```
+
+   程序优先读取进程环境，其次读取该共享文件；也兼容旧名 `LONGPORT_*`。凭据不会复制到 `settings.json`。该数据源只创建官方 `QuoteContext` 读取行情，不创建交易上下文，不读取资产/订单，也不能下单。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
+
 ## `settings.json` 字段说明
 
-配置分为四个顶层组：`provider`、`general`、`prompt`、`validation`。
+AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当前活动档案的兼容镜像。其余主要组为 `general`、`prompt`、`validation`。
 
-### provider — AI 提供商
+### AI 模型档案
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `active_ai_profile_id` | string | 当前运行档案 ID |
+| `ai_profiles.<id>.display_name` | string | 界面显示名称 |
+| `ai_profiles.<id>.provider` | object | 该档案独立的模型、地址、Key 与推理参数 |
+| `ai_profiles.<id>.verification.status` | string | `untested` / `passed` / `failed`；只有与当前配置指纹一致的 `passed` 档案才能切换 |
+| `ai_profiles.<id>.verification.checks` | object | 真实探测的连接认证、参数接受、有效正文与随机挑战值匹配结果 |
+| `ai_profiles.<id>.verification.observations` | object | 是否观察到 reasoning 等非门禁信息；未返回可见 reasoning 不等于模型不可用 |
+
+### provider — 当前活动档案镜像
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `provider.model` | string | `"deepseek-v4-flash"` | 模型名称（须与网关支持的名称一致） |
 | `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
-| `provider.api_key` | string | `""` | API Key（明文，内存中临时使用；不持久化到文件） |
-| `provider.api_key_encrypted` | string | `""` | 加密后的 Key；留空表示未配置（通过 GUI 保存时自动加密写入） |
-| `provider.thinking` | bool | `true` | 是否启用思考/推理类扩展参数（依模型与网关而定）。关闭可 3–5 倍提速但分析质量下降 |
-| `provider.reasoning_effort` | string | `"high"` | 推理深度：`low` / `medium` / `high` / `max` |
-| `provider.context_window` | int | `2000000` | 用于上下文占用提示的窗口大小（tokens） |
+| `provider.api_key` | string | `""` | 当前活动档案的 API Key；会明文持久化到本地 `settings.json`，该文件默认被 Git 忽略 |
+| `provider.api_key_encrypted` | string | `""` | 兼容保留字段；当前实现不使用它提供加密存储 |
+| `provider.adapter_id` | string | `"auto"` | 请求适配器：`deepseek`、`openai`、`anthropic_adaptive`、`anthropic_budget`、`minimax_m3`、`minimax_m2`、`mimo`、`cursor_agent`、`generic_openai_compatible`、`generic_reasoning_compatible`；`auto` 仅用于旧配置迁移/识别 |
+| `provider.thinking` | bool | `true` | Thinking 开关；界面会按适配器决定是否可切换，固定 Thinking 模型不能关闭 |
+| `provider.reasoning_effort` | string | `"high"` | 推理深度：`minimal` / `low` / `medium` / `high` / `xhigh` / `max`；界面只开放当前模型适配器声明支持的档位 |
+| `provider.context_window` | int | `2000000` | 该档案独立的上下文窗口（1,024–100,000,000 tokens），用于用量提示和预警；在 AI 模型窗口按供应商官方模型文档填写，未知模型不会自动猜测 |
 
 ### general — 通用设置
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
+| `general.last_data_source` | string | `"mt5"` | K 线数据来源：`mt5` / `tradingview` / `longbridge`（GUI 下拉选项）；`akshare` / `yfinance`（仅代码支持） |
 | `general.last_tradingview_exchange` | string | `""` | TradingView 交易所。空字符串 =（自动）依次探测预设列表。如 `OANDA`、`SSE`、`HKEX` 等 |
-| `general.last_symbol` | string | `"XAUUSDm"` | 默认品种。MT5 需含后缀（如 `m`），TradingView 用标准名（如 `XAUUSD`） |
+| `general.last_symbol` | string | `"XAUUSDm"` | 当前数据源的默认品种。MT5 需匹配终端名称；TradingView 如 `XAUUSD`；Longbridge 必须为 `ticker.region`，支持 `US` / `HK` / `SH` / `SZ` 后缀，如 `AAPL.US` |
+| `general.last_symbols_by_source` | object | `{}` | 各数据源最后使用的品种，切换数据源时自动维护，避免把 MT5/TradingView 代码误带入 Longbridge |
 | `general.last_timeframe` | string | `"15m"` | 默认周期，如 `1m`、`5m`、`15m`、`1h`、`4h`、`1d` |
-| `general.analysis_bar_count` | int | `100` | 提交分析时使用的 K 线数量（2–5000） |
+| `general.analysis_bar_count` | int | `100` | 提交分析时使用的 K 线数量（通常为 2–5000；Longbridge 因单次行情上限最多 945） |
 | `general.refresh_interval_ms` | int | `1000` | 图表自动刷新间隔（毫秒） |
 | `general.context_warning_threshold_pct` | float | `80.0` | 上下文占用警告阈值（百分比） |
 | `general.decision_stance` | string | `"balanced"` | 阶段二交易倾向：`conservative` / `balanced` / `aggressive` / `extreme_aggressive` |
@@ -90,5 +113,16 @@
 ## 安全提醒
 
 - **不要**将 `config/settings.json`、`config/exception_state.json`、`config/tv_symbol_aliases.json` 提交到 Git。
+- API Key 在输入框中默认以圆点隐藏，但这只是界面遮罩，不代表磁盘加密。
 - 若曾误提交 API Key，请立即在服务商处**作废并轮换**密钥。
 - 建议在仓库根目录执行：`powershell -ExecutionPolicy Bypass -File tools\setup_git_secrets.ps1`
+
+连接测试有界面级硬截止，并把同一时刻的探测限制为一个。若第三方 SDK 无视自身超时且永久阻塞，界面会显示“前一次底层探测仍在终止”；持续出现时需重启 PA_Agent。此限制避免连续点击累积阻塞线程，但 Python 线程本身无法被安全强杀。
+
+## Longbridge Token 更新边界
+
+- Legacy Access Token 通常有到期时间；程序只在本地解析 JWT `exp` 并在连接时让服务端校验权限，没有“查询当前 Token 是否被撤销”的独立接口。
+- Longbridge SDK 提供刷新 Access Token 的能力，但刷新后仍需安全持久化新 Token 并重建连接；PA_Agent 当前没有自动执行该流程。
+- 当前使用方式仍需在 Longbridge 开放平台生成/刷新 Token 后，手动替换 `Quant\env` 中的 `LONGBRIDGE_ACCESS_TOKEN` 并重新连接数据源。
+- Longbridge OAuth 2 可管理刷新与缓存，但需要单独的 OAuth 应用和首次浏览器授权，未在本次只读 Legacy 接入中启用。
+- 常规中、美、港交易时段和午休分段会用于 K 线闭合判断；特殊半日市没有可靠的提前收盘时刻字段，可能延迟到常规收盘时间才标记闭合。

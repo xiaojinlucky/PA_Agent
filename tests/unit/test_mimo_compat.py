@@ -21,8 +21,8 @@ def test_is_mimo_provider_detects_base_url_and_model() -> None:
 def test_resolve_mimo_thinking_extra_body() -> None:
     on = resolve_mimo_thinking_extra_body(thinking=True)
     off = resolve_mimo_thinking_extra_body(thinking=False)
-    assert on == {"chat_template_kwargs": {"enable_thinking": True}}
-    assert off == {"chat_template_kwargs": {"enable_thinking": False}}
+    assert on == {"thinking": {"type": "enabled"}}
+    assert off == {"thinking": {"type": "disabled"}}
 
 
 def test_patch_messages_injects_reasoning_for_tool_calls() -> None:

@@ -5,6 +5,7 @@ from pa_agent.data.market_defaults import (
     GOLD_MT5_SYMBOL,
     GOLD_TV_EXCHANGE,
     GOLD_TV_SYMBOL,
+    TV_GOLD_SYMBOL_BY_EXCHANGE,
     ashare_tv_probe_order,
     infer_ashare_tv_exchange,
     is_partial_tv_symbol_input,
@@ -25,6 +26,11 @@ def test_crypto_symbol_migrates_to_gold():
     assert normalize_gold_symbol_for_kind("tradingview", "BTCUSDT") == GOLD_TV_SYMBOL
 
 
+def test_longbridge_requires_ticker_region_default():
+    assert normalize_gold_symbol_for_kind("longbridge", "XAUUSD") == "AAPL.US"
+    assert normalize_gold_symbol_for_kind("longbridge", "aapl.us") == "AAPL.US"
+
+
 def test_mt5_suffix_on_tv_becomes_xauusd():
     assert normalize_gold_symbol_for_kind("tradingview", "XAUUSDm") == GOLD_TV_SYMBOL
 
@@ -42,7 +48,7 @@ def test_tv_forex_auto_probe_tries_all_forex_presets():
     assert exchanges == [
         ex
         for ex in TV_EXCHANGE_PRESETS
-        if ex and ex not in {"SSE", "SZSE", "HKEX"}
+        if ex in TV_GOLD_SYMBOL_BY_EXCHANGE
     ]
     assert ("OANDA", "XAUUSD") in plan
     assert ("TVC", "GOLD") in plan

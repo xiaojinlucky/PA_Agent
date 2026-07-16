@@ -19,26 +19,30 @@ from pa_agent.util.mask_secret import mask_secret
 # ── Module-level state ────────────────────────────────────────────────────────
 
 _active_formatters: List["MaskingFormatter"] = []
+_known_api_keys: list[str] = []
 _configured: bool = False
 
 # ── MaskingFormatter ──────────────────────────────────────────────────────────
 
 
 class MaskingFormatter(logging.Formatter):
-    """Logging formatter that replaces the plaintext API key with its masked form."""
+    """Logging formatter that masks every API key seen during this process."""
 
     def __init__(self, fmt: str, api_key: str = "") -> None:
         super().__init__(fmt)
-        self._api_key = api_key
+        self._api_keys: list[str] = []
+        self.set_api_key(api_key)
 
     def format(self, record: logging.LogRecord) -> str:  # noqa: A003
         message = super().format(record)
-        if self._api_key:
-            message = message.replace(self._api_key, mask_secret(self._api_key))
+        for api_key in sorted(tuple(self._api_keys), key=len, reverse=True):
+            message = message.replace(api_key, mask_secret(api_key))
         return message
 
     def set_api_key(self, new_key: str) -> None:
-        self._api_key = new_key
+        key = str(new_key or "")
+        if key and key not in self._api_keys:
+            self._api_keys.append(key)
 
 
 # ── Public functions ──────────────────────────────────────────────────────────
@@ -80,6 +84,9 @@ def configure_logging(api_key: str = "") -> None:
     """
     global _configured  # noqa: PLW0603
 
+    if api_key and api_key not in _known_api_keys:
+        _known_api_keys.append(api_key)
+
     if _configured:
         if api_key:
             update_api_key(api_key)
@@ -91,6 +98,9 @@ def configure_logging(api_key: str = "") -> None:
     # Build formatters
     file_formatter = MaskingFormatter(_LOG_FORMAT, api_key=api_key)
     console_formatter = MaskingFormatter(_LOG_FORMAT, api_key=api_key)
+    for known_key in _known_api_keys:
+        file_formatter.set_api_key(known_key)
+        console_formatter.set_api_key(known_key)
 
     # Track all active formatters so update_api_key can reach them
     _active_formatters.clear()
@@ -148,6 +158,8 @@ def _silence_noisy_libraries() -> None:
 
 
 def update_api_key(new_key: str) -> None:
-    """Update the masking key in all active MaskingFormatter instances."""
+    """Add a key to every formatter without forgetting previously used keys."""
+    if new_key and new_key not in _known_api_keys:
+        _known_api_keys.append(new_key)
     for formatter in _active_formatters:
         formatter.set_api_key(new_key)

@@ -329,9 +329,13 @@ class CursorSdkClient:
         reasoning_effort: str | None = None,
         cancel_token: Any | None = None,
         timeout_s: float = 600.0,
+        max_output_tokens: int | None = None,
     ) -> AIReply:
         """Stream a Cursor Agent run and surface thinking/content to the GUI."""
-        del reasoning_effort, timeout_s
+        del reasoning_effort, max_output_tokens
+
+        if timeout_s <= 0:
+            raise ValueError("timeout_s must be greater than zero")
 
         if cancel_token is not None and cancel_token.is_set():
             raise CancelledError("Request cancelled before API call")
@@ -345,7 +349,10 @@ class CursorSdkClient:
             ) from exc
 
         prompt = _messages_to_prompt(messages)
-        model_id = resolve_cursor_sdk_model_id(self._settings.model)
+        model_id = resolve_cursor_sdk_model_id(
+            self._settings.model,
+            allow_direct=self._settings.adapter_id == "cursor_agent",
+        )
         cwd = _default_workspace()
 
         self._log.info("CursorSdkClient.stream_chat: model_id=%s chars=%d", model_id, len(prompt))
@@ -354,8 +361,39 @@ class CursorSdkClient:
         content_parts: list[str] = []
         t0 = time.monotonic()
 
-        client = CursorClient.launch_bridge(workspace=cwd)
+        timed_out = threading.Event()
+        runtime: dict[str, Any] = {}
+
+        def _cancel_for_timeout() -> None:
+            timed_out.set()
+            run = runtime.get("run")
+            try:
+                if run is not None and run.supports("cancel"):
+                    run.cancel()
+            except Exception:  # noqa: BLE001
+                pass
+            client_for_timeout = runtime.get("client")
+            try:
+                if client_for_timeout is not None:
+                    client_for_timeout.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        timer = threading.Timer(float(timeout_s), _cancel_for_timeout)
+        timer.daemon = True
+        timer.start()
+        client: Any = None
+        result: Any = None
         try:
+            client = CursorClient.launch_bridge(
+                workspace=cwd,
+                timeout=float(timeout_s),
+                client_timeout=float(timeout_s),
+                max_retries=0,
+            )
+            runtime["client"] = client
+            if timed_out.is_set():
+                raise TimeoutError("Cursor SDK request timed out")
             with Agent.create(
                 AgentOptions(
                     api_key=self._settings.api_key,
@@ -364,9 +402,16 @@ class CursorSdkClient:
                 ),
                 client=client,
             ) as agent:
+                if timed_out.is_set():
+                    raise TimeoutError("Cursor SDK request timed out")
                 run = agent.send(prompt)
+                runtime["run"] = run
+                if timed_out.is_set():
+                    raise TimeoutError("Cursor SDK request timed out")
                 try:
                     for event in run.events():
+                        if timed_out.is_set():
+                            raise TimeoutError("Cursor SDK request timed out")
                         if cancel_token is not None and cancel_token.is_set():
                             if run.supports("cancel"):
                                 run.cancel()
@@ -378,10 +423,24 @@ class CursorSdkClient:
                             on_reasoning_token=on_reasoning_token,
                             on_content_token=on_content_token,
                         )
-                finally:
+                    if timed_out.is_set():
+                        raise TimeoutError("Cursor SDK request timed out")
                     result = run.wait()
+                    if timed_out.is_set():
+                        raise TimeoutError("Cursor SDK request timed out")
+                finally:
+                    runtime.pop("run", None)
+        except Exception as exc:
+            if timed_out.is_set() and not isinstance(exc, TimeoutError):
+                raise TimeoutError("Cursor SDK request timed out") from None
+            raise
         finally:
-            client.close()
+            timer.cancel()
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:  # noqa: BLE001
+                pass
 
         latency_ms = (time.monotonic() - t0) * 1000
         reasoning_content = "".join(reasoning_parts)

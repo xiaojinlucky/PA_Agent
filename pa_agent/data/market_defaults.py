@@ -17,6 +17,12 @@ GOLD_TV_EXCHANGE = "OANDA"
 A_SHARE_DEFAULT_SYMBOL = "000001"
 A_SHARE_DEFAULT_TIMEFRAME = "1h"
 
+# Longbridge 证券代码必须为 ticker.region；XAUUSD 不是可用代码。
+LONGBRIDGE_DEFAULT_SYMBOL = "AAPL.US"
+_LONGBRIDGE_SYMBOL_RE = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._!-]*\.[A-Za-z]{2,4}$"
+)
+
 # Exchange → correct gold symbol on TradingView (do not use XAUUSD on TVC)
 TV_GOLD_SYMBOL_BY_EXCHANGE: dict[str, str] = {
     "OANDA": "XAUUSD",
@@ -101,6 +107,8 @@ def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
     from pa_agent.data.ashare_common import normalize_ashare_symbol
 
     sym = (symbol or "").strip()
+    if kind == "longbridge":
+        return sym.upper() if _LONGBRIDGE_SYMBOL_RE.fullmatch(sym) else LONGBRIDGE_DEFAULT_SYMBOL
     if kind in ("akshare", "eastmoney", "tushare"):
         code = normalize_ashare_symbol(sym)
         if not code or not _looks_like_ashare_code(code):
@@ -476,7 +484,12 @@ def migrate_general_gold_defaults(general: dict) -> None:
     """In-place migration: gold symbol + valid TV exchange/symbol pair."""
     kind = str(general.get("last_data_source", "mt5"))
     sym = str(general.get("last_symbol", ""))
+    symbols_by_source = general.get("last_symbols_by_source")
+    if isinstance(symbols_by_source, dict):
+        sym = str(symbols_by_source.get(kind, sym))
     general["last_symbol"] = normalize_gold_symbol_for_kind(kind, sym)
+    if isinstance(symbols_by_source, dict):
+        symbols_by_source[kind] = general["last_symbol"]
     if kind == "tradingview":
         ex, sym, _ = resolve_tv_pair(
             str(general.get("last_tradingview_exchange", "")),

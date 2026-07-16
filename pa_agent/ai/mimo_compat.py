@@ -1,6 +1,6 @@
 """Xiaomi MiMo API compatibility helpers.
 
-Reference: https://github.com/Miku-cy/MiMo-API-Compat-Fix
+Reference: https://mimo.mi.com/docs/api/chat/openai-api
 
 MiMo uses an OpenAI-compatible API with DeepSeek-style ``reasoning_content``.
 When an assistant message contains ``tool_calls`` but omits ``reasoning_content``,
@@ -66,8 +66,8 @@ def mimo_max_output_tokens(model: str) -> int:
 
 
 def resolve_mimo_thinking_extra_body(*, thinking: bool) -> dict[str, Any]:
-    """Return MiMo ``chat_template_kwargs`` block for extra_body."""
-    return {"chat_template_kwargs": {"enable_thinking": bool(thinking)}}
+    """Return the official MiMo V2.5 thinking toggle for ``extra_body``."""
+    return {"thinking": {"type": "enabled" if thinking else "disabled"}}
 
 
 def build_assistant_api_message(
@@ -151,6 +151,11 @@ class ReasoningCache:
                     key=lambda k: float(self._cache[k].get("timestamp", 0)),
                 )
                 del self._cache[oldest]
+
+    def clear(self) -> None:
+        """清空进程内推理回放缓存，用于切换 AI 档案。"""
+        with self._lock:
+            self._cache.clear()
 
 
 def patch_messages_for_mimo(

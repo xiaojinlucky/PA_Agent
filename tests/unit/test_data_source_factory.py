@@ -2,17 +2,19 @@
 from __future__ import annotations
 
 from pa_agent.config.settings import GeneralSettings
+from pa_agent.data.eastmoney_source import EastMoneySource
 from pa_agent.data.factory import (
     DATA_SOURCE_CHOICES,
     create_data_source,
     default_symbol_for_kind,
     default_tradingview_exchange,
+    max_analysis_bars_for_kind,
     normalize_data_source_kind,
 )
-from pa_agent.data.eastmoney_source import EastMoneySource
+from pa_agent.data.longbridge_source import LongbridgeSource
 from pa_agent.data.mt5 import MT5Source
-from pa_agent.data.tushare_source import TushareSource
 from pa_agent.data.tradingview import TradingViewSource
+from pa_agent.data.tushare_source import TushareSource
 
 
 def test_normalize_data_source_kind_defaults_unknown():
@@ -38,9 +40,14 @@ def test_tushare_not_in_ui_choices():
     assert "tushare" not in ui_kinds
 
 
+def test_longbridge_is_visible_in_ui_choices():
+    assert "longbridge" in {k for k, _ in DATA_SOURCE_CHOICES}
+
+
 def test_create_data_source_returns_expected_types():
     assert isinstance(create_data_source("mt5"), MT5Source)
     assert isinstance(create_data_source("tradingview"), TradingViewSource)
+    assert isinstance(create_data_source("longbridge"), LongbridgeSource)
     assert isinstance(create_data_source("eastmoney"), EastMoneySource)
     assert isinstance(create_data_source("tushare"), TushareSource)
 
@@ -48,8 +55,14 @@ def test_create_data_source_returns_expected_types():
 def test_default_symbols_per_kind():
     assert default_symbol_for_kind("mt5") == "XAUUSDm"
     assert default_symbol_for_kind("tradingview") == "XAUUSD"
+    assert default_symbol_for_kind("longbridge") == "AAPL.US"
     assert default_symbol_for_kind("eastmoney") == "000001"
     assert default_symbol_for_kind("tushare") == "000001"
+
+
+def test_longbridge_analysis_limit_reserves_refresh_warmup():
+    assert max_analysis_bars_for_kind("longbridge") == 945
+    assert max_analysis_bars_for_kind("mt5") == 5_000
 
 
 def test_default_tradingview_exchange_is_auto():

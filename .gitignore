@@ -14,12 +14,14 @@ venv/
 .ruff_cache/
 .mypy_cache/
 .hypothesis/
+scratch/
 
 # ── 密钥与本地配置（切勿提交）────────────────────────────────────────────────
 .env
 .env.*
 config/settings.json
 config/settings.local.json
+config/.*.tmp
 config/exception_state.json
 config/secret.key
 config/tv_symbol_aliases.json

@@ -4,14 +4,15 @@
 
 ---
 
-面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / yfinance / AkShare** 读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不是**截图识图，**不连接券商、不执行下单**。
+面向主观交易者的 **价格行为（Price Action）** AI 辅助决策工具。从 **MT5 / TradingView / Longbridge / yfinance / AkShare** 读取 K 线，将结构化 K 线数据与预计算特征送入大模型做**两阶段分析**（市场诊断 → 交易决策），**不是**截图识图，**不执行下单**。Longbridge 接入仅创建只读报价连接。
 
 ---
 
 ## 主要功能
 
-- 📈 **多数据源**：MT5（Windows）、TradingView（全平台）、yfinance（期货/加密货币）、AkShare（A 股）
+- 📈 **多数据源**：MT5（Windows）、TradingView（全平台）、Longbridge OpenAPI（证券只读行情）、yfinance（期货/加密货币）、AkShare（A 股）
 - 🧠 **两阶段 AI 分析**：市场诊断 → 策略路由 → 交易决策（限价/突破/市价或不下单）
+- 🔁 **多模型档案**：保存多套 API / 模型 / 推理参数与上下文窗口，真实挑战测试通过后可一键切换
 - 🔄 **增量分析与持续跟踪**：新增 K 线时复用上次结论；开启 `keep_analysis` 后新 K 线收盘自动触发新一轮分析
 - 🌳 **决策树可视化**：赛博科幻风格可交互流程图，自动播放闸门→策略路径动画
 - 🔮 **未来走势预期**：AI 预测下一根 K 线方向和下一个市场周期位置
@@ -19,7 +20,7 @@
 - 📚 **经验库**：按周期位置检索历史案例供分析参考
 - 📝 **完整落盘**：Prompt、原始响应、诊断/决策 JSON、Token 用量、追问记录
 - 🛡️ **可配置校验体系**：JSON 校验、一致性检查、语义校验、截断修复、失败自动重试
-- 🔒 **API Key** 本地加密存储
+- 🙈 **API Key 输入框默认隐藏**；本地 `settings.json` 被 Git 忽略（当前格式不是磁盘加密）
 
 ---
 
@@ -29,7 +30,7 @@
 | -------- | ----------------------------------------------------------------------- |
 | 操作系统 | Windows 10 / 11（主支持）、macOS 12+（TradingView 数据源）              |
 | Python   | 3.11+                                                                    |
-| 数据源   | MT5 / TradingView / yfinance / AkShare **至少配置一种**                  |
+| 数据源   | MT5 / TradingView / Longbridge / yfinance / AkShare **至少配置一种**     |
 | 网络     | 可访问所配置的 AI API（如 DeepSeek、PackyAPI 等）                        |
 
 ---
@@ -43,11 +44,11 @@ pip install -e .
 python -m pa_agent.main
 ```
 
-首次启动后在**设置**中填写 **Base URL**、**模型名** 与 **API Key**。
+首次启动后打开 **AI 模型设置**，填写 **适配器、Base URL、模型 ID、API Key 与上下文窗口**，点击“测试并保存”；连接认证、参数接受、有效正文和随机挑战值四项均通过后才可激活。不同提供商支持的 Thinking 开关和推理强度不同，界面会按所选适配器限制可用选项；上下文窗口须按该模型官方文档填写，程序不会对未知模型猜测。
 
 > 如需隔离环境也可创建虚拟环境：`python -m venv .venv` 后激活再 `pip install -e .`。
 
-**安装内容**：PyQt6（GUI 框架）+ pyqtgraph（K 线图表绘图）+ numpy/pandas（数据处理）+ openai（AI API 客户端）+ **akshare/baostock（A 股数据源）** + json 校验、模型定义等全套依赖。
+**安装内容**：PyQt6（GUI 框架）+ pyqtgraph（K 线图表绘图）+ numpy/pandas（数据处理）+ openai（AI API 客户端）+ **longbridge（证券行情）** + **akshare/baostock（A 股数据源）** + json 校验、模型定义等全套依赖。
 
 > 若需运行测试（pytest）或代码格式化（ruff/black），额外安装：`pip install -e ".[dev]"`。
 

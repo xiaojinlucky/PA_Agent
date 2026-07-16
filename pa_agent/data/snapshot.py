@@ -184,6 +184,8 @@ def build_live_frame(
                     low=b.low,
                     close=b.close,
                     volume=b.volume,
+                    amount=b.amount,
+                    pct_chg=b.pct_chg,
                     closed=not is_forming,
                 )
             )
@@ -209,6 +211,8 @@ def _rebase_closed_bars(closed_raw: list[KlineBar]) -> list[KlineBar]:
                 low=b.low,
                 close=b.close,
                 volume=b.volume,
+                amount=b.amount,
+                pct_chg=b.pct_chg,
                 closed=True,
             )
         )

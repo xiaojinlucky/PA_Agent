@@ -93,9 +93,21 @@ class GeneralSettingsDialog(QDialog):
         analysis_form = QFormLayout(analysis_group)
 
         self._analysis_bar_count_spin = QSpinBox()
-        self._analysis_bar_count_spin.setRange(2, 5_000)
+        from pa_agent.data.factory import max_analysis_bars_for_kind
+
+        data_source_kind = getattr(
+            self._settings.general, "last_data_source", "mt5"
+        )
+        max_analysis_bars = max_analysis_bars_for_kind(data_source_kind)
+        self._analysis_bar_count_spin.setRange(2, max_analysis_bars)
+        limit_hint = (
+            " Longbridge 单次行情上限下最多可设 945 根。"
+            if data_source_kind == "longbridge"
+            else ""
+        )
         self._analysis_bar_count_spin.setToolTip(
             "提交 AI 分析时使用的已收盘 K 线根数（不含当前未收盘 K 线）。"
+            + limit_hint
         )
         analysis_form.addRow("用于分析的 K 线数量:", self._analysis_bar_count_spin)
 

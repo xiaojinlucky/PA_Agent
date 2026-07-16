@@ -8,11 +8,13 @@ from pa_agent.data.market_defaults import (
     A_SHARE_DEFAULT_SYMBOL,
     GOLD_MT5_SYMBOL,
     GOLD_TV_SYMBOL,
+    LONGBRIDGE_DEFAULT_SYMBOL,
 )
 
 DataSourceKind = Literal[
     "mt5",
     "tradingview",
+    "longbridge",
     "akshare",
     "eastmoney",
     "tushare",
@@ -23,6 +25,7 @@ DataSourceKind = Literal[
 DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = (
     ("mt5", "MT5"),
     ("tradingview", "TradingView"),
+    ("longbridge", "Longbridge"),
 )
 
 _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
@@ -32,6 +35,7 @@ _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
 _DEFAULT_SYMBOLS: dict[DataSourceKind, str] = {
     "mt5": GOLD_MT5_SYMBOL,
     "tradingview": GOLD_TV_SYMBOL,
+    "longbridge": LONGBRIDGE_DEFAULT_SYMBOL,
     "akshare": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney": A_SHARE_DEFAULT_SYMBOL,
     "tushare": A_SHARE_DEFAULT_SYMBOL,
@@ -62,6 +66,8 @@ def data_source_label(kind: str | None) -> str:
         return "东方财富"
     if normalized == "tushare":
         return "Tushare(A股)"
+    if normalized == "longbridge":
+        return "Longbridge"
     if normalized == "akshare":
         return "AkShare"
     if normalized == "yfinance":
@@ -73,6 +79,15 @@ def default_symbol_for_kind(kind: str | None) -> str:
     return _DEFAULT_SYMBOLS[normalize_data_source_kind(kind)]
 
 
+def max_analysis_bars_for_kind(kind: str | None) -> int:
+    """返回数据源单次刷新可支持的最大分析窗口。"""
+    if normalize_data_source_kind(kind) == "longbridge":
+        from pa_agent.data.longbridge_source import LONGBRIDGE_MAX_ANALYSIS_BARS
+
+        return LONGBRIDGE_MAX_ANALYSIS_BARS
+    return 5_000
+
+
 def create_data_source(kind: str | None) -> DataSource:
     """Instantiate a fresh data source for *kind* (not connected)."""
     normalized = normalize_data_source_kind(kind)
@@ -80,6 +95,10 @@ def create_data_source(kind: str | None) -> DataSource:
         from pa_agent.data.tradingview import TradingViewSource
 
         return TradingViewSource()
+    if normalized == "longbridge":
+        from pa_agent.data.longbridge_source import LongbridgeSource
+
+        return LongbridgeSource()
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource
 

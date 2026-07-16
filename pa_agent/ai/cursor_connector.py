@@ -29,15 +29,21 @@ def is_openclaw_cs_model(model: str | None) -> bool:
     return m == _CURSOR_MODEL or m.startswith(f"{_CURSOR_MODEL}/")
 
 
-def resolve_cursor_sdk_model_id(model: str | None) -> str:
+def resolve_cursor_sdk_model_id(
+    model: str | None,
+    *,
+    allow_direct: bool = False,
+) -> str:
     """Resolve Cursor SDK model id from ``openclaw_cs`` alias.
 
     ``openclaw_cs/<cursorModelId>`` -> ``<cursorModelId>``
     ``openclaw_cs`` -> ``auto``
+    Explicit ``cursor_agent`` profiles may pass a direct model id with
+    ``allow_direct=True``.
     """
     raw = (model or "").strip()
     if not is_openclaw_cs_model(raw):
-        return _CURSOR_DEFAULT_MODEL_ID
+        return raw if allow_direct and raw else _CURSOR_DEFAULT_MODEL_ID
     suffix = raw[len(_CURSOR_MODEL) :].lstrip("/")
     return suffix or _CURSOR_DEFAULT_MODEL_ID
 
@@ -85,5 +91,5 @@ def apply_cursor_provider_to_settings(
     if not key:
         return "Cursor 路由需要 API Key（形如 crsr_...）。请在设置里填写 API Key。"
     if not key.startswith("crsr_"):
-        logger.warning("Cursor API key does not start with crsr_: %s", key[:8])
+        logger.warning("Cursor API key does not use the expected crsr_ prefix")
     return None

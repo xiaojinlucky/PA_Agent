@@ -97,3 +97,33 @@ def test_analysis_keeps_head_when_closed_false_but_period_ended() -> None:
     assert frame is not None
     assert frame.bars[0].close == 10.5
     assert frame.bars[0].ts_open == ts_open
+
+
+def test_snapshot_rebase_preserves_turnover_and_pct_change() -> None:
+    import time
+
+    now_ms = int(time.time() * 1000)
+    bars = [
+        KlineBar(
+            seq=1,
+            ts_open=float(now_ms - 60_000),
+            open=10.0,
+            high=11.0,
+            low=9.0,
+            close=10.5,
+            volume=100.0,
+            amount=1050.0,
+            pct_chg=1.25,
+            closed=True,
+        )
+    ]
+
+    analysis = build_analysis_frame(bars, 1, "AAPL.US", "15m", now_ms=now_ms)
+    live = build_live_frame(bars, 1, "AAPL.US", "15m", now_ms=now_ms)
+
+    assert analysis is not None
+    assert live is not None
+    assert analysis.bars[0].amount == 1050.0
+    assert analysis.bars[0].pct_chg == 1.25
+    assert live.bars[0].amount == 1050.0
+    assert live.bars[0].pct_chg == 1.25

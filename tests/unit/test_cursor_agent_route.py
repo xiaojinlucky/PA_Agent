@@ -25,6 +25,10 @@ def test_resolve_cursor_gateway_model_preserves_sub_alias() -> None:
     assert resolve_cursor_sdk_model_id("openclaw_cs/composer-2.5") == "composer-2.5"
     assert resolve_cursor_sdk_model_id("openclaw_cs") == "auto"
     assert resolve_cursor_sdk_model_id("deepseek-v4-pro") == "auto"
+    assert (
+        resolve_cursor_sdk_model_id("composer-2.5", allow_direct=True)
+        == "composer-2.5"
+    )
 
 
 def test_should_use_cursor_provider_when_base_url_matches_gateway() -> None:

@@ -39,3 +39,13 @@ def test_prefix_chain_disabled_for_openclaw_cs():
         api_key="sk-test",
     )
     assert supports_kv_prefix_chain(settings) is False
+
+
+def test_explicit_non_deepseek_adapter_disables_prefix_chain():
+    settings = AIProviderSettings(
+        base_url="https://api.deepseek.com",
+        model="deepseek-reasoner",
+        api_key="sk-test",
+        adapter_id="openai",
+    )
+    assert supports_kv_prefix_chain(settings) is False

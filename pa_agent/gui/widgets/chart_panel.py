@@ -1,8 +1,13 @@
 """ChartPanel — wrapper around ChartWidget with titlebar, legend, and footer."""
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget
+
+if TYPE_CHECKING:
+    from pa_agent.gui.chart_widget import ChartWidget
 
 
 class ChartPanel(QWidget):
@@ -189,6 +194,6 @@ class ChartPanel(QWidget):
         """Show hovered K-line context in the footer."""
         self._footer_left.setText(summary or self._footer_hint_text)
 
-    def chart_widget(self) -> "ChartWidget":  # type: ignore[name-defined]
+    def chart_widget(self) -> ChartWidget:
         """Return the internal ``ChartWidget`` instance for signal connections."""
         return self._chart

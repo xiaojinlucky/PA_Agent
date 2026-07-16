@@ -256,6 +256,7 @@ class MainWindow(QMainWindow):
         self._cancel_token: Any = None
         self._window_closing = False
         self._analysis_in_progress = False
+        self._ai_settings_dialog_open = False
         self._last_analysis_had_error = False
         self._switching = False
         self._chart_refresh_paused = False
@@ -404,6 +405,10 @@ class MainWindow(QMainWindow):
             _last_ds = normalize_data_source_kind(
                 getattr(_settings.general, "last_data_source", "mt5")
             )
+            _saved_symbols = getattr(
+                _settings.general, "last_symbols_by_source", {}
+            ) or {}
+            _last_symbol = _saved_symbols.get(_last_ds, _last_symbol) or _last_symbol
         self._active_data_source_kind = _last_ds
 
         ctrl_layout.addWidget(QLabel("数据来源:"))
@@ -416,12 +421,18 @@ class MainWindow(QMainWindow):
         self._data_source_combo.setMinimumWidth(108)
         self._data_source_combo.setToolTip(
             "K 线数据来源：MT5（需终端登录）、TradingView（tvDatafeed）、"
-            "本地仅支持 MT5 与 TradingView"
+            "Longbridge（OpenAPI 只读行情）"
         )
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
         )
         ctrl_layout.addWidget(self._data_source_combo)
+
+        self._data_source_health_label = QLabel("")
+        self._data_source_health_label.setObjectName("sourceHealthLabel")
+        self._data_source_health_label.setWordWrap(False)
+        self._data_source_health_label.hide()
+        ctrl_layout.addWidget(self._data_source_health_label)
 
         # TradingView exchange is forced to «auto» whenever the data source is TV.
         # We still keep the field visible for clarity, but it is not user-editable.
@@ -685,6 +696,14 @@ class MainWindow(QMainWindow):
             )
         )
 
+        self._update_data_source_health_label()
+        self._data_source_health_timer = QTimer(self)
+        self._data_source_health_timer.setInterval(60_000)
+        self._data_source_health_timer.timeout.connect(
+            self._update_data_source_health_label
+        )
+        self._data_source_health_timer.start()
+
         return tab
 
     def _connect_event_bus(self) -> None:
@@ -720,7 +739,20 @@ class MainWindow(QMainWindow):
         if settings is not None:
             interval_ms = getattr(settings.general, "refresh_interval_ms", 1000)
             n_bars = self._analysis_bar_count()
-        if self._current_data_source_kind() in ("akshare", "eastmoney", "tushare") and interval_ms < 2500:
+        from pa_agent.data.factory import max_analysis_bars_for_kind
+
+        max_bars = max_analysis_bars_for_kind(self._current_data_source_kind())
+        if n_bars > max_bars:
+            message = (
+                f"Longbridge 最多支持 {max_bars} 根分析 K 线；"
+                "请在“其他通用设置”中调低后重试"
+            )
+            logger.warning("RefreshLoop not started: %s", message)
+            self._status_bar.showMessage(message)
+            return
+        if self._current_data_source_kind() in (
+            "akshare", "eastmoney", "tushare", "longbridge"
+        ) and interval_ms < 2500:
             interval_ms = 2500
 
         self._refresh_cancel_token = CancelToken()
@@ -971,6 +1003,66 @@ class MainWindow(QMainWindow):
                 w.setVisible(visible)
                 w.setEnabled(visible)
 
+    def _update_data_source_health_label(self) -> None:
+        """显示当前数据源的关键可用性状态，不暴露任何凭据。"""
+        label = getattr(self, "_data_source_health_label", None)
+        if label is None:
+            return
+        if self._current_data_source_kind() != "longbridge":
+            label.clear()
+            label.hide()
+            return
+
+        data_source = getattr(self._ctx, "data_source", None)
+        expiry = getattr(data_source, "token_expiry", None)
+        expires_at = getattr(expiry, "expires_at_utc", None)
+        if expires_at is not None:
+            from pa_agent.data.longbridge_source import (
+                classify_longbridge_token_expiry,
+            )
+
+            expiry = classify_longbridge_token_expiry(expires_at)
+        status = str(getattr(expiry, "status", "unknown") or "unknown")
+        date_text = expires_at.strftime("%Y-%m-%d UTC") if expires_at is not None else ""
+        connected = bool(getattr(data_source, "_connected", False))
+        if not connected:
+            if status == "expired":
+                token_text = (
+                    f"本地 Token 已于 {date_text} 到期" if date_text else "Token 已到期"
+                )
+            elif status == "expiring":
+                token_text = (
+                    f"本地 Token 将于 {date_text} 到期"
+                    if date_text
+                    else "Token 即将到期"
+                )
+            else:
+                token_text = (
+                    f"本地 Token 至 {date_text}" if date_text else "Token 状态未知"
+                )
+            text = f"Longbridge 未连接 · {token_text}"
+            object_name = "sourceHealthError"
+        elif status == "valid":
+            text = f"行情只读 · Token 至 {date_text}" if date_text else "行情只读 · Token 有效"
+            object_name = "sourceHealthOk"
+        elif status == "expiring":
+            text = f"行情只读 · Token 将于 {date_text} 到期"
+            object_name = "sourceHealthWarning"
+        elif status == "expired":
+            text = f"Token 已于 {date_text} 到期" if date_text else "Token 已到期"
+            object_name = "sourceHealthError"
+        else:
+            text = "行情只读 · 到期日未知（连接时校验）"
+            object_name = "sourceHealthUnknown"
+        label.setText(text)
+        label.setObjectName(object_name)
+        label.setToolTip(
+            "这里只显示本地 Token 到期时间；服务端撤销状态仍以 Longbridge 实际连接结果为准。"
+        )
+        label.style().unpolish(label)
+        label.style().polish(label)
+        label.show()
+
     def _force_tv_exchange_auto(self) -> None:
         """Force TradingView exchange UI to «auto» (empty string)."""
         combo = getattr(self, "_tv_exchange_combo", None)
@@ -982,23 +1074,6 @@ class MainWindow(QMainWindow):
         combo.blockSignals(True)
         combo.setCurrentIndex(idx)
         combo.blockSignals(False)
-
-    def _apply_gold_defaults_for_data_source(self, kind: str) -> None:
-        """Reset symbol/exchange to defaults when switching data source."""
-        from pa_agent.data.market_defaults import (
-            A_SHARE_DEFAULT_TIMEFRAME,
-            normalize_gold_symbol_for_kind,
-        )
-
-        sym = normalize_gold_symbol_for_kind(
-            kind, self._symbol_combo.currentText().strip()
-        )
-        self._symbol_combo.blockSignals(True)
-        self._symbol_combo.setCurrentText(sym)
-        self._symbol_combo.blockSignals(False)
-        if kind == "akshare":
-            if self._tf_combo.currentText() not in ("1h", "4h", "1d"):
-                self._tf_combo.setCurrentText(A_SHARE_DEFAULT_TIMEFRAME)
 
     def _apply_tv_exchange_to_source(self, data_source: Any) -> None:
         from pa_agent.data.tradingview import TradingViewSource
@@ -1079,6 +1154,10 @@ class MainWindow(QMainWindow):
             line.setPlaceholderText(
                 "A股 6 位 / 港股 1810 / 名称 小米集团；交易所可自动；或 XAUUSD+OANDA"
             )
+        elif kind == "longbridge":
+            line.setPlaceholderText(
+                "Longbridge 代码，如 AAPL.US、700.HK、600519.SH、000001.SZ"
+            )
         elif kind in ("akshare", "eastmoney", "tushare"):
             line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
         else:
@@ -1117,7 +1196,10 @@ class MainWindow(QMainWindow):
 
     def _populate_timeframe_combo_for_source(self) -> None:
         data_source = getattr(self._ctx, "data_source", None)
-        preferred = ["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
+        preferred = [
+            "1m", "2m", "3m", "5m", "10m", "15m", "20m", "30m", "45m",
+            "1h", "2h", "3h", "4h", "1d", "1w",
+        ]
         supported: list[str] = []
         if data_source is not None:
             try:
@@ -1125,8 +1207,7 @@ class MainWindow(QMainWindow):
             except Exception as exc:  # noqa: BLE001
                 logger.debug("supported_timeframes failed: %s", exc)
         items = [tf for tf in preferred if tf in supported]
-        if not items and supported:
-            items = supported[:12]
+        items.extend(tf for tf in supported if tf not in items)
 
         current = self._tf_combo.currentText()
         self._tf_combo.blockSignals(True)
@@ -1155,7 +1236,7 @@ class MainWindow(QMainWindow):
             self._switch_data_source(kind)
 
     def _on_data_source_combo_changed(self, index: int) -> None:
-        """Switch K-line data source (MT5 / TradingView)."""
+        """Switch K-line data source (MT5 / TradingView / Longbridge)."""
         if getattr(self, "_switching", False):
             return
         if getattr(self, "_demo_mode", False):
@@ -1186,31 +1267,95 @@ class MainWindow(QMainWindow):
                 self._data_source_combo.blockSignals(False)
 
     def _switch_data_source(self, kind: str) -> None:
-        """Replace ctx.data_source, reconnect, and restart RefreshLoop."""
+        """事务式切换数据源；新源就绪前不破坏当前连接。"""
         from pa_agent.config.settings import save_settings
-        from pa_agent.data.factory import create_data_source, data_source_label
+        from pa_agent.data.factory import (
+            create_data_source,
+            data_source_label,
+            default_symbol_for_kind,
+            max_analysis_bars_for_kind,
+        )
+        from pa_agent.data.market_defaults import normalize_gold_symbol_for_kind
 
         if self._switching:
             return
+        old_source = getattr(self._ctx, "data_source", None)
+        previous_kind = self._current_data_source_kind()
+        current_symbol = self._symbol_combo.currentText().strip()
+        current_timeframe = self._tf_combo.currentText()
+        previous_frame_bars = getattr(self, "_last_frame_ready_bars", None)
+        previous_chart_paused = getattr(self, "_chart_refresh_paused", False)
+        settings = getattr(self._ctx, "settings", None)
+        saved_symbols: dict[str, str] = {}
+        if settings is not None:
+            saved_symbols = dict(
+                getattr(settings.general, "last_symbols_by_source", {}) or {}
+            )
+            if current_symbol:
+                saved_symbols[previous_kind] = current_symbol
+
+        analysis_bar_count = self._analysis_bar_count()
+        max_analysis_bars = max_analysis_bars_for_kind(kind)
+        if analysis_bar_count > max_analysis_bars:
+            raise ValueError(
+                f"Longbridge 最多支持 {max_analysis_bars} 根分析 K 线；"
+                "请先在“其他通用设置”中调低"
+            )
+
+        target_symbol = normalize_gold_symbol_for_kind(
+            kind, saved_symbols.get(kind, default_symbol_for_kind(kind))
+        )
         self._switching = True
+        new_source = None
+        committed = False
+        refresh_stopped = False
         try:
+            # 先连接、验证品种并订阅新源；失败时旧源和刷新线程保持原状。
+            new_source = create_data_source(kind)
+            if kind == "tradingview":
+                from pa_agent.data.tradingview import TradingViewSource
+
+                if isinstance(new_source, TradingViewSource):
+                    new_source.on_probe_status = self._on_tv_probe_status
+                    saved_exchange = ""
+                    if settings is not None:
+                        saved_exchange = (
+                            getattr(
+                                settings.general, "last_tradingview_exchange", ""
+                            )
+                            or ""
+                        )
+                    new_source.set_exchange(saved_exchange)
+            new_source.connect()
+            supported_timeframes = list(new_source.supported_timeframes())
+            if current_timeframe in supported_timeframes:
+                target_timeframe = current_timeframe
+            elif "15m" in supported_timeframes:
+                target_timeframe = "15m"
+            elif supported_timeframes:
+                target_timeframe = supported_timeframes[0]
+            else:
+                raise ValueError(f"{data_source_label(kind)} 未声明可用周期")
+            new_source.subscribe(target_symbol, target_timeframe)
+
             self._cancel_analysis_worker()
             self._analysis_in_progress = False
             if self._ui_is_alive():
                 self._update_submit_button_state()
 
             self._stop_refresh_loop()
-            self._disconnect_data_source(getattr(self._ctx, "data_source", None))
+            refresh_stopped = True
 
             self._last_frame_ready_bars = None
 
+            self._ctx.data_source = new_source
             self._active_data_source_kind = kind
+            committed = True
             self._sync_tv_exchange_visibility()
-            self._apply_gold_defaults_for_data_source(kind)
+            self._update_data_source_health_label()
 
             # Restore saved TV exchange before applying to data source
             if kind == "tradingview":
-                settings = getattr(self._ctx, "settings", None)
                 saved_ex = ""
                 if settings is not None:
                     saved_ex = getattr(settings.general, 'last_tradingview_exchange', '') or ''
@@ -1222,24 +1367,15 @@ class MainWindow(QMainWindow):
                     self._tv_exchange_combo.setCurrentIndex(idx)
                     self._tv_exchange_combo.blockSignals(False)
 
-            symbol = self._symbol_combo.currentText().strip()
-            timeframe = self._tf_combo.currentText()
-
-            new_source = create_data_source(kind)
-            # Wire auto-probe status callback for TV
-            from pa_agent.data.tradingview import TradingViewSource
-            if isinstance(new_source, TradingViewSource):
-                new_source.on_probe_status = self._on_tv_probe_status
-            new_source.connect()
-            self._apply_tv_exchange_to_source(new_source)
-            new_source.subscribe(symbol, timeframe)
-
-            self._ctx.data_source = new_source
+            self._symbol_combo.blockSignals(True)
+            self._symbol_combo.setCurrentText(target_symbol)
+            self._symbol_combo.blockSignals(False)
+            self._tf_combo.blockSignals(True)
+            self._tf_combo.setCurrentText(target_timeframe)
+            self._tf_combo.blockSignals(False)
 
             self._populate_symbol_combo_for_source()
             self._populate_timeframe_combo_for_source()
-            if kind == "tradingview":
-                self._persist_tradingview_exchange()
 
             if hasattr(self, "_chart_widget"):
                 self._chart_widget.reset()
@@ -1249,15 +1385,9 @@ class MainWindow(QMainWindow):
             self._free_chat_session = None
             self._disable_chat_input()
 
-            settings = getattr(self._ctx, "settings", None)
-            if settings is not None:
-                settings.general.last_data_source = kind  # type: ignore[assignment]
-                settings.general.last_symbol = self._symbol_combo.currentText().strip()
-                settings.general.last_timeframe = self._tf_combo.currentText()
-                try:
-                    save_settings(settings)
-                except Exception as exc:  # noqa: BLE001
-                    logger.debug("Failed to persist data source: %s", exc)
+            self._start_refresh_loop()
+            self._update_symbol_data_alert()
+            self._refresh_chart_once()
 
             label = data_source_label(kind)
             if kind == "tradingview":
@@ -1277,8 +1407,54 @@ class MainWindow(QMainWindow):
                 self._symbol_combo.currentText(),
                 self._tf_combo.currentText(),
             )
-            self._update_symbol_data_alert()
-            self._refresh_chart_once()
+            if settings is not None:
+                settings.general.last_data_source = kind  # type: ignore[assignment]
+                settings.general.last_symbol = self._symbol_combo.currentText().strip()
+                saved_symbols[kind] = settings.general.last_symbol
+                settings.general.last_symbols_by_source = saved_symbols
+                settings.general.last_timeframe = self._tf_combo.currentText()
+                if kind == "tradingview":
+                    settings.general.last_tradingview_exchange = self._tv_exchange_text()
+                try:
+                    save_settings(settings)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to persist data source settings (%s)",
+                        type(exc).__name__,
+                    )
+                    self._status_bar.showMessage(
+                        "数据源已切换，但设置未保存；下次启动可能恢复为旧数据源"
+                    )
+            # 到这里新源已完整就绪，最后再释放旧连接；此后不再执行可抛出的收尾。
+            self._disconnect_data_source(old_source)
+        except Exception:
+            if committed:
+                try:
+                    self._stop_refresh_loop()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.debug("Failed to stop new RefreshLoop: %s", rollback_exc)
+                self._ctx.data_source = old_source
+                self._active_data_source_kind = previous_kind
+                self._last_frame_ready_bars = previous_frame_bars
+                try:
+                    self._symbol_combo.blockSignals(True)
+                    self._symbol_combo.setCurrentText(current_symbol)
+                    self._symbol_combo.blockSignals(False)
+                    self._tf_combo.blockSignals(True)
+                    self._tf_combo.setCurrentText(current_timeframe)
+                    self._tf_combo.blockSignals(False)
+                    self._sync_tv_exchange_visibility()
+                    self._update_data_source_health_label()
+                    self._populate_symbol_combo_for_source()
+                    self._populate_timeframe_combo_for_source()
+                    self._set_chart_refresh_paused(previous_chart_paused)
+                    if refresh_stopped:
+                        self._start_refresh_loop()
+                except Exception as rollback_exc:  # noqa: BLE001
+                    logger.warning("Data source switch rollback incomplete: %s", rollback_exc)
+            if new_source is not None and new_source is not old_source:
+                self._disconnect_data_source(new_source)
+            raise
         finally:
             self._switching = False
             self._update_submit_button_state()
@@ -1337,6 +1513,18 @@ class MainWindow(QMainWindow):
                 label.show()
                 return
             label.hide()
+            return
+        if kind == "longbridge":
+            checker = getattr(data_source, "is_symbol_available", None)
+            if callable(checker) and checker(symbol):
+                label.hide()
+                return
+            label.setText(
+                "Longbridge 品种需带市场后缀，例如 AAPL.US、700.HK、"
+                "600519.SH 或 000001.SZ；XAUUSD 不可直接使用。"
+            )
+            label.setStyleSheet("color: #e6b800; font-size: 11px;")
+            label.show()
             return
         if kind != "mt5":
             label.hide()
@@ -1433,6 +1621,17 @@ class MainWindow(QMainWindow):
         """Start (or restart) continuous data refresh for the current symbol/timeframe."""
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
+            if self._current_data_source_kind() == "longbridge":
+                try:
+                    self._switch_data_source("longbridge")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Longbridge reconnect failed (%s)", type(exc).__name__
+                    )
+                    self._status_bar.showMessage(
+                        f"Longbridge 重连失败：{exc}"
+                    )
+                return
             self._status_bar.showMessage("数据源未连接，请先切换数据来源")
             return
 
@@ -1709,7 +1908,11 @@ class MainWindow(QMainWindow):
                 flow.set_step_status(0, "done")
                 flow.set_step_caption(0, "已就绪")
 
-        if self._pending_submit_after_close and bars:
+        if (
+            self._pending_submit_after_close
+            and bars
+            and not self._ai_settings_dialog_open
+        ):
             self._check_pending_bar_close(bars)
 
         if self._chart_refresh_paused:
@@ -1728,7 +1931,11 @@ class MainWindow(QMainWindow):
                 return
 
         # Auto-incremental: if a switch set the pending flag, trigger now
-        if self._auto_incremental_pending and bars:
+        if (
+            self._auto_incremental_pending
+            and bars
+            and not self._ai_settings_dialog_open
+        ):
             self._auto_incremental_pending = False
             symbol = self._symbol_combo.currentText().strip()
             tf = self._tf_combo.currentText()
@@ -1851,7 +2058,9 @@ class MainWindow(QMainWindow):
 
             # ── Step 3: Unsubscribe, clear cached snapshot, re-subscribe ───────
             data_source = getattr(self._ctx, "data_source", None)
-            if data_source is not None:
+            # Longbridge 的 subscribe 会先在线校验证券；保留旧订阅直到新代码通过，
+            # 这样合法格式但不存在的代码不会破坏当前可用行情。
+            if data_source is not None and self._current_data_source_kind() != "longbridge":
                 try:
                     data_source.unsubscribe()
                 except Exception as exc:  # noqa: BLE001
@@ -1869,6 +2078,18 @@ class MainWindow(QMainWindow):
                         "subscribe(%s, %s) failed: %s", new_symbol, new_tf, exc
                     )
                     self._status_bar.showMessage(f"订阅失败：{exc}")
+                    if self._current_data_source_kind() == "longbridge":
+                        old_symbol = getattr(data_source, "_symbol", "")
+                        old_timeframe = getattr(data_source, "_timeframe", "")
+                        if old_symbol and old_timeframe:
+                            new_symbol, new_tf = old_symbol, old_timeframe
+                            self._symbol_combo.blockSignals(True)
+                            self._symbol_combo.setCurrentText(old_symbol)
+                            self._symbol_combo.blockSignals(False)
+                            self._tf_combo.blockSignals(True)
+                            self._tf_combo.setCurrentText(old_timeframe)
+                            self._tf_combo.blockSignals(False)
+                    return
 
             # ── Step 4: Reset ChartWidget ─────────────────────────────────────
             if hasattr(self, "_chart_widget"):
@@ -1900,6 +2121,11 @@ class MainWindow(QMainWindow):
             settings = getattr(self._ctx, "settings", None)
             if settings is not None:
                 settings.general.last_symbol = new_symbol
+                saved_symbols = getattr(
+                    settings.general, "last_symbols_by_source", {}
+                ) or {}
+                settings.general.last_symbols_by_source = saved_symbols
+                saved_symbols[self._current_data_source_kind()] = new_symbol
                 settings.general.last_timeframe = new_tf
                 try:
                     from pa_agent.config.settings import save_settings
@@ -2306,6 +2532,8 @@ class MainWindow(QMainWindow):
         sentinel.  If the sentinel changes between ticks a new bar has closed and
         we auto-submit.
         """
+        if self._ai_settings_dialog_open:
+            return
         if not getattr(self, "_keep_analysis_checkbox", None):
             return
         if not self._keep_analysis_checkbox.isChecked():
@@ -4069,27 +4297,184 @@ class MainWindow(QMainWindow):
         """打开 AI 模型设置对话框."""
         from pa_agent.gui.ai_model_settings_dialog import AIModelSettingsDialog
         from pa_agent.config.settings import Settings
-        from pa_agent.util.logging import update_api_key
+
+        if self._ai_request_in_progress():
+            QMessageBox.information(
+                self,
+                "AI 正在运行",
+                "当前分析或追问尚未结束，结束后再修改或切换 AI 模型。",
+            )
+            return
 
         settings: Settings = self._ctx.settings  # type: ignore[assignment]
         if settings is None:
             settings = Settings()
 
-        dlg = AIModelSettingsDialog(settings, parent=self)
+        dlg = AIModelSettingsDialog(
+            settings,
+            parent=self,
+            activation_allowed=True,
+        )
         if focus_api_key:
             dlg.focus_api_key_field()
-        if dlg.exec():
-            self._ctx.settings = settings
-            from pa_agent.ai.client_factory import create_ai_client
-
-            self._ctx.client = create_ai_client(settings.provider, logger_=logger)
-            if settings is not None:
-                key = getattr(settings.provider, "api_key", "") or ""
-                self._debug_widget._api_key = key
-                self._ai_sidebar.bind_settings(settings)
-                update_api_key(key)
+        self._ai_settings_dialog_open = True
+        self._sync_submit_button_state()
+        try:
+            dlg.exec()
+        finally:
+            self._ai_settings_dialog_open = False
+            self._sync_submit_button_state()
+        self._ctx.settings = settings
+        requested_id = dlg.activation_requested_id
+        if requested_id:
+            self._activate_ai_profile_runtime(
+                requested_id,
+                candidate_settings=dlg.runtime_candidate,
+            )
+        elif dlg.runtime_refresh_required:
+            self._activate_ai_profile_runtime(settings.active_ai_profile_id)
+        elif dlg.persisted_changes:
+            self._ai_sidebar.bind_settings(settings)
             self._update_ai_mode_label()
             self._refresh_api_key_ui_state()
+
+    def _ai_request_in_progress(self) -> bool:
+        """模型切换门禁：分析、准备任务或自由追问任一运行时均返回 True。"""
+        if (
+            self._analysis_in_progress
+            or self._pending_submit_after_close
+            or self._auto_incremental_pending
+        ):
+            return True
+        self._reap_zombie_workers()
+        if any(worker.isRunning() for worker in getattr(self, "_zombie_workers", [])):
+            return True
+        for worker_name in ("_worker", "_prep_worker", "_snapshot_fetch_worker"):
+            worker = getattr(self, worker_name, None)
+            if worker is not None and getattr(worker, "isRunning", lambda: False)():
+                return True
+        panel = getattr(self, "_stream_panel", None)
+        if bool(getattr(panel, "_sending", False)):
+            return True
+        chat_worker = getattr(panel, "_worker", None)
+        return bool(
+            chat_worker is not None
+            and getattr(chat_worker, "isRunning", lambda: False)()
+        )
+
+    def _activate_ai_profile_runtime(
+        self,
+        profile_id: str,
+        *,
+        candidate_settings: Any = None,
+    ) -> bool:
+        """原子切换活动档案，并清理不可跨模型复用的运行态。"""
+        if self._ai_request_in_progress():
+            QMessageBox.information(
+                self,
+                "暂不能切换",
+                "当前分析或追问尚未结束，模型未切换。",
+            )
+            return False
+
+        from pa_agent.ai.client_factory import create_ai_client
+        from pa_agent.ai.deepseek_client import clear_provider_runtime_caches
+        from pa_agent.ai.session_ledger import SessionTokenLedger
+        from pa_agent.config.settings import save_settings
+        from pa_agent.util.logging import update_api_key
+
+        settings = self._ctx.settings
+        candidate = (
+            candidate_settings.model_copy(deep=True)
+            if candidate_settings is not None
+            else settings.model_copy(deep=True)
+            if settings is not None
+            else None
+        )
+        profile = candidate.ai_profiles.get(profile_id) if candidate is not None else None
+        if profile is None:
+            QMessageBox.warning(self, "切换失败", "目标 AI 模型档案不存在。")
+            return False
+        if not profile.verification.is_current_for(profile.provider):
+            QMessageBox.warning(self, "切换失败", "目标档案未通过当前配置的真实连接测试。")
+            return False
+
+        candidate_key = profile.provider.api_key or ""
+        update_api_key(candidate_key)
+        try:
+            new_client = create_ai_client(profile.provider.model_copy(deep=True), logger_=logger)
+            candidate.activate_ai_profile(profile_id)
+            new_ledger = SessionTokenLedger(
+                context_window=candidate.provider.context_window,
+                warn_pct=candidate.general.context_warning_threshold_pct,
+            )
+            clear_provider_runtime_caches()
+            save_settings(candidate)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("AI profile activation failed (%s)", type(exc).__name__)
+            QMessageBox.warning(
+                self,
+                "切换失败",
+                "AI 模型档案未切换。请查看日志中的错误信息。",
+            )
+            return False
+
+        settings.ai_profiles = {
+            key: value.model_copy(deep=True)
+            for key, value in candidate.ai_profiles.items()
+        }
+        settings.active_ai_profile_id = candidate.active_ai_profile_id
+        settings.provider = candidate.provider.model_copy(deep=True)
+        self._ctx.client = new_client
+        self._ctx.ledger = new_ledger
+        self._free_chat_session = None
+        post_commit_errors: list[str] = []
+
+        def _refresh_runtime_state(name: str, action: Any) -> None:
+            try:
+                action()
+            except Exception as exc:  # noqa: BLE001
+                post_commit_errors.append(name)
+                logger.warning(
+                    "AI profile post-commit refresh failed: %s (%s)",
+                    name,
+                    type(exc).__name__,
+                )
+
+        panel = getattr(self, "_stream_panel", None)
+        if panel is not None:
+            reset_session = getattr(panel, "reset_provider_session", None)
+            if callable(reset_session):
+                _refresh_runtime_state("stream_session", reset_session)
+            else:
+                _refresh_runtime_state(
+                    "stream_input", lambda: panel.set_input_enabled(False)
+                )
+
+        key = settings.provider.api_key or ""
+        debug_widget = getattr(self, "_debug_widget", None)
+        if debug_widget is not None:
+            _refresh_runtime_state("debug_clear", debug_widget.clear)
+            debug_widget._api_key = key
+        pending_writer = getattr(self._ctx, "pending_writer", None)
+        if pending_writer is not None:
+            pending_writer._api_key = key
+        _refresh_runtime_state(
+            "sidebar_bind", lambda: self._ai_sidebar.bind_settings(settings)
+        )
+        _refresh_runtime_state("log_mask", lambda: update_api_key(key))
+        _refresh_runtime_state("mode_label", self._update_ai_mode_label)
+        _refresh_runtime_state("key_state", self._refresh_api_key_ui_state)
+        active = settings.ai_profiles[settings.active_ai_profile_id]
+        if post_commit_errors:
+            self._status_bar.showMessage(
+                "AI 档案已切换，但部分界面状态刷新失败；建议重启 PA_Agent"
+            )
+        else:
+            self._status_bar.showMessage(
+                f"已切换 AI 档案：{active.display_name} · {active.provider.model}"
+            )
+        return True
 
     def _open_feishu_settings_dialog(self) -> None:
         """打开飞书机器人设置对话框."""
@@ -4133,42 +4518,33 @@ class MainWindow(QMainWindow):
             flow_viz.schedule_refit_view()
 
     def _update_ai_mode_label(self) -> None:
-        """Show current thinking / reasoning_effort / model in the toolbar."""
+        """Show active profile and adapter-aware thinking state in the toolbar."""
         settings = getattr(self._ctx, "settings", None)
         if settings is None:
             self._ai_mode_label.setText("")
             return
         p = settings.provider
-        base = (p.base_url or "").lower()
-        if "deepseek.com" in base:
-            thinking = "开" if p.thinking else "关"
+        profile = settings.ai_profiles.get(settings.active_ai_profile_id)
+        profile_name = profile.display_name if profile is not None else settings.active_ai_profile_id
+        try:
+            from pa_agent.ai.provider_capabilities import resolve_provider_capability
+
+            capability = resolve_provider_capability(p)
+            if not capability.supports_thinking_on:
+                thinking_text = "无 Thinking 控件"
+            elif not capability.supports_thinking_off:
+                thinking_text = "Thinking 固定开启"
+            elif not p.thinking:
+                thinking_text = "Thinking 关闭"
+            elif capability.supported_efforts:
+                thinking_text = f"Thinking {p.reasoning_effort}"
+            else:
+                thinking_text = "Thinking 开启"
             self._ai_mode_label.setText(
-                f"思考: {thinking} · effort={p.reasoning_effort} · {p.model}"
+                f"AI: {profile_name} · {p.model} · {thinking_text}"
             )
-        elif "kkone.vip" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            self._ai_mode_label.setText(
-                f"KKAI 思考: {thinking} · budget≈{effort} · {p.model}"
-            )
-        elif "yunwu.ai" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"云雾 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        elif "packyapi.com" in base:
-            thinking = "开" if p.thinking else "关"
-            effort = p.reasoning_effort if p.thinking else "—"
-            mode = "adaptive" if "opus-4-7" in p.model or "opus-4-6" in p.model else "effort"
-            self._ai_mode_label.setText(
-                f"PackyAPI 思考: {thinking} · {mode}={effort} · {p.model}"
-            )
-        else:
-            self._ai_mode_label.setText(
-                f"模型: {p.model} · 思考={('开' if p.thinking else '关')}"
-            )
+        except ValueError:
+            self._ai_mode_label.setText(f"AI: {profile_name} · {p.model}")
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
@@ -4180,6 +4556,8 @@ class MainWindow(QMainWindow):
         """Human-readable reason when submit is disabled, or None if allowed."""
         if not self._has_api_key_configured():
             return "未配置 API Key，请点击左上角「AI 模型」填写后才能分析"
+        if self._ai_settings_dialog_open:
+            return "AI 模型设置窗口已打开"
         if self._demo_mode:
             return "演示模式中，请退出演示后再提交真实分析"
         if self._analysis_in_progress:

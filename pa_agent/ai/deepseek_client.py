@@ -3,23 +3,25 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
-from typing import Any, Callable, TYPE_CHECKING
+from collections.abc import Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pa_agent.util.threading import CancelToken
 
-from pa_agent.config.settings import AIProviderSettings
-from pa_agent.util.mask_secret import mask_secret
 from pa_agent.ai.mimo_compat import (
     ReasoningCache,
-    is_mimo_provider,
     mimo_max_output_tokens,
     patch_messages_for_mimo,
-    resolve_mimo_thinking_extra_body,
     response_message_dict,
     store_reasoning_from_response,
 )
+from pa_agent.ai.provider_capabilities import (
+    normalise_reasoning_effort,
+    resolve_provider_capability,
+)
+from pa_agent.config.settings import AIProviderSettings
 
 try:
     from openai import OpenAI as _OpenAI  # type: ignore[import]
@@ -32,6 +34,11 @@ else:
 logger = logging.getLogger(__name__)
 
 _MIMO_REASONING_CACHE = ReasoningCache()
+
+
+def clear_provider_runtime_caches() -> None:
+    """清空不得跨 AI 档案复用的进程内缓存。"""
+    _MIMO_REASONING_CACHE.clear()
 
 
 @dataclass
@@ -136,7 +143,7 @@ def supports_kv_prefix_chain(settings: AIProviderSettings | None) -> bool:
         return False
     if _is_openclaw_agent_model(settings.model):
         return False
-    return _is_deepseek_native(settings.base_url) or _is_deepseek_model(settings.model)
+    return resolve_provider_capability(settings).adapter_id == "deepseek"
 
 
 def _extract_cached_prompt_tokens(usage: Any) -> int:
@@ -172,20 +179,8 @@ def _workbuddy_agent_request_extra(settings: AIProviderSettings) -> dict[str, An
     return _openclaw_agent_request_extra(settings)
 
 
-def _is_kkai_openai_proxy(base_url: str) -> bool:
-    """KKAI (api.kkone.vip) OpenAI-compatible gateway."""
-    url = (base_url or "").lower()
-    return "kkone.vip" in url
-
-
 def _is_packyapi(base_url: str) -> bool:
     return "packyapi.com" in (base_url or "").lower()
-
-
-def _is_minimax(base_url: str) -> bool:
-    """MiniMax (api.minimax.io) OpenAI-compatible gateway."""
-    url = (base_url or "").lower()
-    return "minimax.io" in url or "minimax.com" in url
 
 
 # Packy claude-officially returns 400 if max_tokens exceeds model output cap.
@@ -194,53 +189,51 @@ _PACKY_CLAUDE_MAX_OUTPUT_TOKENS = 128_000
 _DEEPSEEK_MAX_OUTPUT_TOKENS = 393_216
 
 
-def _model_uses_claude_adaptive(model: str) -> bool:
-    """Claude models that require thinking.type=adaptive (not budget_tokens)."""
-    m = (model or "").lower()
-    return any(
-        token in m
-        for token in (
-            "claude-opus-4-7",
-            "claude-opus-4-6",
-            "claude-sonnet-4-6",
-        )
-    )
-
-
-_EFFORT_TO_ADAPTIVE_OUTPUT: dict[str, str] = {
-    "none": "low",
-    "minimal": "low",
-    "low": "low",
-    "medium": "medium",
-    "high": "high",
-    "max": "max",
-    "xhigh": "max",
-}
-
-
-def _adaptive_output_effort(reasoning_effort: str | None) -> str:
-    key = (reasoning_effort or "medium").strip().lower()
-    return _EFFORT_TO_ADAPTIVE_OUTPUT.get(key, "medium")
-
-
 # Sent to OpenAI-compatible gateways; upstream may clamp below these values.
-_PRACTICAL_UNLIMITED_MAX_TOKENS = 524288
-# Anthropic-style thinking requires budget_tokens < max_tokens.
-_PRACTICAL_UNLIMITED_THINKING_BUDGET = 524287
+_MINIMAX_M2_MAX_OUTPUT_TOKENS = 128_000
+_OPENAI_GPT5_MAX_OUTPUT_TOKENS = 128_000
+_ANTHROPIC_CURRENT_MAX_OUTPUT_TOKENS = 128_000
+_ANTHROPIC_HAIKU_45_MAX_OUTPUT_TOKENS = 64_000
+
+# Application policy for legacy Claude models using manual thinking budgets.
+# Anthropic requires budget_tokens < max_tokens and notes diminishing use above 32k.
+_EFFORT_TO_THINKING_BUDGET = {
+    "low": 4_096,
+    "medium": 16_384,
+    "high": 32_768,
+}
 
 
 def _effort_budget_tokens(effort: str | None, *, max_output: int) -> int:
     """Thinking budget; must stay below max_output (Anthropic/Packy rule)."""
-    del effort  # reserved for future per-effort tuning
-    return min(_PRACTICAL_UNLIMITED_THINKING_BUDGET, max(1024, max_output - 1))
+    if max_output <= 1_024:
+        raise ValueError("max_output must be greater than 1024 for Anthropic thinking")
+    response_reserve = max(256, min(4_096, max_output // 4))
+    upper = max_output - response_reserve
+    if upper < 1_024:
+        raise ValueError("max_output leaves too little room for Anthropic response text")
+    key = str(effort or "high").strip().lower()
+    if key == "max":
+        return upper
+    target = _EFFORT_TO_THINKING_BUDGET.get(key, _EFFORT_TO_THINKING_BUDGET["high"])
+    return min(target, upper)
 
 
 def _thinking_enabled(extra_body: dict[str, Any], effort: str | None) -> bool:
     if extra_body:
-        if extra_body.get("chat_template_kwargs", {}).get("enable_thinking"):
-            return True
         return extra_body.get("thinking", {}).get("type") in ("enabled", "adaptive")
     return effort is not None and effort != "none"
+
+
+def _is_stream_options_rejection(exc: BaseException) -> bool:
+    """Retry only when the provider explicitly rejects ``stream_options``."""
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+    if not isinstance(exc, TypeError) and status not in (400, 422):
+        return False
+    text = str(exc).lower()
+    return "stream_options" in text or "include_usage" in text
 
 
 def _packy_anthropic_messages_api(settings: AIProviderSettings) -> bool:
@@ -249,7 +242,7 @@ def _packy_anthropic_messages_api(settings: AIProviderSettings) -> bool:
 
 
 def _is_mimo(settings: AIProviderSettings) -> bool:
-    return is_mimo_provider(settings.base_url, settings.model)
+    return resolve_provider_capability(settings).adapter_id == "mimo"
 
 
 def _prepare_chat_messages(
@@ -287,16 +280,35 @@ def _prepare_api_messages(
     return api_messages, system_param
 
 
-def _provider_max_output_tokens(settings: AIProviderSettings) -> int:
+def _provider_max_output_tokens(settings: AIProviderSettings) -> int | None:
     """Per-gateway completion cap (max_tokens); avoids 400 from provider limits."""
     model = (settings.model or "").lower()
+    capability = resolve_provider_capability(settings)
     if _is_packyapi(settings.base_url) and "claude" in model:
         return _PACKY_CLAUDE_MAX_OUTPUT_TOKENS
-    if _is_deepseek_native(settings.base_url):
+    if capability.adapter_id == "deepseek":
         return _DEEPSEEK_MAX_OUTPUT_TOKENS
-    if _is_mimo(settings):
+    if capability.adapter_id == "mimo":
         return mimo_max_output_tokens(settings.model)
-    return _PRACTICAL_UNLIMITED_MAX_TOKENS
+    if capability.adapter_id == "minimax_m2":
+        return _MINIMAX_M2_MAX_OUTPUT_TOKENS
+    if capability.adapter_id == "openai" and model.startswith("gpt-5"):
+        return _OPENAI_GPT5_MAX_OUTPUT_TOKENS
+    if capability.adapter_id in {
+        "anthropic_adaptive",
+        "anthropic_adaptive_always",
+    }:
+        return _ANTHROPIC_CURRENT_MAX_OUTPUT_TOKENS
+    if capability.adapter_id == "anthropic_budget":
+        if "haiku-4-5" in model:
+            return _ANTHROPIC_HAIKU_45_MAX_OUTPUT_TOKENS
+        return _ANTHROPIC_CURRENT_MAX_OUTPUT_TOKENS
+    return None
+
+
+def _completion_token_parameter(settings: AIProviderSettings) -> str:
+    capability = resolve_provider_capability(settings)
+    return capability.max_tokens_parameter or "max_tokens"
 
 
 def _completion_max_tokens(
@@ -304,10 +316,23 @@ def _completion_max_tokens(
     *,
     extra_body: dict[str, Any],
     effort: str | None,
-) -> int:
+) -> int | None:
     """Total completion budget (thinking + content) for OpenAI-compatible APIs."""
     del effort, extra_body
     return _provider_max_output_tokens(settings)
+
+
+def _bounded_output_tokens(
+    default_max: int | None,
+    requested_max: int | None,
+) -> int | None:
+    """Apply an optional caller budget without exceeding provider limits."""
+    if requested_max is None:
+        return default_max
+    value = int(requested_max)
+    if value <= 0:
+        raise ValueError("max_output_tokens must be greater than zero")
+    return min(default_max, value) if default_max is not None else value
 
 
 def _resolve_thinking_params(
@@ -315,94 +340,68 @@ def _resolve_thinking_params(
     *,
     thinking: bool | None,
     reasoning_effort: str | None,
+    max_output_tokens: int | None = None,
 ) -> tuple[dict[str, Any], str | None]:
     """Return (extra_body, reasoning_effort) for chat.completions.create."""
     _thinking = thinking if thinking is not None else settings.thinking
-    _effort = reasoning_effort if reasoning_effort is not None else settings.reasoning_effort
-    model = settings.model or ""
+    requested_effort = (
+        reasoning_effort if reasoning_effort is not None else settings.reasoning_effort
+    )
+    capability = resolve_provider_capability(settings)
+    _effort = normalise_reasoning_effort(capability, requested_effort)
+    transport = capability.thinking_transport
 
-    if _is_deepseek_native(settings.base_url) or _is_deepseek_model(model):
-        # DeepSeek v4+ requires thinking.type=adaptive + output_config.effort;
-        # the old "enabled"/"disabled" values are no longer accepted.
-        # Also covers DeepSeek models proxied through non-native gateways (e.g. QClaw).
-        if _thinking:
-            extra_body: dict[str, Any] = {
-                "thinking": {"type": "adaptive"},
-                "output_config": {"effort": _adaptive_output_effort(_effort)},
-            }
-            return extra_body, _effort or "medium"
-        else:
-            extra_body = {
-                "thinking": {"type": "disabled"},
-            }
-            return extra_body, None
-
-    if _is_minimax(settings.base_url):
-        # MiniMax (api.minimax.io):
-        # - thinking.type only accepts "adaptive" (on) or "disabled" (off); no budget_tokens
-        # - reasoning_split=True exposes thinking via reasoning_content / reasoning_details
-        # - M2.x cannot disable thinking; "disabled" is accepted but ignored
-        if _thinking:
-            extra_body = {
-                "thinking": {"type": "adaptive"},
-                "reasoning_split": True,
-            }
-        else:
-            extra_body = {
-                "thinking": {"type": "disabled"},
-                "reasoning_split": True,
-            }
-        # MiniMax does not use reasoning_effort
-        return extra_body, None
-
-    if _is_mimo(settings):
-        # MiMo: DeepSeek-style reasoning via chat_template_kwargs.enable_thinking
-        return resolve_mimo_thinking_extra_body(thinking=_thinking), (
-            _effort or "medium" if _thinking else None
+    if transport == "deepseek_toggle":
+        return (
+            {"thinking": {"type": "enabled" if _thinking else "disabled"}},
+            _effort if _thinking else None,
         )
 
-    if not _thinking:
+    if transport == "reasoning_effort":
+        if _thinking:
+            return {}, _effort
+        if capability.adapter_id == "openai" and capability.supports_thinking_off:
+            return {}, "none"
         return {}, None
 
-    max_out = _completion_max_tokens(
-        settings, extra_body={}, effort=_effort
+    if transport == "anthropic_adaptive":
+        if not _thinking and capability.supports_thinking_off:
+            return {"thinking": {"type": "disabled"}}, None
+        extra_body: dict[str, Any] = {"thinking": {"type": "adaptive"}}
+        if _effort is not None:
+            extra_body["output_config"] = {"effort": _effort}
+        return extra_body, None
+
+    if transport == "minimax_adaptive":
+        effective_thinking = _thinking or not capability.supports_thinking_off
+        return {
+            "thinking": {"type": "adaptive" if effective_thinking else "disabled"},
+            "reasoning_split": True,
+        }, None
+
+    if transport == "mimo_toggle":
+        return {
+            "thinking": {"type": "enabled" if _thinking else "disabled"}
+        }, None
+
+    if not _thinking or transport == "none":
+        return {}, None
+
+    max_out = _bounded_output_tokens(
+        _completion_max_tokens(settings, extra_body={}, effort=_effort),
+        max_output_tokens,
     )
 
-    if _is_packyapi(settings.base_url) and "claude" in model.lower():
-        # Packy (e.g. claude-officially): budget_tokens only; reasoning_effort rejected.
+    if transport == "anthropic_budget":
+        if max_out is None:
+            raise ValueError("Anthropic manual thinking requires a known output limit")
         budget = _effort_budget_tokens(_effort, max_output=max_out)
-        return (
-            {"thinking": {"type": "enabled", "budget_tokens": budget}},
-            None,
-        )
+        extra_body = {
+            "thinking": {"type": "enabled", "budget_tokens": budget},
+        }
+        return extra_body, None
 
-    if _is_kkai_openai_proxy(settings.base_url):
-        # KKAI claude-opus-4-5: reasoning_effort -> 503 paprika_mode on some routes.
-        budget = _effort_budget_tokens(_effort, max_output=max_out)
-        return (
-            {"thinking": {"type": "enabled", "budget_tokens": budget}},
-            None,
-        )
-
-    if _model_uses_claude_adaptive(model):
-        # Yunwu / New-API style gateways: Opus 4.7+ needs adaptive thinking.
-        return (
-            {
-                "thinking": {"type": "adaptive"},
-                "output_config": {"effort": _adaptive_output_effort(_effort)},
-            },
-            _effort or "medium",
-        )
-
-    if "claude" in model.lower():
-        budget = _effort_budget_tokens(_effort, max_output=max_out)
-        return (
-            {"thinking": {"type": "enabled", "budget_tokens": budget}},
-            _effort or "medium",
-        )
-
-    # Other models on OpenAI-compatible proxies (o-series, deepseek-reasoner, etc.)
-    return {}, _effort or "medium"
+    return {}, None
 
 
 class DeepSeekClient:
@@ -425,6 +424,7 @@ class DeepSeekClient:
         context_window: int | None = None,
         cancel_token: "CancelToken | None" = None,
         timeout_s: float = 600.0,
+        max_output_tokens: int | None = None,
     ) -> AIReply:
         """Send *messages* to the DeepSeek API and return a structured reply.
 
@@ -436,27 +436,34 @@ class DeepSeekClient:
             raise CancelledError("Request cancelled before API call")
 
         extra_body, _effort = _resolve_thinking_params(
-            self._settings, thinking=thinking, reasoning_effort=reasoning_effort
+            self._settings,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
         )
         extra_body = {**extra_body, **_openclaw_agent_request_extra(self._settings)}
         api_messages, system_param = _prepare_api_messages(self._settings, messages)
         if system_param:
             extra_body = {**extra_body, "system": system_param}
         _thinking_on = _thinking_enabled(extra_body, _effort)
-        _max_tokens = _completion_max_tokens(
-            self._settings, extra_body=extra_body, effort=_effort
+        _max_tokens = _bounded_output_tokens(
+            _completion_max_tokens(
+                self._settings,
+                extra_body=extra_body,
+                effort=_effort,
+            ),
+            max_output_tokens,
         )
+        _token_parameter = _completion_token_parameter(self._settings)
 
-        masked_key = mask_secret(self._settings.api_key)
         self._log.debug(
             "DeepSeekClient.chat: model=%s thinking=%s effort=%s max_tokens=%s "
-            "system_hoisted=%s key=...%s msgs=%d",
+            "system_hoisted=%s msgs=%d",
             self._settings.model,
             _thinking_on,
             _effort,
             _max_tokens,
             bool(system_param),
-            masked_key[-4:] if len(masked_key) >= 4 else "****",
             len(api_messages),
         )
 
@@ -466,6 +473,7 @@ class DeepSeekClient:
         client = _OpenAI(
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,
+            max_retries=0,
         )
 
         t0 = time.monotonic()
@@ -473,8 +481,9 @@ class DeepSeekClient:
             "model": _effective_api_model(self._settings),
             "messages": api_messages,
             "timeout": timeout_s,
-            "max_tokens": _max_tokens,
         }
+        if _max_tokens is not None:
+            create_kwargs[_token_parameter] = _max_tokens
         if extra_body:
             create_kwargs["extra_body"] = extra_body
         if _effort is not None:
@@ -582,6 +591,7 @@ class DeepSeekClient:
         reasoning_effort: str | None = None,
         cancel_token: "CancelToken | None" = None,
         timeout_s: float = 600.0,
+        max_output_tokens: int | None = None,
     ) -> AIReply:
         """Stream *messages* to the DeepSeek API, calling callbacks per token.
 
@@ -612,16 +622,25 @@ class DeepSeekClient:
             )
 
         extra_body, _effort = _resolve_thinking_params(
-            self._settings, thinking=thinking, reasoning_effort=reasoning_effort
+            self._settings,
+            thinking=thinking,
+            reasoning_effort=reasoning_effort,
+            max_output_tokens=max_output_tokens,
         )
         extra_body = {**extra_body, **_openclaw_agent_request_extra(self._settings)}
         api_messages, system_param = _prepare_api_messages(self._settings, messages)
         if system_param:
             extra_body = {**extra_body, "system": system_param}
         _thinking_on = _thinking_enabled(extra_body, _effort)
-        _max_tokens = _completion_max_tokens(
-            self._settings, extra_body=extra_body, effort=_effort
+        _max_tokens = _bounded_output_tokens(
+            _completion_max_tokens(
+                self._settings,
+                extra_body=extra_body,
+                effort=_effort,
+            ),
+            max_output_tokens,
         )
+        _token_parameter = _completion_token_parameter(self._settings)
 
         self._log.info(
             "DeepSeekClient.stream_chat: model=%s thinking=%s reasoning_effort=%s "
@@ -640,6 +659,7 @@ class DeepSeekClient:
         client = _OpenAI(
             base_url=self._settings.base_url,
             api_key=self._settings.api_key,
+            max_retries=0,
         )
 
         t0 = time.monotonic()
@@ -656,14 +676,16 @@ class DeepSeekClient:
             # Build kwargs with stream_options to get usage in the final chunk.
             # Some providers may not support it; if the create() call itself
             # rejects stream_options we retry without it.
+            deadline = t0 + float(timeout_s)
             stream_kwargs: dict[str, Any] = {
                 "model": _effective_api_model(self._settings),
                 "messages": api_messages,
                 "timeout": timeout_s,
-                "max_tokens": _max_tokens,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
+            if _max_tokens is not None:
+                stream_kwargs[_token_parameter] = _max_tokens
             if extra_body:
                 stream_kwargs["extra_body"] = extra_body
             if _effort is not None:
@@ -671,13 +693,20 @@ class DeepSeekClient:
 
             try:
                 stream = client.chat.completions.create(**stream_kwargs)
-            except Exception:
-                # Retry without stream_options if provider rejects it
+            except Exception as exc:
+                if not _is_stream_options_rejection(exc):
+                    raise
                 self._log.debug("stream_options not supported; retrying without it")
                 stream_kwargs.pop("stream_options", None)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("AI request timed out") from None
+                stream_kwargs["timeout"] = remaining
                 stream = client.chat.completions.create(**stream_kwargs)
 
             for chunk in stream:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("AI request timed out")
                 # Check cancellation on each chunk
                 if cancel_token is not None and cancel_token.is_set():
                     raise CancelledError("Request cancelled during streaming")
@@ -718,10 +747,11 @@ class DeepSeekClient:
                     reasoning_content += r
                     if on_reasoning_token is not None:
                         on_reasoning_token(r)
-                elif delta.content:
-                    content += delta.content
+                delta_content = getattr(delta, "content", None)
+                if delta_content:
+                    content += delta_content
                     if on_content_token is not None:
-                        on_content_token(delta.content)
+                        on_content_token(delta_content)
 
         except CancelledError:
             raise
@@ -783,11 +813,13 @@ class DeepSeekClient:
                 self._settings.base_url,
             )
         if _thinking_on and len(reasoning_content) < 80:
+            adapter_id = resolve_provider_capability(self._settings).adapter_id
             self._log.warning(
                 "Thinking enabled but reasoning_content is very short (%d chars). "
-                "For KKAI/Claude use reasoning_effort (not DeepSeek extra_body); "
-                "check model ID, token group, and reasoning_effort=%s.",
+                "Check adapter, model ID, token group, and provider response fields "
+                "(adapter=%s reasoning_effort=%s).",
                 len(reasoning_content),
+                adapter_id,
                 _effort,
             )
 

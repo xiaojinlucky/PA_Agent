@@ -40,6 +40,39 @@ def test_round_trip(tmp_path):
     assert loaded.provider.model == original.provider.model
 
 
+def test_longbridge_source_and_per_source_symbols_round_trip(tmp_path):
+    p = tmp_path / "settings.json"
+    original = Settings()
+    original.general.last_data_source = "longbridge"
+    original.general.last_symbol = "AAPL.US"
+    original.general.last_symbols_by_source = {
+        "mt5": "XAUUSD",
+        "longbridge": "AAPL.US",
+    }
+
+    save_settings(original, p)
+    loaded = load_settings(p)
+
+    assert loaded.general.last_data_source == "longbridge"
+    assert loaded.general.last_symbol == "AAPL.US"
+    assert loaded.general.last_symbols_by_source["mt5"] == "XAUUSD"
+    assert loaded.general.last_symbols_by_source["longbridge"] == "AAPL.US"
+
+
+def test_active_source_symbol_map_drives_startup_symbol(tmp_path):
+    p = tmp_path / "settings.json"
+    raw = Settings().model_dump()
+    raw["general"]["last_data_source"] = "longbridge"
+    raw["general"]["last_symbol"] = "XAUUSD"
+    raw["general"]["last_symbols_by_source"] = {"longbridge": "gld.us"}
+    p.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_settings(p)
+
+    assert loaded.general.last_symbol == "GLD.US"
+    assert loaded.general.last_symbols_by_source["longbridge"] == "GLD.US"
+
+
 def test_api_key_present_on_disk(tmp_path):
     """The saved JSON contains the plaintext API key."""
     p = tmp_path / "settings.json"

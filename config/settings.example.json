@@ -1,11 +1,40 @@
 {
   "provider": {
-    "model": "deepseek-chat",
+    "model": "deepseek-v4-flash",
     "base_url": "https://api.deepseek.com",
+    "api_key": "",
     "api_key_encrypted": "",
+    "adapter_id": "deepseek",
     "thinking": true,
     "reasoning_effort": "high",
-    "context_window": 128000
+    "context_window": 2000000
+  },
+  "active_ai_profile_id": "default",
+  "ai_profiles": {
+    "default": {
+      "id": "default",
+      "display_name": "默认配置",
+      "provider": {
+        "model": "deepseek-v4-flash",
+        "base_url": "https://api.deepseek.com",
+        "api_key": "",
+        "api_key_encrypted": "",
+        "adapter_id": "deepseek",
+        "thinking": true,
+        "reasoning_effort": "high",
+        "context_window": 2000000
+      },
+      "verification": {
+        "status": "untested",
+        "tested_at": "",
+        "adapter_id": "",
+        "capability_schema_version": 3,
+        "config_fingerprint": "",
+        "checks": {},
+        "observations": {},
+        "error": ""
+      }
+    }
   },
   "general": {
     "analysis_bar_count": 100,
@@ -14,6 +43,11 @@
     "last_data_source": "mt5",
     "last_tradingview_exchange": "OANDA",
     "last_symbol": "XAUUSDm",
+    "last_symbols_by_source": {
+      "mt5": "XAUUSDm",
+      "tradingview": "XAUUSD",
+      "longbridge": "AAPL.US"
+    },
     "last_timeframe": "15m",
     "decision_flow_auto_play": true,
     "decision_flow_play_seconds": 50,

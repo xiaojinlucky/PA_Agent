@@ -1,19 +1,20 @@
 """Unit tests for DeepSeekClient (task 6.5)."""
 from __future__ import annotations
 
-import sys
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import MagicMock, patch, call
-from pa_agent.config.settings import AIProviderSettings
+
 from pa_agent.ai.deepseek_client import (
-    DeepSeekClient,
     AIReply,
-    AIUsage,
     CancelledError,
+    DeepSeekClient,
     _completion_max_tokens,
+    _effort_budget_tokens,
     _is_deepseek_model,
     _openclaw_agent_request_extra,
 )
+from pa_agent.config.settings import AIProviderSettings
 
 
 def _make_settings(api_key: str = "sk-test-1234abcd") -> AIProviderSettings:
@@ -52,7 +53,7 @@ def test_chat_does_not_send_forbidden_params():
     mock_openai.return_value.chat.completions.create.return_value = mock_resp
 
     with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
-        reply = client.chat([{"role": "user", "content": "hi"}])
+        client.chat([{"role": "user", "content": "hi"}])
 
     call_kwargs = mock_openai.return_value.chat.completions.create.call_args
     kwargs = call_kwargs.kwargs if call_kwargs.kwargs else {}
@@ -94,6 +95,7 @@ def test_completion_max_tokens_deepseek_cap():
 def test_completion_max_tokens_packy_claude_cap():
     settings = _make_settings()
     settings.base_url = "https://www.packyapi.com/v1"
+    settings.model = "claude-sonnet-4-6"
     extra_body = {"thinking": {"type": "enabled", "budget_tokens": 127_999}}
     assert _completion_max_tokens(settings, extra_body=extra_body, effort="max") == 128_000
 
@@ -113,7 +115,7 @@ def test_packy_hoists_system_message_to_extra_body():
     assert api_msgs == [{"role": "user", "content": "USR"}]
 
 
-def test_packy_claude_thinking_uses_budget_not_reasoning_effort():
+def test_packy_current_claude_uses_adaptive_without_openai_effort():
     settings = _make_settings()
     settings.base_url = "https://www.packyapi.com/v1"
     settings.model = "claude-sonnet-4-6"
@@ -122,8 +124,76 @@ def test_packy_claude_thinking_uses_budget_not_reasoning_effort():
 
     extra, effort = _resolve_thinking_params(settings, thinking=True, reasoning_effort="max")
     assert effort is None
-    assert extra["thinking"]["type"] == "enabled"
-    assert extra["thinking"]["budget_tokens"] == 127_999
+    assert extra == {
+        "thinking": {"type": "adaptive"},
+        "output_config": {"effort": "max"},
+    }
+
+
+def test_manual_thinking_budget_effort_levels_are_distinct():
+    assert _effort_budget_tokens("low", max_output=128_000) == 4_096
+    assert _effort_budget_tokens("medium", max_output=128_000) == 16_384
+    assert _effort_budget_tokens("high", max_output=128_000) == 32_768
+    assert _effort_budget_tokens("max", max_output=128_000) == 123_904
+
+
+def test_deepseek_maps_low_and_medium_to_official_high():
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    settings = _make_settings()
+    settings.model = "deepseek-v4-pro"
+    for requested in ("low", "medium"):
+        extra, effort = _resolve_thinking_params(
+            settings,
+            thinking=True,
+            reasoning_effort=requested,
+        )
+        assert extra == {"thinking": {"type": "enabled"}}
+        assert effort == "high"
+
+
+def test_openai_thinking_off_uses_none_effort_and_completion_tokens():
+    settings = _make_settings()
+    settings.base_url = "https://api.openai.com/v1"
+    settings.model = "gpt-5.6"
+    settings.thinking = False
+    client = DeepSeekClient(settings)
+
+    mock_openai = MagicMock()
+    mock_openai.return_value.chat.completions.create.return_value = _make_mock_response()
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.chat([{"role": "user", "content": "hi"}])
+
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["reasoning_effort"] == "none"
+    assert "max_completion_tokens" in kwargs
+    assert "max_tokens" not in kwargs
+
+
+def test_minimax_m2_cannot_disable_thinking_but_m3_can():
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    m2 = _make_settings()
+    m2.base_url = "https://api.minimax.io/v1"
+    m2.model = "MiniMax-M2.7"
+    m2_extra, m2_effort = _resolve_thinking_params(
+        m2, thinking=False, reasoning_effort="low"
+    )
+    assert m2_extra == {
+        "thinking": {"type": "adaptive"},
+        "reasoning_split": True,
+    }
+    assert m2_effort is None
+
+    m3 = m2.model_copy(update={"model": "MiniMax-M3"})
+    m3_extra, m3_effort = _resolve_thinking_params(
+        m3, thinking=False, reasoning_effort="low"
+    )
+    assert m3_extra == {
+        "thinking": {"type": "disabled"},
+        "reasoning_split": True,
+    }
+    assert m3_effort is None
 
 
 def test_chat_sends_max_tokens_when_thinking():
@@ -149,6 +219,7 @@ def test_chat_kkai_sends_thinking_object_not_reasoning_effort():
     """KKAI Claude: thinking budget in extra_body; reasoning_effort rejected upstream."""
     settings = _make_settings()
     settings.base_url = "https://api.kkone.vip/v1"
+    settings.model = "claude-opus-4-5"
     settings.thinking = True
     settings.reasoning_effort = "high"
     client = DeepSeekClient(settings)
@@ -161,13 +232,15 @@ def test_chat_kkai_sends_thinking_object_not_reasoning_effort():
         client.chat([{"role": "user", "content": "hi"}])
 
     kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
-    assert kwargs["extra_body"]["thinking"] == {"type": "enabled", "budget_tokens": 999_998}
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled", "budget_tokens": 32_768}
+    assert "output_config" not in kwargs["extra_body"]
     assert "reasoning_effort" not in kwargs
 
 
 def test_chat_kkai_thinking_off_sends_no_thinking_params():
     settings = _make_settings()
     settings.base_url = "https://api.kkone.vip/v1"
+    settings.model = "claude-opus-4-5"
     settings.thinking = False
     client = DeepSeekClient(settings)
 
@@ -201,7 +274,7 @@ def test_chat_yunwu_opus_47_sends_adaptive_thinking():
     kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
     assert kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
     assert kwargs["extra_body"]["output_config"] == {"effort": "high"}
-    assert kwargs["reasoning_effort"] == "high"
+    assert "reasoning_effort" not in kwargs
 
 
 def test_chat_yunwu_thinking_off_sends_nothing():
@@ -219,13 +292,14 @@ def test_chat_yunwu_thinking_off_sends_nothing():
         client.chat([{"role": "user", "content": "hi"}])
 
     kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
-    assert "extra_body" not in kwargs
+    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
     assert "reasoning_effort" not in kwargs
 
 
 def test_stream_kkai_passes_thinking_extra_body():
     settings = _make_settings()
     settings.base_url = "https://api.kkone.vip/v1"
+    settings.model = "claude-opus-4-5"
     settings.thinking = True
     settings.reasoning_effort = "medium"
     client = DeepSeekClient(settings)
@@ -234,7 +308,7 @@ def test_stream_kkai_passes_thinking_extra_body():
     chunk_reason.choices = [MagicMock()]
     delta = MagicMock()
     delta.reasoning_content = "think"
-    delta.content = None
+    delta.content = "answer"
     chunk_reason.choices[0].delta = delta
     chunk_reason.usage = None
     chunk_reason.id = "id-1"
@@ -261,9 +335,99 @@ def test_stream_kkai_passes_thinking_extra_body():
         )
 
     kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
-    assert kwargs["extra_body"]["thinking"]["budget_tokens"] == 999_998
+    assert kwargs["extra_body"]["thinking"]["budget_tokens"] == 16_384
     assert "reasoning_effort" not in kwargs
     assert reply.reasoning_content == "think"
+    assert reply.content == "answer"
+
+
+def test_probe_budget_leaves_room_for_anthropic_response_text() -> None:
+    settings = _make_settings()
+    settings.base_url = "https://api.kkone.vip/v1"
+    settings.model = "claude-opus-4-5"
+    settings.reasoning_effort = "max"
+    client = DeepSeekClient(settings)
+    mock_openai = MagicMock()
+    mock_openai.return_value.chat.completions.create.return_value = _make_mock_response()
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.chat(
+            [{"role": "user", "content": "hi"}],
+            max_output_tokens=2_048,
+        )
+
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["max_tokens"] == 2_048
+    assert kwargs["extra_body"]["thinking"]["budget_tokens"] == 1_536
+
+
+def test_openai_gpt5_runtime_uses_documented_output_cap() -> None:
+    settings = _make_settings()
+    settings.base_url = "https://api.openai.com/v1"
+    settings.model = "gpt-5.6"
+    settings.adapter_id = "openai"
+    client = DeepSeekClient(settings)
+    mock_openai = MagicMock()
+    mock_openai.return_value.chat.completions.create.return_value = _make_mock_response()
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.chat([{"role": "user", "content": "hi"}])
+
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["max_completion_tokens"] == 128_000
+    assert mock_openai.call_args.kwargs["max_retries"] == 0
+
+
+def test_generic_runtime_omits_unknown_output_cap() -> None:
+    settings = _make_settings()
+    settings.base_url = "https://gateway.example/v1"
+    settings.model = "custom-chat"
+    settings.adapter_id = "generic_openai_compatible"
+    settings.thinking = False
+    client = DeepSeekClient(settings)
+    mock_openai = MagicMock()
+    mock_openai.return_value.chat.completions.create.return_value = _make_mock_response()
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.chat([{"role": "user", "content": "hi"}])
+
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert "max_tokens" not in kwargs
+
+
+def test_stream_timeout_is_not_retried() -> None:
+    settings = _make_settings()
+    client = DeepSeekClient(settings)
+    mock_openai = MagicMock()
+    create = mock_openai.return_value.chat.completions.create
+    create.side_effect = TimeoutError("timeout")
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        with pytest.raises(TimeoutError):
+            client.stream_chat([{"role": "user", "content": "hi"}])
+
+    assert create.call_count == 1
+
+
+def test_stream_options_rejection_retries_once_without_option() -> None:
+    class StreamOptionsRejected(Exception):
+        status_code = 400
+
+    settings = _make_settings()
+    client = DeepSeekClient(settings)
+    mock_openai = MagicMock()
+    create = mock_openai.return_value.chat.completions.create
+    create.side_effect = [
+        StreamOptionsRejected("stream_options is unsupported"),
+        iter([]),
+    ]
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.stream_chat([{"role": "user", "content": "hi"}])
+
+    assert create.call_count == 2
+    assert "stream_options" in create.call_args_list[0].kwargs
+    assert "stream_options" not in create.call_args_list[1].kwargs
 
 
 def test_chat_cancel_token_raises():
@@ -365,10 +529,10 @@ def test_stream_chat_passes_tool_choice_none_for_openclaw() -> None:
     assert extra.get("tool_choice") == "none"
 
 
-def test_mimo_chat_sends_enable_thinking_extra_body() -> None:
+def test_mimo_chat_sends_official_thinking_extra_body() -> None:
     settings = _make_settings()
     settings.base_url = "https://api.xiaomimimo.com/v1"
-    settings.model = "mimo-v2-flash"
+    settings.model = "mimo-v2.5-pro"
     settings.thinking = True
     client = DeepSeekClient(settings)
 
@@ -380,8 +544,9 @@ def test_mimo_chat_sends_enable_thinking_extra_body() -> None:
         client.chat([{"role": "user", "content": "hi"}])
 
     kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
-    assert kwargs["extra_body"]["chat_template_kwargs"] == {"enable_thinking": True}
-    assert kwargs["max_tokens"] == 65_536
+    assert kwargs["extra_body"]["thinking"] == {"type": "enabled"}
+    assert kwargs["max_completion_tokens"] == 131_072
+    assert "reasoning_effort" not in kwargs
 
 
 def test_mimo_chat_patches_tool_call_messages_before_send() -> None:
