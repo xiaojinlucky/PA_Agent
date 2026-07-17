@@ -183,6 +183,18 @@ class OkxRestClient:
                 write_may_have_reached=method != "GET",
             )
         code = str(payload.get("code", ""))
+        uncertain_write_status = (
+            method != "GET"
+            and (
+                response.status in {408, 429}
+                or response.status >= 500
+            )
+        )
+        if uncertain_write_status:
+            raise BrokerTransportError(
+                f"OKX 写请求返回不确定 HTTP {response.status}",
+                write_may_have_reached=True,
+            )
         if response.status < 200 or response.status >= 300 or code != "0":
             raise BrokerApiError(code or str(response.status), str(payload.get("msg") or "请求失败"))
         data = payload.get("data")

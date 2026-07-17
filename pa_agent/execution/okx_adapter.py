@@ -1,10 +1,13 @@
 """OKX spot/perpetual lifecycle adapter."""
 from __future__ import annotations
 
+import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from pa_agent.execution.credentials import account_identity_fingerprint
 from pa_agent.execution.errors import (
     BrokerApiError,
     BrokerRejected,
@@ -33,6 +36,61 @@ def _decimal(value: object, *, default: Decimal | None = None) -> Decimal | None
     except (InvalidOperation, ValueError, TypeError):
         return default
     return parsed if parsed.is_finite() else default
+
+
+def _aggregate_okx_fills(
+    rows: list[dict[str, Any]],
+) -> tuple[Decimal, Decimal | None]:
+    """Aggregate exact fills without inventing prices or double-counting IDs."""
+    anonymous: list[tuple[Decimal, Decimal | None]] = []
+    by_trade_id: dict[str, tuple[Decimal, Decimal | None]] = {}
+    for item in rows:
+        raw_quantity = item.get("fillSz")
+        quantity = _decimal(raw_quantity)
+        if raw_quantity in (None, "") or quantity is None or quantity < 0:
+            raise ReconciliationError("OKX 成交明细包含无效数量")
+        if quantity == 0:
+            continue
+        price = _decimal(item.get("fillPx"))
+        if price is not None and price <= 0:
+            price = None
+        trade_id = str(item.get("tradeId") or "")
+        if not trade_id:
+            anonymous.append((quantity, price))
+            continue
+        existing = by_trade_id.get(trade_id)
+        if existing is None:
+            by_trade_id[trade_id] = (quantity, price)
+            continue
+        existing_quantity, existing_price = existing
+        if existing_quantity != quantity:
+            raise ReconciliationError("OKX 重复成交编号的数量不一致")
+        if (
+            existing_price is not None
+            and price is not None
+            and existing_price != price
+        ):
+            raise ReconciliationError("OKX 重复成交编号的价格不一致")
+        by_trade_id[trade_id] = (
+            quantity,
+            existing_price if existing_price is not None else price,
+        )
+    unique = [*by_trade_id.values(), *anonymous]
+    total = sum((quantity for quantity, _price in unique), Decimal("0"))
+    complete_prices = total > 0 and all(
+        price is not None for _quantity, price in unique
+    )
+    if not complete_prices:
+        return total, None
+    notional = sum(
+        (
+            quantity * price
+            for quantity, price in unique
+            if price is not None
+        ),
+        Decimal("0"),
+    )
+    return total, notional / total
 
 
 def _positive_decimal(value: object, label: str) -> Decimal:
@@ -72,6 +130,8 @@ def _okx_order_state(raw: dict[str, Any]) -> str:
         return "filled"
     if state in {"canceled", "mmp_canceled"}:
         return "canceled"
+    if state in {"rejected", "order_failed"}:
+        return "rejected"
     return "unknown"
 
 
@@ -84,10 +144,59 @@ class OkxAdapter:
         *,
         margin_mode: str = "cross",
         entry_timeout_seconds: int = 120,
+        runtime_id: str = "",
+        write_executor: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> None:
         self._client = client
         self._margin_mode = margin_mode
         self._entry_timeout_seconds = int(entry_timeout_seconds)
+        self._runtime_id = runtime_id or str(uuid.uuid4())
+        self._write_executor = write_executor or (lambda operation: operation())
+
+    def bind_runtime_id(self, runtime_id: str) -> None:
+        self._runtime_id = runtime_id
+
+    def bind_write_executor(
+        self,
+        executor: Callable[[Callable[[], Any]], Any],
+    ) -> None:
+        self._write_executor = executor
+
+    def _write(self, operation: Callable[[], Any]) -> Any:
+        return self._write_executor(operation)
+
+    def _identity_from_config(
+        self,
+        plan: ExecutionPlan,
+        account_config: dict[str, Any],
+    ) -> str:
+        uid = str(account_config.get("uid") or "").strip()
+        main_uid = str(account_config.get("mainUid") or "").strip()
+        raw_account_type = account_config.get("type")
+        account_type = (
+            "" if raw_account_type is None else str(raw_account_type).strip()
+        )
+        if not uid or not main_uid or not account_type:
+            raise PreflightError(
+                "OKX account/config 缺少 uid、mainUid 或账户类型，禁止交易"
+            )
+        return account_identity_fingerprint(
+            "okx",
+            plan.environment,
+            uid,
+            main_uid,
+            account_type,
+        )
+
+    def account_identity(
+        self,
+        plan: ExecutionPlan,
+        *,
+        account_profile: str | None = None,
+    ) -> str:
+        del account_profile
+        self._client.sync_server_time()
+        return self._identity_from_config(plan, self._client.account_config())
 
     @staticmethod
     def _trade_mode(plan: ExecutionPlan) -> str:
@@ -136,6 +245,7 @@ class OkxAdapter:
                 )
 
         account_config = self._client.account_config()
+        account_identity = self._identity_from_config(plan, account_config)
         position_mode = str(account_config.get("posMode") or "net_mode")
         if plan.product == "swap" and position_mode not in {
             "net_mode",
@@ -189,6 +299,7 @@ class OkxAdapter:
             warnings.append("两档止盈相同，将只建立一档保护")
         return PreflightResult(
             selected_account="okx",
+            account_identity=account_identity,
             quantity=plan.quantity,
             entry_price=plan.entry_price,
             take_profit_1=plan.take_profit_1,
@@ -239,15 +350,17 @@ class OkxAdapter:
 
         try:
             if plan.entry_type == "breakout":
-                response = self._client.place_algo_order(
-                    {
-                        **common,
-                        "algoClOrdId": client_id,
-                        "ordType": "trigger",
-                        "triggerPx": str(preflight.entry_price),
-                        "orderPx": "-1",
-                        "triggerPxType": "last",
-                    }
+                response = self._write(
+                    lambda: self._client.place_algo_order(
+                        {
+                            **common,
+                            "algoClOrdId": client_id,
+                            "ordType": "trigger",
+                            "triggerPx": str(preflight.entry_price),
+                            "orderPx": "-1",
+                            "triggerPxType": "last",
+                        }
+                    )
                 )
                 broker_order_id = str(response.get("algoId") or "")
                 entry_kind = "algo"
@@ -259,7 +372,7 @@ class OkxAdapter:
                 }
                 if plan.entry_type == "limit":
                     body["px"] = str(preflight.entry_price)
-                response = self._client.place_order(body)
+                response = self._write(lambda: self._client.place_order(body))
                 broker_order_id = str(response.get("ordId") or "")
                 entry_kind = "regular"
         except BrokerApiError as exc:
@@ -387,19 +500,30 @@ class OkxAdapter:
         )
         try:
             if kind == "algo" and child_order_id:
-                self._client.cancel_order(
-                    instrument=record.plan.instrument,
-                    order_id=child_order_id,
+                self._write(
+                    lambda: self._client.cancel_order(
+                        instrument=record.plan.instrument,
+                        order_id=child_order_id,
+                    )
                 )
             elif kind == "algo":
-                self._client.cancel_algo_orders(
-                    [{"algoId": record.broker_order_id, "instId": record.plan.instrument}]
+                self._write(
+                    lambda: self._client.cancel_algo_orders(
+                        [
+                            {
+                                "algoId": record.broker_order_id,
+                                "instId": record.plan.instrument,
+                            }
+                        ]
+                    )
                 )
             else:
-                self._client.cancel_order(
-                    instrument=record.plan.instrument,
-                    order_id=record.broker_order_id,
-                    client_order_id=record.client_order_id,
+                self._write(
+                    lambda: self._client.cancel_order(
+                        instrument=record.plan.instrument,
+                        order_id=record.broker_order_id,
+                        client_order_id=record.client_order_id,
+                    )
                 )
         except BrokerApiError as exc:
             raise BrokerRejected(str(exc)) from exc
@@ -422,6 +546,7 @@ class OkxAdapter:
         state = dict(record.broker_state)
         state["entry_cancel_requested"] = True
         state["entry_cancel_status"] = "submitted"
+        state.pop("entry_cancel_runtime_id", None)
         state["entry_cancel_target"] = (
             "child_order" if child_order_id else kind
         )
@@ -443,7 +568,11 @@ class OkxAdapter:
         gross = reported_quantity
         average = reported_average
         fill_rows: list[dict[str, Any]] = []
-        needs_fills = gross <= 0 or record.plan.product == "spot"
+        needs_fills = (
+            gross <= 0
+            or average is None
+            or record.plan.product == "spot"
+        )
         if needs_fills:
             order_id = str(
                 record.broker_state.get("entry_child_order_id")
@@ -461,32 +590,21 @@ class OkxAdapter:
                 instrument=record.plan.instrument,
                 order_id=order_id,
             )
-            confirmed = sum(
-                (
-                    _decimal(item.get("fillSz"), default=Decimal("0"))
-                    or Decimal("0")
-                )
-                for item in fill_rows
-            )
-            if confirmed <= 0:
+            confirmed, confirmed_average = _aggregate_okx_fills(fill_rows)
+            if confirmed <= 0 and (
+                gross <= 0 or record.plan.product == "spot"
+            ):
                 raise ReconciliationError(
                     "OKX 显示已成交但成交明细尚未返回可靠数量"
                 )
-            if gross > 0 and confirmed != gross:
+            if confirmed > 0 and gross > 0 and confirmed != gross:
                 raise ReconciliationError(
                     "OKX 订单成交量与成交明细暂不一致，禁止建立保护"
                 )
-            gross = confirmed
-            if average is None:
-                weighted = sum(
-                    (
-                        (_decimal(item.get("fillSz"), default=Decimal("0")) or Decimal("0"))
-                        * (_decimal(item.get("fillPx"), default=Decimal("0")) or Decimal("0"))
-                    )
-                    for item in fill_rows
-                )
-                if weighted > 0:
-                    average = weighted / gross
+            if confirmed > 0:
+                gross = confirmed
+            if average is None and confirmed > 0:
+                average = confirmed_average
         if gross > record.plan.quantity:
             raise ReconciliationError(
                 "OKX 实际成交数量超过本次计划量"
@@ -600,6 +718,9 @@ class OkxAdapter:
                     "average_fill_price": "",
                 }
             )
+        if targets:
+            targets[0]["state"] = "submitting"
+            targets[0]["submit_runtime_id"] = self._runtime_id
         state["protection_targets"] = targets
         state["protection_base_quantity"] = str(record.remaining_quantity)
         state["realized_before_protection"] = (
@@ -672,6 +793,38 @@ class OkxAdapter:
                     "state_reason": "已按客户算法订单号恢复 OKX 保护单",
                 }
             )
+        if pending.get("state") == "planned":
+            for target in targets:
+                if target["client_algo_id"] == pending["client_algo_id"]:
+                    target["state"] = "submitting"
+                    target["submit_runtime_id"] = self._runtime_id
+                    break
+            state["protection_targets"] = targets
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "state_reason": "已持久化 OKX 保护单提交中状态",
+                }
+            )
+        if (
+            pending.get("state") == "submitting"
+            and pending.get("submit_runtime_id") != self._runtime_id
+        ):
+            for target in targets:
+                if target["client_algo_id"] == pending["client_algo_id"]:
+                    target["state"] = "unknown"
+                    break
+            state["protection_targets"] = targets
+            state["write_unknown"] = "protection"
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "needs_attention": True,
+                    "state_reason": (
+                        "OKX 保护单提交进程中断，按客户订单号只读对账并禁止重发"
+                    ),
+                }
+            )
         plan = record.plan
         body: dict[str, Any] = {
             "instId": plan.instrument,
@@ -693,7 +846,7 @@ class OkxAdapter:
             if pos_side == "net":
                 body["reduceOnly"] = True
         try:
-            response = self._client.place_algo_order(body)
+            response = self._write(lambda: self._client.place_algo_order(body))
         except BrokerApiError as exc:
             raise BrokerRejected(f"OKX 保护单被拒绝：{exc}") from exc
         except BrokerTransportError as exc:
@@ -731,7 +884,19 @@ class OkxAdapter:
             if target["client_algo_id"] == pending["client_algo_id"]:
                 target["algo_id"] = algo_id
                 target["state"] = "live"
+                target.pop("submit_runtime_id", None)
                 break
+        next_pending = next(
+            (
+                target
+                for target in targets
+                if not target.get("algo_id") and target.get("state") == "planned"
+            ),
+            None,
+        )
+        if next_pending is not None:
+            next_pending["state"] = "submitting"
+            next_pending["submit_runtime_id"] = self._runtime_id
         state["protection_targets"] = targets
         all_placed = all(item.get("algo_id") for item in targets)
         return record.model_copy(
@@ -796,7 +961,67 @@ class OkxAdapter:
             if settled_state.get("write_unknown") == "cancel_entry":
                 settled_state.pop("write_unknown", None)
             settled_state.pop("entry_cancel_status", None)
+        if state in {"rejected", "canceled"}:
+            entry_order_id = str(
+                child_order_id
+                or record.broker_state.get("entry_child_order_id")
+                or (
+                    record.broker_order_id
+                    if str(record.broker_state.get("entry_kind")) != "algo"
+                    else ""
+                )
+            )
+            if not entry_order_id and raw.get("accFillSz") in (None, ""):
+                return self._entry_quantity_unconfirmed(
+                    record,
+                    "OKX 入场终态缺少可查询的普通订单号",
+                )
+            try:
+                filled, avg = self._confirmed_terminal_fill(
+                    record,
+                    order_id=entry_order_id,
+                    order=raw,
+                    maximum_quantity=record.plan.quantity,
+                )
+            except ReconciliationError as exc:
+                return self._entry_quantity_unconfirmed(record, str(exc))
+            settled_state.pop("entry_fill_quantity_unknown", None)
+            if settled_state.get("write_unknown") == "entry_fill_quantity":
+                settled_state.pop("write_unknown", None)
         if state == "rejected":
+            if filled > 0:
+                try:
+                    gross, managed, avg, metadata = (
+                        self._confirmed_entry_quantity(
+                            record,
+                            reported_quantity=filled,
+                            reported_average=avg,
+                        )
+                    )
+                except (
+                    BrokerApiError,
+                    BrokerTransportError,
+                    ReconciliationError,
+                ) as exc:
+                    return self._entry_quantity_unconfirmed(record, str(exc))
+                broker_state = dict(settled_state)
+                broker_state.update(metadata)
+                updated = record.model_copy(
+                    update={
+                        "filled_quantity": gross,
+                        "remaining_quantity": managed,
+                        "average_fill_price": avg,
+                        "realized_pnl": record.realized_pnl or Decimal("0"),
+                        "broker_state": broker_state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "OKX 入场被拒前已有成交，准备保护实际仓位"
+                        ),
+                    }
+                )
+                return self._initialise_protection_targets(updated).model_copy(
+                    update={"needs_attention": True}
+                )
             return record.model_copy(
                 update={
                     "state": ExecutionState.REJECTED,
@@ -874,6 +1099,22 @@ class OkxAdapter:
                 }
             )
             return self._initialise_protection_targets(updated)
+        if (
+            record.broker_state.get("entry_cancel_intent")
+            and not record.broker_state.get("entry_cancel_requested")
+            and record.broker_state.get("entry_cancel_runtime_id")
+            != self._runtime_id
+        ):
+            state_data = dict(record.broker_state)
+            state_data["entry_cancel_status"] = "unknown"
+            state_data["write_unknown"] = "cancel_entry"
+            return record.model_copy(
+                update={
+                    "broker_state": state_data,
+                    "needs_attention": True,
+                    "state_reason": "OKX 撤销入场进程中断，保持停写并只读确认",
+                }
+            )
         if state == "partially_filled":
             updated = record.model_copy(
                 update={
@@ -888,6 +1129,7 @@ class OkxAdapter:
                 if not bool(updated.broker_state.get("entry_cancel_intent")):
                     broker_state = dict(updated.broker_state)
                     broker_state["entry_cancel_intent"] = True
+                    broker_state["entry_cancel_runtime_id"] = self._runtime_id
                     return updated.model_copy(
                         update={
                             "broker_state": broker_state,
@@ -910,6 +1152,7 @@ class OkxAdapter:
             if not bool(record.broker_state.get("entry_cancel_intent")):
                 state_data = dict(record.broker_state)
                 state_data["entry_cancel_intent"] = True
+                state_data["entry_cancel_runtime_id"] = self._runtime_id
                 return record.model_copy(
                     update={
                         "broker_state": state_data,
@@ -975,6 +1218,80 @@ class OkxAdapter:
             total += pnl
         return total
 
+    def _confirmed_terminal_fill(
+        self,
+        record: ExecutionRecord,
+        *,
+        order_id: str,
+        order: dict[str, Any],
+        maximum_quantity: Decimal,
+    ) -> tuple[Decimal, Decimal | None]:
+        """Confirm a terminal OKX exit fill from order data or exact fills."""
+        status = _okx_order_state(order)
+        raw_quantity = order.get("accFillSz")
+        quantity = _decimal(raw_quantity)
+        price = _decimal(order.get("avgPx"))
+        quantity_reported = raw_quantity not in (None, "")
+        if quantity_reported and quantity is None:
+            raise ReconciliationError("OKX 终态成交数量无效")
+        quantity_missing = not quantity_reported or (
+            status == "filled" and (quantity is None or quantity <= 0)
+        )
+        price_missing = quantity is not None and quantity > 0 and price is None
+        must_query = quantity_missing or price_missing
+        if quantity is not None and quantity < 0:
+            raise ReconciliationError("OKX 终态成交数量为负数")
+        if must_query and status in {"filled", "canceled", "rejected"}:
+            try:
+                rows = self._client.fills(
+                    instrument_type=(
+                        "SPOT" if record.plan.product == "spot" else "SWAP"
+                    ),
+                    instrument=record.plan.instrument,
+                    order_id=order_id,
+                )
+            except (BrokerApiError, BrokerTransportError) as exc:
+                if quantity_missing:
+                    raise ReconciliationError(
+                        "OKX 终态成交数量缺失且成交明细查询失败"
+                    ) from exc
+                return quantity or Decimal("0"), price
+            confirmed, confirmed_price = _aggregate_okx_fills(rows)
+            if quantity_missing:
+                if confirmed <= 0:
+                    raise ReconciliationError(
+                        "OKX 终态成交数量缺失且成交明细尚未确认零成交"
+                    )
+                quantity = confirmed
+            elif confirmed > 0 and confirmed != quantity:
+                raise ReconciliationError(
+                    "OKX 订单成交量与成交明细暂不一致"
+                )
+            if price is None and confirmed > 0:
+                price = confirmed_price
+        quantity = quantity or Decimal("0")
+        if status == "filled" and quantity <= 0:
+            raise ReconciliationError("OKX 显示已成交但无法确认实际成交数量")
+        if quantity > maximum_quantity:
+            raise ReconciliationError("OKX 终态成交数量超过本次可退出数量")
+        return quantity, price
+
+    @staticmethod
+    def _exit_quantity_unconfirmed(
+        record: ExecutionRecord,
+        message: str,
+    ) -> ExecutionRecord:
+        state = dict(record.broker_state)
+        state["write_unknown"] = "exit_fill_quantity"
+        return record.model_copy(
+            update={
+                "broker_state": state,
+                "needs_attention": True,
+                "last_error": message,
+                "state_reason": "OKX 退出订单终态数量未确认，保持停写并只读对账",
+            }
+        )
+
     def _protection_status(
         self,
         target: dict[str, Any],
@@ -995,17 +1312,30 @@ class OkxAdapter:
             child_ids.append(single)
         total = Decimal("0")
         notional = Decimal("0")
+        complete_prices = True
         realized = Decimal("0")
         realized_known = True
         child_states: list[str] = []
         unique_child_ids = list(dict.fromkeys(str(item) for item in child_ids if item))
+        target_quantity = (
+            _decimal(target.get("quantity"), default=Decimal("0"))
+            or Decimal("0")
+        )
         for order_id in unique_child_ids:
             order = self._client.get_order(instrument=instrument, order_id=str(order_id))
             child_states.append(_okx_order_state(order))
-            qty = _decimal(order.get("accFillSz"), default=Decimal("0")) or Decimal("0")
-            price = _decimal(order.get("avgPx"), default=Decimal("0")) or Decimal("0")
+            qty, confirmed_price = self._confirmed_terminal_fill(
+                record,
+                order_id=str(order_id),
+                order=order,
+                maximum_quantity=target_quantity,
+            )
             total += qty
-            notional += qty * price
+            if qty > 0:
+                if confirmed_price is None:
+                    complete_prices = False
+                else:
+                    notional += qty * confirmed_price
             if record.plan.product == "swap" and qty > 0:
                 fill_pnl = self._swap_order_realized_pnl(
                     instrument=instrument,
@@ -1015,9 +1345,17 @@ class OkxAdapter:
                     realized_known = False
                 else:
                     realized += fill_pnl
+        if total > target_quantity:
+            raise ReconciliationError(
+                "OKX 保护子订单累计成交数量超过目标保护数量"
+            )
         target["exit_order_ids"] = unique_child_ids
         target["filled_quantity"] = str(total)
-        target["average_fill_price"] = str(notional / total) if total > 0 else ""
+        target["average_fill_price"] = (
+            str(notional / total)
+            if total > 0 and complete_prices
+            else ""
+        )
         if record.plan.product == "swap":
             target["realized_pnl"] = str(realized) if realized_known else ""
             target["realized_pnl_known"] = realized_known
@@ -1087,6 +1425,9 @@ class OkxAdapter:
                     "average_fill_price": "",
                 }
             )
+        if additions:
+            additions[0]["state"] = "submitting"
+            additions[0]["submit_runtime_id"] = self._runtime_id
         targets.extend(additions)
         return targets, bool(additions), unprotected
 
@@ -1102,6 +1443,8 @@ class OkxAdapter:
             targets = [
                 self._protection_status(target, record) for target in targets
             ]
+        except ReconciliationError as exc:
+            return self._exit_quantity_unconfirmed(record, str(exc))
         except (BrokerApiError, BrokerTransportError) as exc:
             return record.model_copy(
                 update={
@@ -1208,13 +1551,17 @@ class OkxAdapter:
                     return None
                 total += value
             return total
-        entry = record.average_fill_price or record.plan.entry_price
+        entry = record.average_fill_price
+        if entry is None:
+            return None
         pnl = Decimal("0")
         for target in targets:
             qty = _decimal(target.get("filled_quantity"), default=Decimal("0")) or Decimal("0")
             price = _decimal(target.get("average_fill_price"))
-            if qty <= 0 or price is None:
+            if qty <= 0:
                 continue
+            if price is None:
+                return None
             pnl += (price - entry) * qty if record.plan.direction == "long" else (entry - price) * qty
         return pnl
 
@@ -1278,6 +1625,8 @@ class OkxAdapter:
                 self._protection_status(item, record)
                 for item in targets
             ]
+        except ReconciliationError as exc:
+            return self._exit_quantity_unconfirmed(record, str(exc))
         except (BrokerApiError, BrokerTransportError) as exc:
             return record.model_copy(
                 update={
@@ -1367,14 +1716,30 @@ class OkxAdapter:
             None,
         )
         if cancel_intent is not None:
+            if cancel_intent.get("cancel_runtime_id") != self._runtime_id:
+                cancel_intent["cancel_status"] = "unknown"
+                state["protection_targets"] = targets
+                state["write_unknown"] = "cancel_protection"
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "realized_pnl": realized,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "OKX 撤保护单进程中断，保持停写并只读确认"
+                        ),
+                    }
+                )
             try:
-                self._client.cancel_algo_orders(
-                    [
-                        {
-                            "algoId": str(cancel_intent["algo_id"]),
-                            "instId": record.plan.instrument,
-                        }
-                    ]
+                self._write(
+                    lambda: self._client.cancel_algo_orders(
+                        [
+                            {
+                                "algoId": str(cancel_intent["algo_id"]),
+                                "instId": record.plan.instrument,
+                            }
+                        ]
+                    )
                 )
             except BrokerApiError as exc:
                 raise BrokerRejected(f"OKX 撤销保护单失败：{exc}") from exc
@@ -1392,6 +1757,7 @@ class OkxAdapter:
                     }
                 )
             cancel_intent["cancel_status"] = "submitted"
+            cancel_intent.pop("cancel_runtime_id", None)
             state["protection_targets"] = targets
             return record.model_copy(
                 update={
@@ -1421,6 +1787,7 @@ class OkxAdapter:
             )
         target["cancel_requested"] = True
         target["cancel_status"] = "intent"
+        target["cancel_runtime_id"] = self._runtime_id
         state["protection_targets"] = targets
         return record.model_copy(
             update={
@@ -1455,7 +1822,7 @@ class OkxAdapter:
             if pos_side == "net":
                 body["reduceOnly"] = True
         try:
-            response = self._client.place_order(body)
+            response = self._write(lambda: self._client.place_order(body))
         except BrokerApiError as exc:
             raise BrokerRejected(f"OKX 主动离场被拒绝：{exc}") from exc
         except BrokerTransportError as exc:
@@ -1483,6 +1850,7 @@ class OkxAdapter:
             )
         state["exit_phase"] = "wait_exit"
         exit_order["order_id"] = order_id
+        exit_order.pop("submit_runtime_id", None)
         state["exit_order"] = exit_order
         state.pop("write_unknown", None)
         return record.model_copy(
@@ -1502,7 +1870,12 @@ class OkxAdapter:
         phase = str(state.get("exit_phase") or "cancel_protection")
         if phase == "cancel_protection":
             targets = state.get("protection_targets") or []
-            if any(
+            interrupted_cancel = any(
+                item.get("cancel_status") == "intent"
+                and item.get("cancel_runtime_id") != self._runtime_id
+                for item in targets
+            )
+            if interrupted_cancel or any(
                 item.get("cancel_status") in {"submitted", "unknown"}
                 for item in targets
             ):
@@ -1521,6 +1894,7 @@ class OkxAdapter:
                 "order_id": "",
                 "client_order_id": _client_id(record.id, "exit"),
                 "quantity": str(record.remaining_quantity),
+                "submit_runtime_id": self._runtime_id,
                 "realized_before_exit": (
                     str(record.realized_pnl)
                     if record.realized_pnl is not None
@@ -1534,6 +1908,19 @@ class OkxAdapter:
                 }
             )
         if phase == "submit_exit_ready":
+            exit_order = dict(state.get("exit_order") or {})
+            if exit_order.get("submit_runtime_id") != self._runtime_id:
+                state["exit_phase"] = "exit_unknown"
+                state["write_unknown"] = "exit"
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "OKX 主动离场提交进程中断，按客户订单号只读对账并禁止重发"
+                        ),
+                    }
+                )
             if not allow_writes:
                 return record.model_copy(
                     update={
@@ -1599,12 +1986,26 @@ class OkxAdapter:
                 }
             )
         status = _okx_order_state(raw)
-        qty = _decimal(raw.get("accFillSz"), default=Decimal("0")) or Decimal("0")
-        price = _decimal(raw.get("avgPx"))
         original_quantity = (
             _decimal(exit_order.get("quantity"), default=record.remaining_quantity)
             or record.remaining_quantity
         )
+        if status in {"filled", "canceled", "rejected"}:
+            try:
+                qty, price = self._confirmed_terminal_fill(
+                    record,
+                    order_id=order_id,
+                    order=raw,
+                    maximum_quantity=original_quantity,
+                )
+            except ReconciliationError as exc:
+                return self._exit_quantity_unconfirmed(record, str(exc))
+        else:
+            qty = (
+                _decimal(raw.get("accFillSz"), default=Decimal("0"))
+                or Decimal("0")
+            )
+            price = _decimal(raw.get("avgPx"))
         remaining = max(original_quantity - qty, Decimal("0"))
         before = _decimal(exit_order.get("realized_before_exit"))
         if record.plan.product == "swap" and qty > 0:
@@ -1612,13 +2013,20 @@ class OkxAdapter:
                 instrument=record.plan.instrument,
                 order_id=order_id,
             )
-        elif qty > 0 and price is not None:
-            entry = record.average_fill_price or record.plan.entry_price
-            exit_pnl = (
-                (price - entry) * qty
-                if record.plan.direction == "long"
-                else (entry - price) * qty
-            )
+        elif qty > 0:
+            if price is None:
+                exit_pnl = None
+            else:
+                entry = record.average_fill_price
+                exit_pnl = (
+                    (
+                        (price - entry) * qty
+                        if record.plan.direction == "long"
+                        else (entry - price) * qty
+                    )
+                    if entry is not None
+                    else None
+                )
         else:
             exit_pnl = Decimal("0")
         realized = before + exit_pnl if before is not None and exit_pnl is not None else None
@@ -1655,7 +2063,7 @@ class OkxAdapter:
                     "last_error": "",
                 }
             )
-        if status == "canceled":
+        if status in {"canceled", "rejected"}:
             if remaining <= 0:
                 return record.model_copy(
                     update={
@@ -1665,7 +2073,7 @@ class OkxAdapter:
                         "unrealized_pnl": Decimal("0"),
                         "broker_state": state,
                         "needs_attention": realized is None,
-                        "state_reason": "OKX 主动离场已成交后撤余单",
+                        "state_reason": "OKX 主动离场终止前已完成成交",
                     }
                 )
             state["protection_targets"] = []
@@ -1678,7 +2086,7 @@ class OkxAdapter:
                     "realized_pnl": realized,
                     "broker_state": state,
                     "needs_attention": True,
-                    "state_reason": "OKX 主动离场订单被撤，按实际剩余仓位恢复保护",
+                    "state_reason": "OKX 主动离场订单终止，按实际剩余仓位恢复保护",
                 }
             )
         return record.model_copy(
@@ -1748,7 +2156,16 @@ class OkxAdapter:
                 ),
                 None,
             )
-            if pending is None or pending.get("state") == "unknown":
+            interrupted_submit = (
+                pending is not None
+                and pending.get("state") == "submitting"
+                and pending.get("submit_runtime_id") != self._runtime_id
+            )
+            if (
+                pending is None
+                or pending.get("state") == "unknown"
+                or interrupted_submit
+            ):
                 return self._place_one_protection(record)
             if not allow_writes:
                 return record.model_copy(
@@ -1804,25 +2221,54 @@ class OkxAdapter:
             return record
         return self._cancel_entry_write(record)
 
+    def _target_account_currency(
+        self,
+        plan: ExecutionPlan,
+        broker_metadata: dict | None,
+    ) -> str:
+        metadata = broker_metadata or {}
+        key = "quote_currency" if plan.product == "spot" else "settle_currency"
+        target = str(metadata.get(key) or "").upper()
+        if target:
+            return target
+        inst_type = "SPOT" if plan.product == "spot" else "SWAP"
+        instrument = next(
+            (
+                item
+                for item in self._client.instruments(inst_type)
+                if str(item.get("instId") or "") == plan.instrument
+            ),
+            None,
+        )
+        if instrument is None:
+            return ""
+        field = "quoteCcy" if plan.product == "spot" else "settleCcy"
+        return str(instrument.get(field) or "").upper()
+
     def account_snapshot(
         self,
         plan: ExecutionPlan,
         *,
         account_profile: str | None = None,
+        broker_metadata: dict | None = None,
     ) -> AccountSnapshot:
         del account_profile
         balances = self._client.balance()
         position_rows = self._client.positions()
         balance = balances[0] if balances else {}
         details = balance.get("details") or []
-        base_currency = "USD"
-        if plan.product == "spot" and "-" in plan.instrument:
-            base_currency = plan.instrument.rsplit("-", 1)[-1]
-        elif position_rows:
-            base_currency = str(position_rows[0].get("ccy") or "USD")
-        detail = next(
-            (item for item in details if str(item.get("ccy")) == base_currency),
-            details[0] if details else {},
+        base_currency = self._target_account_currency(plan, broker_metadata)
+        detail = (
+            next(
+                (
+                    item
+                    for item in details
+                    if str(item.get("ccy") or "").upper() == base_currency
+                ),
+                {},
+            )
+            if base_currency
+            else {}
         )
         positions: list[PositionSnapshot] = []
         for item in position_rows:

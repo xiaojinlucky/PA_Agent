@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 import os
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pa_agent.execution.errors import CredentialError
@@ -21,6 +22,7 @@ class LongbridgeAccountCredentials:
     app_key: str
     app_secret: str
     access_token: str
+    account_identity: str = ""
 
 
 @dataclass(frozen=True)
@@ -28,6 +30,21 @@ class OkxCredentials:
     api_key: str
     secret_key: str
     passphrase: str
+
+
+def account_identity_fingerprint(
+    broker: str,
+    environment: str,
+    *identity_parts: object,
+) -> str:
+    """Return a non-secret, stable fingerprint for one concrete broker account."""
+    values = [str(part or "").strip() for part in identity_parts]
+    if not broker.strip() or not environment.strip() or any(not value for value in values):
+        raise CredentialError("券商账户身份字段不完整，禁止创建交易会话")
+    payload = "\x1f".join(
+        [broker.strip().lower(), environment.strip().lower(), *values]
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def shared_env_path() -> Path:
@@ -119,7 +136,7 @@ def _validate_longbridge_profile_identity(
     *,
     profile: str,
     credentials: LongbridgeAccountCredentials,
-) -> None:
+) -> str:
     account_id_key = {
         "paper": "LONGBRIDGE_PAPER_ACCOUNT_ID",
         "comprehensive": "LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID",
@@ -143,6 +160,13 @@ def _validate_longbridge_profile_identity(
         raise CredentialError(
             f"{profile} Access Token 与绑定账户 ID 不匹配，禁止创建交易会话"
         )
+    environment = "demo" if profile == "paper" else "live"
+    return account_identity_fingerprint(
+        "longbridge",
+        environment,
+        account_class,
+        token_account_id,
+    )
 
 
 def load_longbridge_account_credentials(
@@ -163,12 +187,12 @@ def load_longbridge_account_credentials(
     for prefix in prefixes:
         credentials = _complete_triplet(values, prefix=prefix)
         if credentials is not None:
-            _validate_longbridge_profile_identity(
+            identity = _validate_longbridge_profile_identity(
                 values,
                 profile=profile,
                 credentials=credentials,
             )
-            return credentials
+            return replace(credentials, account_identity=identity)
     expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise CredentialError(f"未找到 {profile} 账户的完整 Longbridge 凭据（需要 {expected}）")
 

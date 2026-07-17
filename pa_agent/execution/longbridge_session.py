@@ -49,6 +49,11 @@ class LongbridgeSession:
             raise self._translate(exc, write=False) from exc
         self._sdk = sdk
         self._lock = threading.RLock()
+        self._account_identity = credentials.account_identity
+
+    @property
+    def account_identity(self) -> str:
+        return self._account_identity
 
     def _translate(self, exc: Exception, *, write: bool) -> Exception:
         sdk = getattr(self, "_sdk", None)
@@ -95,7 +100,7 @@ class LongbridgeSession:
         symbol: str,
         side: str,
         price: Decimal,
-    ) -> dict[str, str]:
+    ) -> dict[str, object]:
         order_side = self._sdk.OrderSide.Buy if side == "buy" else self._sdk.OrderSide.Sell
         try:
             with self._lock:
@@ -109,8 +114,10 @@ class LongbridgeSession:
         except Exception as exc:
             raise self._translate(exc, write=False) from exc
         return {
-            "cash_max_qty": str(getattr(response, "cash_max_qty", "") or "0"),
-            "margin_max_qty": str(getattr(response, "margin_max_qty", "") or "0"),
+            "cash_max_qty": _public_value(getattr(response, "cash_max_qty", None)),
+            "margin_max_qty": _public_value(
+                getattr(response, "margin_max_qty", None)
+            ),
         }
 
     def positions(self, symbol: str | None = None) -> list[dict[str, Any]]:
@@ -199,6 +206,9 @@ class LongbridgeSession:
             normalized = "unknown"
         else:
             normalized = "pending"
+        executed_quantity = getattr(detail, "executed_quantity", None)
+        if executed_quantity is None:
+            executed_quantity = getattr(detail, "executed_qty", None)
         return {
             "order_id": str(getattr(detail, "order_id", "") or order_id),
             "state": normalized,
@@ -207,10 +217,10 @@ class LongbridgeSession:
                 or getattr(detail, "submitted_quantity", None)
                 or "0"
             ),
-            "filled_quantity": str(
-                getattr(detail, "executed_quantity", None)
-                or getattr(detail, "executed_qty", None)
-                or "0"
+            "filled_quantity": (
+                str(executed_quantity)
+                if executed_quantity is not None
+                else ""
             ),
             "average_fill_price": str(
                 getattr(detail, "executed_price", None) or ""
@@ -351,10 +361,27 @@ class LongbridgeSession:
             "init_margin",
             "maintenance_margin",
         )
-        return [
-            {field: _public_value(getattr(row, field, None)) for field in fields}
-            for row in rows
-        ]
+        result: list[dict[str, Any]] = []
+        for row in rows:
+            item = {
+                field: _public_value(getattr(row, field, None))
+                for field in fields
+            }
+            item["cash_infos"] = [
+                {
+                    field: _public_value(getattr(cash, field, None))
+                    for field in (
+                        "currency",
+                        "available_cash",
+                        "withdraw_cash",
+                        "frozen_cash",
+                        "settling_cash",
+                    )
+                }
+                for cash in (getattr(row, "cash_infos", None) or [])
+            ]
+            result.append(item)
+        return result
 
     def profit_summary(self) -> dict[str, Any]:
         try:

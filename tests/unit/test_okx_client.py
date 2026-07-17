@@ -8,7 +8,7 @@ import json
 import pytest
 
 from pa_agent.execution.credentials import OkxCredentials
-from pa_agent.execution.errors import BrokerApiError
+from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
 from pa_agent.execution.okx_client import HttpResponse, OkxRestClient
 
 
@@ -109,6 +109,29 @@ def test_top_level_and_item_errors_are_both_rejected():
     with pytest.raises(BrokerApiError) as item:
         _client(item_transport).place_order({"instId": "BTC-USDT"})
     assert item.value.code == "51000"
+
+
+@pytest.mark.parametrize("status", [408, 429, 500, 503])
+def test_post_uncertain_http_status_is_never_treated_as_definite_rejection(
+    status,
+):
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "50011",
+                    "data": [],
+                    "msg": "temporarily unavailable",
+                },
+                status=status,
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
 
 
 def test_query_is_sorted_and_signed_as_transmitted():

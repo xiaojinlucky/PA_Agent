@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from decimal import Decimal
 
 import pytest
@@ -8,6 +9,7 @@ from pa_agent.config.settings import Settings
 from pa_agent.execution.errors import (
     BrokerApiError,
     BrokerRejected,
+    CredentialError,
     LiveTradingDisabled,
     PreflightError,
     SubmissionUnknown,
@@ -38,6 +40,18 @@ class FakeAdapter:
         self.reconcile_error = None
         self.cancel_error = None
         self.reconcile_write_unknown = False
+        self.runtime_id = ""
+        self.identity = "okx-account-a"
+        self.write_executor = lambda operation: operation()
+
+    def bind_runtime_id(self, runtime_id):
+        self.runtime_id = runtime_id
+
+    def bind_write_executor(self, executor):
+        self.write_executor = executor
+
+    def account_identity(self, _plan, *, account_profile=None):
+        return self.identity
 
     def preflight(self, plan):
         self.calls.append(("preflight", plan.id))
@@ -45,6 +59,7 @@ class FakeAdapter:
             raise self.preflight_error
         return PreflightResult(
             selected_account="okx",
+            account_identity=self.identity,
             quantity=plan.quantity,
             entry_price=plan.entry_price,
             take_profit_1=plan.take_profit_1,
@@ -105,6 +120,7 @@ class FakeAdapter:
         return record
 
     def request_exit(self, record, *, reason):
+        self.calls.append(("request_exit", reason))
         return record.model_copy(update={"state": ExecutionState.EXIT_PENDING})
 
     def cancel_entry(self, record):
@@ -114,7 +130,14 @@ class FakeAdapter:
             update={"broker_state": {**record.broker_state, "cancel": True}}
         )
 
-    def account_snapshot(self, _plan, *, account_profile=None):
+    def account_snapshot(
+        self,
+        _plan,
+        *,
+        account_profile=None,
+        broker_metadata=None,
+    ):
+        del broker_metadata
         self.calls.append(("account_snapshot", account_profile))
         return AccountSnapshot(
             broker="okx",
@@ -273,6 +296,49 @@ def test_unknown_submit_is_not_retried_and_disarms_session(tmp_path, monkeypatch
     assert [call[0] for call in adapter.calls].count("submit_entry") == 1
 
 
+def test_unknown_submit_save_failure_rotates_runtime_and_never_resubmits(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    adapter.submit_error = SubmissionUnknown("timeout")
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    old_runtime = service._runtime_id
+    original_save = service.store.save
+
+    def fail_unknown_save(record, *, event_kind, event_payload=None):
+        if event_kind == "entry_submit_unknown":
+            raise RuntimeError("simulated sqlite commit failure")
+        return original_save(
+            record,
+            event_kind=event_kind,
+            event_payload=event_payload,
+        )
+
+    monkeypatch.setattr(service.store, "save", fail_unknown_save)
+    with pytest.raises(RuntimeError, match="sqlite commit failure"):
+        service.submit(execution.id)
+
+    assert service.is_armed is False
+    assert service._runtime_id != old_runtime
+    assert [call[0] for call in adapter.calls].count("submit_entry") == 1
+
+    monkeypatch.setattr(service.store, "save", original_save)
+    adapter.submit_error = None
+    service.arm("启用实盘交易")
+    service.reconcile_once()
+
+    assert [call[0] for call in adapter.calls].count("submit_entry") == 1
+    persisted = service.store.get(execution.id)
+    assert persisted is not None
+    assert persisted.state == ExecutionState.UNKNOWN
+    assert "submit_interrupted" in [
+        event.kind for event in service.store.events(execution.id)
+    ]
+
+
 def test_disarmed_reconcile_is_read_only_but_still_updates_state(
     tmp_path,
     monkeypatch,
@@ -301,6 +367,34 @@ def test_account_refresh_is_read_only_and_persisted(tmp_path, monkeypatch):
     persisted = service.store.latest_account_snapshot("okx", "okx-live")
     assert persisted is not None
     assert persisted.equity == Decimal("1000")
+
+
+def test_legacy_active_execution_without_identity_cannot_refresh_account(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    legacy_active = service.store.save(
+        execution.model_copy(
+            update={
+                "state": ExecutionState.ENTRY_PENDING,
+                "selected_account": "okx",
+                "account_identity": "",
+            }
+        ),
+        event_kind="legacy_active_fixture",
+    )
+    service.arm("启用实盘交易")
+
+    with pytest.raises(CredentialError, match="身份指纹"):
+        service.refresh_account(legacy_active.id)
+
+    assert service.is_armed is False
+    assert not [
+        call for call in adapter.calls if call[0] == "account_snapshot"
+    ]
 
 
 def test_monitor_once_refreshes_actual_selected_account(
@@ -335,6 +429,107 @@ def test_unknown_reconcile_write_disarms_entire_session(tmp_path, monkeypatch):
 
     assert updates[0].broker_state["write_unknown"] == "protection"
     assert service.is_armed is False
+
+
+def test_disarm_is_linearized_with_every_adapter_broker_write(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, analysis = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(analysis)
+    service._adapter(execution.plan)
+    service.arm("启用实盘交易")
+    write_started = threading.Event()
+    release_write = threading.Event()
+    disarm_started = threading.Event()
+    disarm_finished = threading.Event()
+    errors: list[BaseException] = []
+
+    def broker_write():
+        write_started.set()
+        if not release_write.wait(2):
+            raise TimeoutError("test write release timeout")
+        adapter.calls.append(("guarded_write",))
+
+    def run_write():
+        try:
+            adapter.write_executor(broker_write)
+        except BaseException as exc:
+            errors.append(exc)
+
+    def run_disarm():
+        disarm_started.set()
+        service.disarm()
+        disarm_finished.set()
+
+    writer = threading.Thread(target=run_write)
+    writer.start()
+    assert write_started.wait(2)
+    disarmer = threading.Thread(target=run_disarm)
+    disarmer.start()
+    assert disarm_started.wait(2)
+    assert disarm_finished.wait(0.1) is False
+
+    release_write.set()
+    writer.join(2)
+    disarmer.join(2)
+
+    assert errors == []
+    assert disarm_finished.is_set()
+    assert service.is_armed is False
+    assert [call for call in adapter.calls if call[0] == "guarded_write"] == [
+        ("guarded_write",)
+    ]
+    with pytest.raises(LiveTradingDisabled):
+        adapter.write_executor(lambda: adapter.calls.append(("late_write",)))
+    assert not [call for call in adapter.calls if call[0] == "late_write"]
+
+
+def test_active_execution_blocks_account_switch_before_read_or_write(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    active = service.submit(execution.id)
+    adapter.calls.clear()
+    adapter.identity = "okx-account-b"
+
+    updates = service.reconcile_once()
+
+    assert updates[0].id == active.id
+    assert updates[0].needs_attention is True
+    assert updates[0].broker_state["identity_or_route_blocked"] is True
+    assert service.is_armed is False
+    assert not [call for call in adapter.calls if call[0] == "reconcile"]
+    with pytest.raises(CredentialError, match="实际账户"):
+        service.refresh_account(active.id)
+    assert not [call for call in adapter.calls if call[0] == "account_snapshot"]
+
+
+def test_manual_exit_account_switch_disarms_before_exit_intent(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    submitted = service.submit(execution.id)
+    opened = service.reconcile_once()[0]
+    assert opened.id == submitted.id
+    assert opened.state == ExecutionState.OPEN
+    adapter.calls.clear()
+    adapter.identity = "okx-account-b"
+
+    with pytest.raises(CredentialError, match="实际账户"):
+        service.request_exit(opened.id, reason="manual")
+
+    assert service.is_armed is False
+    assert not [call for call in adapter.calls if call[0] == "request_exit"]
 
 
 def test_restart_turns_persisted_submitting_intent_into_unknown_without_resubmit(
@@ -376,6 +571,155 @@ def test_restart_turns_persisted_submitting_intent_into_unknown_without_resubmit
     assert "submit_interrupted" in [
         event.kind for event in restarted.store.events(interrupted.id)
     ]
+
+
+def test_write_result_save_failure_rotates_runtime_and_prevents_reconcile_resubmit(
+    tmp_path,
+    monkeypatch,
+):
+    class MarkerAdapter(FakeAdapter):
+        def reconcile(self, record, *, allow_writes):
+            self.calls.append(("reconcile", record.state, allow_writes))
+            marker = str(record.broker_state.get("submit_runtime_id") or "")
+            if marker and marker != self.runtime_id:
+                return record.model_copy(
+                    update={
+                        "broker_state": {
+                            **record.broker_state,
+                            "write_unknown": "protection",
+                        },
+                        "needs_attention": True,
+                    }
+                )
+            if allow_writes:
+                self.write_executor(
+                    lambda: self.calls.append(("broker_write", marker))
+                )
+                return record.model_copy(update={"state": ExecutionState.OPEN})
+            return record
+
+    adapter = MarkerAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    submitted = service.submit(execution.id)
+    old_runtime = adapter.runtime_id
+    service.store.save(
+        submitted.model_copy(
+            update={
+                "state": ExecutionState.PROTECTING,
+                "broker_state": {
+                    **submitted.broker_state,
+                    "submit_runtime_id": old_runtime,
+                },
+            }
+        ),
+        event_kind="protection_intent_fixture",
+    )
+    original_save = service.store.save
+    failed = False
+
+    def fail_first_reconciled_save(record, *, event_kind, event_payload=None):
+        nonlocal failed
+        if event_kind == "reconciled" and not failed:
+            failed = True
+            raise RuntimeError("simulated sqlite commit failure")
+        return original_save(
+            record,
+            event_kind=event_kind,
+            event_payload=event_payload,
+        )
+
+    monkeypatch.setattr(service.store, "save", fail_first_reconciled_save)
+    with pytest.raises(RuntimeError, match="sqlite commit failure"):
+        service.reconcile_once()
+
+    assert service.is_armed is False
+    assert service._runtime_id != old_runtime
+    assert len([call for call in adapter.calls if call[0] == "broker_write"]) == 1
+
+    monkeypatch.setattr(service.store, "save", original_save)
+    service.arm("启用实盘交易")
+    service.reconcile_once()
+
+    assert len([call for call in adapter.calls if call[0] == "broker_write"]) == 1
+    persisted = service.store.get(submitted.id)
+    assert persisted is not None
+    assert persisted.broker_state["write_unknown"] == "protection"
+
+
+def test_cancel_result_save_failure_rotates_runtime_and_prevents_cancel_resubmit(
+    tmp_path,
+    monkeypatch,
+):
+    class CancelMarkerAdapter(FakeAdapter):
+        def cancel_entry(self, record):
+            self.write_executor(
+                lambda: self.calls.append(("broker_cancel", record.id))
+            )
+            return record.model_copy(
+                update={
+                    "broker_state": {
+                        **record.broker_state,
+                        "entry_cancel_requested": True,
+                    }
+                }
+            )
+
+        def reconcile(self, record, *, allow_writes):
+            self.calls.append(("reconcile", record.state, allow_writes))
+            marker = str(
+                record.broker_state.get("entry_cancel_runtime_id") or ""
+            )
+            if marker and marker != self.runtime_id:
+                return record.model_copy(
+                    update={
+                        "broker_state": {
+                            **record.broker_state,
+                            "entry_cancel_status": "unknown",
+                            "write_unknown": "cancel_entry",
+                        },
+                        "needs_attention": True,
+                    }
+                )
+            return record
+
+    adapter = CancelMarkerAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    submitted = service.submit(execution.id)
+    old_runtime = adapter.runtime_id
+    original_save = service.store.save
+    failed = False
+
+    def fail_first_cancel_save(record, *, event_kind, event_payload=None):
+        nonlocal failed
+        if event_kind == "cancel_entry_requested" and not failed:
+            failed = True
+            raise RuntimeError("simulated sqlite commit failure")
+        return original_save(
+            record,
+            event_kind=event_kind,
+            event_payload=event_payload,
+        )
+
+    monkeypatch.setattr(service.store, "save", fail_first_cancel_save)
+    with pytest.raises(RuntimeError, match="sqlite commit failure"):
+        service.cancel_entry(submitted.id)
+
+    assert service.is_armed is False
+    assert service._runtime_id != old_runtime
+    assert len([call for call in adapter.calls if call[0] == "broker_cancel"]) == 1
+
+    monkeypatch.setattr(service.store, "save", original_save)
+    service.arm("启用实盘交易")
+    service.reconcile_once()
+
+    assert len([call for call in adapter.calls if call[0] == "broker_cancel"]) == 1
+    persisted = service.store.get(submitted.id)
+    assert persisted is not None
+    assert persisted.broker_state["write_unknown"] == "cancel_entry"
 
 
 def test_private_preflight_api_error_is_persisted_as_blocked(
@@ -426,9 +770,25 @@ def test_active_okx_execution_rebuilds_adapter_from_plan_snapshot(
             captured["simulated"] = simulated
 
     class CapturingAdapter:
-        def __init__(self, _client, *, margin_mode, entry_timeout_seconds):
+        def __init__(
+            self,
+            _client,
+            *,
+            margin_mode,
+            entry_timeout_seconds,
+            runtime_id,
+            write_executor,
+        ):
             captured["margin_mode"] = margin_mode
             captured["entry_timeout_seconds"] = entry_timeout_seconds
+            captured["runtime_id_set"] = bool(runtime_id)
+            captured["write_executor_set"] = callable(write_executor)
+
+        def bind_runtime_id(self, _runtime_id):
+            pass
+
+        def bind_write_executor(self, _write_executor):
+            pass
 
     monkeypatch.setattr(
         "pa_agent.execution.service.load_okx_credentials",
@@ -456,6 +816,8 @@ def test_active_okx_execution_rebuilds_adapter_from_plan_snapshot(
         "simulated": False,
         "margin_mode": "cross",
         "entry_timeout_seconds": 120,
+        "runtime_id_set": True,
+        "write_executor_set": True,
     }
 
     service._adapters.clear()
@@ -492,6 +854,46 @@ def test_post_entry_rejection_keeps_position_monitored_and_disarms(
     assert current.state == ExecutionState.PROTECTING
     assert current.needs_attention is True
     assert service.is_armed is False
+
+
+@pytest.mark.parametrize(
+    "active_state",
+    [ExecutionState.ENTRY_PENDING, ExecutionState.PARTIALLY_FILLED],
+)
+def test_reconcile_cancel_rejection_keeps_entry_active_and_disarms(
+    tmp_path,
+    monkeypatch,
+    active_state,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    submitted = service.submit(execution.id)
+    if active_state == ExecutionState.PARTIALLY_FILLED:
+        submitted = service.store.save(
+            submitted.model_copy(
+                update={
+                    "state": active_state,
+                    "filled_quantity": Decimal("1"),
+                    "remaining_quantity": Decimal("1"),
+                }
+            ),
+            event_kind="test_partial_fill",
+        )
+    adapter.reconcile_error = BrokerRejected("cancel rejected")
+
+    updated = service.reconcile_once()[0]
+
+    assert updated.state == active_state
+    assert updated.needs_attention is True
+    assert service.is_armed is False
+    assert service.store.route_claim_owner(updated) == updated.id
+
+    adapter.reconcile_error = None
+    adapter.calls.clear()
+    service.reconcile_once()
+    assert ("reconcile", active_state, False) in adapter.calls
 
 
 def test_manual_cancel_rejection_keeps_entry_monitored_and_disarms(

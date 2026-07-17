@@ -14,6 +14,7 @@ from pa_agent.execution.errors import (
     BrokerTransportError,
     FallbackEligiblePreflightError,
     PreflightError,
+    ReconciliationError,
     SubmissionUnknown,
 )
 from pa_agent.execution.models import (
@@ -35,6 +36,61 @@ def _decimal(value: object, default: Decimal | None = None) -> Decimal | None:
     except (InvalidOperation, TypeError, ValueError):
         return default
     return parsed if parsed.is_finite() else default
+
+
+def _aggregate_executions(
+    executions: list[dict[str, Any]],
+) -> tuple[Decimal, Decimal | None]:
+    """Aggregate exact fills without treating a missing price as zero."""
+    anonymous: list[tuple[Decimal, Decimal | None]] = []
+    by_trade_id: dict[str, tuple[Decimal, Decimal | None]] = {}
+    for item in executions:
+        raw_quantity = item.get("quantity")
+        quantity = _decimal(raw_quantity)
+        if raw_quantity in (None, "") or quantity is None or quantity < 0:
+            raise ReconciliationError("Longbridge 成交明细包含无效数量")
+        if quantity == 0:
+            continue
+        price = _decimal(item.get("price"))
+        if price is not None and price <= 0:
+            price = None
+        trade_id = str(item.get("trade_id") or "")
+        if not trade_id:
+            anonymous.append((quantity, price))
+            continue
+        existing = by_trade_id.get(trade_id)
+        if existing is None:
+            by_trade_id[trade_id] = (quantity, price)
+            continue
+        existing_quantity, existing_price = existing
+        if existing_quantity != quantity:
+            raise ReconciliationError("Longbridge 重复成交编号的数量不一致")
+        if (
+            existing_price is not None
+            and price is not None
+            and existing_price != price
+        ):
+            raise ReconciliationError("Longbridge 重复成交编号的价格不一致")
+        by_trade_id[trade_id] = (
+            quantity,
+            existing_price if existing_price is not None else price,
+        )
+    unique = [*by_trade_id.values(), *anonymous]
+    total = sum((quantity for quantity, _price in unique), Decimal("0"))
+    complete_prices = total > 0 and all(
+        price is not None for _quantity, price in unique
+    )
+    if not complete_prices:
+        return total, None
+    notional = sum(
+        (
+            quantity * price
+            for quantity, price in unique
+            if price is not None
+        ),
+        Decimal("0"),
+    )
+    return total, notional / total
 
 
 def _request_id(execution_id: str, action: str, index: int = 0) -> str:
@@ -61,11 +117,27 @@ class LongbridgeAdapter:
         *,
         allow_outside_rth: bool = False,
         entry_timeout_seconds: int = 120,
+        runtime_id: str = "",
+        write_executor: Callable[[Callable[[], Any]], Any] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._sessions: dict[str, Any] = {}
         self._allow_outside_rth = bool(allow_outside_rth)
         self._entry_timeout_seconds = int(entry_timeout_seconds)
+        self._runtime_id = runtime_id or str(uuid.uuid4())
+        self._write_executor = write_executor or (lambda operation: operation())
+
+    def bind_runtime_id(self, runtime_id: str) -> None:
+        self._runtime_id = runtime_id
+
+    def bind_write_executor(
+        self,
+        executor: Callable[[Callable[[], Any]], Any],
+    ) -> None:
+        self._write_executor = executor
+
+    def _write(self, operation: Callable[[], Any]) -> Any:
+        return self._write_executor(operation)
 
     def _session(self, profile: str):
         session = self._sessions.get(profile)
@@ -75,10 +147,39 @@ class LongbridgeAdapter:
         return session
 
     @staticmethod
+    def _capacity(value: object, label: str) -> Decimal:
+        parsed = _decimal(value)
+        if parsed is None or parsed < 0:
+            raise PreflightError(f"Longbridge {label} 返回值无效")
+        return parsed
+
+    @staticmethod
     def _max_quantity(estimate: dict[str, Any]) -> Decimal:
-        cash = _decimal(estimate.get("cash_max_qty"), Decimal("0")) or Decimal("0")
-        margin = _decimal(estimate.get("margin_max_qty"), Decimal("0")) or Decimal("0")
+        cash = LongbridgeAdapter._capacity(
+            estimate.get("cash_max_qty"),
+            "cash_max_qty",
+        )
+        margin = LongbridgeAdapter._capacity(
+            estimate.get("margin_max_qty"),
+            "margin_max_qty",
+        )
         return max(cash, margin)
+
+    def account_identity(
+        self,
+        plan: ExecutionPlan,
+        *,
+        account_profile: str | None = None,
+    ) -> str:
+        profile = account_profile or plan.requested_account
+        identity = str(
+            getattr(self._session(profile), "account_identity", "") or ""
+        )
+        if not identity:
+            raise PreflightError(
+                f"Longbridge {profile} 账户缺少可验证的实际账户身份"
+            )
+        return identity
 
     def _profile_preflight(
         self,
@@ -121,6 +222,10 @@ class LongbridgeAdapter:
             )
         return PreflightResult(
             selected_account=profile,
+            account_identity=self.account_identity(
+                plan,
+                account_profile=profile,
+            ),
             quantity=plan.quantity,
             entry_price=plan.entry_price,
             take_profit_1=plan.take_profit_1,
@@ -211,7 +316,9 @@ class LongbridgeAdapter:
         body["client_request_id"] = request_id
         body["remark"] = remark
         try:
-            order_id = self._session(profile).submit_order(body)
+            order_id = self._write(
+                lambda: self._session(profile).submit_order(body)
+            )
         except BrokerApiError as exc:
             raise BrokerRejected(str(exc)) from exc
         except BrokerTransportError as exc:
@@ -259,7 +366,11 @@ class LongbridgeAdapter:
 
     def _cancel_entry_write(self, record: ExecutionRecord) -> ExecutionRecord:
         try:
-            self._session(record.selected_account).cancel_order(record.broker_order_id)
+            self._write(
+                lambda: self._session(record.selected_account).cancel_order(
+                    record.broker_order_id
+                )
+            )
         except BrokerApiError as exc:
             raise BrokerRejected(f"Longbridge 撤销入场失败：{exc}") from exc
         except BrokerTransportError as exc:
@@ -278,6 +389,7 @@ class LongbridgeAdapter:
         state = dict(record.broker_state)
         state["entry_cancel_requested"] = True
         state["entry_cancel_status"] = "submitted"
+        state.pop("entry_cancel_runtime_id", None)
         return record.model_copy(
             update={
                 "broker_state": state,
@@ -300,7 +412,8 @@ class LongbridgeAdapter:
             "remark": _remark(record.id, "stop", record.revision + 1),
             "quantity": str(record.remaining_quantity),
             "trigger_price": str(record.preflight.stop_loss if record.preflight else record.plan.stop_loss),
-            "state": "planned",
+            "state": "submitting",
+            "submit_runtime_id": self._runtime_id,
         }
         return record.model_copy(
             update={
@@ -357,6 +470,7 @@ class LongbridgeAdapter:
                 )
             stop["order_id"] = recovered_order_id
             stop["state"] = str(found.get("state") or "pending")
+            stop.pop("submit_runtime_id", None)
             state["stop_order"] = stop
             state.pop("write_unknown", None)
             return record.model_copy(
@@ -366,6 +480,34 @@ class LongbridgeAdapter:
                     "needs_attention": False,
                     "last_error": "",
                     "state_reason": "已按备注恢复 Longbridge 止损订单",
+                }
+            )
+        if stop.get("state") == "planned":
+            state = dict(record.broker_state)
+            stop["state"] = "submitting"
+            stop["submit_runtime_id"] = self._runtime_id
+            state["stop_order"] = stop
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "state_reason": "已持久化 Longbridge 止损提交中状态",
+                }
+            )
+        if (
+            stop.get("state") == "submitting"
+            and stop.get("submit_runtime_id") != self._runtime_id
+        ):
+            state = dict(record.broker_state)
+            stop["state"] = "unknown"
+            state["stop_order"] = stop
+            state["write_unknown"] = "stop"
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "needs_attention": True,
+                    "state_reason": (
+                        "Longbridge 止损提交进程中断，按备注只读对账并禁止重发"
+                    ),
                 }
             )
         body = {
@@ -379,7 +521,9 @@ class LongbridgeAdapter:
             "client_request_id": str(stop["request_id"]),
         }
         try:
-            order_id = self._session(record.selected_account).submit_order(body)
+            order_id = self._write(
+                lambda: self._session(record.selected_account).submit_order(body)
+            )
         except BrokerApiError as exc:
             raise BrokerRejected(f"Longbridge 止损单被拒绝：{exc}") from exc
         except BrokerTransportError as exc:
@@ -400,6 +544,7 @@ class LongbridgeAdapter:
         state = dict(record.broker_state)
         stop["order_id"] = order_id
         stop["state"] = "pending"
+        stop.pop("submit_runtime_id", None)
         state["stop_order"] = stop
         return record.model_copy(
             update={
@@ -434,7 +579,54 @@ class LongbridgeAdapter:
             if settled_state.get("write_unknown") == "cancel_entry":
                 settled_state.pop("write_unknown", None)
             settled_state.pop("entry_cancel_status", None)
+            try:
+                filled, avg = self._confirmed_terminal_fill(
+                    record,
+                    session=self._session(record.selected_account),
+                    order_id=record.broker_order_id,
+                    order=order,
+                    maximum_quantity=record.plan.quantity,
+                )
+            except ReconciliationError as exc:
+                state_data = dict(settled_state)
+                state_data["entry_fill_quantity_unknown"] = True
+                state_data["write_unknown"] = "entry_fill_quantity"
+                return record.model_copy(
+                    update={
+                        "broker_state": state_data,
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": (
+                            "Longbridge 入场终态成交数量未确认，"
+                            "禁止结束监控或建立保护"
+                        ),
+                    }
+                )
+            settled_state.pop("entry_fill_quantity_unknown", None)
+            if settled_state.get("write_unknown") == "entry_fill_quantity":
+                settled_state.pop("write_unknown", None)
+            if filled > 0 and avg is None:
+                settled_state["entry_average_price_unknown"] = True
+            elif avg is not None:
+                settled_state.pop("entry_average_price_unknown", None)
         if status == "rejected":
+            if filled > 0:
+                updated = record.model_copy(
+                    update={
+                        "filled_quantity": filled,
+                        "remaining_quantity": filled,
+                        "average_fill_price": avg,
+                        "realized_pnl": record.realized_pnl or Decimal("0"),
+                        "broker_state": settled_state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "Longbridge 入场被拒前已有成交，准备保护实际仓位"
+                        ),
+                    }
+                )
+                return self._initialise_stop(updated).model_copy(
+                    update={"needs_attention": True}
+                )
             return record.model_copy(
                 update={
                     "state": ExecutionState.REJECTED,
@@ -568,6 +760,24 @@ class LongbridgeAdapter:
                 }
             )
             return self._initialise_stop(updated)
+        if (
+            record.broker_state.get("entry_cancel_intent")
+            and not record.broker_state.get("entry_cancel_requested")
+            and record.broker_state.get("entry_cancel_runtime_id")
+            != self._runtime_id
+        ):
+            state_data = dict(record.broker_state)
+            state_data["entry_cancel_status"] = "unknown"
+            state_data["write_unknown"] = "cancel_entry"
+            return record.model_copy(
+                update={
+                    "broker_state": state_data,
+                    "needs_attention": True,
+                    "state_reason": (
+                        "Longbridge 撤销入场进程中断，保持停写并只读确认"
+                    ),
+                }
+            )
         if status == "partially_filled":
             updated = record.model_copy(
                 update={
@@ -582,6 +792,7 @@ class LongbridgeAdapter:
                 if not bool(record.broker_state.get("entry_cancel_intent")):
                     state = dict(updated.broker_state)
                     state["entry_cancel_intent"] = True
+                    state["entry_cancel_runtime_id"] = self._runtime_id
                     return updated.model_copy(
                         update={
                             "broker_state": state,
@@ -607,6 +818,7 @@ class LongbridgeAdapter:
             if not bool(record.broker_state.get("entry_cancel_intent")):
                 state = dict(record.broker_state)
                 state["entry_cancel_intent"] = True
+                state["entry_cancel_runtime_id"] = self._runtime_id
                 return record.model_copy(
                     update={
                         "broker_state": state,
@@ -657,6 +869,85 @@ class LongbridgeAdapter:
             return datetime.fromisoformat(record.created_at).astimezone(UTC)
         except ValueError:
             return None
+
+    def _confirmed_terminal_fill(
+        self,
+        record: ExecutionRecord,
+        *,
+        session: Any,
+        order_id: str,
+        order: dict[str, Any],
+        maximum_quantity: Decimal,
+    ) -> tuple[Decimal, Decimal | None]:
+        """Confirm terminal exit quantity from the order or exact executions."""
+        status = str(order.get("state") or "")
+        raw_quantity = order.get("filled_quantity")
+        quantity = _decimal(raw_quantity)
+        price = _decimal(order.get("average_fill_price"))
+        quantity_reported = raw_quantity not in (None, "")
+        if quantity_reported and quantity is None:
+            raise ReconciliationError("Longbridge 终态成交数量无效")
+        quantity_missing = not quantity_reported or (
+            status == "filled" and (quantity is None or quantity <= 0)
+        )
+        price_missing = quantity is not None and quantity > 0 and price is None
+        must_query = quantity_missing or price_missing
+        if quantity is not None and quantity < 0:
+            raise ReconciliationError("Longbridge 终态成交数量为负数")
+        if must_query:
+            try:
+                executions = session.executions(
+                    symbol=record.plan.instrument,
+                    order_id=order_id,
+                    start_at=self._record_created_at(record) or datetime.now(UTC),
+                )
+            except (BrokerApiError, BrokerTransportError) as exc:
+                if quantity_missing:
+                    raise ReconciliationError(
+                        "Longbridge 终态成交数量缺失且成交明细查询失败"
+                    ) from exc
+                return quantity or Decimal("0"), price
+            confirmed, confirmed_price = _aggregate_executions(executions)
+            if quantity_missing:
+                if confirmed <= 0:
+                    raise ReconciliationError(
+                        "Longbridge 终态成交数量缺失且成交明细尚未确认零成交"
+                    )
+                quantity = confirmed
+            elif confirmed > 0 and confirmed != quantity:
+                raise ReconciliationError(
+                    "Longbridge 订单成交量与成交明细暂不一致"
+                )
+            if price is None and confirmed > 0:
+                price = confirmed_price
+        quantity = quantity or Decimal("0")
+        if status == "filled" and quantity <= 0:
+            raise ReconciliationError(
+                "Longbridge 显示已成交但无法确认实际成交数量"
+            )
+        if quantity > maximum_quantity:
+            raise ReconciliationError(
+                "Longbridge 终态成交数量超过本次可退出数量"
+            )
+        return quantity, price
+
+    @staticmethod
+    def _exit_quantity_unconfirmed(
+        record: ExecutionRecord,
+        message: str,
+    ) -> ExecutionRecord:
+        state = dict(record.broker_state)
+        state["write_unknown"] = "exit_fill_quantity"
+        return record.model_copy(
+            update={
+                "broker_state": state,
+                "needs_attention": True,
+                "last_error": message,
+                "state_reason": (
+                    "Longbridge 退出订单终态数量未确认，保持停写并只读对账"
+                ),
+            }
+        )
 
     @staticmethod
     def _take_profit_targets(record: ExecutionRecord) -> list[dict[str, Any]]:
@@ -722,6 +1013,8 @@ class LongbridgeAdapter:
             "remark": _remark(record.id, f"exit{index}", attempt),
             "order_id": "",
             "cancel_requested": False,
+            "cancel_status": "submitting",
+            "cancel_runtime_id": self._runtime_id,
         }
         return record.model_copy(
             update={
@@ -791,8 +1084,16 @@ class LongbridgeAdapter:
                 )
             stop_state = str(stop_status.get("state") or "")
             if stop_state == "filled":
-                exit_qty = _decimal(stop_status.get("filled_quantity"), Decimal("0")) or Decimal("0")
-                exit_price = _decimal(stop_status.get("average_fill_price"))
+                try:
+                    exit_qty, exit_price = self._confirmed_terminal_fill(
+                        record,
+                        session=session,
+                        order_id=str(stop.get("order_id") or ""),
+                        order=stop_status,
+                        maximum_quantity=record.remaining_quantity,
+                    )
+                except ReconciliationError as exc:
+                    return self._exit_quantity_unconfirmed(record, str(exc))
                 return self._close_from_exit(
                     record,
                     quantity=exit_qty,
@@ -800,11 +1101,16 @@ class LongbridgeAdapter:
                     reason="止损在撤单竞争中成交",
                 )
             if stop_state in {"canceled", "rejected"}:
-                stop_filled = (
-                    _decimal(stop_status.get("filled_quantity"), Decimal("0"))
-                    or Decimal("0")
-                )
-                stop_price = _decimal(stop_status.get("average_fill_price"))
+                try:
+                    stop_filled, stop_price = self._confirmed_terminal_fill(
+                        record,
+                        session=session,
+                        order_id=str(stop.get("order_id") or ""),
+                        order=stop_status,
+                        maximum_quantity=record.remaining_quantity,
+                    )
+                except ReconciliationError as exc:
+                    return self._exit_quantity_unconfirmed(record, str(exc))
                 updated = (
                     self._close_from_exit(
                         record,
@@ -824,6 +1130,7 @@ class LongbridgeAdapter:
                     action["reason"] = "止损撤单竞态后退出剩余仓位"
                 action["phase"] = "submit_exit"
                 action["cancel_status"] = "confirmed"
+                action["submit_runtime_id"] = self._runtime_id
                 state["partial_exit"] = action
                 stop["state"] = stop_state
                 state["stop_order"] = stop
@@ -841,6 +1148,22 @@ class LongbridgeAdapter:
                         ),
                     }
                 )
+            if (
+                action.get("cancel_status") == "submitting"
+                and action.get("cancel_runtime_id") != self._runtime_id
+            ):
+                action["cancel_status"] = "unknown"
+                state["partial_exit"] = action
+                state["write_unknown"] = "cancel_stop"
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "Longbridge 撤止损进程中断，保持停写并只读确认"
+                        ),
+                    }
+                )
             if not allow_writes:
                 return record.model_copy(
                     update={
@@ -848,8 +1171,20 @@ class LongbridgeAdapter:
                         "state_reason": "Longbridge 减仓待执行；需启用本次会话",
                     }
                 )
+            if action.get("cancel_status") != "submitting":
+                action["cancel_status"] = "submitting"
+                action["cancel_runtime_id"] = self._runtime_id
+                state["partial_exit"] = action
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "state_reason": "已持久化 Longbridge 撤止损提交中状态",
+                    }
+                )
             try:
-                session.cancel_order(str(stop.get("order_id") or ""))
+                self._write(
+                    lambda: session.cancel_order(str(stop.get("order_id") or ""))
+                )
             except BrokerApiError as exc:
                 raise BrokerRejected(f"Longbridge 撤止损失败：{exc}") from exc
             except BrokerTransportError as exc:
@@ -866,6 +1201,7 @@ class LongbridgeAdapter:
                 )
             action["cancel_requested"] = True
             action["cancel_status"] = "submitted"
+            action.pop("cancel_runtime_id", None)
             state["partial_exit"] = action
             return record.model_copy(
                 update={
@@ -875,11 +1211,35 @@ class LongbridgeAdapter:
             )
 
         if phase == "submit_exit":
+            submit_runtime_id = str(action.get("submit_runtime_id") or "")
+            if submit_runtime_id and submit_runtime_id != self._runtime_id:
+                action["phase"] = "exit_unknown"
+                action["state"] = "unknown"
+                state["partial_exit"] = action
+                state["write_unknown"] = "exit"
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "Longbridge 减仓提交进程中断，按备注只读对账并禁止重发"
+                        ),
+                    }
+                )
             if not allow_writes:
                 return record.model_copy(
                     update={
                         "needs_attention": True,
                         "state_reason": "Longbridge 旧止损已撤；需启用会话立即减仓",
+                    }
+                )
+            if not submit_runtime_id:
+                action["submit_runtime_id"] = self._runtime_id
+                state["partial_exit"] = action
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "state_reason": "已持久化 Longbridge 减仓提交中状态",
                     }
                 )
             body = {
@@ -892,7 +1252,7 @@ class LongbridgeAdapter:
                 "client_request_id": str(action["request_id"]),
             }
             try:
-                order_id = session.submit_order(body)
+                order_id = self._write(lambda: session.submit_order(body))
             except BrokerApiError as exc:
                 raise BrokerRejected(f"Longbridge 减仓被拒绝：{exc}") from exc
             except BrokerTransportError as exc:
@@ -912,6 +1272,7 @@ class LongbridgeAdapter:
                 )
             action["order_id"] = order_id
             action["phase"] = "wait_exit"
+            action.pop("submit_runtime_id", None)
             state["partial_exit"] = action
             return record.model_copy(
                 update={
@@ -933,8 +1294,19 @@ class LongbridgeAdapter:
                 )
             status = str(exit_order.get("state") or "")
             if status == "filled":
-                qty = _decimal(exit_order.get("filled_quantity"), Decimal("0")) or Decimal("0")
-                price = _decimal(exit_order.get("average_fill_price"))
+                try:
+                    qty, price = self._confirmed_terminal_fill(
+                        record,
+                        session=session,
+                        order_id=str(action.get("order_id") or ""),
+                        order=exit_order,
+                        maximum_quantity=(
+                            _decimal(action.get("quantity"))
+                            or record.remaining_quantity
+                        ),
+                    )
+                except ReconciliationError as exc:
+                    return self._exit_quantity_unconfirmed(record, str(exc))
                 updated = self._close_from_exit(
                     record,
                     quantity=qty,
@@ -952,11 +1324,19 @@ class LongbridgeAdapter:
                     return self._initialise_stop(updated)
                 return updated
             if status in {"canceled", "rejected"}:
-                qty = (
-                    _decimal(exit_order.get("filled_quantity"), Decimal("0"))
-                    or Decimal("0")
-                )
-                price = _decimal(exit_order.get("average_fill_price"))
+                try:
+                    qty, price = self._confirmed_terminal_fill(
+                        record,
+                        session=session,
+                        order_id=str(action.get("order_id") or ""),
+                        order=exit_order,
+                        maximum_quantity=(
+                            _decimal(action.get("quantity"))
+                            or record.remaining_quantity
+                        ),
+                    )
+                except ReconciliationError as exc:
+                    return self._exit_quantity_unconfirmed(record, str(exc))
                 updated = (
                     self._close_from_exit(
                         record,
@@ -1008,27 +1388,37 @@ class LongbridgeAdapter:
     ) -> ExecutionRecord:
         quantity = min(max(quantity, Decimal("0")), record.remaining_quantity)
         remaining = max(record.remaining_quantity - quantity, Decimal("0"))
-        entry = record.average_fill_price or record.plan.entry_price
+        entry = record.average_fill_price
         prior = record.realized_pnl or Decimal("0")
-        trade_pnl = Decimal("0")
-        if price is not None:
+        state = dict(record.broker_state)
+        prior_unknown = bool(
+            state.get("realized_pnl_unknown")
+            or state.get("entry_average_price_unknown")
+            or entry is None
+        )
+        if prior_unknown or (quantity > 0 and price is None):
+            realized = None
+            state["realized_pnl_unknown"] = True
+        else:
             trade_pnl = (
                 (price - entry) * quantity
                 if record.plan.direction == "long"
                 else (entry - price) * quantity
-            )
+            ) if price is not None else Decimal("0")
+            realized = prior + trade_pnl
         return record.model_copy(
             update={
                 "state": ExecutionState.CLOSED if remaining <= 0 else ExecutionState.OPEN,
                 "remaining_quantity": remaining,
-                "realized_pnl": prior + trade_pnl,
+                "realized_pnl": realized,
                 "unrealized_pnl": Decimal("0") if remaining <= 0 else record.unrealized_pnl,
+                "broker_state": state,
                 "state_reason": (
                     f"Longbridge 仓位已关闭（{reason}）"
                     if remaining <= 0
                     else f"Longbridge 已完成部分减仓（{reason}）"
                 ),
-                "needs_attention": False,
+                "needs_attention": realized is None,
                 "last_error": "",
             }
         )
@@ -1062,8 +1452,16 @@ class LongbridgeAdapter:
                 }
             )
         if stop_status.get("state") == "filled":
-            qty = _decimal(stop_status.get("filled_quantity"), Decimal("0")) or Decimal("0")
-            price = _decimal(stop_status.get("average_fill_price"))
+            try:
+                qty, price = self._confirmed_terminal_fill(
+                    record,
+                    session=session,
+                    order_id=str(stop["order_id"]),
+                    order=stop_status,
+                    maximum_quantity=record.remaining_quantity,
+                )
+            except ReconciliationError as exc:
+                return self._exit_quantity_unconfirmed(record, str(exc))
             return self._close_from_exit(
                 record,
                 quantity=qty,
@@ -1079,11 +1477,16 @@ class LongbridgeAdapter:
                 }
             )
         if stop_status.get("state") in {"canceled", "rejected"}:
-            qty = (
-                _decimal(stop_status.get("filled_quantity"), Decimal("0"))
-                or Decimal("0")
-            )
-            price = _decimal(stop_status.get("average_fill_price"))
+            try:
+                qty, price = self._confirmed_terminal_fill(
+                    record,
+                    session=session,
+                    order_id=str(stop["order_id"]),
+                    order=stop_status,
+                    maximum_quantity=record.remaining_quantity,
+                )
+            except ReconciliationError as exc:
+                return self._exit_quantity_unconfirmed(record, str(exc))
             updated = (
                 self._close_from_exit(
                     record,
@@ -1233,6 +1636,9 @@ class LongbridgeAdapter:
             state = dict(started.broker_state)
             action = dict(state["partial_exit"])
             action["phase"] = "submit_exit"
+            action.pop("cancel_status", None)
+            action.pop("cancel_runtime_id", None)
+            action["submit_runtime_id"] = self._runtime_id
             state["partial_exit"] = action
             started = started.model_copy(update={"broker_state": state})
         return started.model_copy(update={"state": ExecutionState.EXIT_PENDING})
@@ -1256,20 +1662,38 @@ class LongbridgeAdapter:
         plan: ExecutionPlan,
         *,
         account_profile: str | None = None,
+        broker_metadata: dict | None = None,
     ) -> AccountSnapshot:
         profile = account_profile or plan.requested_account
         session = self._session(profile)
         balances = session.account_balances()
         positions_raw = session.positions()
         profit = session.profit_summary()
+        metadata_currency = str(
+            (broker_metadata or {}).get("currency") or ""
+        ).upper()
+        profit_currency = str(profit.get("currency") or "").upper()
+        primary_currency = metadata_currency or profit_currency
         primary = next(
             (
                 item
                 for item in balances
-                if str(item.get("currency") or "") == str(profit.get("currency") or "")
+                if str(item.get("currency") or "").upper() == primary_currency
             ),
-            balances[0] if balances else {},
+            {},
         )
+        cash_info = next(
+            (
+                item
+                for balance in balances
+                for item in (balance.get("cash_infos") or [])
+                if str(item.get("currency") or "").upper() == primary_currency
+            ),
+            {},
+        )
+        equity = _decimal(primary.get("net_assets"))
+        if equity is None and profit_currency == primary_currency:
+            equity = _decimal(profit.get("current_total_asset"))
         positions: list[PositionSnapshot] = []
         for item in positions_raw:
             quantity = _decimal(item.get("quantity"), Decimal("0")) or Decimal("0")
@@ -1293,13 +1717,16 @@ class LongbridgeAdapter:
         return AccountSnapshot(
             broker="longbridge",
             account_profile=profile,
-            base_currency=str(primary.get("currency") or profit.get("currency") or ""),
-            equity=_decimal(primary.get("net_assets"))
-            or _decimal(profit.get("current_total_asset")),
+            base_currency=primary_currency,
+            equity=equity,
             cash=_decimal(primary.get("total_cash")),
-            available=_decimal(primary.get("remaining_finance_amount")),
+            available=_decimal(cash_info.get("available_cash")),
             buying_power=_decimal(primary.get("buy_power")),
-            total_pnl=_decimal(profit.get("sum_profit")),
+            total_pnl=(
+                _decimal(profit.get("sum_profit"))
+                if profit_currency == primary_currency
+                else None
+            ),
             realized_pnl=None,
             unrealized_pnl=None,
             positions=positions,
@@ -1307,6 +1734,12 @@ class LongbridgeAdapter:
                 "risk_level": str(primary.get("risk_level") or ""),
                 "margin_call": str(primary.get("margin_call") or ""),
                 "max_finance_amount": str(primary.get("max_finance_amount") or ""),
+                "remaining_finance_amount": str(
+                    primary.get("remaining_finance_amount") or ""
+                ),
+                "withdraw_cash": str(cash_info.get("withdraw_cash") or ""),
+                "frozen_cash": str(cash_info.get("frozen_cash") or ""),
+                "settling_cash": str(cash_info.get("settling_cash") or ""),
                 "profit_rate": str(profit.get("sum_profit_rate") or ""),
             },
         )

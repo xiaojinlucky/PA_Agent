@@ -15,8 +15,9 @@ from pa_agent.execution.models import (
 
 
 class FakeLongbridgeSession:
-    def __init__(self, *, maximum="10"):
+    def __init__(self, *, maximum="10", identity="longbridge-account"):
         self.maximum = maximum
+        self.account_identity = identity
         self.calls = []
         self.orders = {}
         self.positions_rows = []
@@ -26,6 +27,7 @@ class FakeLongbridgeSession:
         self.submit_error = None
         self.cancel_error = None
         self.executions_by_order = {}
+        self.executions_error = None
 
     def static_info(self, symbol):
         self.calls.append(("static_info", symbol))
@@ -73,6 +75,8 @@ class FakeLongbridgeSession:
 
     def executions(self, *, symbol, order_id, start_at):
         self.calls.append(("executions", symbol, order_id, start_at))
+        if self.executions_error:
+            raise self.executions_error
         return list(self.executions_by_order.get(order_id, []))
 
     def find_today_order_by_remark(self, *, symbol, remark):
@@ -100,6 +104,15 @@ class FakeLongbridgeSession:
                 "risk_level": "1",
                 "margin_call": "0",
                 "max_finance_amount": "20000",
+                "cash_infos": [
+                    {
+                        "currency": "USD",
+                        "available_cash": "4000",
+                        "withdraw_cash": "3500",
+                        "frozen_cash": "500",
+                        "settling_cash": "0",
+                    }
+                ],
             }
         ]
 
@@ -152,6 +165,23 @@ def test_intraday_capacity_shortage_falls_back_before_submit():
 
     assert result.selected_account == "comprehensive"
     assert result.warnings and "回退综合账户" in result.warnings[0]
+
+
+@pytest.mark.parametrize(
+    "invalid_maximum",
+    [None, "", "nan", "Infinity", "-1", "not-a-number"],
+)
+def test_invalid_intraday_capacity_never_triggers_account_fallback(
+    invalid_maximum,
+):
+    intraday = FakeLongbridgeSession(maximum=invalid_maximum)
+    comprehensive = FakeLongbridgeSession(maximum="10")
+    adapter, _ = _adapter(intraday, comprehensive)
+
+    with pytest.raises(PreflightError, match="返回值无效"):
+        adapter.preflight(_plan())
+
+    assert not comprehensive.calls
 
 
 def test_paper_capacity_shortage_never_falls_back_to_live_account():
@@ -386,6 +416,105 @@ def test_filled_without_any_confirmed_quantity_never_builds_stop():
     ) == 1
 
 
+def test_canceled_entry_with_missing_fill_quantity_stays_active_until_confirmed():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "canceled", "filled_quantity": "", "average_fill_price": ""}
+    )
+    intraday.executions_error = BrokerTransportError(
+        "temporary read failure",
+        write_may_have_reached=False,
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+    intraday.executions_error = None
+    still_unresolved = adapter.reconcile(unresolved, allow_writes=False)
+    intraday.orders[record.broker_order_id]["filled_quantity"] = "0"
+    canceled = adapter.reconcile(still_unresolved, allow_writes=False)
+
+    assert unresolved.state == ExecutionState.ENTRY_PENDING
+    assert unresolved.broker_state["write_unknown"] == "entry_fill_quantity"
+    assert still_unresolved.state == ExecutionState.ENTRY_PENDING
+    assert still_unresolved.broker_state["write_unknown"] == "entry_fill_quantity"
+    assert canceled.state == ExecutionState.CANCELED
+    assert "write_unknown" not in canceled.broker_state
+
+
+def test_missing_entry_average_price_prevents_later_fake_realized_pnl():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": ""}
+    )
+
+    protecting = adapter.reconcile(record, allow_writes=True)
+    opened = adapter.reconcile(protecting, allow_writes=True)
+    stop_id = opened.broker_state["stop_order"]["order_id"]
+    intraday.orders[stop_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": "95"}
+    )
+    closed = adapter.reconcile(opened, allow_writes=True)
+
+    assert protecting.average_fill_price is None
+    assert protecting.broker_state["entry_average_price_unknown"] is True
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl is None
+    assert closed.broker_state["realized_pnl_unknown"] is True
+
+
+def test_entry_executions_with_partial_missing_prices_keep_average_unknown():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "", "average_fill_price": ""}
+    )
+    intraday.executions_by_order[record.broker_order_id] = [
+        {"trade_id": "entry-1", "quantity": "1", "price": "100"},
+        {"trade_id": "entry-2", "quantity": "1", "price": ""},
+    ]
+
+    protecting = adapter.reconcile(record, allow_writes=True)
+
+    assert protecting.state == ExecutionState.PROTECTING
+    assert protecting.filled_quantity == Decimal("2")
+    assert protecting.average_fill_price is None
+    assert protecting.broker_state["entry_average_price_unknown"] is True
+
+
 def test_entry_timeout_requests_cancel_instead_of_leaving_order_open():
     intraday = FakeLongbridgeSession()
     sessions = {"intraday": intraday, "comprehensive": FakeLongbridgeSession()}
@@ -598,7 +727,84 @@ def test_protecting_without_intent_persists_stop_metadata_before_write():
 
     initialised = adapter.reconcile(record, allow_writes=True)
 
-    assert initialised.broker_state["stop_order"]["state"] == "planned"
+    assert initialised.broker_state["stop_order"]["state"] == "submitting"
+    assert initialised.broker_state["stop_order"]["submit_runtime_id"]
+    assert not [call for call in intraday.calls if call[0] == "submit_order"]
+
+
+def test_restart_after_stop_intent_never_resubmits_longbridge_stop():
+    intraday = FakeLongbridgeSession()
+    sessions = {
+        "intraday": intraday,
+        "comprehensive": FakeLongbridgeSession(),
+    }
+    first_adapter = LongbridgeAdapter(
+        lambda profile: sessions[profile],
+        runtime_id="runtime-one",
+    )
+    plan = _plan()
+    preflight = first_adapter.preflight(plan)
+    record = first_adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": "100"}
+    )
+    interrupted = first_adapter.reconcile(record, allow_writes=True)
+    restarted = LongbridgeAdapter(
+        lambda profile: sessions[profile],
+        runtime_id="runtime-two",
+    )
+
+    unknown = restarted.reconcile(interrupted, allow_writes=True)
+
+    assert unknown.broker_state["stop_order"]["state"] == "unknown"
+    assert unknown.broker_state["write_unknown"] == "stop"
+    assert unknown.needs_attention is True
+    assert len(
+        [call for call in intraday.calls if call[0] == "submit_order"]
+    ) == 1
+
+
+def test_restart_after_exit_intent_never_resubmits_longbridge_exit():
+    intraday = FakeLongbridgeSession()
+    sessions = {
+        "intraday": intraday,
+        "comprehensive": FakeLongbridgeSession(),
+    }
+    adapter = LongbridgeAdapter(
+        lambda profile: sessions[profile],
+        runtime_id="runtime-two",
+    )
+    plan = _plan()
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "submit_exit",
+                "quantity": "2",
+                "request_id": "request",
+                "remark": "remark",
+                "submit_runtime_id": "runtime-one",
+            }
+        },
+    )
+
+    unknown = adapter.reconcile(record, allow_writes=True)
+
+    assert unknown.broker_state["partial_exit"]["phase"] == "exit_unknown"
+    assert unknown.broker_state["write_unknown"] == "exit"
     assert not [call for call in intraday.calls if call[0] == "submit_order"]
 
 
@@ -697,7 +903,8 @@ def test_partially_filled_canceled_exit_rebuilds_stop_for_exact_remainder():
     assert recovering.remaining_quantity == Decimal("1")
     assert recovering.realized_pnl == Decimal("10")
     assert recovering.broker_state["stop_order"]["quantity"] == "1"
-    assert recovering.broker_state["stop_order"]["state"] == "planned"
+    assert recovering.broker_state["stop_order"]["state"] == "submitting"
+    assert recovering.broker_state["stop_order"]["submit_runtime_id"]
 
 
 def test_partially_filled_stop_blocks_take_profit_then_rebuilds_for_remainder():
@@ -780,6 +987,228 @@ def test_stop_cancel_race_reduces_followup_exit_to_actual_remainder():
     assert pending.broker_state["partial_exit"]["phase"] == "wait_exit"
 
 
+def test_terminal_stop_without_confirmed_fill_quantity_stays_open_and_stops_writes():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": "100"}
+    )
+    record = adapter.reconcile(record, allow_writes=True)
+    opened = adapter.reconcile(record, allow_writes=True)
+    stop_id = opened.broker_state["stop_order"]["order_id"]
+    intraday.orders[stop_id].update(
+        {"state": "filled", "filled_quantity": "", "average_fill_price": ""}
+    )
+
+    unresolved = adapter.reconcile(opened, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.OPEN
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+    assert unresolved.needs_attention is True
+
+
+def test_terminal_stop_with_known_quantity_but_missing_price_never_fakes_pnl():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": "100"}
+    )
+    record = adapter.reconcile(record, allow_writes=True)
+    opened = adapter.reconcile(record, allow_writes=True)
+    stop_id = opened.broker_state["stop_order"]["order_id"]
+    intraday.orders[stop_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": ""}
+    )
+
+    closed = adapter.reconcile(opened, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.remaining_quantity == Decimal("0")
+    assert closed.realized_pnl is None
+    assert closed.needs_attention is True
+
+
+def test_terminal_active_exit_without_confirmed_quantity_never_closes_position():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    exit_id = "exit-missing-fill"
+    intraday.orders[exit_id] = {
+        "order_id": exit_id,
+        "state": "filled",
+        "quantity": "2",
+        "filled_quantity": "",
+        "average_fill_price": "",
+        "remark": "exit",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "wait_exit",
+                "quantity": "2",
+                "reason": "manual",
+                "order_id": exit_id,
+            }
+        },
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.EXIT_PENDING
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+
+
+@pytest.mark.parametrize("status", ["canceled", "rejected"])
+def test_terminal_exit_missing_quantity_and_empty_executions_is_not_zero(status):
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    exit_id = f"exit-{status}-missing-fill"
+    intraday.orders[exit_id] = {
+        "order_id": exit_id,
+        "state": status,
+        "quantity": "2",
+        "filled_quantity": "",
+        "average_fill_price": "",
+        "remark": "exit",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "wait_exit",
+                "quantity": "2",
+                "reason": "manual",
+                "order_id": exit_id,
+            }
+        },
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.EXIT_PENDING
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+
+
+def test_terminal_exit_with_partial_missing_prices_never_invents_average_or_pnl():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    exit_id = "exit-mixed-price"
+    intraday.orders[exit_id] = {
+        "order_id": exit_id,
+        "state": "filled",
+        "quantity": "2",
+        "filled_quantity": "",
+        "average_fill_price": "",
+        "remark": "exit",
+    }
+    intraday.executions_by_order[exit_id] = [
+        {"trade_id": "trade-1", "quantity": "1", "price": "110"},
+        {"trade_id": "trade-2", "quantity": "1", "price": ""},
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "wait_exit",
+                "quantity": "2",
+                "reason": "manual",
+                "order_id": exit_id,
+            }
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl is None
+    assert closed.needs_attention is True
+
+
+def test_terminal_exit_deduplicates_exact_trade_ids():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    exit_id = "exit-duplicate-trade"
+    intraday.orders[exit_id] = {
+        "order_id": exit_id,
+        "state": "filled",
+        "quantity": "1",
+        "filled_quantity": "1",
+        "average_fill_price": "",
+        "remark": "exit",
+    }
+    duplicate = {
+        "trade_id": "same-trade",
+        "quantity": "1",
+        "price": "110",
+    }
+    intraday.executions_by_order[exit_id] = [duplicate, dict(duplicate)]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("1"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "wait_exit",
+                "quantity": "1",
+                "reason": "manual",
+                "order_id": exit_id,
+            }
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl == Decimal("10")
+
+
 def test_account_snapshot_maps_funds_positions_and_profit():
     intraday = FakeLongbridgeSession()
     intraday.positions_rows = [
@@ -799,7 +1228,110 @@ def test_account_snapshot_maps_funds_positions_and_profit():
     snapshot = adapter.account_snapshot(_plan())
 
     assert snapshot.equity == Decimal("12000")
+    assert snapshot.available == Decimal("4000")
     assert snapshot.buying_power == Decimal("15000")
     assert snapshot.total_pnl == Decimal("2000")
     assert snapshot.realized_pnl is None
     assert snapshot.positions[0].instrument == "GLD.US"
+
+
+def test_longbridge_account_snapshot_selects_profit_currency_not_first_row():
+    intraday = FakeLongbridgeSession()
+    intraday.account_balances = lambda: [
+        {
+            "currency": "HKD",
+            "net_assets": "999999",
+            "total_cash": "888888",
+            "buy_power": "777777",
+            "cash_infos": [
+                {"currency": "HKD", "available_cash": "666666"}
+            ],
+        },
+        {
+            "currency": "USD",
+            "net_assets": "12000",
+            "total_cash": "5000",
+            "buy_power": "15000",
+            "cash_infos": [
+                {"currency": "USD", "available_cash": "4000"}
+            ],
+        },
+    ]
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+
+    snapshot = adapter.account_snapshot(_plan())
+
+    assert snapshot.base_currency == "USD"
+    assert snapshot.equity == Decimal("12000")
+    assert snapshot.available == Decimal("4000")
+    assert snapshot.buying_power == Decimal("15000")
+
+
+def test_longbridge_account_snapshot_uses_same_currency_profit_equity_only():
+    intraday = FakeLongbridgeSession()
+    rows = [
+        {
+            "currency": "HKD",
+            "net_assets": "10",
+            "total_cash": "2",
+            "buy_power": "3",
+            "cash_infos": [{"currency": "HKD", "available_cash": "1"}],
+        },
+        {
+            "currency": "USD",
+            "net_assets": "20",
+            "total_cash": "4",
+            "buy_power": "6",
+            "cash_infos": [{"currency": "USD", "available_cash": "2"}],
+        },
+    ]
+    intraday.account_balances = lambda: list(rows)
+    intraday.profit_summary = lambda: {
+        "currency": "EUR",
+        "sum_profit": "9",
+        "current_total_asset": "999",
+    }
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+
+    first = adapter.account_snapshot(_plan())
+    rows.reverse()
+    second = adapter.account_snapshot(_plan())
+
+    assert first == second.model_copy(update={"captured_at": first.captured_at})
+    assert first.base_currency == "EUR"
+    assert first.equity == Decimal("999")
+    assert first.cash is None
+    assert first.available is None
+    assert first.buying_power is None
+    assert first.total_pnl == Decimal("9")
+
+
+def test_longbridge_account_snapshot_never_crosses_metadata_currency():
+    intraday = FakeLongbridgeSession()
+    intraday.account_balances = lambda: [
+        {
+            "currency": "USD",
+            "net_assets": "20",
+            "total_cash": "4",
+            "buy_power": "6",
+            "cash_infos": [{"currency": "USD", "available_cash": "2"}],
+        }
+    ]
+    intraday.profit_summary = lambda: {
+        "currency": "EUR",
+        "sum_profit": "9",
+        "current_total_asset": "999",
+    }
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+
+    snapshot = adapter.account_snapshot(
+        _plan(),
+        broker_metadata={"currency": "SGD"},
+    )
+
+    assert snapshot.base_currency == "SGD"
+    assert snapshot.equity is None
+    assert snapshot.cash is None
+    assert snapshot.available is None
+    assert snapshot.buying_power is None
+    assert snapshot.total_pnl is None

@@ -43,9 +43,15 @@ def _clear(monkeypatch):
         monkeypatch.delenv(key, raising=False)
 
 
-def _legacy_token(account_class: str, account_id: str) -> str:
+def _legacy_token(
+    account_class: str,
+    account_id: str,
+    nonce: str = "",
+) -> str:
     payload = base64.urlsafe_b64encode(
-        json.dumps({"ac": account_class, "aaid": int(account_id)}).encode()
+        json.dumps(
+            {"ac": account_class, "aaid": int(account_id), "nonce": nonce}
+        ).encode()
     ).decode().rstrip("=")
     return f"header.{payload}.signature"
 
@@ -85,6 +91,48 @@ def test_longbridge_profiles_never_mix_credentials(tmp_path, monkeypatch):
     assert paper.access_token == paper_token
     assert comprehensive.access_token == comprehensive_token
     assert intraday.access_token == intraday_token
+    assert len(
+        {
+            paper.account_identity,
+            comprehensive.account_identity,
+            intraday.account_identity,
+        }
+    ) == 3
+
+
+def test_longbridge_token_rotation_keeps_same_concrete_account_identity(
+    tmp_path,
+    monkeypatch,
+):
+    _clear(monkeypatch)
+    env_file = tmp_path / "env"
+    first_token = _legacy_token("lb", "202", "old")
+    env_file.write_text(
+        "LONGBRIDGE_COMPREHENSIVE_APP_KEY=key\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_SECRET=secret\n"
+        f"LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN={first_token}\n"
+        "LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID=202\n",
+        encoding="utf-8",
+    )
+    first = load_longbridge_account_credentials(
+        "comprehensive",
+        env_file=env_file,
+    )
+    second_token = _legacy_token("lb", "202", "new")
+    env_file.write_text(
+        "LONGBRIDGE_COMPREHENSIVE_APP_KEY=new-key\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_SECRET=new-secret\n"
+        f"LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN={second_token}\n"
+        "LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID=202\n",
+        encoding="utf-8",
+    )
+    second = load_longbridge_account_credentials(
+        "comprehensive",
+        env_file=env_file,
+    )
+
+    assert first.access_token != second.access_token
+    assert first.account_identity == second.account_identity
 
 
 @pytest.mark.parametrize(

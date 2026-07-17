@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from pa_agent.execution.errors import BrokerTransportError
 from pa_agent.execution.models import (
     ExecutionPlan,
@@ -27,6 +29,13 @@ class FakeOkxClient:
         self.cancel_algo_error = None
         self.orders = {}
         self.fills_by_order = {}
+        self.fills_error = None
+        self.account_config_row = {
+            "posMode": "net_mode",
+            "uid": "1001",
+            "mainUid": "1001",
+            "type": "0",
+        }
 
     def sync_server_time(self):
         self.calls.append(("sync_server_time",))
@@ -72,7 +81,8 @@ class FakeOkxClient:
         ]
 
     def account_config(self):
-        return {"posMode": "net_mode"}
+        self.calls.append(("account_config",))
+        return dict(self.account_config_row)
 
     def max_order_size(self, **kwargs):
         self.calls.append(("max_order_size", kwargs))
@@ -178,6 +188,8 @@ class FakeOkxClient:
 
     def fills(self, **kwargs):
         self.calls.append(("fills", kwargs))
+        if self.fills_error:
+            raise self.fills_error
         return list(self.fills_by_order.get(kwargs.get("order_id"), []))
 
 
@@ -216,6 +228,36 @@ def test_preflight_uses_live_instrument_specs_and_account_maximum():
     assert result.broker_metadata["position_mode"] == "net_mode"
     assert result.broker_metadata["current_leverage"] == "5"
     assert ("instruments", "SWAP") in client.calls
+
+
+def test_okx_preflight_identity_changes_with_actual_account_config():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+
+    first = adapter.preflight(plan)
+    client.account_config_row["uid"] = "2002"
+    client.account_config_row["mainUid"] = "2002"
+    client.account_config_row["type"] = 0
+    second = adapter.preflight(plan)
+
+    assert first.account_identity
+    assert second.account_identity
+    assert first.account_identity != second.account_identity
+    assert adapter.account_identity(plan) == second.account_identity
+
+
+def test_okx_account_identity_syncs_server_time_before_private_config():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+
+    identity = adapter.account_identity(_plan())
+
+    assert identity
+    assert client.calls[:2] == [
+        ("sync_server_time",),
+        ("account_config",),
+    ]
 
 
 def test_regular_swap_entry_has_deterministic_client_id_and_position_side():
@@ -472,6 +514,111 @@ def test_filled_without_any_confirmed_quantity_stays_read_only():
     ]
 
 
+def test_canceled_entry_with_missing_fill_quantity_stays_active_until_confirmed():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    client.orders[record.broker_order_id].update(
+        {"state": "canceled", "accFillSz": "", "avgPx": ""}
+    )
+    client.fills_error = BrokerTransportError(
+        "temporary read failure",
+        write_may_have_reached=False,
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+    client.fills_error = None
+    still_unresolved = adapter.reconcile(unresolved, allow_writes=False)
+    client.orders[record.broker_order_id]["accFillSz"] = "0"
+    canceled = adapter.reconcile(still_unresolved, allow_writes=False)
+
+    assert unresolved.state == ExecutionState.ENTRY_PENDING
+    assert unresolved.broker_state["write_unknown"] == "entry_fill_quantity"
+    assert still_unresolved.state == ExecutionState.ENTRY_PENDING
+    assert still_unresolved.broker_state["write_unknown"] == "entry_fill_quantity"
+    assert canceled.state == ExecutionState.CANCELED
+    assert "write_unknown" not in canceled.broker_state
+
+
+def test_swap_known_fill_quantity_missing_average_still_builds_protection():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    client.orders[record.broker_order_id].update(
+        {"state": "filled", "accFillSz": "2", "avgPx": ""}
+    )
+
+    protecting = adapter.reconcile(record, allow_writes=True)
+
+    assert protecting.state == ExecutionState.PROTECTING
+    assert protecting.filled_quantity == Decimal("2")
+    assert protecting.remaining_quantity == Decimal("2")
+    assert protecting.average_fill_price is None
+    assert not [call for call in client.calls if call[0] == "place_algo_order"]
+
+
+@pytest.mark.parametrize("product", ["spot", "swap"])
+def test_entry_fills_with_partial_missing_prices_keep_average_unknown(product):
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan(product=product)
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    client.orders[record.broker_order_id].update(
+        {"state": "filled", "accFillSz": "2", "avgPx": ""}
+    )
+    client.fills_by_order[record.broker_order_id] = [
+        {
+            "tradeId": "entry-1",
+            "fillSz": "1",
+            "fillPx": "100",
+            "fee": "0",
+            "feeCcy": "",
+        },
+        {
+            "tradeId": "entry-2",
+            "fillSz": "1",
+            "fillPx": "",
+            "fee": "0",
+            "feeCcy": "",
+        },
+    ]
+
+    protecting = adapter.reconcile(record, allow_writes=True)
+
+    assert protecting.state == ExecutionState.PROTECTING
+    assert protecting.filled_quantity == Decimal("2")
+    assert protecting.average_fill_price is None
+
+
 def test_spot_base_fee_is_deducted_and_quantity_is_rounded_down():
     client = FakeOkxClient()
     adapter = OkxAdapter(client)
@@ -626,6 +773,65 @@ def test_account_snapshot_maps_funds_position_and_pnl():
     assert snapshot.positions[0].direction == "long"
 
 
+def test_okx_account_snapshot_uses_settlement_currency_independent_of_row_order():
+    client = FakeOkxClient()
+    client.balance_rows = [
+        {
+            "details": [
+                {
+                    "ccy": "BTC",
+                    "eq": "99",
+                    "cashBal": "88",
+                    "availBal": "77",
+                    "availEq": "66",
+                },
+                {
+                    "ccy": "USDT",
+                    "eq": "10000",
+                    "cashBal": "9000",
+                    "availBal": "8000",
+                    "availEq": "8500",
+                },
+            ]
+        }
+    ]
+    adapter = OkxAdapter(client)
+
+    snapshot = adapter.account_snapshot(_plan())
+
+    assert snapshot.base_currency == "USDT"
+    assert snapshot.equity == Decimal("10000")
+    assert snapshot.cash == Decimal("9000")
+    assert snapshot.available == Decimal("8000")
+    assert snapshot.buying_power == Decimal("8500")
+
+
+def test_okx_account_snapshot_does_not_fallback_to_unrelated_currency():
+    client = FakeOkxClient()
+    client.balance_rows = [
+        {
+            "details": [
+                {
+                    "ccy": "BTC",
+                    "eq": "99",
+                    "cashBal": "88",
+                    "availBal": "77",
+                    "availEq": "66",
+                }
+            ]
+        }
+    ]
+    adapter = OkxAdapter(client)
+
+    snapshot = adapter.account_snapshot(_plan())
+
+    assert snapshot.base_currency == "USDT"
+    assert snapshot.equity is None
+    assert snapshot.cash is None
+    assert snapshot.available is None
+    assert snapshot.buying_power is None
+
+
 def test_spot_account_snapshot_maps_nonzero_balances_as_holdings():
     client = FakeOkxClient()
     client.balance_rows = [
@@ -736,6 +942,370 @@ def test_protection_submit_unknown_is_never_blindly_retried():
     assert recovered.broker_state["protection_targets"][0]["algo_id"] == "recovered"
     assert "write_unknown" not in recovered.broker_state
     assert len([call for call in client.calls if call[0] == "place_algo_order"]) == 1
+
+
+def test_restart_after_protection_intent_never_resubmits_okx_protection():
+    client = FakeOkxClient()
+    first_adapter = OkxAdapter(client, runtime_id="runtime-one")
+    plan = _plan()
+    preflight = first_adapter.preflight(plan)
+    interrupted = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.PROTECTING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "protection_targets": [
+                {
+                    "index": 1,
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "client_algo_id": "client-protection",
+                    "algo_id": "",
+                    "state": "submitting",
+                    "submit_runtime_id": "runtime-one",
+                }
+            ]
+        },
+    )
+    restarted = OkxAdapter(client, runtime_id="runtime-two")
+
+    unknown = restarted.reconcile(interrupted, allow_writes=True)
+
+    assert unknown.broker_state["protection_targets"][0]["state"] == "unknown"
+    assert unknown.broker_state["write_unknown"] == "protection"
+    assert not [call for call in client.calls if call[0] == "place_algo_order"]
+
+
+def test_restart_after_exit_intent_never_resubmits_okx_exit():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client, runtime_id="runtime-two")
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    interrupted = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "submit_exit_ready",
+            "exit_order": {
+                "order_id": "",
+                "client_order_id": "client-exit",
+                "quantity": "2",
+                "submit_runtime_id": "runtime-one",
+            },
+        },
+    )
+
+    unknown = adapter.reconcile(interrupted, allow_writes=True)
+
+    assert unknown.broker_state["exit_phase"] == "exit_unknown"
+    assert unknown.broker_state["write_unknown"] == "exit"
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_terminal_protection_fill_without_confirmed_quantity_stays_open():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.algo_orders["protection"] = {
+        "algoId": "protection",
+        "state": "effective",
+        "ordIdList": ["exit-missing-fill"],
+    }
+    client.orders["exit-missing-fill"] = {
+        "ordId": "exit-missing-fill",
+        "state": "filled",
+        "accFillSz": "",
+        "avgPx": "",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.OPEN,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "index": 1,
+                    "client_algo_id": "client-protection",
+                    "algo_id": "protection",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                }
+            ],
+        },
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.OPEN
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+    assert unresolved.needs_attention is True
+
+
+def test_spot_protection_fill_with_partial_missing_prices_never_invents_pnl():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan(product="spot")
+    preflight = adapter.preflight(plan)
+    client.algo_orders["protection"] = {
+        "algoId": "protection",
+        "state": "effective",
+        "ordIdList": ["exit-mixed-price"],
+    }
+    client.orders["exit-mixed-price"] = {
+        "ordId": "exit-mixed-price",
+        "state": "filled",
+        "accFillSz": "2",
+        "avgPx": "",
+    }
+    client.fills_by_order["exit-mixed-price"] = [
+        {"tradeId": "protect-1", "fillSz": "1", "fillPx": "110"},
+        {"tradeId": "protect-2", "fillSz": "1", "fillPx": ""},
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.OPEN,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "protection_base_quantity": "2",
+            "realized_before_protection": "0",
+            "protection_targets": [
+                {
+                    "index": 1,
+                    "client_algo_id": "client-protection",
+                    "algo_id": "protection",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                }
+            ],
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl is None
+    assert closed.needs_attention is True
+    assert closed.broker_state["protection_targets"][0]["average_fill_price"] == ""
+
+
+def test_terminal_active_exit_without_confirmed_quantity_never_closes_position():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.orders["exit-missing-fill"] = {
+        "ordId": "exit-missing-fill",
+        "state": "filled",
+        "accFillSz": "",
+        "avgPx": "",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "wait_exit",
+            "exit_order": {
+                "order_id": "exit-missing-fill",
+                "client_order_id": "client-exit",
+                "quantity": "2",
+            },
+        },
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.EXIT_PENDING
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+
+
+@pytest.mark.parametrize("status", ["canceled", "rejected"])
+def test_terminal_exit_missing_quantity_and_empty_fills_is_not_zero(status):
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.orders["exit-missing-fill"] = {
+        "ordId": "exit-missing-fill",
+        "state": status,
+        "accFillSz": "",
+        "avgPx": "",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "wait_exit",
+            "exit_order": {
+                "order_id": "exit-missing-fill",
+                "client_order_id": "client-exit",
+                "quantity": "2",
+            },
+        },
+    )
+
+    unresolved = adapter.reconcile(record, allow_writes=True)
+
+    assert unresolved.state == ExecutionState.EXIT_PENDING
+    assert unresolved.remaining_quantity == Decimal("2")
+    assert unresolved.broker_state["write_unknown"] == "exit_fill_quantity"
+
+
+def test_spot_terminal_exit_with_partial_missing_prices_never_invents_pnl():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan(product="spot")
+    preflight = adapter.preflight(plan)
+    client.orders["exit-mixed-price"] = {
+        "ordId": "exit-mixed-price",
+        "state": "filled",
+        "accFillSz": "2",
+        "avgPx": "",
+    }
+    client.fills_by_order["exit-mixed-price"] = [
+        {"tradeId": "exit-1", "fillSz": "1", "fillPx": "110"},
+        {"tradeId": "exit-2", "fillSz": "1", "fillPx": ""},
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "wait_exit",
+            "exit_order": {
+                "order_id": "exit-mixed-price",
+                "client_order_id": "client-exit",
+                "quantity": "2",
+            },
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl is None
+    assert closed.needs_attention is True
+
+
+def test_spot_terminal_exit_deduplicates_exact_trade_ids():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan(product="spot")
+    preflight = adapter.preflight(plan)
+    client.orders["exit-duplicate-trade"] = {
+        "ordId": "exit-duplicate-trade",
+        "state": "filled",
+        "accFillSz": "1",
+        "avgPx": "",
+    }
+    duplicate = {
+        "tradeId": "same-trade",
+        "fillSz": "1",
+        "fillPx": "110",
+    }
+    client.fills_by_order["exit-duplicate-trade"] = [
+        duplicate,
+        dict(duplicate),
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("1"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "wait_exit",
+            "exit_order": {
+                "order_id": "exit-duplicate-trade",
+                "client_order_id": "client-exit",
+                "quantity": "1",
+                "realized_before_exit": "0",
+            },
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.realized_pnl == Decimal("10")
+
+
+def test_spot_terminal_exit_with_known_quantity_missing_price_never_fakes_pnl():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan(product="spot")
+    preflight = adapter.preflight(plan)
+    client.orders["exit-missing-price"] = {
+        "ordId": "exit-missing-price",
+        "state": "filled",
+        "accFillSz": "2",
+        "avgPx": "",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "wait_exit",
+            "exit_order": {
+                "order_id": "exit-missing-price",
+                "client_order_id": "client-exit",
+                "quantity": "2",
+            },
+        },
+    )
+
+    closed = adapter.reconcile(record, allow_writes=True)
+
+    assert closed.state == ExecutionState.CLOSED
+    assert closed.remaining_quantity == Decimal("0")
+    assert closed.realized_pnl is None
+    assert closed.needs_attention is True
 
 
 def test_swap_realized_pnl_uses_okx_fill_pnl_not_contract_count_times_price():

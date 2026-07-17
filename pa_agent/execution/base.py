@@ -12,6 +12,13 @@ from pa_agent.execution.models import (
 
 
 class BrokerAdapter(Protocol):
+    def account_identity(
+        self,
+        plan: ExecutionPlan,
+        *,
+        account_profile: str | None = None,
+    ) -> str: ...
+
     def preflight(self, plan: ExecutionPlan) -> PreflightResult: ...
 
     def prepare_submit(self, record: ExecutionRecord) -> ExecutionRecord: ...
@@ -39,4 +46,5 @@ class BrokerAdapter(Protocol):
         plan: ExecutionPlan,
         *,
         account_profile: str | None = None,
+        broker_metadata: dict | None = None,
     ) -> AccountSnapshot: ...

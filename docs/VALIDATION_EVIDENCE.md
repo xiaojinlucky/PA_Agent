@@ -118,3 +118,64 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 首轮独立严格审查结论为 **FAIL**，提出 2 个阻塞项：Token 仅按变量名前缀选择可能串账户；未保存下拉切换会造成界面账户与服务账户不一致。
 - 主线程增加 Token 类型与账户 ID 双重绑定，以及覆盖所有交易配置控件的 dirty guard；未保存变更立即停用旧会话，并在保存前禁用启用、提交、撤单和离场。
 - 第二轮同一独立审查线程复跑相关范围：83 通过、0 失败；六维结论为 **PASS**，阻塞落地的问题 0。审查线程未修改代码、配置、数据库或 Git，也未调用券商写接口。
+
+## 2026-07-17 外部审核适配与执行安全最终验收
+
+### 范围与安全边界
+
+- 基线为 `main` / `origin/main` 的 `9e5c6ccd0b04136514bdd84b7ae55276b8d92a78`；本节对应的安全加固仍是未提交工作区改动。
+- 网页版 GPT 的审核先按本机项目规则、Longbridge skill、实际 SDK/API、现有 SQLite 账本与运行配置重新核对；只采纳有代码证据且属于原始交易闭环范围的问题。
+- 没有调用 Longbridge 或 OKX 写接口，没有发送模拟或真实订单。OKX 私有只读仍被缺失的 `OKX_PASSPHRASE` 阻断。
+- 生产 `records/execution.sqlite3` 保持 schema v1、0 条 execution、0 条活动记录；v1 → v2 迁移只在副本验证，未触碰生产账本。
+
+### 主线程回归
+
+执行凭据、计划、生命周期、服务、账本、Longbridge 行情/交易适配器及 OKX 适配器/客户端共 9 个测试文件：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/unit/test_execution_credentials.py tests/unit/test_execution_lifecycle.py tests/unit/test_execution_plan_builder.py tests/unit/test_execution_service.py tests/unit/test_execution_store.py tests/unit/test_longbridge_adapter.py tests/unit/test_longbridge_source.py tests/unit/test_okx_adapter.py tests/unit/test_okx_client.py -q -p no:cacheprovider --basetemp scratch/pytest_execution_round2_20260717_0644
+```
+
+结果：201 通过、0 失败。
+
+全量单元测试：
+
+```powershell
+.venv\Scripts\python.exe -m pytest tests/unit -q -o addopts='' -p no:cacheprovider --basetemp scratch/pytest_all_round2_20260717_0647
+```
+
+结果：931 通过、28 失败。28 项与本轮执行域无关且与修复前基线一致，集中在旧决策连续性、预测面板、追问历史、阶段二标准化等模块；本轮未修改或掩盖这些失败。
+
+### 墨菲式重复故障验证
+
+- 独立进程原子路由占用。
+- 停用与在途写线性化。
+- 入场结果未知且本地保存失败。
+- 保护写成功但本地保存失败。
+- 撤单成功但本地保存失败。
+- Longbridge 撤止损与离场竞态。
+- OKX 保护撤单未知且禁止重试。
+
+上述 7 项连续运行 10 轮：70 通过、0 失败。
+
+### 静态检查
+
+- 变更 Python 文件定向 Ruff（忽略仓库既有中文标点 `RUF001` 与无效注释 `RUF100`）：通过。
+- `compileall` 覆盖执行模块与对应测试：通过。
+- `git diff --check`：通过；仅有 Windows LF/CRLF 提示，无空白错误。
+- 验收结束时没有 PA_Agent / pytest Python 残留进程。
+
+### 对抗式审查循环
+
+三个独立只读审查线程分别侧重生命周期逻辑、并发与安全、测试与实际运行。首轮和第二轮合计发现 8 个阻塞项：
+
+1. 执行阶段撤单拒绝被误判为整笔入场拒绝。
+2. 旧活动记录缺少实际账户身份时仍允许读取资金。
+3. 券商写成功后本地保存失败可能在同一运行实例重发。
+4. Longbridge 目标币种缺失时可能错误选择余额行。
+5. 终态缺少成交数量和明细时被错误当作零成交。
+6. 部分成交缺价时生成虚假均价或盈亏。
+7. OKX 重启后的首次私有身份读取没有先同步服务器时间。
+8. 入场提交结果未知且 UNKNOWN 状态保存失败时，服务可能在停写前抛出。
+
+主线程仅修复上述阻塞项并增加反例；可选重构均保留原方案。最终三个审查线程从需求完整性、逻辑正确性、边界情况、代码质量、测试覆盖和实际运行结果六方面均给出 **PASS**，阻塞落地的问题为 0。独立线程复跑的交易与交易控制范围为 159 通过、0 失败；审查线程没有修改源码、配置、数据库或 Git。

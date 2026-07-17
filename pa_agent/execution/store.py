@@ -1,6 +1,7 @@
 """SQLite-backed execution ledger with append-only transition events."""
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import threading
@@ -16,7 +17,16 @@ from pa_agent.execution.models import (
     utc_now_iso,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_CLAIM_RELEASABLE_STATES = frozenset(
+    {
+        ExecutionState.CLOSED,
+        ExecutionState.BLOCKED,
+        ExecutionState.CANCELED,
+        ExecutionState.REJECTED,
+        ExecutionState.ERROR,
+    }
+)
 
 
 class ExecutionStore:
@@ -51,13 +61,31 @@ class ExecutionStore:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.executescript(
+            connection.execute(
                 """
-                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS execution_meta (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
-                );
+                )
+                """
+            )
+            existing_version = connection.execute(
+                "SELECT value FROM execution_meta WHERE key='schema_version'"
+            ).fetchone()
+            if existing_version is not None:
+                try:
+                    parsed_version = int(existing_version["value"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError(
+                        "execution.sqlite3 schema 版本无效"
+                    ) from exc
+                if parsed_version not in {1, _SCHEMA_VERSION}:
+                    raise RuntimeError(
+                        "不支持的 execution.sqlite3 schema 版本"
+                    )
+            connection.executescript(
+                """
+                BEGIN IMMEDIATE;
                 CREATE TABLE IF NOT EXISTS executions (
                     id TEXT PRIMARY KEY,
                     analysis_digest TEXT NOT NULL UNIQUE,
@@ -70,6 +98,16 @@ class ExecutionStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_executions_active
                     ON executions(state, updated_at);
+                CREATE TABLE IF NOT EXISTS execution_route_claims (
+                    route_key TEXT PRIMARY KEY,
+                    execution_id TEXT NOT NULL UNIQUE,
+                    broker TEXT NOT NULL,
+                    environment TEXT NOT NULL,
+                    account_identity TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    FOREIGN KEY(execution_id) REFERENCES executions(id)
+                );
                 CREATE TABLE IF NOT EXISTS execution_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     execution_id TEXT NOT NULL,
@@ -90,7 +128,7 @@ class ExecutionStore:
                 CREATE INDEX IF NOT EXISTS idx_account_snapshots_latest
                     ON account_snapshots(broker, account_profile, snapshot_id);
                 INSERT INTO execution_meta(key, value)
-                VALUES ('schema_version', '1')
+                VALUES ('schema_version', '2')
                 ON CONFLICT(key) DO UPDATE SET value=excluded.value;
                 COMMIT;
                 """
@@ -299,6 +337,154 @@ class ExecutionStore:
                 (safe_limit,),
             ).fetchall()
         return [ExecutionRecord.model_validate_json(row["payload_json"]) for row in rows]
+
+    @staticmethod
+    def _route_key(
+        *,
+        broker: str,
+        environment: str,
+        account_identity: str,
+        instrument: str,
+    ) -> str:
+        payload = "\x1f".join(
+            (
+                broker.strip().lower(),
+                environment.strip().lower(),
+                account_identity.strip(),
+                instrument.strip().upper(),
+            )
+        )
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def acquire_route_claim(
+        self,
+        record: ExecutionRecord,
+        *,
+        account_identity: str,
+    ) -> ExecutionRecord | None:
+        """Atomically claim one concrete broker/account/instrument route.
+
+        Returns the conflicting owner, or ``None`` when this execution owns the
+        route. Terminal owners are replaced in the same SQLite transaction.
+        """
+        identity = account_identity.strip()
+        if not identity:
+            raise RuntimeError("实际账户身份为空，禁止占用活动路由")
+        route_key = self._route_key(
+            broker=record.plan.broker,
+            environment=record.plan.environment,
+            account_identity=identity,
+            instrument=record.plan.instrument,
+        )
+        now = utc_now_iso()
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing_by_execution = connection.execute(
+                    """
+                    SELECT route_key
+                    FROM execution_route_claims
+                    WHERE execution_id=?
+                    """,
+                    (record.id,),
+                ).fetchone()
+                if (
+                    existing_by_execution is not None
+                    and existing_by_execution["route_key"] != route_key
+                ):
+                    raise RuntimeError(
+                        "同一 execution 已绑定其他实际账户路由，禁止改绑"
+                    )
+                claim = connection.execute(
+                    """
+                    SELECT execution_id
+                    FROM execution_route_claims
+                    WHERE route_key=?
+                    """,
+                    (route_key,),
+                ).fetchone()
+                if claim is None:
+                    connection.execute(
+                        """
+                        INSERT INTO execution_route_claims(
+                            route_key, execution_id, broker, environment,
+                            account_identity, instrument, claimed_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            route_key,
+                            record.id,
+                            record.plan.broker,
+                            record.plan.environment,
+                            identity,
+                            record.plan.instrument,
+                            now,
+                        ),
+                    )
+                    connection.execute("COMMIT")
+                    return None
+                owner_id = str(claim["execution_id"])
+                if owner_id == record.id:
+                    connection.execute("COMMIT")
+                    return None
+                owner_row = connection.execute(
+                    "SELECT payload_json FROM executions WHERE id=?",
+                    (owner_id,),
+                ).fetchone()
+                if owner_row is None:
+                    raise RuntimeError(
+                        "活动路由占用指向不存在的 execution，禁止自动接管"
+                    )
+                owner = ExecutionRecord.model_validate_json(
+                    owner_row["payload_json"]
+                )
+                if owner.state not in _CLAIM_RELEASABLE_STATES:
+                    connection.execute("COMMIT")
+                    return owner
+                connection.execute(
+                    """
+                    UPDATE execution_route_claims
+                    SET execution_id=?, broker=?, environment=?,
+                        account_identity=?, instrument=?, claimed_at=?
+                    WHERE route_key=? AND execution_id=?
+                    """,
+                    (
+                        record.id,
+                        record.plan.broker,
+                        record.plan.environment,
+                        identity,
+                        record.plan.instrument,
+                        now,
+                        route_key,
+                        owner_id,
+                    ),
+                )
+                connection.execute("COMMIT")
+                return None
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+
+    def route_claim_owner(self, record: ExecutionRecord) -> str | None:
+        identity = record.account_identity.strip()
+        if not identity:
+            return None
+        route_key = self._route_key(
+            broker=record.plan.broker,
+            environment=record.plan.environment,
+            account_identity=identity,
+            instrument=record.plan.instrument,
+        )
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT execution_id
+                FROM execution_route_claims
+                WHERE route_key=?
+                """,
+                (route_key,),
+            ).fetchone()
+        return str(row["execution_id"]) if row is not None else None
 
     def events(self, execution_id: str) -> list[ExecutionEvent]:
         with self._lock, self._connect() as connection:

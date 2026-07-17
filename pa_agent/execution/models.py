@@ -79,6 +79,7 @@ class PreflightResult(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     selected_account: str
+    account_identity: str = ""
     quantity: Decimal = Field(gt=0)
     entry_price: Decimal = Field(gt=0)
     take_profit_1: Decimal = Field(gt=0)
@@ -160,6 +161,7 @@ class ExecutionRecord(BaseModel):
     plan: ExecutionPlan
     state: ExecutionState = ExecutionState.READY
     selected_account: str = ""
+    account_identity: str = ""
     preflight: PreflightResult | None = None
     client_order_id: str = ""
     broker_order_id: str = ""
