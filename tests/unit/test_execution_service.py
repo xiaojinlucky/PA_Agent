@@ -134,16 +134,25 @@ def _settings():
     return settings
 
 
-def _service(tmp_path, monkeypatch, adapter, *, gate=True):
+def _service(
+    tmp_path,
+    monkeypatch,
+    adapter,
+    *,
+    gate=True,
+    paper_gate=True,
+    settings=None,
+):
     record = _record()
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
     path = _persist(record, tmp_path)
     service = ExecutionService(
-        settings=_settings(),
+        settings=settings or _settings(),
         pending_writer=FakePendingWriter(path),
         store=ExecutionStore(tmp_path / "execution.sqlite3"),
         adapter_factories={"okx": lambda _plan: adapter},
         gate_checker=lambda: gate,
+        paper_gate_checker=lambda: paper_gate,
         okx_live_gate_checker=lambda: True,
     )
     return service, record
@@ -178,6 +187,40 @@ def test_okx_live_requires_its_independent_hard_gate(tmp_path, monkeypatch):
     service._settings.execution.okx.simulated = True
     service.arm("启用实盘交易")
     assert service.is_armed is True
+
+
+def test_longbridge_paper_uses_independent_gate_and_rearms_after_switch(
+    tmp_path,
+    monkeypatch,
+):
+    settings = _settings()
+    settings.execution.selected_broker = "longbridge"
+    settings.execution.longbridge.source_symbol = "XAUUSD"
+    settings.execution.longbridge.instrument = "GLD.US"
+    settings.execution.longbridge.quantity = "1"
+    settings.execution.longbridge.preferred_account = "paper"
+    service, _ = _service(
+        tmp_path,
+        monkeypatch,
+        FakeAdapter(),
+        gate=False,
+        paper_gate=True,
+        settings=settings,
+    )
+
+    assert service.arm_confirmation_text() == "启用模拟交易"
+    with pytest.raises(LiveTradingDisabled, match="确认文字"):
+        service.arm("启用实盘交易")
+
+    service.arm("启用模拟交易")
+    assert service.is_armed is True
+
+    settings.execution.longbridge.preferred_account = "comprehensive"
+    service.reload_settings(settings)
+    assert service.is_armed is False
+    assert service.arm_confirmation_text() == "启用实盘交易"
+    with pytest.raises(LiveTradingDisabled, match="PA_AGENT_LIVE"):
+        service.arm("启用实盘交易")
 
 
 def test_prepare_is_idempotent_and_never_auto_submits_when_disarmed(

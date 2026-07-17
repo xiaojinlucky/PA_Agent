@@ -1,5 +1,7 @@
 """Unit tests for settings load/save round-trip (task 2.4)."""
+
 from __future__ import annotations
+
 import json
 from unittest.mock import patch
 
@@ -158,6 +160,17 @@ def test_execution_routes_round_trip_without_credentials(tmp_path):
     assert loaded.execution.okx.margin_mode == "isolated"
     assert "api_key" not in raw["execution"]["okx"]
     assert "passphrase" not in raw["execution"]["okx"]
+
+
+def test_longbridge_paper_profile_round_trip(tmp_path):
+    p = tmp_path / "settings.json"
+    original = Settings()
+    original.execution.longbridge.preferred_account = "paper"
+
+    save_settings(original, p)
+    loaded = load_settings(p)
+
+    assert loaded.execution.longbridge.preferred_account == "paper"
 
 
 def test_pushplus_auto_disabled_when_enabled_without_token(tmp_path):

@@ -1,4 +1,4 @@
-"""Longbridge comprehensive/intraday execution lifecycle and safe fallback."""
+"""Longbridge paper/comprehensive/intraday lifecycle and safe fallback."""
 from __future__ import annotations
 
 import uuid
@@ -142,6 +142,8 @@ class LongbridgeAdapter:
         except ValueError as exc:
             raise PreflightError(f"Longbridge 品种格式无效：{plan.instrument}") from exc
         preferred = plan.requested_account
+        if preferred == "paper" and self._allow_outside_rth:
+            raise PreflightError("Longbridge 模拟账户不支持美股盘前/盘后交易")
         try:
             return self._profile_preflight(plan, preferred)
         except FallbackEligiblePreflightError as preferred_error:

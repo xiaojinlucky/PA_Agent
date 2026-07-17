@@ -23,7 +23,7 @@ DataSourceKind = Literal[
 ]
 NormalizationMode = Literal["strict", "lenient"]
 ExecutionBroker = Literal["longbridge", "okx"]
-LongbridgeAccountProfile = Literal["comprehensive", "intraday"]
+LongbridgeAccountProfile = Literal["paper", "comprehensive", "intraday"]
 OkxProduct = Literal["spot", "swap"]
 OkxMarginMode = Literal["cross", "isolated"]
 

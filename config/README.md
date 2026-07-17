@@ -37,15 +37,23 @@
 6. 如需使用交易执行，在同一 `Quant\env` 中配置（不要写入仓库）：
 
    ```text
+   # Longbridge 模拟账户
+   LONGBRIDGE_PAPER_APP_KEY=...
+   LONGBRIDGE_PAPER_APP_SECRET=...
+   LONGBRIDGE_PAPER_ACCESS_TOKEN=...
+   LONGBRIDGE_PAPER_ACCOUNT_ID=...
+
    # Longbridge 综合账户
    LONGBRIDGE_COMPREHENSIVE_APP_KEY=...
    LONGBRIDGE_COMPREHENSIVE_APP_SECRET=...
    LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=...
+   LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID=...
 
    # Longbridge 日内融资子账户
    LONGBRIDGE_INTRADAY_APP_KEY=...
    LONGBRIDGE_INTRADAY_APP_SECRET=...
    LONGBRIDGE_INTRADAY_ACCESS_TOKEN=...
+   LONGBRIDGE_INTRADAY_ACCOUNT_ID=...
 
    # OKX
    OKX_API_KEY=...
@@ -55,11 +63,14 @@
    # 所有真实写操作的总开关
    PA_AGENT_LIVE_TRADING_ENABLED=false
 
+   # Longbridge 模拟账户写操作的独立开关
+   PA_AGENT_PAPER_TRADING_ENABLED=false
+
    # OKX Live 的独立第二道开关
    OKX_LIVE_ENABLED=false
    ```
 
-   两个开关默认都应保持 `false`。即使改为 `true`，每次重启 PA 后仍需在 **实盘交易** 窗口输入 `启用实盘交易`；该启用状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
+   真实写开关默认保持 `false`。Longbridge 模拟账户只读取 `PA_AGENT_PAPER_TRADING_ENABLED`，不要求也不会开启实盘总开关；每次重启后仍需输入 `启用模拟交易`。综合账户、日内账户及 OKX Live 仍要求输入 `启用实盘交易`，会话状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
 
 ## `settings.json` 字段说明
 
@@ -150,7 +161,7 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 | `execution.longbridge.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
 | `execution.longbridge.instrument` | string | `""` | Longbridge 精确证券代码，如 `GLD.US` |
 | `execution.longbridge.quantity` | string | `""` | 下单数量；按券商实时 lot size 校验 |
-| `execution.longbridge.preferred_account` | string | `"comprehensive"` | `comprehensive` 或 `intraday` |
+| `execution.longbridge.preferred_account` | string | `"comprehensive"` | `paper`、`comprehensive` 或 `intraday`；切换并保存后会停用当前写会话 |
 | `execution.longbridge.allow_comprehensive_fallback` | bool | `true` | 仅日内账户在提交前明确数量不足时回退综合账户；认证、网络、超时和未知状态绝不回退 |
 | `execution.longbridge.allow_outside_rth` | bool | `false` | 美股是否允许盘前/盘后 |
 | `execution.okx.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
@@ -162,6 +173,8 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 | `execution.okx.api_base_url` | string | `"https://www.okx.com"` | 必须使用 HTTPS |
 
 保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。券商、账户、品种、数量、保证金模式和开关全部来自本地配置；大模型输出中的同名字段会被忽略。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
+
+Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
 
 ## 安全提醒
 

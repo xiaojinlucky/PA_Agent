@@ -201,3 +201,30 @@ def test_okx_route_snapshot_and_fingerprint_include_connection_route(
     assert plan.okx_margin_mode == "cross"
     assert plan.entry_timeout_seconds == 45
     assert execution_route_fingerprint(settings) != original_fingerprint
+
+
+def test_longbridge_paper_route_is_demo_and_never_inherits_live_options(
+    tmp_path,
+    monkeypatch,
+):
+    record = _record()
+    settings = _settings()
+    settings.execution.selected_broker = "longbridge"
+    settings.execution.longbridge.source_symbol = "XAUUSD"
+    settings.execution.longbridge.instrument = "GLD.US"
+    settings.execution.longbridge.quantity = "1"
+    settings.execution.longbridge.preferred_account = "paper"
+    settings.execution.longbridge.allow_comprehensive_fallback = True
+    settings.execution.longbridge.allow_outside_rth = True
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    plan = build_execution_plan(record, settings, record_path=path)
+    paper_fingerprint = execution_route_fingerprint(settings)
+    settings.execution.longbridge.preferred_account = "comprehensive"
+
+    assert plan.environment == "demo"
+    assert plan.requested_account == "paper"
+    assert plan.allow_account_fallback is False
+    assert plan.longbridge_allow_outside_rth is False
+    assert execution_route_fingerprint(settings) != paper_fingerprint

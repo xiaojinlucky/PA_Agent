@@ -344,7 +344,7 @@ class MainWindow(QMainWindow):
         )
         self._demo_mode_label.hide()
         self._status_bar.addWidget(self._demo_mode_label, 1)
-        self._execution_status_label = QLabel("实盘：停用")
+        self._execution_status_label = QLabel("交易：停用")
         self._execution_status_label.setObjectName("mutedLabel")
         self._status_bar.addPermanentWidget(self._execution_status_label)
         self._status_bar.showMessage("就绪")
@@ -756,7 +756,7 @@ class MainWindow(QMainWindow):
                     return
                 bus = getattr(self._ctx, "event_bus", None)
                 if bus is not None and hasattr(bus, "emit_execution_error"):
-                    bus.emit_execution_error(f"实盘计划未生成：{exc}")
+                    bus.emit_execution_error(f"交易计划未生成：{exc}")
 
         threading.Thread(
             target=_run,
@@ -773,8 +773,9 @@ class MainWindow(QMainWindow):
             state_text = getattr(state, "value", str(state))
             plan = getattr(record, "plan", None)
             instrument = getattr(plan, "instrument", "") if plan is not None else ""
+            mode = "模拟" if getattr(plan, "environment", "live") == "demo" else "实盘"
             attention = " ⚠" if bool(getattr(record, "needs_attention", False)) else ""
-            label.setText(f"实盘：{instrument} {state_text}{attention}".strip())
+            label.setText(f"交易（{mode}）：{instrument} {state_text}{attention}".strip())
             reason = str(getattr(record, "state_reason", "") or "")
             error = str(getattr(record, "last_error", "") or "")
             label.setToolTip("\n".join(item for item in (reason, error) if item))
@@ -784,7 +785,7 @@ class MainWindow(QMainWindow):
     def _on_execution_error(self, message: str) -> None:
         label = getattr(self, "_execution_status_label", None)
         if label is not None:
-            label.setText("实盘：需处理 ⚠")
+            label.setText("交易：需处理 ⚠")
             label.setToolTip(str(message))
         self._status_bar.showMessage(str(message))
 
@@ -793,9 +794,20 @@ class MainWindow(QMainWindow):
         if label is None:
             return
         if armed:
-            label.setText("实盘：本次会话已启用")
-        elif not label.text().startswith("实盘：需处理"):
-            label.setText("实盘：停用")
+            settings = getattr(self._ctx, "settings", None)
+            execution = getattr(settings, "execution", None)
+            paper = bool(
+                execution is not None
+                and execution.selected_broker == "longbridge"
+                and execution.longbridge.preferred_account == "paper"
+            )
+            label.setText(
+                "交易：本次模拟会话已启用"
+                if paper
+                else "交易：本次实盘会话已启用"
+            )
+        elif not label.text().startswith("交易：需处理"):
+            label.setText("交易：停用")
 
     def _start_refresh_loop(self) -> None:
         """Start the RefreshLoop only when the data source is connected."""

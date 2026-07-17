@@ -18,11 +18,22 @@ class EmptyStore:
 
 
 class FakeService:
-    is_armed = False
-    store = EmptyStore()
+    def __init__(self, *, armed=False):
+        self.is_armed = armed
+        self.store = EmptyStore()
+        self.disarm_calls = 0
+        self.reload_calls = 0
 
     def latest_execution(self):
         return None
+
+    def disarm(self):
+        self.is_armed = False
+        self.disarm_calls += 1
+
+    def reload_settings(self, _settings):
+        self.is_armed = False
+        self.reload_calls += 1
 
 
 def test_dialog_round_trips_longbridge_route_without_credentials(qtbot):
@@ -51,6 +62,89 @@ def test_dialog_round_trips_longbridge_route_without_credentials(qtbot):
     assert settings.execution.longbridge.quantity == "10"
     assert settings.execution.longbridge.preferred_account == "intraday"
     assert settings.execution.longbridge.allow_comprehensive_fallback is True
+
+
+def test_dialog_switches_paper_live_profiles_without_cross_environment_options(qtbot):
+    settings = Settings()
+    settings.execution.longbridge.allow_outside_rth = True
+    dialog = TradingDialog(settings=settings, service=FakeService())
+    qtbot.addWidget(dialog)
+
+    dialog._broker.setCurrentIndex(dialog._broker.findData("longbridge"))
+    dialog._lb_account.setCurrentIndex(dialog._lb_account.findData("paper"))
+
+    assert dialog._lb_fallback.isEnabled() is False
+    assert dialog._lb_outside_rth.isEnabled() is False
+    assert dialog._arm_button.text() == "启用本次模拟会话"
+
+    dialog._apply_widgets()
+    assert settings.execution.longbridge.preferred_account == "paper"
+
+    dialog._lb_account.setCurrentIndex(dialog._lb_account.findData("intraday"))
+    assert dialog._lb_fallback.isEnabled() is True
+    assert dialog._lb_outside_rth.isEnabled() is True
+
+
+@pytest.mark.parametrize(
+    ("saved_profile", "selected_profile"),
+    [
+        ("comprehensive", "paper"),
+        ("paper", "comprehensive"),
+        ("intraday", "paper"),
+    ],
+)
+def test_unsaved_profile_switch_disarms_and_blocks_trade_actions(
+    qtbot,
+    saved_profile,
+    selected_profile,
+):
+    settings = Settings()
+    settings.execution.longbridge.preferred_account = saved_profile
+    service = FakeService(armed=True)
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+
+    dialog._lb_account.setCurrentIndex(
+        dialog._lb_account.findData(selected_profile)
+    )
+
+    assert dialog._configuration_dirty is True
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
+    assert dialog._arm_button.isEnabled() is False
+    assert dialog._execute_button.isEnabled() is False
+    assert dialog._cancel_button.isEnabled() is False
+    assert dialog._exit_button.isEnabled() is False
+    assert "请先保存配置" in dialog._arm_label.text()
+
+
+def test_saving_profile_switch_clears_dirty_guard_and_keeps_session_disarmed(
+    qtbot,
+    monkeypatch,
+):
+    settings = Settings()
+    settings.execution.longbridge.preferred_account = "comprehensive"
+    service = FakeService(armed=True)
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.save_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.QMessageBox.information",
+        lambda *_args, **_kwargs: None,
+    )
+
+    dialog._lb_account.setCurrentIndex(dialog._lb_account.findData("paper"))
+    dialog._save_configuration()
+
+    assert settings.execution.longbridge.preferred_account == "paper"
+    assert dialog._configuration_dirty is False
+    assert service.reload_calls == 1
+    assert service.is_armed is False
+    assert dialog._arm_button.isEnabled() is True
+    assert dialog._execute_button.isEnabled() is True
 
 
 def test_dialog_switches_okx_product_and_margin_controls(qtbot):

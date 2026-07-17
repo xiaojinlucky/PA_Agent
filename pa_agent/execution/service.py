@@ -13,6 +13,7 @@ from pa_agent.execution.credentials import (
     load_longbridge_account_credentials,
     load_okx_credentials,
     okx_live_gate_enabled,
+    paper_trading_gate_enabled,
 )
 from pa_agent.execution.errors import (
     BrokerApiError,
@@ -42,6 +43,7 @@ from pa_agent.execution.plan_builder import (
 from pa_agent.execution.store import ExecutionStore
 
 _ARM_CONFIRMATION = "启用实盘交易"
+_PAPER_ARM_CONFIRMATION = "启用模拟交易"
 
 
 class ExecutionService:
@@ -58,6 +60,7 @@ class ExecutionService:
             str, Callable[[ExecutionPlan], BrokerAdapter]
         ] | None = None,
         gate_checker: Callable[[], bool] | None = None,
+        paper_gate_checker: Callable[[], bool] | None = None,
         okx_live_gate_checker: Callable[[], bool] | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
@@ -67,6 +70,9 @@ class ExecutionService:
         self._store = store or ExecutionStore()
         self._adapter_factories = adapter_factories or {}
         self._gate_checker = gate_checker or hard_live_gate_enabled
+        self._paper_gate_checker = (
+            paper_gate_checker or paper_trading_gate_enabled
+        )
         self._okx_live_gate_checker = (
             okx_live_gate_checker or okx_live_gate_enabled
         )
@@ -74,6 +80,8 @@ class ExecutionService:
         self._adapters: dict[tuple[str, str], BrokerAdapter] = {}
         self._armed = False
         self._armed_broker: str | None = None
+        self._armed_environment: str | None = None
+        self._armed_account: str | None = None
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
         self._monitor_thread: threading.Thread | None = None
@@ -84,34 +92,64 @@ class ExecutionService:
 
     @property
     def is_armed(self) -> bool:
-        return self._armed and bool(self._gate_checker())
+        return self._armed and self._armed_gate_enabled()
 
-    @staticmethod
-    def arm_confirmation_text() -> str:
+    def _selected_route_identity(self) -> tuple[str, str, str]:
+        execution = self._settings.execution
+        broker = str(execution.selected_broker)
+        if broker == "longbridge":
+            account = str(execution.longbridge.preferred_account)
+            environment = "demo" if account == "paper" else "live"
+            return broker, environment, account
+        environment = "demo" if bool(execution.okx.simulated) else "live"
+        return broker, environment, "okx"
+
+    def _armed_gate_enabled(self) -> bool:
+        if not self._armed:
+            return False
+        if self._armed_broker == "longbridge" and self._armed_environment == "demo":
+            return bool(self._paper_gate_checker())
+        return bool(self._gate_checker())
+
+    def arm_confirmation_text(self) -> str:
+        broker, environment, account = self._selected_route_identity()
+        if broker == "longbridge" and environment == "demo" and account == "paper":
+            return _PAPER_ARM_CONFIRMATION
         return _ARM_CONFIRMATION
 
     def arm(self, confirmation: str) -> None:
-        if confirmation.strip() != _ARM_CONFIRMATION:
-            raise LiveTradingDisabled("实盘启用确认文字不匹配")
-        if not self._gate_checker():
+        expected = self.arm_confirmation_text()
+        if confirmation.strip() != expected:
+            raise LiveTradingDisabled("交易启用确认文字不匹配")
+        if not bool(self._settings.execution.enabled):
+            raise LiveTradingDisabled("执行模块尚未在 PA 配置中启用")
+        broker, environment, account = self._selected_route_identity()
+        if broker == "longbridge" and environment == "demo":
+            if not self._paper_gate_checker():
+                raise LiveTradingDisabled(
+                    "共享 env 中 PA_AGENT_PAPER_TRADING_ENABLED 不是 true"
+                )
+        elif not self._gate_checker():
             raise LiveTradingDisabled(
                 "共享 env 中 PA_AGENT_LIVE_TRADING_ENABLED 不是 true"
             )
-        if not bool(self._settings.execution.enabled):
-            raise LiveTradingDisabled("执行模块尚未在 PA 配置中启用")
         if (
-            self._settings.execution.selected_broker == "okx"
-            and not bool(self._settings.execution.okx.simulated)
+            broker == "okx"
+            and environment == "live"
             and not self._okx_live_gate_checker()
         ):
             raise LiveTradingDisabled("共享 env 中 OKX_LIVE_ENABLED 不是 true")
         self._armed = True
-        self._armed_broker = str(self._settings.execution.selected_broker)
+        self._armed_broker = broker
+        self._armed_environment = environment
+        self._armed_account = account
         self._emit_armed()
 
     def disarm(self) -> None:
         self._armed = False
         self._armed_broker = None
+        self._armed_environment = None
+        self._armed_account = None
         self._emit_armed()
 
     def reload_settings(self, settings=None) -> None:
@@ -214,19 +252,29 @@ class ExecutionService:
             self._armed = False
             self._emit_armed()
             raise LiveTradingDisabled("执行模块尚未在 PA 配置中启用")
-        if not self._gate_checker():
-            self._armed = False
-            self._emit_armed()
-            raise LiveTradingDisabled(
-                "PA_AGENT_LIVE_TRADING_ENABLED 未开启，禁止券商写操作"
-            )
         if not self._armed:
-            raise LiveTradingDisabled("本次 PA 会话尚未启用实盘")
+            raise LiveTradingDisabled("本次 PA 会话尚未启用交易写操作")
+        if not self._armed_gate_enabled():
+            paper = (
+                self._armed_broker == "longbridge"
+                and self._armed_environment == "demo"
+            )
+            self.disarm()
+            gate = (
+                "PA_AGENT_PAPER_TRADING_ENABLED"
+                if paper
+                else "PA_AGENT_LIVE_TRADING_ENABLED"
+            )
+            raise LiveTradingDisabled(f"{gate} 未开启，禁止券商写操作")
 
     def _plan_writes_enabled(self, plan: ExecutionPlan) -> bool:
         if not self.is_armed:
             return False
         if self._armed_broker != plan.broker:
+            return False
+        if self._armed_environment != plan.environment:
+            return False
+        if self._armed_account != plan.requested_account:
             return False
         if plan.broker == "okx" and plan.environment == "live":
             return bool(self._okx_live_gate_checker())
@@ -241,10 +289,17 @@ class ExecutionService:
                 f"本次会话只启用了 {armed_broker}，不能写入 {plan.broker}"
             )
         if not self._plan_writes_enabled(plan):
-            self.disarm()
-            raise LiveTradingDisabled(
-                "OKX Live 写操作还需要 OKX_LIVE_ENABLED=true"
+            okx_live_gate_missing = (
+                plan.broker == "okx"
+                and plan.environment == "live"
+                and not self._okx_live_gate_checker()
             )
+            self.disarm()
+            if okx_live_gate_missing:
+                raise LiveTradingDisabled(
+                    "OKX Live 写操作还需要 OKX_LIVE_ENABLED=true"
+                )
+            raise LiveTradingDisabled("本次会话启用的账户或环境与执行计划不一致")
 
     def _active_conflict(
         self,
@@ -624,7 +679,11 @@ class ExecutionService:
             broker=broker,
             environment=(
                 "demo"
-                if broker == "okx" and bool(route.simulated)
+                if (
+                    broker == "okx" and bool(route.simulated)
+                ) or (
+                    broker == "longbridge" and requested == "paper"
+                )
                 else "live"
             ),
             product=product,

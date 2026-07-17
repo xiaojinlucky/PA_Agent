@@ -53,7 +53,7 @@ class ExecutionPlan(BaseModel):
     broker: Literal["longbridge", "okx"]
     environment: Literal["live", "demo"]
     product: Literal["securities", "spot", "swap"]
-    requested_account: Literal["comprehensive", "intraday", "okx"]
+    requested_account: Literal["paper", "comprehensive", "intraday", "okx"]
     allow_account_fallback: bool = False
     source_symbol: str
     instrument: str

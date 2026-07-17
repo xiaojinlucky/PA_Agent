@@ -44,9 +44,11 @@ class TradingDialog(QDialog):
         self._settings = settings
         self._service = service
         self._event_bus = event_bus
+        self._configuration_dirty = False
         self._setup_ui()
         self._load_values()
         self._connect_bus()
+        self._connect_configuration_guard()
         self._refresh_recent()
         self._update_arm_state(self._service.is_armed)
 
@@ -173,8 +175,12 @@ class TradingDialog(QDialog):
         self._lb_quantity.setPlaceholderText("券商数量，例如 10")
         form.addRow("数量:", self._lb_quantity)
         self._lb_account = QComboBox()
+        self._lb_account.addItem("模拟账户", "paper")
         self._lb_account.addItem("综合账户", "comprehensive")
         self._lb_account.addItem("日内融资子账户", "intraday")
+        self._lb_account.currentIndexChanged.connect(
+            self._sync_longbridge_profile_controls
+        )
         form.addRow("首选账户:", self._lb_account)
         self._lb_fallback = QCheckBox("日内账户预检数量不足时，提交前改用综合账户")
         form.addRow("安全回退:", self._lb_fallback)
@@ -217,6 +223,54 @@ class TradingDialog(QDialog):
         bus.account_update.connect(self._on_account_update)
         bus.execution_error.connect(self._on_execution_error)
         bus.execution_armed.connect(self._update_arm_state)
+
+    def _connect_configuration_guard(self) -> None:
+        checkboxes = (
+            self._enabled,
+            self._auto_execute,
+            self._lb_fallback,
+            self._lb_outside_rth,
+            self._okx_simulated,
+        )
+        combos = (
+            self._broker,
+            self._lb_account,
+            self._okx_product,
+            self._okx_margin,
+        )
+        line_edits = (
+            self._lb_source,
+            self._lb_instrument,
+            self._lb_quantity,
+            self._okx_source,
+            self._okx_instrument,
+            self._okx_quantity,
+            self._okx_base_url,
+        )
+        for checkbox in checkboxes:
+            checkbox.toggled.connect(self._mark_configuration_dirty)
+        for combo in combos:
+            combo.currentIndexChanged.connect(self._mark_configuration_dirty)
+        for line_edit in line_edits:
+            line_edit.textChanged.connect(self._mark_configuration_dirty)
+        self._min_confidence.valueChanged.connect(self._mark_configuration_dirty)
+
+    def _mark_configuration_dirty(self, *_args) -> None:
+        if self._configuration_dirty:
+            return
+        self._configuration_dirty = True
+        self._service.disarm()
+        self._update_arm_state(False)
+
+    def _reject_unsaved_action(self) -> bool:
+        if not self._configuration_dirty:
+            return False
+        QMessageBox.warning(
+            self,
+            "配置尚未保存",
+            "交易配置已有未保存变更。请先点击“保存配置”，再启用或操作订单。",
+        )
+        return True
 
     def _load_values(self) -> None:
         execution = self._settings.execution
@@ -284,15 +338,25 @@ class TradingDialog(QDialog):
         QMessageBox.information(
             self,
             "已保存",
-            "交易配置已保存；实盘会话已保持停用，需重新确认启用。",
+            "交易配置已保存；交易会话已保持停用，需重新确认启用。",
         )
+        self._configuration_dirty = False
         self._update_arm_state(False)
 
     def _arm_session(self) -> None:
+        if self._reject_unsaved_action():
+            return
+        confirmation = self._service.arm_confirmation_text()
+        paper = self._is_longbridge_paper_route()
         text, accepted = QInputDialog.getText(
             self,
-            "启用本次实盘会话",
-            "真实订单可能产生资金损失。\n请输入：启用实盘交易",
+            "启用本次模拟交易会话" if paper else "启用本次实盘会话",
+            (
+                "模拟订单不会进入真实证券账户，但仍会按真实行情撮合。"
+                if paper
+                else "真实订单可能产生资金损失。"
+            )
+            + f"\n请输入：{confirmation}",
         )
         if not accepted:
             return
@@ -305,8 +369,9 @@ class TradingDialog(QDialog):
         self._service.disarm()
 
     def _refresh_account(self) -> None:
+        if self._reject_unsaved_action():
+            return
         try:
-            self._apply_widgets()
             self._service.reload_settings(self._settings)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.warning(self, "账户读取失败", str(exc))
@@ -335,6 +400,8 @@ class TradingDialog(QDialog):
         return self._service.latest_execution()
 
     def _submit_selected(self) -> None:
+        if self._reject_unsaved_action():
+            return
         execution = self._selected_execution()
         if execution is None:
             QMessageBox.information(self, "没有计划", "尚无可执行的 PA 分析计划。")
@@ -345,6 +412,8 @@ class TradingDialog(QDialog):
         )
 
     def _cancel_selected(self) -> None:
+        if self._reject_unsaved_action():
+            return
         execution = self._selected_execution()
         if execution is None:
             return
@@ -354,6 +423,8 @@ class TradingDialog(QDialog):
         )
 
     def _exit_selected(self) -> None:
+        if self._reject_unsaved_action():
+            return
         execution = self._selected_execution()
         if execution is None:
             return
@@ -392,17 +463,56 @@ class TradingDialog(QDialog):
         self._route_stack.setCurrentIndex(
             0 if self._broker.currentData() == "longbridge" else 1
         )
+        self._sync_longbridge_profile_controls()
+
+    def _is_longbridge_paper_route(self) -> bool:
+        return (
+            self._broker.currentData() == "longbridge"
+            and self._lb_account.currentData() == "paper"
+        )
+
+    def _sync_longbridge_profile_controls(self) -> None:
+        profile = self._lb_account.currentData()
+        self._lb_fallback.setEnabled(profile == "intraday")
+        self._lb_fallback.setToolTip(
+            "仅日内融资子账户可在提交前因数量不足回退综合账户"
+        )
+        self._lb_outside_rth.setEnabled(profile != "paper")
+        self._lb_outside_rth.setToolTip(
+            "Longbridge 模拟账户只支持常规交易时段"
+            if profile == "paper"
+            else "以账户与品种权限为准"
+        )
+        paper = self._is_longbridge_paper_route()
+        self._arm_button.setText(
+            "启用本次模拟会话" if paper else "启用本次实盘会话"
+        )
 
     def _sync_okx_margin_enabled(self) -> None:
         self._okx_margin.setEnabled(self._okx_product.currentData() == "swap")
 
     def _update_arm_state(self, armed: bool) -> None:
+        if self._configuration_dirty:
+            self._arm_label.setText("配置有未保存变更：已停用旧会话，请先保存配置")
+            self._arm_button.setEnabled(False)
+            self._disarm_button.setEnabled(False)
+            self._execute_button.setEnabled(False)
+            self._cancel_button.setEnabled(False)
+            self._exit_button.setEnabled(False)
+            return
         if armed:
-            self._arm_label.setText("本次会话：已启用实盘写操作")
+            self._arm_label.setText(
+                "本次会话：已启用模拟写操作"
+                if self._is_longbridge_paper_route()
+                else "本次会话：已启用实盘写操作"
+            )
         else:
             self._arm_label.setText("本次会话：停用（仍可只读监控账户与订单）")
         self._arm_button.setEnabled(not armed)
         self._disarm_button.setEnabled(armed)
+        self._execute_button.setEnabled(True)
+        self._cancel_button.setEnabled(True)
+        self._exit_button.setEnabled(True)
 
     def _on_execution_update(self, record: ExecutionRecord) -> None:
         self._execution_detail.setText(

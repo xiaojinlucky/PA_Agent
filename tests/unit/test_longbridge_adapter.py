@@ -154,6 +154,37 @@ def test_intraday_capacity_shortage_falls_back_before_submit():
     assert result.warnings and "回退综合账户" in result.warnings[0]
 
 
+def test_paper_capacity_shortage_never_falls_back_to_live_account():
+    paper = FakeLongbridgeSession(maximum="0")
+    comprehensive = FakeLongbridgeSession(maximum="10")
+    sessions = {"paper": paper, "comprehensive": comprehensive}
+    adapter = LongbridgeAdapter(lambda profile: sessions[profile])
+    plan = _plan(account="paper", fallback=True).model_copy(
+        update={"environment": "demo"}
+    )
+
+    with pytest.raises(PreflightError, match="paper 可交易数量"):
+        adapter.preflight(plan)
+
+    assert not comprehensive.calls
+
+
+def test_paper_route_rejects_outside_regular_trading_hours():
+    paper = FakeLongbridgeSession(maximum="10")
+    adapter = LongbridgeAdapter(
+        lambda _profile: paper,
+        allow_outside_rth=True,
+    )
+    plan = _plan(account="paper", fallback=False).model_copy(
+        update={"environment": "demo"}
+    )
+
+    with pytest.raises(PreflightError, match="模拟账户不支持"):
+        adapter.preflight(plan)
+
+    assert not paper.calls
+
+
 def test_network_or_auth_error_never_falls_back():
     intraday = FakeLongbridgeSession()
     intraday.preflight_error = BrokerTransportError(

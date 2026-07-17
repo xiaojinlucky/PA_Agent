@@ -1,6 +1,9 @@
 """Load broker credentials from process environment or Quant's shared env file."""
 from __future__ import annotations
 
+import base64
+import binascii
+import json
 import os
 import re
 from collections.abc import Mapping
@@ -88,13 +91,69 @@ def _complete_triplet(
     return None
 
 
+def _longbridge_token_identity(access_token: str) -> tuple[str, str]:
+    """Read signed legacy-token identity claims so profile mistakes fail closed."""
+    try:
+        parts = access_token.split(".")
+        if len(parts) != 3:
+            raise ValueError("unexpected token shape")
+        payload = parts[1] + "=" * (-len(parts[1]) % 4)
+        claims = json.loads(base64.urlsafe_b64decode(payload))
+        if not isinstance(claims, dict):
+            raise ValueError("unexpected token claims")
+        account_class = str(claims.get("ac", "") or "").strip()
+        account_id = str(claims.get("aaid", "") or "").strip()
+    except (ValueError, TypeError, UnicodeDecodeError, binascii.Error) as exc:
+        raise CredentialError(
+            "Longbridge Legacy Access Token 无法解析账户身份，禁止创建交易会话"
+        ) from exc
+    if not account_class or not account_id:
+        raise CredentialError(
+            "Longbridge Legacy Access Token 缺少账户身份，禁止创建交易会话"
+        )
+    return account_class, account_id
+
+
+def _validate_longbridge_profile_identity(
+    values: Mapping[str, str],
+    *,
+    profile: str,
+    credentials: LongbridgeAccountCredentials,
+) -> None:
+    account_id_key = {
+        "paper": "LONGBRIDGE_PAPER_ACCOUNT_ID",
+        "comprehensive": "LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID",
+        "intraday": "LONGBRIDGE_INTRADAY_ACCOUNT_ID",
+    }[profile]
+    expected_account_id = str(values.get(account_id_key, "") or "").strip()
+    if not expected_account_id:
+        raise CredentialError(
+            f"{profile} 未配置 {account_id_key}，禁止创建交易会话"
+        )
+
+    account_class, token_account_id = _longbridge_token_identity(
+        credentials.access_token
+    )
+    expected_class = "lb_papertrading" if profile == "paper" else "lb"
+    if account_class != expected_class:
+        raise CredentialError(
+            f"{profile} Access Token 的账户类型不匹配，禁止创建交易会话"
+        )
+    if token_account_id != expected_account_id:
+        raise CredentialError(
+            f"{profile} Access Token 与绑定账户 ID 不匹配，禁止创建交易会话"
+        )
+
+
 def load_longbridge_account_credentials(
     profile: str,
     *,
     env_file: Path | None = None,
 ) -> LongbridgeAccountCredentials:
     values = merged_environment(env_file)
-    if profile == "comprehensive":
+    if profile == "paper":
+        prefixes = ("LONGBRIDGE_PAPER",)
+    elif profile == "comprehensive":
         prefixes = ("LONGBRIDGE_COMPREHENSIVE", "LONGBRIDGE")
     elif profile == "intraday":
         prefixes = ("LONGBRIDGE_INTRADAY",)
@@ -104,6 +163,11 @@ def load_longbridge_account_credentials(
     for prefix in prefixes:
         credentials = _complete_triplet(values, prefix=prefix)
         if credentials is not None:
+            _validate_longbridge_profile_identity(
+                values,
+                profile=profile,
+                credentials=credentials,
+            )
             return credentials
     expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise CredentialError(f"未找到 {profile} 账户的完整 Longbridge 凭据（需要 {expected}）")
@@ -131,6 +195,12 @@ def load_okx_credentials(*, env_file: Path | None = None) -> OkxCredentials:
 def hard_live_gate_enabled(*, env_file: Path | None = None) -> bool:
     values = merged_environment(env_file)
     return str(values.get("PA_AGENT_LIVE_TRADING_ENABLED", "")).strip().lower() in _TRUE_VALUES
+
+
+def paper_trading_gate_enabled(*, env_file: Path | None = None) -> bool:
+    """Require an explicit switch for simulated broker writes."""
+    values = merged_environment(env_file)
+    return str(values.get("PA_AGENT_PAPER_TRADING_ENABLED", "")).strip().lower() in _TRUE_VALUES
 
 
 def okx_live_gate_enabled(*, env_file: Path | None = None) -> bool:

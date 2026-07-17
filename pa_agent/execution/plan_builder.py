@@ -68,6 +68,7 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
     if target == "longbridge":
         route = execution.longbridge
         requested_account = route.preferred_account
+        is_paper = requested_account == "paper"
         payload = {
             "broker": target,
             "product": "securities",
@@ -79,9 +80,9 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
             "source_symbol": str(route.source_symbol or "").strip().upper(),
             "instrument": str(route.instrument or "").strip().upper(),
             "quantity": str(_positive_decimal(route.quantity, "quantity")),
-            "environment": "live",
+            "environment": "demo" if is_paper else "live",
             "okx_margin_mode": "",
-            "longbridge_outside_rth": bool(route.allow_outside_rth),
+            "longbridge_outside_rth": bool(route.allow_outside_rth) and not is_paper,
             "min_trade_confidence": int(execution.min_trade_confidence),
             "entry_timeout_seconds": int(execution.entry_timeout_seconds),
         }
@@ -173,13 +174,14 @@ def build_execution_plan(
         route = execution.longbridge
         product = "securities"
         requested_account = route.preferred_account
+        is_paper = requested_account == "paper"
         allow_fallback = bool(
             requested_account == "intraday" and route.allow_comprehensive_fallback
         )
-        environment = "live"
+        environment = "demo" if is_paper else "live"
         okx_api_base_url = ""
         okx_margin_mode = ""
-        longbridge_allow_outside_rth = bool(route.allow_outside_rth)
+        longbridge_allow_outside_rth = bool(route.allow_outside_rth) and not is_paper
     elif broker == "okx":
         route = execution.okx
         product = route.product
