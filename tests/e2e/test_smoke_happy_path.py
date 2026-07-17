@@ -92,4 +92,4 @@ def test_happy_path_shows_trading_decision(qtbot, tmp_path):
     )
 
     # PendingWriter.save_full should have been called
-    pending_writer.save_full.assert_called_once()
+    pending_writer.save_full_durable.assert_called_once()

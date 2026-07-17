@@ -54,6 +54,6 @@ def test_happy_path(frame, pending_writer, assembler, exp_reader):
     assert record.stage1_diagnosis is not None
     assert record.stage2_decision is not None
 
-    # save_full was called (not save_partial)
-    pending_writer.save_full.assert_called_once_with(record)
+    # Complete records use the strict, atomically verified persistence path.
+    pending_writer.save_full_durable.assert_called_once_with(record)
     pending_writer.save_partial.assert_not_called()

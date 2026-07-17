@@ -297,6 +297,9 @@ class MainWindow(QMainWindow):
         self._connect_event_bus()
         self._update_ai_mode_label()
         self._sync_submit_button_state()
+        execution_service = getattr(self._ctx, "execution_service", None)
+        if execution_service is not None:
+            execution_service.start_monitoring()
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -341,6 +344,9 @@ class MainWindow(QMainWindow):
         )
         self._demo_mode_label.hide()
         self._status_bar.addWidget(self._demo_mode_label, 1)
+        self._execution_status_label = QLabel("实盘：停用")
+        self._execution_status_label.setObjectName("mutedLabel")
+        self._status_bar.addPermanentWidget(self._execution_status_label)
         self._status_bar.showMessage("就绪")
         self._refresh_api_key_ui_state()
 
@@ -362,7 +368,12 @@ class MainWindow(QMainWindow):
         _general_action.triggered.connect(self._open_general_settings_dialog)
         menu_bar.addAction(_general_action)
 
-        # 4. 演示模式 — 保留下拉菜单
+        # 4. 实盘交易 — 功能配置、账户/盈亏和生命周期操作
+        _trading_action = QAction("实盘交易", self)
+        _trading_action.triggered.connect(self._open_trading_dialog)
+        menu_bar.addAction(_trading_action)
+
+        # 5. 演示模式 — 保留下拉菜单
         demo_menu = menu_bar.addMenu("演示模式")
         self._demo_manual_action = QAction("手动选择记录…", self)
         self._demo_manual_action.triggered.connect(lambda: self._on_demo_menu_action("manual"))
@@ -711,6 +722,80 @@ class MainWindow(QMainWindow):
         if bus is None:
             return
         bus.status.connect(self._on_status_update)
+        if hasattr(bus, "execution_update"):
+            bus.execution_update.connect(self._on_execution_update)
+        if hasattr(bus, "execution_error"):
+            bus.execution_error.connect(self._on_execution_error)
+        if hasattr(bus, "execution_armed"):
+            bus.execution_armed.connect(self._on_execution_armed)
+
+    def _prepare_execution_from_record(self, record: Any) -> None:
+        """Create a durable execution plan off the UI thread when configured."""
+        settings = getattr(self._ctx, "settings", None)
+        execution = getattr(settings, "execution", None)
+        service = getattr(self._ctx, "execution_service", None)
+        if service is None or execution is None or not bool(execution.enabled):
+            return
+
+        import threading
+
+        is_demo = bool(getattr(self, "_demo_mode", False))
+
+        def _run() -> None:
+            try:
+                service.prepare_analysis(record, is_demo_replay=is_demo)
+            except Exception as exc:  # noqa: BLE001
+                from pa_agent.execution.errors import PlanBlocked
+
+                if isinstance(exc, PlanBlocked) and exc.code in {
+                    "no_order",
+                    "analysis_not_tradable",
+                    "analysis_failed",
+                    "demo_replay",
+                }:
+                    return
+                bus = getattr(self._ctx, "event_bus", None)
+                if bus is not None and hasattr(bus, "emit_execution_error"):
+                    bus.emit_execution_error(f"实盘计划未生成：{exc}")
+
+        threading.Thread(
+            target=_run,
+            name="pa-execution-prepare",
+            daemon=True,
+        ).start()
+
+    def _on_execution_update(self, record: Any) -> None:
+        label = getattr(self, "_execution_status_label", None)
+        if label is None:
+            return
+        try:
+            state = getattr(record, "state", "")
+            state_text = getattr(state, "value", str(state))
+            plan = getattr(record, "plan", None)
+            instrument = getattr(plan, "instrument", "") if plan is not None else ""
+            attention = " ⚠" if bool(getattr(record, "needs_attention", False)) else ""
+            label.setText(f"实盘：{instrument} {state_text}{attention}".strip())
+            reason = str(getattr(record, "state_reason", "") or "")
+            error = str(getattr(record, "last_error", "") or "")
+            label.setToolTip("\n".join(item for item in (reason, error) if item))
+        except RuntimeError:
+            return
+
+    def _on_execution_error(self, message: str) -> None:
+        label = getattr(self, "_execution_status_label", None)
+        if label is not None:
+            label.setText("实盘：需处理 ⚠")
+            label.setToolTip(str(message))
+        self._status_bar.showMessage(str(message))
+
+    def _on_execution_armed(self, armed: bool) -> None:
+        label = getattr(self, "_execution_status_label", None)
+        if label is None:
+            return
+        if armed:
+            label.setText("实盘：本次会话已启用")
+        elif not label.text().startswith("实盘：需处理"):
+            label.setText("实盘：停用")
 
     def _start_refresh_loop(self) -> None:
         """Start the RefreshLoop only when the data source is connected."""
@@ -3770,6 +3855,7 @@ class MainWindow(QMainWindow):
 
     def _on_record_ready_impl(self, record: Any) -> None:
         self._last_analysis_record = record
+        self._prepare_execution_from_record(record)
         import json as _json
 
         exc_info = getattr(record, "exception", None)
@@ -4232,6 +4318,9 @@ class MainWindow(QMainWindow):
             self._cancel_analysis_worker()
             self._cancel_snapshot_fetch_worker()
             self._stop_refresh_loop()
+            execution_service = getattr(self._ctx, "execution_service", None)
+            if execution_service is not None:
+                execution_service.stop_monitoring()
         except RuntimeError as exc:
             logger.debug("Shutdown cleanup skipped: %s", exc)
         super().closeEvent(event)
@@ -4500,6 +4589,23 @@ class MainWindow(QMainWindow):
             self._ctx.settings = settings
             self._ai_sidebar.bind_settings(settings)
             self._apply_chart_display_settings()
+
+    def _open_trading_dialog(self) -> None:
+        """Open functional broker configuration and lifecycle controls."""
+        from pa_agent.gui.trading_dialog import TradingDialog
+
+        service = getattr(self._ctx, "execution_service", None)
+        settings = getattr(self._ctx, "settings", None)
+        if service is None or settings is None:
+            QMessageBox.warning(self, "实盘交易", "实盘执行服务尚未初始化。")
+            return
+        dialog = TradingDialog(
+            settings=settings,
+            service=service,
+            event_bus=getattr(self._ctx, "event_bus", None),
+            parent=self,
+        )
+        dialog.exec()
 
     def _apply_chart_display_settings(self) -> None:
         """Sync chart label font sizes and decision-flow zoom from persisted settings."""

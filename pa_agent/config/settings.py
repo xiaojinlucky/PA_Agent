@@ -22,6 +22,10 @@ DataSourceKind = Literal[
     "mt5", "tradingview", "longbridge", "akshare", "eastmoney", "tushare"
 ]
 NormalizationMode = Literal["strict", "lenient"]
+ExecutionBroker = Literal["longbridge", "okx"]
+LongbridgeAccountProfile = Literal["comprehensive", "intraday"]
+OkxProduct = Literal["spot", "swap"]
+OkxMarginMode = Literal["cross", "isolated"]
 
 
 class AIProviderSettings(BaseModel):
@@ -264,6 +268,58 @@ class PushPlusSettings(BaseModel):
     token: str = ""
 
 
+class LongbridgeExecutionSettings(BaseModel):
+    """Non-secret Longbridge execution route settings."""
+
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
+
+    source_symbol: str = ""
+    instrument: str = ""
+    quantity: str = ""
+    preferred_account: LongbridgeAccountProfile = "comprehensive"
+    allow_comprehensive_fallback: bool = True
+    allow_outside_rth: bool = False
+
+
+class OkxExecutionSettings(BaseModel):
+    """Non-secret OKX execution route settings."""
+
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
+
+    source_symbol: str = ""
+    instrument: str = ""
+    quantity: str = ""
+    product: OkxProduct = "spot"
+    margin_mode: OkxMarginMode = "cross"
+    simulated: bool = False
+    api_base_url: str = "https://www.okx.com"
+
+    @field_validator("api_base_url", mode="before")
+    @classmethod
+    def _normalise_okx_base_url(cls, value: object) -> str:
+        text = str(value or "https://www.okx.com").strip().rstrip("/")
+        if not text.startswith("https://"):
+            raise ValueError("OKX API 地址必须使用 https://")
+        return text
+
+
+class ExecutionSettings(BaseModel):
+    """Live execution behaviour; credentials remain in the shared env file."""
+
+    model_config = ConfigDict(extra="ignore", validate_assignment=True)
+
+    enabled: bool = False
+    auto_execute: bool = False
+    selected_broker: ExecutionBroker = "longbridge"
+    min_trade_confidence: int = Field(default=70, ge=0, le=100)
+    poll_interval_seconds: float = Field(default=2.0, ge=1.0, le=30.0)
+    entry_timeout_seconds: int = Field(default=120, ge=10, le=86_400)
+    longbridge: LongbridgeExecutionSettings = Field(
+        default_factory=LongbridgeExecutionSettings
+    )
+    okx: OkxExecutionSettings = Field(default_factory=OkxExecutionSettings)
+
+
 class Settings(BaseModel):
     """Root settings object persisted to config/settings.json."""
     model_config = ConfigDict(extra="ignore")
@@ -278,6 +334,7 @@ class Settings(BaseModel):
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
     pushplus: PushPlusSettings = Field(default_factory=PushPlusSettings)
     tushare: TushareSettings = Field(default_factory=TushareSettings)
+    execution: ExecutionSettings = Field(default_factory=ExecutionSettings)
 
     @model_validator(mode="after")
     def _normalise_ai_profiles(self) -> "Settings":

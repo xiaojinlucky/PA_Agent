@@ -32,11 +32,38 @@
    LONGBRIDGE_ACCESS_TOKEN=...
    ```
 
-   程序优先读取进程环境，其次读取该共享文件；也兼容旧名 `LONGPORT_*`。凭据不会复制到 `settings.json`。该数据源只创建官方 `QuoteContext` 读取行情，不创建交易上下文，不读取资产/订单，也不能下单。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
+   程序优先读取进程环境，其次读取该共享文件；也兼容旧名 `LONGPORT_*`。凭据不会复制到 `settings.json`。Longbridge **行情数据源**仍只创建官方 `QuoteContext`；只有单独启用下述交易执行模块时，才会按所选账户创建交易上下文。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
+
+6. 如需使用交易执行，在同一 `Quant\env` 中配置（不要写入仓库）：
+
+   ```text
+   # Longbridge 综合账户
+   LONGBRIDGE_COMPREHENSIVE_APP_KEY=...
+   LONGBRIDGE_COMPREHENSIVE_APP_SECRET=...
+   LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=...
+
+   # Longbridge 日内融资子账户
+   LONGBRIDGE_INTRADAY_APP_KEY=...
+   LONGBRIDGE_INTRADAY_APP_SECRET=...
+   LONGBRIDGE_INTRADAY_ACCESS_TOKEN=...
+
+   # OKX
+   OKX_API_KEY=...
+   OKX_SECRET_KEY=...
+   OKX_PASSPHRASE=...
+
+   # 所有真实写操作的总开关
+   PA_AGENT_LIVE_TRADING_ENABLED=false
+
+   # OKX Live 的独立第二道开关
+   OKX_LIVE_ENABLED=false
+   ```
+
+   两个开关默认都应保持 `false`。即使改为 `true`，每次重启 PA 后仍需在 **实盘交易** 窗口输入 `启用实盘交易`；该启用状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
 
 ## `settings.json` 字段说明
 
-AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当前活动档案的兼容镜像。其余主要组为 `general`、`prompt`、`validation`。
+AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当前活动档案的兼容镜像。其余主要组为 `general`、`prompt`、`validation`、`execution`。
 
 ### AI 模型档案
 
@@ -110,6 +137,32 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 | `validation.retry_max_semantic` | int | `1` | 语义错误（category c）最大重试次数（0–3） |
 | `validation.retry_stage2` | bool | `true` | 阶段二校验失败时是否重试 |
 
+### execution — 交易执行（默认关闭）
+
+| 字段 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `execution.enabled` | bool | `false` | 是否允许完整分析记录生成执行计划；关闭时不能启用会话或提交既有计划 |
+| `execution.auto_execute` | bool | `false` | 会话已启用时自动提交新计划；建议先保持关闭并人工确认 |
+| `execution.selected_broker` | string | `"longbridge"` | 当前写操作只允许 `longbridge` 或 `okx` 之一 |
+| `execution.min_trade_confidence` | int | `70` | 独立于提示弹窗的执行置信度门槛 |
+| `execution.poll_interval_seconds` | float | `2.0` | 活动订单/保护/盈亏轮询间隔 |
+| `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量 |
+| `execution.longbridge.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
+| `execution.longbridge.instrument` | string | `""` | Longbridge 精确证券代码，如 `GLD.US` |
+| `execution.longbridge.quantity` | string | `""` | 下单数量；按券商实时 lot size 校验 |
+| `execution.longbridge.preferred_account` | string | `"comprehensive"` | `comprehensive` 或 `intraday` |
+| `execution.longbridge.allow_comprehensive_fallback` | bool | `true` | 仅日内账户在提交前明确数量不足时回退综合账户；认证、网络、超时和未知状态绝不回退 |
+| `execution.longbridge.allow_outside_rth` | bool | `false` | 美股是否允许盘前/盘后 |
+| `execution.okx.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
+| `execution.okx.instrument` | string | `""` | OKX 精确 `instId`，不限制黄金，如 `XAUT-USDT`、`BTC-USDT-SWAP` |
+| `execution.okx.quantity` | string | `""` | 现货为基础币数量，永续为合约张数 |
+| `execution.okx.product` | string | `"spot"` | `spot` 或 `swap`；现货不新开空仓 |
+| `execution.okx.margin_mode` | string | `"cross"` | 永续 `cross` 或 `isolated`；程序只读取当前杠杆，不自动修改 |
+| `execution.okx.simulated` | bool | `false` | 是否发送 OKX 模拟交易标头 |
+| `execution.okx.api_base_url` | string | `"https://www.okx.com"` | 必须使用 HTTPS |
+
+保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。券商、账户、品种、数量、保证金模式和开关全部来自本地配置；大模型输出中的同名字段会被忽略。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
+
 ## 安全提醒
 
 - **不要**将 `config/settings.json`、`config/exception_state.json`、`config/tv_symbol_aliases.json` 提交到 Git。
@@ -123,6 +176,6 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 
 - Legacy Access Token 通常有到期时间；程序只在本地解析 JWT `exp` 并在连接时让服务端校验权限，没有“查询当前 Token 是否被撤销”的独立接口。
 - Longbridge SDK 提供刷新 Access Token 的能力，但刷新后仍需安全持久化新 Token 并重建连接；PA_Agent 当前没有自动执行该流程。
-- 当前使用方式仍需在 Longbridge 开放平台生成/刷新 Token 后，手动替换 `Quant\env` 中的 `LONGBRIDGE_ACCESS_TOKEN` 并重新连接数据源。
+- 当前使用方式仍需在 Longbridge 开放平台生成/刷新 Token 后，手动替换 `Quant\env` 中对应的行情或账户 Profile Access Token，并重新连接/重启相关上下文。
 - Longbridge OAuth 2 可管理刷新与缓存，但需要单独的 OAuth 应用和首次浏览器授权，未在本次只读 Legacy 接入中启用。
 - 常规中、美、港交易时段和午休分段会用于 K 线闭合判断；特殊半日市没有可靠的提前收盘时刻字段，可能延迟到常规收盘时间才标记闭合。

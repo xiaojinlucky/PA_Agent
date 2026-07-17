@@ -22,6 +22,10 @@ class EventBus(QObject):
     status = pyqtSignal(str)           # status text
     exception = pyqtSignal(object)     # AlarmPayload
     token_update = pyqtSignal(dict)    # token/cost update dict
+    execution_update = pyqtSignal(object)  # ExecutionRecord
+    account_update = pyqtSignal(object)    # AccountSnapshot
+    execution_error = pyqtSignal(str)
+    execution_armed = pyqtSignal(bool)
 
     def emit_status(self, text: str) -> None:
         """Convenience wrapper — emit a status string."""
@@ -38,3 +42,15 @@ class EventBus(QObject):
     def emit_token_update(self, data: dict) -> None:
         """Convenience wrapper — emit a token/cost update dict."""
         self.token_update.emit(data)
+
+    def emit_execution_update(self, record: object) -> None:
+        self.execution_update.emit(record)
+
+    def emit_account_update(self, snapshot: object) -> None:
+        self.account_update.emit(snapshot)
+
+    def emit_execution_error(self, message: str) -> None:
+        self.execution_error.emit(message)
+
+    def emit_execution_armed(self, armed: bool) -> None:
+        self.execution_armed.emit(bool(armed))

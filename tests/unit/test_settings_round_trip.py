@@ -137,6 +137,29 @@ def test_tushare_round_trip(tmp_path):
     assert loaded.tushare.token == "ts-test-token"
 
 
+def test_execution_routes_round_trip_without_credentials(tmp_path):
+    p = tmp_path / "settings.json"
+    original = Settings()
+    original.execution.enabled = True
+    original.execution.selected_broker = "okx"
+    original.execution.okx.source_symbol = "BTCUSD"
+    original.execution.okx.instrument = "BTC-USDT-SWAP"
+    original.execution.okx.quantity = "0.25"
+    original.execution.okx.product = "swap"
+    original.execution.okx.margin_mode = "isolated"
+
+    save_settings(original, p)
+    loaded = load_settings(p)
+    raw = json.loads(p.read_text(encoding="utf-8"))
+
+    assert loaded.execution.enabled is True
+    assert loaded.execution.selected_broker == "okx"
+    assert loaded.execution.okx.instrument == "BTC-USDT-SWAP"
+    assert loaded.execution.okx.margin_mode == "isolated"
+    assert "api_key" not in raw["execution"]["okx"]
+    assert "passphrase" not in raw["execution"]["okx"]
+
+
 def test_pushplus_auto_disabled_when_enabled_without_token(tmp_path):
     """load_settings disables pushplus when enabled but token empty."""
     p = tmp_path / "settings.json"

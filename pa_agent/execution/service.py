@@ -1,0 +1,732 @@
+"""Application-level execution coordinator, monitor and live-session gate."""
+from __future__ import annotations
+
+import logging
+import threading
+from collections.abc import Callable
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+
+from pa_agent.execution.base import BrokerAdapter
+from pa_agent.execution.credentials import (
+    hard_live_gate_enabled,
+    load_longbridge_account_credentials,
+    load_okx_credentials,
+    okx_live_gate_enabled,
+)
+from pa_agent.execution.errors import (
+    BrokerApiError,
+    BrokerRejected,
+    BrokerTransportError,
+    CredentialError,
+    LiveTradingDisabled,
+    PlanBlocked,
+    PreflightError,
+    SubmissionUnknown,
+)
+from pa_agent.execution.longbridge_adapter import LongbridgeAdapter
+from pa_agent.execution.longbridge_session import LongbridgeSession
+from pa_agent.execution.models import (
+    AccountSnapshot,
+    ExecutionPlan,
+    ExecutionRecord,
+    ExecutionState,
+    utc_now_iso,
+)
+from pa_agent.execution.okx_adapter import OkxAdapter
+from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.plan_builder import (
+    build_execution_plan,
+    execution_route_fingerprint,
+)
+from pa_agent.execution.store import ExecutionStore
+
+_ARM_CONFIRMATION = "启用实盘交易"
+
+
+class ExecutionService:
+    """Owns broker adapters and guarantees intent persistence before writes."""
+
+    def __init__(
+        self,
+        *,
+        settings,
+        pending_writer,
+        event_bus=None,
+        store: ExecutionStore | None = None,
+        adapter_factories: dict[
+            str, Callable[[ExecutionPlan], BrokerAdapter]
+        ] | None = None,
+        gate_checker: Callable[[], bool] | None = None,
+        okx_live_gate_checker: Callable[[], bool] | None = None,
+        logger: logging.Logger | None = None,
+    ) -> None:
+        self._settings = settings
+        self._pending_writer = pending_writer
+        self._event_bus = event_bus
+        self._store = store or ExecutionStore()
+        self._adapter_factories = adapter_factories or {}
+        self._gate_checker = gate_checker or hard_live_gate_enabled
+        self._okx_live_gate_checker = (
+            okx_live_gate_checker or okx_live_gate_enabled
+        )
+        self._logger = logger or logging.getLogger(__name__)
+        self._adapters: dict[tuple[str, str], BrokerAdapter] = {}
+        self._armed = False
+        self._armed_broker: str | None = None
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._monitor_thread: threading.Thread | None = None
+
+    @property
+    def store(self) -> ExecutionStore:
+        return self._store
+
+    @property
+    def is_armed(self) -> bool:
+        return self._armed and bool(self._gate_checker())
+
+    @staticmethod
+    def arm_confirmation_text() -> str:
+        return _ARM_CONFIRMATION
+
+    def arm(self, confirmation: str) -> None:
+        if confirmation.strip() != _ARM_CONFIRMATION:
+            raise LiveTradingDisabled("实盘启用确认文字不匹配")
+        if not self._gate_checker():
+            raise LiveTradingDisabled(
+                "共享 env 中 PA_AGENT_LIVE_TRADING_ENABLED 不是 true"
+            )
+        if not bool(self._settings.execution.enabled):
+            raise LiveTradingDisabled("执行模块尚未在 PA 配置中启用")
+        if (
+            self._settings.execution.selected_broker == "okx"
+            and not bool(self._settings.execution.okx.simulated)
+            and not self._okx_live_gate_checker()
+        ):
+            raise LiveTradingDisabled("共享 env 中 OKX_LIVE_ENABLED 不是 true")
+        self._armed = True
+        self._armed_broker = str(self._settings.execution.selected_broker)
+        self._emit_armed()
+
+    def disarm(self) -> None:
+        self._armed = False
+        self._armed_broker = None
+        self._emit_armed()
+
+    def reload_settings(self, settings=None) -> None:
+        """Apply saved non-secret route settings and invalidate broker clients."""
+        with self._lock:
+            if settings is not None:
+                self._settings = settings
+            self._adapters.clear()
+            self.disarm()
+
+    def _emit_armed(self) -> None:
+        if self._event_bus is not None and hasattr(
+            self._event_bus, "emit_execution_armed"
+        ):
+            self._event_bus.emit_execution_armed(self.is_armed)
+
+    def _emit_record(self, record: ExecutionRecord) -> None:
+        if self._event_bus is not None and hasattr(
+            self._event_bus, "emit_execution_update"
+        ):
+            self._event_bus.emit_execution_update(record)
+
+    def _emit_account(self, snapshot: AccountSnapshot) -> None:
+        if self._event_bus is not None and hasattr(
+            self._event_bus, "emit_account_update"
+        ):
+            self._event_bus.emit_account_update(snapshot)
+
+    def _emit_error(self, message: str) -> None:
+        self._logger.warning("Execution: %s", message)
+        if self._event_bus is not None and hasattr(
+            self._event_bus, "emit_execution_error"
+        ):
+            self._event_bus.emit_execution_error(message)
+
+    def _adapter(self, plan: ExecutionPlan) -> BrokerAdapter:
+        cache_key = (plan.broker, plan.config_fingerprint)
+        cached = self._adapters.get(cache_key)
+        if cached is not None:
+            return cached
+        custom = self._adapter_factories.get(plan.broker)
+        if custom is not None:
+            adapter = custom(plan)
+        elif plan.broker == "okx":
+            if not plan.okx_api_base_url or not plan.okx_margin_mode:
+                raise PreflightError(
+                    "旧 OKX 执行缺少不可变路由快照，禁止连接或写入"
+                )
+            client = OkxRestClient(
+                load_okx_credentials(),
+                base_url=plan.okx_api_base_url,
+                simulated=plan.environment == "demo",
+            )
+            adapter = OkxAdapter(
+                client,
+                margin_mode=plan.okx_margin_mode,
+                entry_timeout_seconds=plan.entry_timeout_seconds,
+            )
+        elif plan.broker == "longbridge":
+            def _session_factory(profile: str):
+                return LongbridgeSession(
+                    load_longbridge_account_credentials(profile)
+                )
+
+            adapter = LongbridgeAdapter(
+                _session_factory,
+                allow_outside_rth=plan.longbridge_allow_outside_rth,
+                entry_timeout_seconds=plan.entry_timeout_seconds,
+            )
+        else:
+            raise PreflightError(f"未知执行券商：{plan.broker}")
+        self._adapters[cache_key] = adapter
+        return adapter
+
+    def prepare_analysis(
+        self,
+        record,
+        *,
+        is_demo_replay: bool = False,
+    ) -> ExecutionRecord:
+        path = Path(self._pending_writer.full_path(record))
+        plan = build_execution_plan(
+            record,
+            self._settings,
+            record_path=path,
+            is_demo_replay=is_demo_replay,
+        )
+        execution, created = self._store.create(plan)
+        self._emit_record(execution)
+        if (
+            created
+            and bool(self._settings.execution.auto_execute)
+            and self.is_armed
+        ):
+            return self.submit(execution.id)
+        return execution
+
+    def _require_writes(self) -> None:
+        if not bool(self._settings.execution.enabled):
+            self._armed = False
+            self._emit_armed()
+            raise LiveTradingDisabled("执行模块尚未在 PA 配置中启用")
+        if not self._gate_checker():
+            self._armed = False
+            self._emit_armed()
+            raise LiveTradingDisabled(
+                "PA_AGENT_LIVE_TRADING_ENABLED 未开启，禁止券商写操作"
+            )
+        if not self._armed:
+            raise LiveTradingDisabled("本次 PA 会话尚未启用实盘")
+
+    def _plan_writes_enabled(self, plan: ExecutionPlan) -> bool:
+        if not self.is_armed:
+            return False
+        if self._armed_broker != plan.broker:
+            return False
+        if plan.broker == "okx" and plan.environment == "live":
+            return bool(self._okx_live_gate_checker())
+        return True
+
+    def _require_plan_writes(self, plan: ExecutionPlan) -> None:
+        self._require_writes()
+        if self._armed_broker != plan.broker:
+            armed_broker = self._armed_broker or "无"
+            self.disarm()
+            raise LiveTradingDisabled(
+                f"本次会话只启用了 {armed_broker}，不能写入 {plan.broker}"
+            )
+        if not self._plan_writes_enabled(plan):
+            self.disarm()
+            raise LiveTradingDisabled(
+                "OKX Live 写操作还需要 OKX_LIVE_ENABLED=true"
+            )
+
+    def _active_conflict(
+        self,
+        record: ExecutionRecord,
+        *,
+        selected_account: str,
+    ) -> ExecutionRecord | None:
+        for active in self._store.list_active():
+            if active.id == record.id:
+                continue
+            if (
+                active.plan.broker == record.plan.broker
+                and active.plan.instrument == record.plan.instrument
+                and active.selected_account == selected_account
+            ):
+                return active
+        return None
+
+    def submit(self, execution_id: str) -> ExecutionRecord:
+        with self._lock:
+            record = self._store.get(execution_id)
+            if record is None:
+                raise KeyError(f"未知 execution id: {execution_id}")
+            self._require_plan_writes(record.plan)
+            if record.state != ExecutionState.READY:
+                raise PreflightError(f"当前状态 {record.state.value} 不能重复提交")
+            try:
+                current_fingerprint = execution_route_fingerprint(
+                    self._settings,
+                    record.plan.broker,
+                )
+            except (PlanBlocked, ValueError) as exc:
+                current_fingerprint = ""
+                route_error = str(exc)
+            else:
+                route_error = ""
+            if current_fingerprint != record.plan.config_fingerprint:
+                blocked = record.model_copy(
+                    update={
+                        "state": ExecutionState.BLOCKED,
+                        "state_reason": "执行配置已变化，旧计划禁止提交",
+                        "last_error": route_error or "route fingerprint mismatch",
+                        "needs_attention": True,
+                    }
+                )
+                blocked = self._store.save(
+                    blocked,
+                    event_kind="stale_plan_blocked",
+                )
+                self._emit_record(blocked)
+                return blocked
+            try:
+                adapter = self._adapter(record.plan)
+                preflight = adapter.preflight(record.plan)
+            except (
+                PreflightError,
+                CredentialError,
+                BrokerApiError,
+                BrokerTransportError,
+            ) as exc:
+                blocked = record.model_copy(
+                    update={
+                        "state": ExecutionState.BLOCKED,
+                        "state_reason": "券商只读预检未通过",
+                        "last_error": str(exc),
+                        "needs_attention": True,
+                    }
+                )
+                blocked = self._store.save(
+                    blocked,
+                    event_kind="preflight_blocked",
+                    event_payload={"error": str(exc)},
+                )
+                self._emit_record(blocked)
+                return blocked
+
+            conflict = self._active_conflict(
+                record,
+                selected_account=preflight.selected_account,
+            )
+            if conflict is not None:
+                blocked = record.model_copy(
+                    update={
+                        "state": ExecutionState.BLOCKED,
+                        "selected_account": preflight.selected_account,
+                        "preflight": preflight,
+                        "state_reason": "同一账户和品种已有活动执行",
+                        "last_error": f"冲突 execution: {conflict.id}",
+                        "needs_attention": True,
+                    }
+                )
+                blocked = self._store.save(
+                    blocked,
+                    event_kind="active_execution_conflict",
+                    event_payload={"conflict_execution_id": conflict.id},
+                )
+                self._emit_record(blocked)
+                return blocked
+
+            record = record.model_copy(
+                update={
+                    "preflight": preflight,
+                    "selected_account": preflight.selected_account,
+                    "state_reason": "券商只读预检通过",
+                }
+            )
+            record = self._store.save(
+                record,
+                event_kind="preflight_passed",
+                event_payload={
+                    "broker": record.plan.broker,
+                    "account": preflight.selected_account,
+                    "instrument": record.plan.instrument,
+                    "quantity": str(preflight.quantity),
+                },
+            )
+            prepared = adapter.prepare_submit(record)
+            prepared = self._store.save(
+                prepared,
+                event_kind="submit_intent",
+                event_payload={
+                    "client_order_id": prepared.client_order_id,
+                    "account": prepared.selected_account,
+                },
+            )
+            try:
+                submitted = adapter.submit_entry(prepared)
+            except BrokerRejected as exc:
+                rejected = prepared.model_copy(
+                    update={
+                        "state": ExecutionState.REJECTED,
+                        "state_reason": "券商拒绝入场订单",
+                        "last_error": str(exc),
+                        "needs_attention": True,
+                    }
+                )
+                rejected = self._store.save(
+                    rejected,
+                    event_kind="entry_rejected",
+                    event_payload={"error": str(exc)},
+                )
+                self._emit_record(rejected)
+                return rejected
+            except (SubmissionUnknown, BrokerTransportError) as exc:
+                unknown = prepared.model_copy(
+                    update={
+                        "state": ExecutionState.UNKNOWN,
+                        "state_reason": "入场提交结果不明，禁止重发并等待对账",
+                        "last_error": str(exc),
+                        "needs_attention": True,
+                    }
+                )
+                unknown = self._store.save(
+                    unknown,
+                    event_kind="entry_submit_unknown",
+                    event_payload={"error": str(exc)},
+                )
+                self.disarm()
+                self._emit_record(unknown)
+                return unknown
+            submitted = self._store.save(
+                submitted,
+                event_kind="entry_accepted",
+                event_payload={"broker_order_id": submitted.broker_order_id},
+            )
+            self._emit_record(submitted)
+            return submitted
+
+    @staticmethod
+    def _materially_changed(
+        before: ExecutionRecord,
+        after: ExecutionRecord,
+    ) -> bool:
+        excluded = {"updated_at", "revision"}
+        before_data = before.model_dump(exclude=excluded)
+        after_data = after.model_dump(exclude=excluded)
+        return before_data != after_data
+
+    def reconcile_once(self) -> list[ExecutionRecord]:
+        updates: list[ExecutionRecord] = []
+        with self._lock:
+            allow_writes = self.is_armed
+            for current in self._store.list_active():
+                if current.state == ExecutionState.SUBMITTING:
+                    current = self._store.save(
+                        current.model_copy(
+                            update={
+                                "state": ExecutionState.UNKNOWN,
+                                "state_reason": (
+                                    "PA 在提交意图后中断；按客户订单号对账，禁止重发"
+                                ),
+                                "needs_attention": True,
+                            }
+                        ),
+                        event_kind="submit_interrupted",
+                    )
+                    self._emit_record(current)
+                try:
+                    adapter = self._adapter(current.plan)
+                    updated = adapter.reconcile(
+                        current,
+                        allow_writes=(
+                            allow_writes
+                            and self._plan_writes_enabled(current.plan)
+                        ),
+                    )
+                    if updated.broker_state.get("write_unknown"):
+                        self.disarm()
+                        allow_writes = False
+                except BrokerRejected as exc:
+                    entry_rejected = current.state in {
+                        ExecutionState.ENTRY_PENDING,
+                        ExecutionState.PARTIALLY_FILLED,
+                        ExecutionState.UNKNOWN,
+                    }
+                    updated = current.model_copy(
+                        update={
+                            "state": (
+                                ExecutionState.REJECTED
+                                if entry_rejected
+                                else current.state
+                            ),
+                            "state_reason": (
+                                "券商拒绝入场订单"
+                                if entry_rejected
+                                else "券商拒绝持仓阶段操作；已停写并保留监控"
+                            ),
+                            "last_error": str(exc),
+                            "needs_attention": True,
+                        }
+                    )
+                    if not entry_rejected:
+                        self.disarm()
+                        allow_writes = False
+                except SubmissionUnknown as exc:
+                    updated = current.model_copy(
+                        update={
+                            "state": (
+                                ExecutionState.UNKNOWN
+                                if current.state
+                                in {
+                                    ExecutionState.ENTRY_PENDING,
+                                    ExecutionState.PARTIALLY_FILLED,
+                                    ExecutionState.UNKNOWN,
+                                }
+                                else current.state
+                            ),
+                            "state_reason": "券商写操作结果不明，已停用本次实盘会话",
+                            "last_error": str(exc),
+                            "needs_attention": True,
+                        }
+                    )
+                    self.disarm()
+                    allow_writes = False
+                except Exception as exc:  # noqa: BLE001
+                    updated = current.model_copy(
+                        update={
+                            "needs_attention": True,
+                            "last_error": str(exc),
+                            "state_reason": "执行对账发生错误，等待下一轮或人工处理",
+                        }
+                    )
+                if not self._materially_changed(current, updated):
+                    continue
+                saved = self._store.save(
+                    updated,
+                    event_kind="reconciled",
+                    event_payload={
+                        "from_state": current.state.value,
+                        "to_state": updated.state.value,
+                        "reason": updated.state_reason,
+                    },
+                )
+                updates.append(saved)
+                self._emit_record(saved)
+        return updates
+
+    def request_exit(self, execution_id: str, *, reason: str = "主动离场") -> ExecutionRecord:
+        with self._lock:
+            current = self._store.get(execution_id)
+            if current is None:
+                raise KeyError(f"未知 execution id: {execution_id}")
+            self._require_plan_writes(current.plan)
+            planned = self._adapter(current.plan).request_exit(current, reason=reason)
+            saved = self._store.save(
+                planned,
+                event_kind="exit_requested",
+                event_payload={"reason": reason},
+            )
+            self._emit_record(saved)
+            return saved
+
+    def cancel_entry(self, execution_id: str) -> ExecutionRecord:
+        with self._lock:
+            current = self._store.get(execution_id)
+            if current is None:
+                raise KeyError(f"未知 execution id: {execution_id}")
+            self._require_plan_writes(current.plan)
+            intent_state = dict(current.broker_state)
+            intent_state["manual_cancel_intent_at"] = utc_now_iso()
+            intent_state["entry_cancel_intent"] = True
+            current = self._store.save(
+                current.model_copy(update={"broker_state": intent_state}),
+                event_kind="cancel_entry_intent",
+            )
+            try:
+                updated = self._adapter(current.plan).cancel_entry(current)
+            except BrokerRejected as exc:
+                updated = current.model_copy(
+                    update={
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": "券商拒绝撤销入场；已停写并保留订单监控",
+                    }
+                )
+                self.disarm()
+            except SubmissionUnknown as exc:
+                broker_state = dict(current.broker_state)
+                broker_state["entry_cancel_requested"] = True
+                broker_state["entry_cancel_status"] = "unknown"
+                broker_state["write_unknown"] = "cancel_entry"
+                updated = current.model_copy(
+                    update={
+                        "state": ExecutionState.UNKNOWN,
+                        "broker_state": broker_state,
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": "撤销入场结果不明，等待对账",
+                    }
+                )
+                self.disarm()
+            if updated.broker_state.get("write_unknown"):
+                self.disarm()
+            saved = self._store.save(updated, event_kind="cancel_entry_requested")
+            self._emit_record(saved)
+            return saved
+
+    def refresh_account(self, execution_id: str | None = None) -> AccountSnapshot:
+        with self._lock:
+            if execution_id:
+                execution = self._store.get(execution_id)
+                if execution is None:
+                    raise KeyError(f"未知 execution id: {execution_id}")
+                plan = execution.plan
+                account_profile = execution.selected_account or None
+            else:
+                plan = self._target_plan_from_settings()
+                account_profile = None
+            snapshot = self._adapter(plan).account_snapshot(
+                plan,
+                account_profile=account_profile,
+            )
+            self._store.save_account_snapshot(snapshot)
+            self._emit_account(snapshot)
+            return snapshot
+
+    def _target_plan_from_settings(self) -> ExecutionPlan:
+        execution = self._settings.execution
+        broker = execution.selected_broker
+        route = execution.longbridge if broker == "longbridge" else execution.okx
+        quantity_text = str(route.quantity or "1")
+        try:
+            quantity = Decimal(quantity_text)
+        except (InvalidOperation, ValueError):
+            quantity = Decimal("1")
+        if not quantity.is_finite() or quantity <= 0:
+            quantity = Decimal("1")
+        product = "securities" if broker == "longbridge" else route.product
+        requested = route.preferred_account if broker == "longbridge" else "okx"
+        instrument = str(route.instrument or "").strip().upper()
+        if not instrument:
+            raise PreflightError("请先配置券商品种，再读取账户")
+        return ExecutionPlan(
+            id="account-read-only",
+            analysis_digest="account-read-only",
+            analysis_record_path="",
+            broker=broker,
+            environment=(
+                "demo"
+                if broker == "okx" and bool(route.simulated)
+                else "live"
+            ),
+            product=product,
+            requested_account=requested,
+            allow_account_fallback=False,
+            source_symbol=str(route.source_symbol or "READONLY").strip().upper(),
+            instrument=instrument,
+            direction="long",
+            entry_type="market",
+            quantity=quantity,
+            entry_price=Decimal("1"),
+            take_profit_1=Decimal("2"),
+            take_profit_2=Decimal("3"),
+            stop_loss=Decimal("0.5"),
+            trade_confidence=100,
+            created_at=utc_now_iso(),
+            config_fingerprint="account-read-only",
+            okx_api_base_url=(
+                route.api_base_url if broker == "okx" else ""
+            ),
+            okx_margin_mode=(
+                route.margin_mode if broker == "okx" else ""
+            ),
+            longbridge_allow_outside_rth=(
+                bool(route.allow_outside_rth)
+                if broker == "longbridge"
+                else False
+            ),
+            entry_timeout_seconds=int(execution.entry_timeout_seconds),
+        )
+
+    def refresh_execution_accounts(
+        self,
+        execution_ids: list[str] | None = None,
+    ) -> list[AccountSnapshot]:
+        """Refresh each active broker/account once, including a just-closed execution."""
+        records: list[ExecutionRecord] = []
+        if execution_ids is None:
+            records = self._store.list_active()
+        else:
+            for execution_id in execution_ids:
+                record = self._store.get(execution_id)
+                if record is not None:
+                    records.append(record)
+        snapshots: list[AccountSnapshot] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for record in records:
+            account = record.selected_account or record.plan.requested_account
+            key = (
+                record.plan.broker,
+                record.plan.environment,
+                account,
+                record.plan.okx_api_base_url,
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                snapshots.append(self.refresh_account(record.id))
+            except Exception as exc:  # noqa: BLE001
+                self._emit_error(
+                    f"{record.plan.broker}/{account} 账户快照刷新失败：{exc}"
+                )
+        return snapshots
+
+    def latest_execution(self) -> ExecutionRecord | None:
+        rows = self._store.list_recent(limit=1)
+        return rows[0] if rows else None
+
+    def start_monitoring(self) -> None:
+        with self._lock:
+            if self._monitor_thread is not None and self._monitor_thread.is_alive():
+                return
+            self._stop_event.clear()
+            self._monitor_thread = threading.Thread(
+                target=self._monitor_loop,
+                name="pa-execution-monitor",
+                daemon=True,
+            )
+            self._monitor_thread.start()
+
+    def _monitor_loop(self) -> None:
+        interval = float(self._settings.execution.poll_interval_seconds)
+        while not self._stop_event.wait(interval):
+            try:
+                self._monitor_once()
+            except Exception as exc:  # noqa: BLE001
+                self._emit_error(f"交易监控轮询失败：{exc}")
+
+    def _monitor_once(self) -> None:
+        """Reconcile orders, then refresh each account seen at loop start."""
+        active_ids = [record.id for record in self._store.list_active()]
+        self.reconcile_once()
+        self.refresh_execution_accounts(active_ids)
+
+    def stop_monitoring(self, timeout: float = 5.0) -> None:
+        self._stop_event.set()
+        thread = self._monitor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=max(0.1, min(float(timeout), 5.0)))
+        if thread is not None and thread.is_alive():
+            self._logger.warning("交易监控线程未在截止时间内退出")
+        else:
+            self._monitor_thread = None
+        self.disarm()

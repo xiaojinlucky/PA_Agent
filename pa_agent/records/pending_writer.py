@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -78,6 +80,38 @@ class PendingWriter:
         data = record.model_dump()
         data = self._sanitize(data, self._api_key)
         self._write_json(path, data)
+        try:
+            from pa_agent.records.analysis_history import invalidate_latest_record_cache
+
+            invalidate_latest_record_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        return path
+
+    def full_path(self, record: AnalysisRecord) -> Path:
+        """Return the canonical full-record path without writing it."""
+        return self._pending_dir / f"{_build_basename(record)}.json"
+
+    def save_full_durable(self, record: AnalysisRecord) -> Path:
+        """Atomically write, fsync and re-read a complete record.
+
+        Unlike :meth:`save_full`, this method propagates any persistence error.
+        Trading execution may only consume records written through this path.
+        """
+        path = self.full_path(record)
+        data = self._sanitize(record.model_dump(), self._api_key)
+        self._write_json_durable(path, data)
+        try:
+            persisted = AnalysisRecord.model_validate_json(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise OSError(f"durable analysis record verification failed: {path}") from exc
+        if (
+            persisted.meta.timestamp_local_ms != record.meta.timestamp_local_ms
+            or persisted.meta.symbol != record.meta.symbol
+            or persisted.meta.timeframe != record.meta.timeframe
+            or persisted.stage2_decision != record.stage2_decision
+        ):
+            raise OSError(f"durable analysis record content mismatch: {path}")
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
 
@@ -160,6 +194,37 @@ class PendingWriter:
             path.write_text(text, encoding="utf-8")
         except OSError as exc:
             self._handle_disk_error(exc, path)
+
+    def _write_json_durable(self, path: Path, data: dict) -> None:
+        """Write JSON through a same-directory temporary file and atomically replace."""
+        text = json.dumps(data, ensure_ascii=False, indent=2)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=path.parent,
+                prefix=f".{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_path, path)
+        except Exception as exc:
+            if temp_path is not None:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            self._handle_disk_error(
+                exc if isinstance(exc, OSError) else OSError(str(exc)),
+                path,
+            )
+            raise
 
     def _handle_disk_error(self, exc: OSError, path: Path) -> None:
         """Log the error and optionally emit to the event bus."""

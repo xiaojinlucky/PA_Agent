@@ -680,7 +680,7 @@ class TwoStageOrchestrator:
                     "exception": None,
                 }
             )
-            self._pending_writer.save_full(record)
+            self._pending_writer.save_full_durable(record)
             on_event(OrchestratorEvent.RecordSaved)
             return record
 
@@ -975,7 +975,7 @@ class TwoStageOrchestrator:
         )
 
         # ── Step 22: Persist full record ──────────────────────────────────────
-        self._pending_writer.save_full(record)
+        self._pending_writer.save_full_durable(record)
 
         # ── Step 23: Record saved event ───────────────────────────────────────
         on_event(OrchestratorEvent.RecordSaved)

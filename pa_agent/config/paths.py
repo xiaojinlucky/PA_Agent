@@ -18,6 +18,7 @@ PA_AGENT_DIR: Path = PROJECT_ROOT
 
 # ── Runtime write directories ─────────────────────────────────────────────────
 RECORDS_PENDING_DIR: Path = PROJECT_ROOT / "records" / "pending"
+EXECUTION_DB_PATH: Path = PROJECT_ROOT / "records" / "execution.sqlite3"
 EXPERIENCE_DIR: Path = PROJECT_ROOT / "experience"
 CONFIG_DIR: Path = PROJECT_ROOT / "config"
 LOGS_DIR: Path = PROJECT_ROOT / "logs"

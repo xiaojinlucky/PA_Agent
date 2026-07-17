@@ -86,5 +86,30 @@
   },
   "tushare": {
     "token": ""
+  },
+  "execution": {
+    "enabled": false,
+    "auto_execute": false,
+    "selected_broker": "longbridge",
+    "min_trade_confidence": 70,
+    "poll_interval_seconds": 2.0,
+    "entry_timeout_seconds": 120,
+    "longbridge": {
+      "source_symbol": "",
+      "instrument": "",
+      "quantity": "",
+      "preferred_account": "comprehensive",
+      "allow_comprehensive_fallback": true,
+      "allow_outside_rth": false
+    },
+    "okx": {
+      "source_symbol": "",
+      "instrument": "",
+      "quantity": "",
+      "product": "spot",
+      "margin_mode": "cross",
+      "simulated": false,
+      "api_base_url": "https://www.okx.com"
+    }
   }
 }

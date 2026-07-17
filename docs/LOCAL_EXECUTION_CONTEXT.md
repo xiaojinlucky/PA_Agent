@@ -1,5 +1,7 @@
 # PA_Agent — 本地执行环境、Skills 与 Memory 摘要
 
+> **历史快照（2026-07-16）**：其中“交易层尚未实现”等条目仅表示开发前状态。当前本机落地进度以根目录 `CONTEXT.md` 和 `docs/LIVE_TRADING_DESIGN.md` 为准。
+
 网页版 GPT 无法直接看到本机 skills、memory、进程、未提交状态和真实配置。本文件只提供与 PA_Agent 直接相关的脱敏快照；最终执行前仍须由本地 Codex 重新实时核验。
 
 ## 本机环境

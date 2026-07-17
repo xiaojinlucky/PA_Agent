@@ -25,6 +25,7 @@ class AppContext:
     pending_writer: Any = None    # PendingWriter
     exp_reader: Any = None        # ExperienceReader
     ledger: Any = None            # SessionTokenLedger
+    execution_service: Any = None # ExecutionService
 
     @classmethod
     def bootstrap(cls) -> "AppContext":
@@ -127,6 +128,16 @@ class AppContext:
             warn_pct=settings.general.context_warning_threshold_pct,
         )
 
+        # ── Broker execution lifecycle (starts disarmed) ─────────────────────
+        from pa_agent.execution.service import ExecutionService
+
+        execution_service = ExecutionService(
+            settings=settings,
+            pending_writer=pending_writer,
+            event_bus=event_bus,
+            logger=app_logger,
+        )
+
         return cls(
             settings=settings,
             logger=app_logger,
@@ -139,4 +150,5 @@ class AppContext:
             pending_writer=pending_writer,
             exp_reader=exp_reader,
             ledger=ledger,
+            execution_service=execution_service,
         )

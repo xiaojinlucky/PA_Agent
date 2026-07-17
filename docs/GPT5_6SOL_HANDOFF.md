@@ -1,5 +1,7 @@
 # GPT-5.6-sol 移交说明
 
+> **历史快照（2026-07-16）**：本文件记录实盘开发前状态与候选方案，其中“当前不具备下单能力”等描述已过期。当前实现与验证真值请读取根目录 `CONTEXT.md` 和 `docs/LIVE_TRADING_DESIGN.md`。
+
 ## 1. 项目真实状态
 
 PA_Agent 是本轮实盘扩展的主项目。当前能从 MT5、TradingView、Longbridge、yfinance 和 AkShare 获取行情，并完成两阶段 AI 分析；当前代码不具备真实下单能力。
