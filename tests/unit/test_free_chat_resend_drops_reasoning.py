@@ -7,6 +7,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from pa_agent.config.settings import AIProviderSettings, Settings
 from pa_agent.orchestrator.free_chat import FreeChatSession
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 from pa_agent.util.threading import CancelToken
@@ -27,6 +28,15 @@ def _make_reply(content: str = "AI response", reasoning: str = "AI reasoning") -
     reply.usage.completion_tokens = 50
     reply.usage.cached_prompt_tokens = 0
     reply.usage.total_tokens = 150
+    return reply
+
+
+def _make_thread_reply(
+    content: str,
+    thread_id: str = "019f6506-f487-72a2-92d2-e7eca30a00f2",
+) -> MagicMock:
+    reply = _make_reply(content, "")
+    reply.request_id = thread_id
     return reply
 
 
@@ -157,8 +167,10 @@ class TestFreeChatResendDropsReasoning:
         assert "追问助手" in messages[0]["content"]
         assert messages[1]["role"] == "user"
         assert "上次分析结果" in messages[1]["content"]
-        assert messages[2]["role"] == "user"
-        assert messages[2]["content"] == "hello"
+        assert messages[2]["role"] == "assistant"
+        assert "上次决策结果" in messages[2]["content"]
+        assert messages[3]["role"] == "user"
+        assert messages[3]["content"] == "hello"
         for msg in messages:
             assert "reasoning_content" not in msg
 
@@ -207,7 +219,7 @@ class TestFreeChatResendDropsReasoning:
         assert ledger.add.call_count == 2
 
     def test_history_for_api_structure_first_turn(self):
-        """On the first send: [followup_system, analysis_ref, new_user]."""
+        """First send includes the validated decision recall before new_user."""
         client = MagicMock()
         client.stream_chat.return_value = _make_reply()
         session = _make_session(client)
@@ -216,13 +228,15 @@ class TestFreeChatResendDropsReasoning:
         session.send("my question", cancel)
 
         messages: list[dict] = client.stream_chat.call_args[0][0]
-        assert len(messages) == 3
+        assert len(messages) == 4
         assert messages[0]["role"] == "system"
         assert "追问助手" in messages[0]["content"]
         assert messages[1]["role"] == "user"
         assert "上次分析结果" in messages[1]["content"]
-        assert messages[2]["role"] == "user"
-        assert messages[2]["content"] == "my question"
+        assert messages[2]["role"] == "assistant"
+        assert "上次决策结果" in messages[2]["content"]
+        assert messages[3]["role"] == "user"
+        assert messages[3]["content"] == "my question"
 
     def test_history_for_api_grows_with_turns(self):
         """On the second send, previous free-chat turn is included in
@@ -238,13 +252,63 @@ class TestFreeChatResendDropsReasoning:
         session.send("question 1", cancel)
         session.send("question 2", cancel)
 
-        # Second call's messages: system, ref, q1, a1, q2
+        # Second call: system, ref, validated recall, q1, a1, q2
         messages: list[dict] = client.stream_chat.call_args_list[1][0][0]
-        assert len(messages) == 5
-        assert messages[2]["role"] == "user"
-        assert messages[2]["content"] == "question 1"
-        assert messages[3]["role"] == "assistant"
-        assert messages[3]["content"] == "reply 1"
-        assert "reasoning_content" not in messages[3]
-        assert messages[4]["role"] == "user"
-        assert messages[4]["content"] == "question 2"
+        assert len(messages) == 6
+        assert messages[3]["role"] == "user"
+        assert messages[3]["content"] == "question 1"
+        assert messages[4]["role"] == "assistant"
+        assert messages[4]["content"] == "reply 1"
+        assert "reasoning_content" not in messages[4]
+        assert messages[5]["role"] == "user"
+        assert messages[5]["content"] == "question 2"
+
+
+def test_codex_free_chat_persists_and_resumes_native_thread() -> None:
+    client = MagicMock()
+    client.supports_native_threading = True
+    client.stream_chat_in_thread.side_effect = [
+        _make_thread_reply("reply 1"),
+        _make_thread_reply("reply 2"),
+    ]
+    pending_writer = MagicMock()
+    pending_writer.load_conversation_checkpoint.return_value = None
+    settings = Settings(
+        provider=AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="gpt-5.6-sol",
+            reasoning_effort="high",
+        )
+    )
+    session = FreeChatSession(
+        base_record=_make_base_record(),
+        client=client,
+        assembler=MagicMock(),
+        pending_writer=pending_writer,
+        ledger=MagicMock(),
+        settings=settings,
+    )
+
+    session.send("question 1", CancelToken())
+    session.send("question 2", CancelToken())
+
+    assert client.stream_chat.call_count == 0
+    first_call, second_call = client.stream_chat_in_thread.call_args_list
+    assert first_call.kwargs["thread_id"] == ""
+    assert first_call.args[0][0]["role"] == "system"
+    assert (
+        second_call.kwargs["thread_id"]
+        == "019f6506-f487-72a2-92d2-e7eca30a00f2"
+    )
+    assert len(second_call.args[0]) == 1
+    assert "PA 程序保存的权威分析状态" in second_call.args[0][0]["content"]
+    assert "question 2" in second_call.args[0][0]["content"]
+    checkpoints = [
+        call.args[0]
+        for call in pending_writer.save_conversation_checkpoint.call_args_list
+    ]
+    assert [item.last_turn for item in checkpoints] == [1, 2]
+    assert all(
+        item.thread_id == "019f6506-f487-72a2-92d2-e7eca30a00f2"
+        for item in checkpoints
+    )

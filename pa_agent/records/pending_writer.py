@@ -16,7 +16,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from pa_agent.records.schema import AnalysisRecord, FollowupTurn
+from pa_agent.records.schema import (
+    AnalysisRecord,
+    ConversationCheckpoint,
+    FollowupTurn,
+    validate_sidecar_record_id,
+)
 from pa_agent.util.mask_secret import mask_secret
 
 
@@ -194,6 +199,58 @@ class PendingWriter:
             path.write_text(text, encoding="utf-8")
         except OSError as exc:
             self._handle_disk_error(exc, path)
+
+    def load_conversation_checkpoint(
+        self,
+        record_id: str,
+    ) -> ConversationCheckpoint | None:
+        """读取可恢复线程；文件缺失或损坏时明确从新线程开始。"""
+        try:
+            path = self._conversation_checkpoint_path(record_id)
+        except ValueError:
+            self._logger.warning("PendingWriter: invalid conversation record id")
+            return None
+        if not path.exists():
+            return None
+        try:
+            checkpoint = ConversationCheckpoint.model_validate_json(
+                path.read_text(encoding="utf-8")
+            )
+        except (OSError, ValueError) as exc:
+            self._logger.warning(
+                "PendingWriter: invalid conversation checkpoint %s: %s",
+                path,
+                type(exc).__name__,
+            )
+            return None
+        if checkpoint.record_id != record_id:
+            self._logger.warning(
+                "PendingWriter: conversation checkpoint record mismatch: %s",
+                path,
+            )
+            return None
+        return checkpoint
+
+    def save_conversation_checkpoint(
+        self,
+        checkpoint: ConversationCheckpoint,
+    ) -> Path:
+        """原子保存非敏感线程定位信息；失败时向调用方暴露错误。"""
+        path = self._conversation_checkpoint_path(checkpoint.record_id)
+        self._write_json_durable(path, checkpoint.model_dump())
+        return path
+
+    def _conversation_checkpoint_path(self, record_id: str) -> Path:
+        """Return a checkpoint path that is guaranteed to stay in pending."""
+
+        safe_record_id = validate_sidecar_record_id(record_id)
+        pending_root = self._pending_dir.resolve(strict=False)
+        path = (
+            self._pending_dir / f"{safe_record_id}.conversation.json"
+        ).resolve(strict=False)
+        if path.parent != pending_root:
+            raise ValueError("conversation checkpoint path escapes pending directory")
+        return path
 
     def _write_json_durable(self, path: Path, data: dict) -> None:
         """Write JSON through a same-directory temporary file and atomically replace."""

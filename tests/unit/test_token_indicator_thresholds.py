@@ -148,6 +148,30 @@ def test_progress_bar_value_matches_percentage(widget, monkeypatch):
     assert widget._progress_bar.value() == 34
 
 
+def test_unknown_context_limit_is_not_replaced_with_a_fake_default(
+    widget,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "pa_agent.gui.conversation_widget.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+
+    widget.update_token_display(
+        {
+            "context_used": 342_000,
+            "context_window": None,
+            "total_input": 300_000,
+            "total_cached_input": 0,
+            "total_output": 42_000,
+        }
+    )
+
+    assert widget._progress_bar.value() == 0
+    assert widget._progress_bar.format() == "上限未知"
+    assert "上限未知" in widget._token_label.text()
+
+
 # ── Clear resets warning flag ─────────────────────────────────────────────────
 
 def test_clear_resets_red_warning_flag(widget, monkeypatch):

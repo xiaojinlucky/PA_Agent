@@ -3,9 +3,20 @@
 from __future__ import annotations
 
 import json
+from threading import Event, Thread
 from unittest.mock import patch
 
-from pa_agent.config.settings import Settings, load_settings, save_settings
+import pytest
+
+import pa_agent.config.settings as settings_module
+from pa_agent.config.settings import (
+    AIProviderSettings,
+    Settings,
+    SettingsConflictError,
+    load_settings,
+    save_ai_profile_activation,
+    save_settings,
+)
 
 
 def test_defaults(tmp_path):
@@ -16,7 +27,7 @@ def test_defaults(tmp_path):
     assert s.provider.base_url == "https://api.deepseek.com"
     assert s.provider.thinking is True
     assert s.provider.reasoning_effort == "high"
-    assert s.provider.context_window == 2_000_000
+    assert s.provider.context_window == 1_000_000
     assert s.general.analysis_bar_count == 100
     assert s.general.last_symbol == "XAUUSDm"
     assert s.general.last_timeframe == "15m"
@@ -211,3 +222,222 @@ def test_migrate_legacy_feishu_json(tmp_path):
     assert loaded.feishu.app_id == "cli_legacy"
     data = json.loads(p.read_text(encoding="utf-8"))
     assert data["feishu"]["webhook_url"] == "https://example.com/legacy-hook"
+
+
+def test_stale_settings_snapshot_cannot_delete_a_new_ai_profile(tmp_path):
+    p = tmp_path / "settings.json"
+    original = Settings()
+    save_settings(original, p)
+    stale = load_settings(p)
+    current = load_settings(p)
+    current.save_ai_profile(
+        "kimi",
+        "Kimi API",
+        AIProviderSettings(
+            model="kimi-k2.6",
+            base_url="https://api.moonshot.cn/v1",
+            adapter_id="kimi",
+        ),
+    )
+    save_settings(current, p)
+
+    stale.general.last_data_source = "okx"
+    with pytest.raises(SettingsConflictError):
+        save_settings(stale, p)
+
+    reloaded = load_settings(p)
+    assert "kimi" in reloaded.ai_profiles
+    assert reloaded.general.last_data_source != "okx"
+
+
+def test_ai_activation_merge_holds_lock_through_atomic_write(tmp_path):
+    """合并读取后，第二个设置写入不能再插入激活写入之前。"""
+
+    path = tmp_path / "settings.json"
+    baseline = Settings()
+    baseline.save_ai_profile(
+        "default",
+        "Codex 订阅",
+        AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="gpt-5.6-sol",
+        ),
+        replace=True,
+    )
+    baseline.mark_ai_profile_verification(
+        "default",
+        passed=True,
+        tested_at="2026-07-20T00:00:00+00:00",
+        adapter_id="codex_subscription",
+        checks={
+            "connection_auth": True,
+            "parameter_acceptance": True,
+            "response_observed": True,
+            "challenge_matched": True,
+        },
+    )
+    save_settings(baseline, path)
+
+    candidate = baseline.model_copy(deep=True)
+    candidate.save_ai_profile(
+        "default",
+        "Codex 订阅",
+        AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="gpt-5.6-terra",
+        ),
+        replace=True,
+    )
+    candidate.provider = candidate.ai_profiles["default"].provider.model_copy(
+        deep=True
+    )
+    candidate.mark_ai_profile_verification(
+        "default",
+        passed=True,
+        tested_at="2026-07-20T01:00:00+00:00",
+        adapter_id="codex_subscription",
+        checks={
+            "connection_auth": True,
+            "parameter_acceptance": True,
+            "response_observed": True,
+            "challenge_matched": True,
+        },
+    )
+
+    first_concurrent = load_settings(path)
+    first_concurrent.general.last_timeframe = "1m"
+    save_settings(first_concurrent, path)
+
+    second_concurrent = load_settings(path)
+    second_concurrent.general.last_data_source = "okx"
+    writer_started = Event()
+    writer_finished = Event()
+    writer_errors: list[Exception] = []
+
+    def _second_writer() -> None:
+        writer_started.set()
+        try:
+            save_settings(second_concurrent, path)
+        except Exception as exc:  # noqa: BLE001
+            writer_errors.append(exc)
+        finally:
+            writer_finished.set()
+
+    real_read = settings_module._read_settings_snapshot
+    writer: Thread | None = None
+
+    def _read_while_spawning_writer(target: object) -> Settings:
+        nonlocal writer
+        snapshot = real_read(target)  # type: ignore[arg-type]
+        writer = Thread(target=_second_writer)
+        writer.start()
+        assert writer_started.wait(timeout=2)
+        assert writer_finished.wait(timeout=0.1) is False
+        return snapshot
+
+    with patch(
+        "pa_agent.config.settings._read_settings_snapshot",
+        side_effect=_read_while_spawning_writer,
+    ):
+        merged = save_ai_profile_activation(baseline, candidate, path)
+
+    assert writer is not None
+    writer.join(timeout=2)
+    assert writer.is_alive() is False
+    assert len(writer_errors) == 1
+    assert isinstance(writer_errors[0], SettingsConflictError)
+
+    reloaded = load_settings(path)
+    assert merged.provider.model == "gpt-5.6-terra"
+    assert reloaded.provider.model == "gpt-5.6-terra"
+    assert reloaded.general.last_timeframe == "1m"
+    assert reloaded.general.last_data_source != "okx"
+
+
+def test_failed_atomic_replace_does_not_mutate_caller_settings(tmp_path):
+    p = tmp_path / "settings.json"
+    settings = Settings()
+    before = settings.model_copy(deep=True)
+
+    with (
+        patch(
+            "pa_agent.config.settings.os.replace",
+            side_effect=OSError("simulated disk failure"),
+        ),
+        pytest.raises(OSError, match="simulated disk failure"),
+    ):
+        save_settings(settings, p)
+
+    assert settings == before
+    assert settings.revision == 0
+    assert not p.exists()
+
+
+def test_codex_subscription_discards_unused_api_fields() -> None:
+    provider = AIProviderSettings(
+        model="gpt-5.6-sol",
+        base_url="https://api.deepseek.com",
+        api_key="must-not-survive",
+        api_key_encrypted="must-not-survive-either",
+        adapter_id="codex_subscription",
+    )
+
+    assert provider.base_url == ""
+    assert provider.api_key == ""
+    assert provider.api_key_encrypted == ""
+
+
+def test_authoritative_catalog_context_survives_profile_round_trip(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    settings.save_ai_profile(
+        "kimi-live",
+        "Kimi 实时目录",
+        AIProviderSettings(
+            model="kimi-k2.6",
+            base_url="https://api.moonshot.cn/v1",
+            adapter_id="kimi",
+            context_window=262_144,
+            context_window_source="catalog",
+        ),
+    )
+
+    save_settings(settings, path)
+    loaded = load_settings(path)
+
+    provider = loaded.ai_profiles["kimi-live"].provider
+    assert provider.context_window == 262_144
+    assert provider.context_window_source == "catalog"
+
+
+def test_unknown_legacy_context_uses_current_builtin_fallback() -> None:
+    settings = Settings(
+        provider=AIProviderSettings(
+            model="gpt-5.6-sol",
+            adapter_id="codex_subscription",
+            context_window=372_000,
+        )
+    )
+
+    assert settings.provider.context_window == 272_000
+    assert settings.provider.context_window_source == "builtin"
+
+
+def test_unknown_model_context_round_trips_as_unknown(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    settings.save_ai_profile(
+        "kimi-preview",
+        "Kimi Preview",
+        AIProviderSettings(
+            model="kimi-account-preview",
+            base_url="https://api.moonshot.cn/v1",
+            adapter_id="kimi",
+            context_window=None,
+        ),
+    )
+
+    save_settings(settings, path)
+    loaded = load_settings(path)
+
+    assert loaded.ai_profiles["kimi-preview"].provider.context_window is None

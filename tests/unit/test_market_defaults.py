@@ -30,6 +30,15 @@ def test_longbridge_requires_ticker_region_default():
     assert normalize_gold_symbol_for_kind("longbridge", "aapl.us") == "AAPL.US"
 
 
+def test_okx_preserves_valid_spot_or_swap_and_repairs_invalid_symbol():
+    assert normalize_gold_symbol_for_kind("okx", "btc-usdt") == "BTC-USDT"
+    assert (
+        normalize_gold_symbol_for_kind("okx", "xau-usdt-swap")
+        == "XAU-USDT-SWAP"
+    )
+    assert normalize_gold_symbol_for_kind("okx", "XAUUSD") == "XAU-USDT-SWAP"
+
+
 def test_mt5_suffix_on_tv_becomes_xauusd():
     assert normalize_gold_symbol_for_kind("tradingview", "XAUUSDm") == GOLD_TV_SYMBOL
 

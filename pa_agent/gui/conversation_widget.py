@@ -458,18 +458,27 @@ class ConversationWidget(QWidget):
 
     def update_token_display(self, data: dict) -> None:
         context_used = data.get("context_used", 0)
-        context_window = data.get("context_window", 1_000_000)
+        context_window = data.get("context_window")
         total_input = data.get("total_input", 0)
         total_output = data.get("total_output", 0)
         total_cached = data.get("total_cached_input", 0)
+        current_input = data.get("current_input", context_used)
+        current_output = data.get("current_output", 0)
 
-        pct = (context_used / context_window * 100.0) if context_window > 0 else 0.0
-        pct_int = min(100, int(pct))
+        context_known = isinstance(context_window, (int, float)) and context_window > 0
+        pct = (
+            context_used / context_window * 100.0
+            if context_known
+            else None
+        )
+        pct_int = min(100, int(pct)) if pct is not None else 0
 
         self._progress_bar.setValue(pct_int)
-        self._progress_bar.setFormat(f"{pct:.1f}%")
+        self._progress_bar.setFormat(
+            f"{pct:.1f}%" if pct is not None else "上限未知"
+        )
 
-        if pct >= _RED_PCT:
+        if pct is not None and pct >= _RED_PCT:
             self._progress_bar.setStyleSheet(_STYLE_RED)
             if not self._red_warned:
                 self._red_warned = True
@@ -478,32 +487,32 @@ class ConversationWidget(QWidget):
                     "上下文用量警告",
                     f"上下文用量已达 {pct:.1f}%，接近上限，建议开启新会话。",
                 )
-        elif pct >= _YELLOW_PCT:
+        elif pct is not None and pct >= _YELLOW_PCT:
             self._progress_bar.setStyleSheet(_STYLE_YELLOW)
         else:
             self._progress_bar.setStyleSheet(_STYLE_NORMAL)
 
         total_tokens = total_input + total_output
 
-        # Build cache-hit rate display
-        # DeepSeek KV Cache: cached tokens are billed at 10% of the normal input price.
+        # 缓存命中只按供应商返回值展示，不在多供应商界面假定具体计费规则。
         cache_hit_pct = (total_cached / total_input * 100.0) if total_input > 0 else 0.0
         if total_cached > 0:
             cache_str = f" · 缓存命中 {total_cached:,} ({cache_hit_pct:.0f}%)"
         else:
             cache_str = ""
 
+        context_limit = f"{context_window:,}" if context_known else "上限未知"
         self._token_label.setText(
-            f"{total_tokens:,} tokens · in {total_input:,} / out {total_output:,}{cache_str}"
+            f"当前 {context_used:,} / {context_limit} · "
+            f"累计 in {total_input:,} / out {total_output:,}{cache_str}"
         )
-        # Keep a full tooltip for details
         self._token_label.setToolTip(
-            f"输入 token：{total_input:,}\n"
-            f"  其中缓存命中：{total_cached:,}（{cache_hit_pct:.1f}%，按 10% 价格计费）\n"
-            f"  未命中缓存：{total_input - total_cached:,}（按原价计费）\n"
-            f"输出 token：{total_output:,}\n"
-            f"合计：{total_tokens:,}\n\n"
-            "DeepSeek KV Cache 缓存命中的 token 按 10% 价格计费，可大幅降低 API 费用。"
+            f"最近一轮上下文：输入 {current_input:,} + 输出 {current_output:,}\n"
+            f"累计输入 token：{total_input:,}\n"
+            f"  其中缓存命中：{total_cached:,}（{cache_hit_pct:.1f}%）\n"
+            f"累计输出 token：{total_output:,}\n"
+            f"累计合计：{total_tokens:,}\n"
+            f"模型上下文上限：{context_limit}"
         )
 
     def clear(self) -> None:

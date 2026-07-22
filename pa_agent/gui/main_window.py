@@ -88,6 +88,55 @@ def _best_probability_key(probs: dict) -> str | None:
     return best_key
 
 
+def _analysis_token_breakdown(record: Any, context_window: int | None) -> dict:
+    """Separate the last model request from cumulative analysis usage."""
+
+    def _usage_value(mapping: dict, key: str) -> int:
+        try:
+            return max(0, int(mapping.get(key, 0) or 0))
+        except (TypeError, ValueError):
+            return 0
+
+    usage_total = getattr(record, "usage_total", {}) or {}
+    latest_usage: dict = {}
+    for attribute in ("stage2_response", "stage1_response"):
+        response = getattr(record, attribute, {}) or {}
+        candidate = response.get("usage") if isinstance(response, dict) else None
+        if isinstance(candidate, dict) and candidate:
+            latest_usage = candidate
+            break
+
+    current_input = _usage_value(latest_usage, "prompt_tokens")
+    current_cached = min(
+        current_input,
+        _usage_value(latest_usage, "cached_prompt_tokens"),
+    )
+    current_output = _usage_value(latest_usage, "completion_tokens")
+    total_input = _usage_value(usage_total, "prompt_tokens")
+    total_cached = min(
+        total_input,
+        _usage_value(usage_total, "cached_prompt_tokens"),
+    )
+    total_output = _usage_value(usage_total, "completion_tokens")
+
+    # Old records may only contain the latest response usage.
+    if total_input + total_output == 0 and current_input + current_output > 0:
+        total_input = current_input
+        total_cached = current_cached
+        total_output = current_output
+
+    return {
+        "context_used": current_input + current_output,
+        "context_window": context_window,
+        "total_input": total_input,
+        "total_cached_input": total_cached,
+        "total_output": total_output,
+        "current_input": current_input,
+        "current_cached_input": current_cached,
+        "current_output": current_output,
+    }
+
+
 # ── AI Worker ─────────────────────────────────────────────────────────────────
 
 class _AnalysisWorker(QThread):
@@ -282,7 +331,7 @@ class MainWindow(QMainWindow):
         self._demo_replayer: Any = None
         self._demo_auto_next_armed = False
         self._demo_waiting_flow_playback = False
-        self._startup_api_key_check_done = False
+        self._startup_ai_auth_check_done = False
         self._startup_tv_connectivity_check_done = False
         self._symbol_switch_timer: QTimer | None = None
         self._pending_symbol_switch: tuple[str, str] | None = None
@@ -348,7 +397,7 @@ class MainWindow(QMainWindow):
         self._execution_status_label.setObjectName("mutedLabel")
         self._status_bar.addPermanentWidget(self._execution_status_label)
         self._status_bar.showMessage("就绪")
-        self._refresh_api_key_ui_state()
+        self._refresh_ai_auth_ui_state()
 
         # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
@@ -431,7 +480,7 @@ class MainWindow(QMainWindow):
         self._data_source_combo.setMinimumWidth(108)
         self._data_source_combo.setToolTip(
             "K 线数据来源：MT5（需终端登录）、TradingView（tvDatafeed）、"
-            "Longbridge（OpenAPI 只读行情）"
+            "Longbridge（OpenAPI 只读行情）、OKX（公共现货/永续 K 线）"
         )
         self._data_source_combo.currentIndexChanged.connect(
             self._on_data_source_combo_changed
@@ -487,13 +536,12 @@ class MainWindow(QMainWindow):
             self._tv_exchange_combo.addItem(label, ex)
         # Restore saved exchange from settings, default to auto.
         saved_ex = ""
-        try:
-            from pa_agent.config.settings import load_settings
-            from pa_agent.config.paths import SETTINGS_JSON_PATH
-            _s = load_settings(SETTINGS_JSON_PATH)
-            saved_ex = getattr(_s.general, 'last_tradingview_exchange', '') or ''
-        except Exception:
-            pass
+        current_settings = getattr(self._ctx, "settings", None)
+        if current_settings is not None:
+            saved_ex = (
+                getattr(current_settings.general, "last_tradingview_exchange", "")
+                or ""
+            )
         idx_ex = self._tv_exchange_combo.findData(saved_ex)
         if idx_ex < 0:
             idx_ex = self._tv_exchange_combo.findData("")
@@ -620,16 +668,17 @@ class MainWindow(QMainWindow):
 
         outer_layout.addLayout(ctrl_layout)
 
-        self._api_key_alert_label = QLabel(
-            "未配置 API Key：请点击左上角「AI 模型」按钮，在设置中填写 API Key 后才能进行 AI 分析。"
+        self._ai_auth_alert_label = QLabel(
+            "AI 模型认证未就绪：Codex 订阅请完成 ChatGPT 登录；"
+            "API 接入请配置对应 API Key。"
         )
-        self._api_key_alert_label.setWordWrap(True)
-        self._api_key_alert_label.setStyleSheet(
+        self._ai_auth_alert_label.setWordWrap(True)
+        self._ai_auth_alert_label.setStyleSheet(
             "background-color: #3d2a00; color: #ffb86c; padding: 8px 10px; "
             "border: 1px solid #8a6d2f; border-radius: 4px; font-weight: 600;"
         )
-        self._api_key_alert_label.hide()
-        outer_layout.addWidget(self._api_key_alert_label)
+        self._ai_auth_alert_label.hide()
+        outer_layout.addWidget(self._ai_auth_alert_label)
 
         # Risk disclaimer (UI-only; never included in AI prompts)
         self._disclaimer_label = QLabel("分析仅供参考，不构成投资建议")
@@ -798,8 +847,16 @@ class MainWindow(QMainWindow):
             execution = getattr(settings, "execution", None)
             paper = bool(
                 execution is not None
-                and execution.selected_broker == "longbridge"
-                and execution.longbridge.preferred_account == "paper"
+                and (
+                    (
+                        execution.selected_broker == "longbridge"
+                        and execution.longbridge.preferred_account == "paper"
+                    )
+                    or (
+                        execution.selected_broker == "okx"
+                        and execution.okx.simulated
+                    )
+                )
             )
             label.setText(
                 "交易：本次模拟会话已启用"
@@ -835,12 +892,13 @@ class MainWindow(QMainWindow):
         if settings is not None:
             interval_ms = getattr(settings.general, "refresh_interval_ms", 1000)
             n_bars = self._analysis_bar_count()
-        from pa_agent.data.factory import max_analysis_bars_for_kind
+        from pa_agent.data.factory import data_source_label, max_analysis_bars_for_kind
 
         max_bars = max_analysis_bars_for_kind(self._current_data_source_kind())
         if n_bars > max_bars:
             message = (
-                f"Longbridge 最多支持 {max_bars} 根分析 K 线；"
+                f"{data_source_label(self._current_data_source_kind())} "
+                f"最多支持 {max_bars} 根分析 K 线；"
                 "请在“其他通用设置”中调低后重试"
             )
             logger.warning("RefreshLoop not started: %s", message)
@@ -1201,7 +1259,7 @@ class MainWindow(QMainWindow):
         try:
             from pa_agent.config.settings import save_settings
 
-            save_settings(settings)
+            save_settings(settings, self._ctx.settings_path)
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to persist TV exchange: %s", exc)
 
@@ -1253,6 +1311,10 @@ class MainWindow(QMainWindow):
         elif kind == "longbridge":
             line.setPlaceholderText(
                 "Longbridge 代码，如 AAPL.US、700.HK、600519.SH、000001.SZ"
+            )
+        elif kind == "okx":
+            line.setPlaceholderText(
+                "OKX 现货如 XAUT-USDT；永续如 XAU-USDT-SWAP"
             )
         elif kind in ("akshare", "eastmoney", "tushare"):
             line.setPlaceholderText("A股 6 位代码，如 600519；指数 000300 或 sh000300")
@@ -1394,7 +1456,8 @@ class MainWindow(QMainWindow):
         max_analysis_bars = max_analysis_bars_for_kind(kind)
         if analysis_bar_count > max_analysis_bars:
             raise ValueError(
-                f"Longbridge 最多支持 {max_analysis_bars} 根分析 K 线；"
+                f"{data_source_label(kind)} 最多支持 "
+                f"{max_analysis_bars} 根分析 K 线；"
                 "请先在“其他通用设置”中调低"
             )
 
@@ -1512,7 +1575,7 @@ class MainWindow(QMainWindow):
                 if kind == "tradingview":
                     settings.general.last_tradingview_exchange = self._tv_exchange_text()
                 try:
-                    save_settings(settings)
+                    save_settings(settings, self._ctx.settings_path)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
                         "Failed to persist data source settings (%s)",
@@ -1622,6 +1685,18 @@ class MainWindow(QMainWindow):
             label.setStyleSheet("color: #e6b800; font-size: 11px;")
             label.show()
             return
+        if kind == "okx":
+            checker = getattr(data_source, "is_symbol_available", None)
+            if callable(checker) and checker(symbol):
+                label.hide()
+                return
+            label.setText(
+                "OKX 品种需使用完整代码：现货如 XAUT-USDT，"
+                "永续如 XAU-USDT-SWAP。"
+            )
+            label.setStyleSheet("color: #e6b800; font-size: 11px;")
+            label.show()
+            return
         if kind != "mt5":
             label.hide()
             return
@@ -1717,15 +1792,18 @@ class MainWindow(QMainWindow):
         """Start (or restart) continuous data refresh for the current symbol/timeframe."""
         data_source = getattr(self._ctx, "data_source", None)
         if data_source is None or not getattr(data_source, "_connected", False):
-            if self._current_data_source_kind() == "longbridge":
+            reconnect_kind = self._current_data_source_kind()
+            if reconnect_kind in ("longbridge", "okx"):
                 try:
-                    self._switch_data_source("longbridge")
+                    self._switch_data_source(reconnect_kind)
                 except Exception as exc:  # noqa: BLE001
                     logger.warning(
-                        "Longbridge reconnect failed (%s)", type(exc).__name__
+                        "%s reconnect failed (%s)",
+                        reconnect_kind,
+                        type(exc).__name__,
                     )
                     self._status_bar.showMessage(
-                        f"Longbridge 重连失败：{exc}"
+                        f"{reconnect_kind.upper()} 重连失败：{exc}"
                     )
                 return
             self._status_bar.showMessage("数据源未连接，请先切换数据来源")
@@ -2153,9 +2231,12 @@ class MainWindow(QMainWindow):
 
             # ── Step 3: Unsubscribe, clear cached snapshot, re-subscribe ───────
             data_source = getattr(self._ctx, "data_source", None)
-            # Longbridge 的 subscribe 会先在线校验证券；保留旧订阅直到新代码通过，
+            # Longbridge / OKX 会先在线校验品种；保留旧订阅直到新代码通过，
             # 这样合法格式但不存在的代码不会破坏当前可用行情。
-            if data_source is not None and self._current_data_source_kind() != "longbridge":
+            if data_source is not None and self._current_data_source_kind() not in (
+                "longbridge",
+                "okx",
+            ):
                 try:
                     data_source.unsubscribe()
                 except Exception as exc:  # noqa: BLE001
@@ -2173,7 +2254,7 @@ class MainWindow(QMainWindow):
                         "subscribe(%s, %s) failed: %s", new_symbol, new_tf, exc
                     )
                     self._status_bar.showMessage(f"订阅失败：{exc}")
-                    if self._current_data_source_kind() == "longbridge":
+                    if self._current_data_source_kind() in ("longbridge", "okx"):
                         old_symbol = getattr(data_source, "_symbol", "")
                         old_timeframe = getattr(data_source, "_timeframe", "")
                         if old_symbol and old_timeframe:
@@ -2224,7 +2305,7 @@ class MainWindow(QMainWindow):
                 settings.general.last_timeframe = new_tf
                 try:
                     from pa_agent.config.settings import save_settings
-                    save_settings(settings)
+                    save_settings(settings, self._ctx.settings_path)
                 except Exception as exc:  # noqa: BLE001
                     logger.debug("Failed to persist symbol/tf to settings: %s", exc)
 
@@ -2526,8 +2607,7 @@ class MainWindow(QMainWindow):
             try:
                 settings.general.keep_analysis = enabled
                 from pa_agent.config.settings import save_settings
-                from pa_agent.config.paths import SETTINGS_JSON_PATH
-                save_settings(settings, SETTINGS_JSON_PATH)
+                save_settings(settings, self._ctx.settings_path)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -3847,8 +3927,7 @@ class MainWindow(QMainWindow):
             try:
                 settings.general.keep_analysis = False
                 from pa_agent.config.settings import save_settings
-                from pa_agent.config.paths import SETTINGS_JSON_PATH
-                save_settings(settings, SETTINGS_JSON_PATH)
+                save_settings(settings, self._ctx.settings_path)
                 logger.info(
                     "持续跟踪分析已因 %s 重试自动关闭", stage
                 )
@@ -4026,33 +4105,32 @@ class MainWindow(QMainWindow):
                 if s2_hit_pct is not None and hasattr(panel, "set_stage_cache_hit"):
                     panel.set_stage_cache_hit("stage2", s2_hit_pct)
 
+            usage_total = getattr(record, "usage_total", {}) or {}
+            token_data: dict = {}
+            if usage_total:
+                settings = getattr(self._ctx, "settings", None)
+                context_window = (
+                    getattr(settings.provider, "context_window", None)
+                    if settings is not None
+                    else None
+                )
+                token_data = _analysis_token_breakdown(record, context_window)
+                ledger = getattr(self._ctx, "ledger", None)
+                if ledger is not None and hasattr(ledger, "seed"):
+                    ledger.seed(
+                        total_input=token_data["total_input"],
+                        total_cached_input=token_data["total_cached_input"],
+                        total_output=token_data["total_output"],
+                        current_input=token_data["current_input"],
+                        current_cached_input=token_data["current_cached_input"],
+                        current_output=token_data["current_output"],
+                    )
+                    token_data = ledger.breakdown()
+                panel.update_token_display(token_data)
+
             if getattr(self, "_demo_mode", False):
                 panel.on_record_saved()
                 panel.set_input_enabled(False)
-                usage_total = getattr(record, "usage_total", {}) or {}
-                if usage_total:
-                    settings = getattr(self._ctx, "settings", None)
-                    context_window = 1_000_000
-                    if settings is not None:
-                        context_window = (
-                            getattr(settings.provider, "context_window", 1_000_000)
-                            or 1_000_000
-                        )
-                    prompt_tokens = usage_total.get("prompt_tokens", 0)
-                    cached_tokens = usage_total.get("cached_prompt_tokens", 0)
-                    completion_tokens = usage_total.get("completion_tokens", 0)
-                    total_tokens = usage_total.get("total_tokens", 0) or (
-                        prompt_tokens + completion_tokens
-                    )
-                    panel.update_token_display(
-                        {
-                            "context_used": total_tokens,
-                            "context_window": context_window,
-                            "total_input": prompt_tokens,
-                            "total_cached_input": cached_tokens,
-                            "total_output": completion_tokens,
-                        }
-                    )
                 return
 
             # ── Create FreeChatSession and wire to stream panel ───────────────
@@ -4086,26 +4164,6 @@ class MainWindow(QMainWindow):
                 logger.warning("Failed to create FreeChatSession: %s", exc)
 
             panel.on_record_saved()
-
-            usage_total = getattr(record, "usage_total", {}) or {}
-            if usage_total:
-                settings = getattr(self._ctx, "settings", None)
-                context_window = 1_000_000
-                if settings is not None:
-                    context_window = getattr(settings.provider, "context_window", 1_000_000) or 1_000_000
-
-                prompt_tokens = usage_total.get("prompt_tokens", 0)
-                cached_tokens = usage_total.get("cached_prompt_tokens", 0)
-                completion_tokens = usage_total.get("completion_tokens", 0)
-                total_tokens = usage_total.get("total_tokens", 0) or (prompt_tokens + completion_tokens)
-
-                panel.update_token_display({
-                    "context_used": total_tokens,
-                    "context_window": context_window,
-                    "total_input": prompt_tokens,
-                    "total_cached_input": cached_tokens,
-                    "total_output": completion_tokens,
-                })
 
     def _bind_decision_tree(
         self,
@@ -4338,12 +4396,12 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     def showEvent(self, event: QShowEvent | None) -> None:
-        """On first show, prompt for API Key when missing."""
+        """On first show, prompt when the active model has no usable auth path."""
         super().showEvent(event)
-        if self._startup_api_key_check_done:
+        if self._startup_ai_auth_check_done:
             return
-        self._startup_api_key_check_done = True
-        QTimer.singleShot(0, self._on_startup_api_key_check)
+        self._startup_ai_auth_check_done = True
+        QTimer.singleShot(0, self._on_startup_ai_auth_check)
         if not self._startup_tv_connectivity_check_done:
             self._startup_tv_connectivity_check_done = True
             QTimer.singleShot(0, self._on_startup_tv_connectivity_check)
@@ -4352,28 +4410,69 @@ class MainWindow(QMainWindow):
             return
         self._ensure_tradingview_reachable()
 
-    def _on_startup_api_key_check(self) -> None:
-        self._refresh_api_key_ui_state()
-        if not self._has_api_key_configured():
+    def _on_startup_ai_auth_check(self) -> None:
+        self._refresh_ai_auth_ui_state()
+        reason = self._ai_profile_readiness_error()
+        if reason is not None:
+            settings = getattr(self._ctx, "settings", None)
+            adapter_id = str(
+                getattr(getattr(settings, "provider", None), "adapter_id", "")
+                or "auto"
+            )
+            if adapter_id == "codex_subscription":
+                guidance = (
+                    "请点击「检测现有登录」；已登录可直接执行「测试并保存」，"
+                    "未登录再选择网页登录或设备码登录。"
+                    "\nCodex 订阅不需要 API Key。"
+                )
+            else:
+                guidance = (
+                    "API 接入请填写该供应商的 API Key，并点击「测试并保存」。"
+                )
             QMessageBox.information(
                 self,
-                "需要配置 API Key",
-                "尚未配置 API Key，将打开设置窗口。\n"
-                "请填写 API Key 并点击「保存」，才能使用「提交分析」与「增量分析」。",
+                "需要验证 AI 模型档案",
+                f"{reason}，将打开设置窗口。\n{guidance}",
             )
-            self._open_settings_dialog(focus_api_key=True)
+            self._open_settings_dialog(focus_auth=True)
 
-    def _has_api_key_configured(self) -> bool:
-        from pa_agent.config.settings import provider_api_key_configured
+    def _has_ai_auth_configured(self) -> bool:
+        from pa_agent.config.settings import active_provider_auth_configured
 
         settings = getattr(self._ctx, "settings", None)
-        return provider_api_key_configured(settings)
+        return active_provider_auth_configured(settings)
 
-    def _refresh_api_key_ui_state(self) -> None:
-        """Show or hide API Key warning and sync submit button state."""
-        configured = self._has_api_key_configured()
-        alert = getattr(self, "_api_key_alert_label", None)
+    def _ai_profile_readiness_error(self) -> str | None:
+        from pa_agent.config.settings import (
+            active_provider_auth_configured,
+            active_provider_verification_current,
+        )
+
+        settings = getattr(self._ctx, "settings", None)
+        adapter_id = str(
+            getattr(getattr(settings, "provider", None), "adapter_id", "")
+            or "auto"
+        )
+        # Codex 登录必须通过外部 CLI 检查。主界面状态刷新会被频繁调用，
+        # 这里不能同步启动子进程，否则按钮和窗口会出现“点击没反应”。
+        # 档案已有真实测试时允许进入；每次正式请求仍由 Codex 客户端检查登录。
+        if adapter_id == "codex_subscription":
+            if not active_provider_verification_current(settings):
+                return "当前 Codex 订阅档案尚未通过真实连接测试"
+            return None
+        if not active_provider_auth_configured(settings):
+            return "AI 模型 API Key 未配置"
+        if not active_provider_verification_current(settings):
+            return "当前 AI 模型档案尚未通过当前配置的真实连接测试"
+        return None
+
+    def _refresh_ai_auth_ui_state(self) -> None:
+        """Show or hide provider-aware auth warning and sync submit state."""
+        reason = self._ai_profile_readiness_error()
+        configured = reason is None
+        alert = getattr(self, "_ai_auth_alert_label", None)
         if alert is not None:
+            alert.setText(reason or "")
             alert.setVisible(not configured)
         self._sync_submit_button_state()
         status_bar = getattr(self, "_status_bar", None)
@@ -4382,16 +4481,14 @@ class MainWindow(QMainWindow):
         if self._analysis_in_progress:
             return
         cur = status_bar.currentMessage() or ""
-        if cur in ("就绪", "") or "API Key" in cur or "提交分析已锁定" in cur:
-            status_bar.showMessage(
-                "未配置 API Key：请点击左上角「AI 模型」填写后才能分析"
-            )
+        if cur in ("就绪", "") or "AI 模型认证" in cur or "提交分析已锁定" in cur:
+            status_bar.showMessage(reason or "")
 
-    def _open_settings_dialog(self, *, focus_api_key: bool = False) -> None:
-        """内部使用：启动时检测到 API Key 未配置时直接打开 AI 模型设置."""
-        self._open_ai_model_settings_dialog(focus_api_key=focus_api_key)
+    def _open_settings_dialog(self, *, focus_auth: bool = False) -> None:
+        """内部使用：启动时检测到认证未就绪时直接打开 AI 模型设置。"""
+        self._open_ai_model_settings_dialog(focus_auth=focus_auth)
 
-    def _open_ai_model_settings_dialog(self, *, focus_api_key: bool = False) -> None:
+    def _open_ai_model_settings_dialog(self, *, focus_auth: bool = False) -> None:
         """打开 AI 模型设置对话框."""
         from pa_agent.gui.ai_model_settings_dialog import AIModelSettingsDialog
         from pa_agent.config.settings import Settings
@@ -4408,33 +4505,44 @@ class MainWindow(QMainWindow):
         if settings is None:
             settings = Settings()
 
-        dlg = AIModelSettingsDialog(
-            settings,
-            parent=self,
-            activation_allowed=True,
-        )
-        if focus_api_key:
-            dlg.focus_api_key_field()
-        self._ai_settings_dialog_open = True
-        self._sync_submit_button_state()
-        try:
-            dlg.exec()
-        finally:
-            self._ai_settings_dialog_open = False
-            self._sync_submit_button_state()
-        self._ctx.settings = settings
-        requested_id = dlg.activation_requested_id
-        if requested_id:
-            self._activate_ai_profile_runtime(
-                requested_id,
-                candidate_settings=dlg.runtime_candidate,
+        dialog_settings = settings
+        while True:
+            dlg = AIModelSettingsDialog(
+                dialog_settings,
+                parent=self,
+                settings_path=self._ctx.settings_path,
+                activation_allowed=True,
             )
-        elif dlg.runtime_refresh_required:
-            self._activate_ai_profile_runtime(settings.active_ai_profile_id)
-        elif dlg.persisted_changes:
-            self._ai_sidebar.bind_settings(settings)
-            self._update_ai_mode_label()
-            self._refresh_api_key_ui_state()
+            if focus_auth:
+                dlg.focus_auth_field()
+                focus_auth = False
+            self._ai_settings_dialog_open = True
+            self._sync_submit_button_state()
+            try:
+                dlg.exec()
+            finally:
+                self._ai_settings_dialog_open = False
+                self._sync_submit_button_state()
+
+            requested_id = dlg.activation_requested_id
+            if requested_id:
+                activated = self._activate_ai_profile_runtime(
+                    requested_id,
+                    candidate_settings=dlg.runtime_candidate,
+                )
+                if not activated and dlg.runtime_candidate is not None:
+                    # 激活失败时不得自动重开窗口。配置冲突等错误会让候选 revision
+                    # 立即过期，自动重开只会再次失败并造成“应用重启”的错觉。
+                    break
+                break
+            if dlg.runtime_refresh_required:
+                self._activate_ai_profile_runtime(settings.active_ai_profile_id)
+            elif dlg.persisted_changes:
+                self._ai_sidebar.bind_settings(settings)
+                self._update_ai_mode_label()
+                self._refresh_ai_auth_ui_state()
+            break
+        self._ctx.settings = settings
 
     def _ai_request_in_progress(self) -> bool:
         """模型切换门禁：分析、准备任务或自由追问任一运行时均返回 True。"""
@@ -4478,7 +4586,11 @@ class MainWindow(QMainWindow):
         from pa_agent.ai.client_factory import create_ai_client
         from pa_agent.ai.deepseek_client import clear_provider_runtime_caches
         from pa_agent.ai.session_ledger import SessionTokenLedger
-        from pa_agent.config.settings import save_settings
+        from pa_agent.config.settings import (
+            SettingsConflictError,
+            apply_settings_snapshot,
+            save_ai_profile_activation,
+        )
         from pa_agent.util.logging import update_api_key
 
         settings = self._ctx.settings
@@ -4496,6 +4608,20 @@ class MainWindow(QMainWindow):
         if not profile.verification.is_current_for(profile.provider):
             QMessageBox.warning(self, "切换失败", "目标档案未通过当前配置的真实连接测试。")
             return False
+        from pa_agent.ai.provider_capabilities import resolve_provider_capability
+        from pa_agent.ai.provider_registry import provider_auth_configured
+
+        capability = resolve_provider_capability(profile.provider)
+        if (
+            capability.client_kind != "codex_cli"
+            and not provider_auth_configured(profile.provider)
+        ):
+            QMessageBox.warning(
+                self,
+                "切换失败",
+                "目标档案当前认证不可用，请检查对应 API Key。",
+            )
+            return False
 
         candidate_key = profile.provider.api_key or ""
         update_api_key(candidate_key)
@@ -4506,10 +4632,37 @@ class MainWindow(QMainWindow):
                 context_window=candidate.provider.context_window,
                 warn_pct=candidate.general.context_warning_threshold_pct,
             )
+            candidate = save_ai_profile_activation(
+                settings,
+                candidate,
+                self._ctx.settings_path,
+            )
+            if (
+                candidate.general.context_warning_threshold_pct
+                != settings.general.context_warning_threshold_pct
+            ):
+                new_ledger = SessionTokenLedger(
+                    context_window=candidate.provider.context_window,
+                    warn_pct=candidate.general.context_warning_threshold_pct,
+                )
             clear_provider_runtime_caches()
-            save_settings(candidate)
+        except SettingsConflictError:
+            logger.warning(
+                "AI profile activation rejected because AI settings changed "
+                "in another window"
+            )
+            QMessageBox.warning(
+                self,
+                "切换失败",
+                "另一个窗口也修改了 AI 模型档案。为避免覆盖，请重新启动 "
+                "PA_Agent，再确认、测试并激活。",
+            )
+            return False
         except Exception as exc:  # noqa: BLE001
-            logger.warning("AI profile activation failed (%s)", type(exc).__name__)
+            logger.warning(
+                "AI profile activation failed (%s)",
+                type(exc).__name__,
+            )
             QMessageBox.warning(
                 self,
                 "切换失败",
@@ -4517,12 +4670,10 @@ class MainWindow(QMainWindow):
             )
             return False
 
-        settings.ai_profiles = {
-            key: value.model_copy(deep=True)
-            for key, value in candidate.ai_profiles.items()
-        }
-        settings.active_ai_profile_id = candidate.active_ai_profile_id
-        settings.provider = candidate.provider.model_copy(deep=True)
+        # 保持共享 Settings 及其嵌套模型的对象身份不变，但同步磁盘完整快照。
+        # 这样既不会覆盖并发保存的普通设置，也不会让持有 general/prompt
+        # 等嵌套对象引用的运行组件继续读取旧值。
+        apply_settings_snapshot(settings, candidate)
         self._ctx.client = new_client
         self._ctx.ledger = new_ledger
         self._free_chat_session = None
@@ -4562,7 +4713,7 @@ class MainWindow(QMainWindow):
         )
         _refresh_runtime_state("log_mask", lambda: update_api_key(key))
         _refresh_runtime_state("mode_label", self._update_ai_mode_label)
-        _refresh_runtime_state("key_state", self._refresh_api_key_ui_state)
+        _refresh_runtime_state("auth_state", self._refresh_ai_auth_ui_state)
         active = settings.ai_profiles[settings.active_ai_profile_id]
         if post_commit_errors:
             self._status_bar.showMessage(
@@ -4669,8 +4820,9 @@ class MainWindow(QMainWindow):
 
     def _submit_block_reason(self) -> str | None:
         """Human-readable reason when submit is disabled, or None if allowed."""
-        if not self._has_api_key_configured():
-            return "未配置 API Key，请点击左上角「AI 模型」填写后才能分析"
+        readiness_error = self._ai_profile_readiness_error()
+        if readiness_error is not None:
+            return readiness_error
         if self._ai_settings_dialog_open:
             return "AI 模型设置窗口已打开"
         if self._demo_mode:

@@ -139,6 +139,40 @@ class LongbridgeAdapter:
     def _write(self, operation: Callable[[], Any]) -> Any:
         return self._write_executor(operation)
 
+    @staticmethod
+    def _available_exit_quantity(
+        record: ExecutionRecord,
+        session: Any,
+    ) -> Decimal:
+        """Read the broker position immediately before an exit-side write."""
+        rows = session.positions(record.plan.instrument)
+        total = Decimal("0")
+        matched = False
+        expected_symbol = record.plan.instrument.strip().upper()
+        for item in rows:
+            if str(item.get("symbol") or "").strip().upper() != expected_symbol:
+                continue
+            quantity = _decimal(item.get("quantity"))
+            available = _decimal(item.get("available_quantity"))
+            if quantity is None or available is None:
+                raise ReconciliationError(
+                    "Longbridge 持仓缺少可用数量，禁止发送离场方向订单"
+                )
+            if available < 0:
+                raise ReconciliationError(
+                    "Longbridge 持仓可用数量为负数，禁止发送离场方向订单"
+                )
+            direction_matches = (
+                quantity > 0
+                if record.plan.direction == "long"
+                else quantity < 0
+            )
+            if not direction_matches:
+                continue
+            matched = True
+            total += min(abs(quantity), available)
+        return total if matched else Decimal("0")
+
     def _session(self, profile: str):
         session = self._sessions.get(profile)
         if session is None:
@@ -510,6 +544,60 @@ class LongbridgeAdapter:
                     ),
                 }
             )
+        try:
+            broker_available = self._available_exit_quantity(
+                record,
+                self._session(record.selected_account),
+            )
+        except (
+            BrokerApiError,
+            BrokerTransportError,
+            ReconciliationError,
+        ) as exc:
+            return record.model_copy(
+                update={
+                    "needs_attention": True,
+                    "last_error": str(exc),
+                    "state_reason": (
+                        "无法核实 Longbridge 实际可用持仓，禁止提交止损"
+                    ),
+                }
+            )
+        desired_quantity = min(
+            Decimal(str(stop["quantity"])),
+            record.remaining_quantity,
+            broker_available,
+        )
+        if desired_quantity <= 0:
+            return record.model_copy(
+                update={
+                    "needs_attention": True,
+                    "state_reason": (
+                        "Longbridge 券商端没有可保护的同向可用持仓，"
+                        "禁止提交可能反向开仓的止损"
+                    ),
+                }
+            )
+        verified_quantity = str(desired_quantity)
+        if str(stop.get("quantity") or "") != verified_quantity:
+            state = dict(record.broker_state)
+            stop["quantity"] = verified_quantity
+            stop["position_quantity_mismatch"] = (
+                desired_quantity != record.remaining_quantity
+            )
+            state["stop_order"] = stop
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "needs_attention": (
+                        desired_quantity != record.remaining_quantity
+                    ),
+                    "state_reason": (
+                        "已按券商实际可用持仓校准 Longbridge 止损数量，"
+                        "等待下一轮再次核实后提交"
+                    ),
+                }
+            )
         body = {
             "symbol": record.plan.instrument,
             "side": "Sell" if record.plan.direction == "long" else "Buy",
@@ -546,12 +634,18 @@ class LongbridgeAdapter:
         stop["state"] = "pending"
         stop.pop("submit_runtime_id", None)
         state["stop_order"] = stop
+        quantity_mismatch = bool(stop.get("position_quantity_mismatch"))
         return record.model_copy(
             update={
                 "state": ExecutionState.OPEN,
                 "broker_state": state,
-                "state_reason": "Longbridge 仓位已成交且止损已建立",
-                "needs_attention": False,
+                "state_reason": (
+                    "Longbridge 止损已按券商实际可用持仓建立；"
+                    "本地仓位数量与券商不一致，请核对"
+                    if quantity_mismatch
+                    else "Longbridge 仓位已成交且止损已建立"
+                ),
+                "needs_attention": quantity_mismatch,
             }
         )
 
@@ -1240,6 +1334,59 @@ class LongbridgeAdapter:
                     update={
                         "broker_state": state,
                         "state_reason": "已持久化 Longbridge 减仓提交中状态",
+                    }
+                )
+            try:
+                broker_available = self._available_exit_quantity(
+                    record,
+                    session,
+                )
+            except (
+                BrokerApiError,
+                BrokerTransportError,
+                ReconciliationError,
+            ) as exc:
+                return record.model_copy(
+                    update={
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": (
+                            "无法核实 Longbridge 实际可用持仓，禁止提交减仓"
+                        ),
+                    }
+                )
+            desired_quantity = min(
+                Decimal(str(action["quantity"])),
+                record.remaining_quantity,
+                broker_available,
+            )
+            if desired_quantity <= 0:
+                return record.model_copy(
+                    update={
+                        "needs_attention": True,
+                        "state_reason": (
+                            "Longbridge 券商端没有同向可用持仓，"
+                            "禁止提交可能反向开仓的减仓单"
+                        ),
+                    }
+                )
+            verified_quantity = str(desired_quantity)
+            if str(action.get("quantity") or "") != verified_quantity:
+                action["quantity"] = verified_quantity
+                action["position_quantity_mismatch"] = (
+                    desired_quantity != record.remaining_quantity
+                )
+                state["partial_exit"] = action
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "needs_attention": (
+                            desired_quantity != record.remaining_quantity
+                        ),
+                        "state_reason": (
+                            "已按券商实际可用持仓校准 Longbridge 减仓数量，"
+                            "等待下一轮再次核实后提交"
+                        ),
                     }
                 )
             body = {

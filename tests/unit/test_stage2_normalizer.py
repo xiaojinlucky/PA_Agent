@@ -892,7 +892,8 @@ def test_prediction_guard_forbids_short_when_next_cycle_bullish() -> None:
             "entry_price": 4022.486,
             "take_profit_price": 4015.365,
             "take_profit_price_2": 4009.473,
-            "stop_loss_price": 4034.234,
+            # 保持盈亏比先通过，确保本用例只验证“下一周期看涨时禁止做空”。
+            "stop_loss_price": 4028.379,
             "reasoning": "test",
             "diagnosis_confidence": 64,
             "diagnosis_confidence_reasoning": "t",

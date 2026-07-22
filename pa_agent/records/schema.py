@@ -4,9 +4,26 @@ Defines the canonical schema for analysis records, followup turns,
 alarm payloads, validation errors, and experience entries.
 """
 
-from typing import Optional
+from typing import Literal, Optional
+from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def validate_sidecar_record_id(value: object) -> str:
+    """Validate a record basename before it is joined to the pending directory."""
+
+    record_id = str(value or "").strip()
+    if (
+        not record_id
+        or record_id in {".", ".."}
+        or "/" in record_id
+        or "\\" in record_id
+        or any(ord(char) < 32 or ord(char) == 127 for char in record_id)
+        or len(record_id) > 240
+    ):
+        raise ValueError("invalid analysis record id")
+    return record_id
 
 
 class RecordMeta(BaseModel):
@@ -55,6 +72,33 @@ class FollowupTurn(BaseModel):
     ai_reasoning: Optional[str]
     usage: dict
     cancelled: bool = False
+
+
+class ConversationCheckpoint(BaseModel):
+    """可恢复的官方模型线程定位信息；不含登录令牌或 API Key。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[1] = 1
+    record_id: str
+    provider_adapter: str = Field(min_length=1, max_length=128)
+    model: str = Field(min_length=1, max_length=256)
+    thread_id: str
+    last_turn: int = Field(default=0, ge=0)
+    updated_at_ms: int = Field(ge=0)
+
+    @field_validator("record_id", mode="before")
+    @classmethod
+    def _validate_record_id(cls, value: object) -> str:
+        return validate_sidecar_record_id(value)
+
+    @field_validator("thread_id", mode="before")
+    @classmethod
+    def _validate_thread_id(cls, value: object) -> str:
+        try:
+            return str(UUID(str(value or "").strip()))
+        except (ValueError, AttributeError) as exc:
+            raise ValueError("invalid Codex thread id") from exc
 
 
 class AlarmPayload(BaseModel):

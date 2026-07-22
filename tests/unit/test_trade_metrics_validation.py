@@ -144,7 +144,7 @@ def test_good_trade_passes_aggressive_stance() -> None:
 
 
 def test_high_rr_allowed_when_trader_equation_passes() -> None:
-    """2:1 reward is allowed when there is no upper RR cap."""
+    """高盈亏比通过时必须保留模型给出的结构止损。"""
     decision = {
         "order_type": "限价单",
         "order_direction": "做多",
@@ -154,11 +154,33 @@ def test_high_rr_allowed_when_trader_equation_passes() -> None:
         "stop_loss_price": 95.0,
         "estimated_win_rate": 55,
     }
+    original_stop = decision["stop_loss_price"]
     errors = validate_order_trade_metrics(decision, decision_stance="aggressive")
     assert not errors
+    assert decision["stop_loss_price"] == original_stop
     rr = compute_risk_reward(100.0, 110.0, 95.0, "做多")
     assert rr is not None
     assert rr["ratio"] == 2.0
+
+
+def test_extreme_aggressive_positive_expectancy_is_not_destroyed_by_stop_rewrite() -> None:
+    """复现 OKX Demo：45% 胜率配合高 RR 原本为正期望，不得被改成 1:1 后拒绝。"""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 4002.5,
+        "take_profit_price": 4008.4,
+        "take_profit_price_2": 4012.9,
+        "stop_loss_price": 4001.9,
+        "estimated_win_rate": 45,
+    }
+    original_stop = decision["stop_loss_price"]
+    errors = validate_order_trade_metrics(
+        decision,
+        decision_stance="extreme_aggressive",
+    )
+    assert not errors
+    assert decision["stop_loss_price"] == original_stop
 
 
 def test_stage2_validator_coerces_bad_rr_to_no_order() -> None:

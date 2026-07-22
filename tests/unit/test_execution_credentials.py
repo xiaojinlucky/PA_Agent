@@ -36,6 +36,14 @@ def _clear(monkeypatch):
         "OKX_SECRET_KEY",
         "OKX_API_SECRET",
         "OKX_PASSPHRASE",
+        "OKX_DEMO_API_KEY",
+        "OKX_DEMO_SECRET_KEY",
+        "OKX_DEMO_API_SECRET",
+        "OKX_DEMO_PASSPHRASE",
+        "OKX_LIVE_API_KEY",
+        "OKX_LIVE_SECRET_KEY",
+        "OKX_LIVE_API_SECRET",
+        "OKX_LIVE_PASSPHRASE",
         "PA_AGENT_LIVE_TRADING_ENABLED",
         "PA_AGENT_PAPER_TRADING_ENABLED",
         "OKX_LIVE_ENABLED",
@@ -227,7 +235,48 @@ def test_okx_passphrase_is_mandatory(tmp_path, monkeypatch):
     )
 
     with pytest.raises(CredentialError, match="OKX_PASSPHRASE"):
-        load_okx_credentials(env_file=env_file)
+        load_okx_credentials("demo", env_file=env_file)
+
+
+def test_okx_demo_and_live_credentials_are_strictly_isolated(
+    tmp_path,
+    monkeypatch,
+):
+    _clear(monkeypatch)
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "OKX_DEMO_API_KEY=demo-key\n"
+        "OKX_DEMO_SECRET_KEY=demo-secret\n"
+        "OKX_DEMO_PASSPHRASE=demo-pass\n"
+        "OKX_LIVE_API_KEY=live-key\n"
+        "OKX_LIVE_SECRET_KEY=live-secret\n"
+        "OKX_LIVE_PASSPHRASE=live-pass\n",
+        encoding="utf-8",
+    )
+
+    demo = load_okx_credentials("demo", env_file=env_file)
+    live = load_okx_credentials("live", env_file=env_file)
+
+    assert demo.api_key == "demo-key"
+    assert live.api_key == "live-key"
+
+
+def test_okx_live_never_falls_back_to_legacy_demo_credentials(
+    tmp_path,
+    monkeypatch,
+):
+    _clear(monkeypatch)
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "OKX_API_KEY=demo-key\n"
+        "OKX_SECRET_KEY=demo-secret\n"
+        "OKX_PASSPHRASE=demo-pass\n",
+        encoding="utf-8",
+    )
+
+    assert load_okx_credentials("demo", env_file=env_file).api_key == "demo-key"
+    with pytest.raises(CredentialError, match="OKX live"):
+        load_okx_credentials("live", env_file=env_file)
 
 
 def test_hard_live_gate_is_false_unless_explicitly_true(tmp_path, monkeypatch):

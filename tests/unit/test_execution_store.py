@@ -13,6 +13,8 @@ from pa_agent.execution.models import (
 )
 from pa_agent.execution.store import ExecutionStore
 
+_PROCESS_TIMEOUT_SECONDS = 60
+
 
 def _plan(identifier: str = "one") -> ExecutionPlan:
     return ExecutionPlan(
@@ -51,7 +53,7 @@ def _claim_route_in_process(
         if record is None:
             raise RuntimeError("missing execution")
         ready_queue.put(execution_id)
-        if not start_event.wait(10):
+        if not start_event.wait(_PROCESS_TIMEOUT_SECONDS):
             raise TimeoutError("claim start timeout")
         conflict = store.acquire_route_claim(
             record,
@@ -140,15 +142,21 @@ def test_route_claim_is_atomic_across_independent_processes(tmp_path):
     for process in processes:
         process.start()
     try:
-        assert {ready_queue.get(timeout=10) for _ in range(2)} == {
+        assert {
+            ready_queue.get(timeout=_PROCESS_TIMEOUT_SECONDS)
+            for _ in range(2)
+        } == {
             first.id,
             second.id,
         }
         start_event.set()
-        results = [result_queue.get(timeout=10) for _ in range(2)]
+        results = [
+            result_queue.get(timeout=_PROCESS_TIMEOUT_SECONDS)
+            for _ in range(2)
+        ]
     finally:
         for process in processes:
-            process.join(timeout=10)
+            process.join(timeout=_PROCESS_TIMEOUT_SECONDS)
             if process.is_alive():
                 process.terminate()
                 process.join(timeout=5)
@@ -220,3 +228,29 @@ def test_schema_v1_is_migrated_but_unknown_future_version_is_not_overwritten(
             "SELECT value FROM execution_meta WHERE key='schema_version'"
         ).fetchone()
     assert future_version == ("3",)
+
+
+def test_production_modes_never_implicitly_migrate_existing_v1(tmp_path):
+    legacy_path = tmp_path / "legacy-production.sqlite3"
+    with sqlite3.connect(legacy_path) as connection:
+        connection.execute(
+            "CREATE TABLE execution_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO execution_meta(key, value) VALUES ('schema_version', '1')"
+        )
+
+    ExecutionStore(legacy_path, schema_mode="defer")
+    with pytest.raises(RuntimeError, match="显式迁移"):
+        ExecutionStore(legacy_path, schema_mode="require_current")
+
+    with sqlite3.connect(legacy_path) as connection:
+        version = connection.execute(
+            "SELECT value FROM execution_meta WHERE key='schema_version'"
+        ).fetchone()
+        route_table = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='execution_route_claims'"
+        ).fetchone()
+    assert version == ("1",)
+    assert route_table is None

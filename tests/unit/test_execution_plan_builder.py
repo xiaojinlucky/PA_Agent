@@ -14,7 +14,12 @@ from pa_agent.execution.plan_builder import (
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 
 
-def _record(*, direction: str = "做多", order_type: str = "限价单") -> AnalysisRecord:
+def _record(
+    *,
+    direction: str = "做多",
+    order_type: str = "限价单",
+    symbol: str = "XAU-USDT-SWAP",
+) -> AnalysisRecord:
     if direction == "做多":
         entry, tp1, tp2, stop = 100, 110, 120, 95
     else:
@@ -23,7 +28,7 @@ def _record(*, direction: str = "做多", order_type: str = "限价单") -> Anal
         meta=RecordMeta(
             timestamp_local_iso="2026-07-17T00:00:00+08:00",
             timestamp_local_ms=1784217600000,
-            symbol="XAUUSD",
+            symbol=symbol,
             timeframe="15m",
             bar_count=100,
             ai_provider={"model": "test"},
@@ -66,7 +71,7 @@ def _settings() -> Settings:
     settings.execution.enabled = True
     settings.execution.selected_broker = "okx"
     settings.execution.min_trade_confidence = 70
-    settings.execution.okx.source_symbol = "XAUUSD"
+    settings.execution.okx.source_symbol = "XAU-USDT-SWAP"
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.quantity = "2"
     settings.execution.okx.product = "swap"
@@ -166,9 +171,10 @@ def test_plan_requires_file_content_to_match_memory_record(tmp_path, monkeypatch
 
 
 def test_okx_spot_cannot_open_short(tmp_path, monkeypatch):
-    record = _record(direction="做空")
+    record = _record(direction="做空", symbol="XAUT-USDT")
     settings = _settings()
     settings.execution.okx.product = "spot"
+    settings.execution.okx.source_symbol = "XAUT-USDT"
     settings.execution.okx.instrument = "XAUT-USDT"
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
     path = _persist(record, tmp_path)
@@ -207,10 +213,10 @@ def test_longbridge_paper_route_is_demo_and_never_inherits_live_options(
     tmp_path,
     monkeypatch,
 ):
-    record = _record()
+    record = _record(symbol="GLD.US")
     settings = _settings()
     settings.execution.selected_broker = "longbridge"
-    settings.execution.longbridge.source_symbol = "XAUUSD"
+    settings.execution.longbridge.source_symbol = "GLD.US"
     settings.execution.longbridge.instrument = "GLD.US"
     settings.execution.longbridge.quantity = "1"
     settings.execution.longbridge.preferred_account = "paper"
@@ -228,3 +234,17 @@ def test_longbridge_paper_route_is_demo_and_never_inherits_live_options(
     assert plan.allow_account_fallback is False
     assert plan.longbridge_allow_outside_rth is False
     assert execution_route_fingerprint(settings) != paper_fingerprint
+
+
+def test_plan_blocks_cross_instrument_price_reuse(tmp_path, monkeypatch):
+    record = _record(symbol="XAUUSD")
+    settings = _settings()
+    settings.execution.okx.source_symbol = "XAUUSD"
+    settings.execution.okx.instrument = "XAU-USDT-SWAP"
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    with pytest.raises(PlanBlocked) as exc:
+        build_execution_plan(record, settings, record_path=path)
+
+    assert exc.value.code == "price_basis_mismatch"

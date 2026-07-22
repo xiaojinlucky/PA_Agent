@@ -43,6 +43,16 @@ def _client(transport, *, simulated=False):
     )
 
 
+def _algo_rows(count: int, *, start: int = 0) -> list[dict[str, str]]:
+    return [
+        {
+            "algoId": f"algo-{index}",
+            "algoClOrdId": f"other-client-{index}",
+        }
+        for index in range(start, start + count)
+    ]
+
+
 def test_private_request_signature_uses_exact_path_query_and_compact_body():
     transport = FakeTransport(
         [_response({"code": "0", "data": [{"ordId": "1", "sCode": "0"}], "msg": ""})]
@@ -172,6 +182,47 @@ def test_public_instruments_does_not_send_private_headers():
     assert "OK-ACCESS-KEY" not in transport.calls[0]["headers"]
 
 
+def test_candles_use_public_endpoint_and_bounded_limit():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [
+                        [
+                            "1784304000000",
+                            "4000",
+                            "4010",
+                            "3990",
+                            "4005",
+                            "10",
+                            "0.01",
+                            "40050",
+                            "1",
+                        ]
+                    ],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+    client = _client(transport, simulated=True)
+
+    rows = client.candles(
+        instrument="XAU-USDT-SWAP",
+        bar="30m",
+        limit=999,
+    )
+
+    assert rows[0][4] == "4005"
+    call = transport.calls[0]
+    assert call["url"].endswith(
+        "/api/v5/market/candles"
+        "?bar=30m&instId=XAU-USDT-SWAP&limit=300"
+    )
+    assert "OK-ACCESS-KEY" not in call["headers"]
+
+
 def test_leverage_info_uses_read_only_private_endpoint():
     transport = FakeTransport(
         [
@@ -202,3 +253,159 @@ def test_leverage_info_uses_read_only_private_endpoint():
     assert transport.calls[0]["url"].endswith(
         "/api/v5/account/leverage-info?instId=BTC-USDT-SWAP&mgnMode=cross"
     )
+
+
+def test_algo_lookup_confirms_absence_only_after_all_read_queries_succeed():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "51603",
+                    "data": [],
+                    "msg": "Order does not exist",
+                }
+            ),
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+        ]
+    )
+    client = _client(transport, simulated=True)
+
+    found = client.find_algo_order_by_client_id(
+        client_algo_id="protection-client",
+        order_type="oco",
+        instrument="XAU-USDT-SWAP",
+    )
+
+    assert found is None
+    assert [call["method"] for call in transport.calls] == ["GET"] * 5
+    assert "/api/v5/trade/orders-algo-pending?" in transport.calls[1]["url"]
+    assert all(
+        "/api/v5/trade/orders-algo-history?" in call["url"]
+        for call in transport.calls[2:]
+    )
+
+
+def test_algo_lookup_finds_match_on_second_pending_page():
+    first_page = _algo_rows(100)
+    target = {
+        "algoId": "algo-target",
+        "algoClOrdId": "protection-client",
+        "state": "live",
+    }
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "51603",
+                    "data": [],
+                    "msg": "Order does not exist",
+                }
+            ),
+            _response({"code": "0", "data": first_page, "msg": ""}),
+            _response({"code": "0", "data": [target], "msg": ""}),
+        ]
+    )
+
+    found = _client(transport, simulated=True).find_algo_order_by_client_id(
+        client_algo_id="protection-client",
+        order_type="oco",
+        instrument="XAU-USDT-SWAP",
+    )
+
+    assert found == target
+    assert len(transport.calls) == 3
+    assert "after=algo-99" in transport.calls[2]["url"]
+    assert "limit=100" in transport.calls[2]["url"]
+
+
+def test_algo_lookup_confirms_absence_after_more_than_one_hundred_rows():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "51603",
+                    "data": [],
+                    "msg": "Order does not exist",
+                }
+            ),
+            _response({"code": "0", "data": _algo_rows(100), "msg": ""}),
+            _response({"code": "0", "data": _algo_rows(1, start=100), "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+        ]
+    )
+
+    found = _client(transport, simulated=True).find_algo_order_by_client_id(
+        client_algo_id="protection-client",
+        order_type="oco",
+        instrument="XAU-USDT-SWAP",
+    )
+
+    assert found is None
+    assert len(transport.calls) == 6
+    assert "after=algo-99" in transport.calls[2]["url"]
+
+
+def test_algo_lookup_second_page_failure_never_confirms_absence():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "51603",
+                    "data": [],
+                    "msg": "Order does not exist",
+                }
+            ),
+            _response({"code": "0", "data": _algo_rows(100), "msg": ""}),
+            _response(
+                {
+                    "code": "50011",
+                    "data": [],
+                    "msg": "temporarily unavailable",
+                }
+            ),
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport, simulated=True).find_algo_order_by_client_id(
+            client_algo_id="protection-client",
+            order_type="oco",
+            instrument="XAU-USDT-SWAP",
+        )
+
+    assert caught.value.code == "50011"
+    assert len(transport.calls) == 3
+
+
+def test_algo_lookup_repeated_cursor_never_confirms_absence():
+    first_page = _algo_rows(100)
+    repeated_page = _algo_rows(99, start=100) + [first_page[-1]]
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "51603",
+                    "data": [],
+                    "msg": "Order does not exist",
+                }
+            ),
+            _response({"code": "0", "data": first_page, "msg": ""}),
+            _response({"code": "0", "data": repeated_page, "msg": ""}),
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport, simulated=True).find_algo_order_by_client_id(
+            client_algo_id="protection-client",
+            order_type="oco",
+            instrument="XAU-USDT-SWAP",
+        )
+
+    assert caught.value.write_may_have_reached is False
+    assert "游标缺失或重复" in str(caught.value)
+    assert len(transport.calls) == 3

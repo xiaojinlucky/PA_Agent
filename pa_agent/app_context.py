@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 
@@ -11,6 +12,7 @@ class AppContext:
     """Carries shared resources to GUI widgets and orchestrators."""
 
     settings: Any = None
+    settings_path: Path | None = None
     logger: logging.Logger = field(default_factory=lambda: logging.getLogger("pa_agent"))
     event_bus: Any = None
 
@@ -25,7 +27,7 @@ class AppContext:
     pending_writer: Any = None    # PendingWriter
     exp_reader: Any = None        # ExperienceReader
     ledger: Any = None            # SessionTokenLedger
-    execution_service: Any = None # ExecutionService
+    execution_service: Any = None # GUI-side ExecutionController
 
     @classmethod
     def bootstrap(cls) -> "AppContext":
@@ -99,8 +101,6 @@ class AppContext:
             app_logger.warning("Initial data source subscription failed: %s", exc)
 
         # ── AI client ─────────────────────────────────────────────────────────
-        from pa_agent.ai.client_factory import create_ai_client
-
         client = create_ai_client(settings.provider, logger_=app_logger)
 
         # ── Prompt assembler ──────────────────────────────────────────────────
@@ -128,10 +128,10 @@ class AppContext:
             warn_pct=settings.general.context_warning_threshold_pct,
         )
 
-        # ── Broker execution lifecycle (starts disarmed) ─────────────────────
-        from pa_agent.execution.service import ExecutionService
+        # ── Broker execution control plane (never writes to brokers) ──────────
+        from pa_agent.execution.controller import ExecutionController
 
-        execution_service = ExecutionService(
+        execution_service = ExecutionController(
             settings=settings,
             pending_writer=pending_writer,
             event_bus=event_bus,
@@ -140,6 +140,7 @@ class AppContext:
 
         return cls(
             settings=settings,
+            settings_path=SETTINGS_JSON_PATH,
             logger=app_logger,
             event_bus=event_bus,
             data_source=data_source,

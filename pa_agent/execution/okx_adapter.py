@@ -1,10 +1,11 @@
 """OKX spot/perpetual lifecycle adapter."""
 from __future__ import annotations
 
+import math
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import Decimal, InvalidOperation
+from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
 from pa_agent.execution.credentials import account_identity_fingerprint
@@ -104,6 +105,19 @@ def _is_multiple(value: Decimal, step: Decimal) -> bool:
     if step <= 0:
         return False
     return value % step == 0
+
+
+def _align_float_artifact(value: Decimal, step: Decimal) -> Decimal | None:
+    """只消除一格二进制浮点精度内的尾差，真实的非整倍价格仍拒绝。"""
+    if _is_multiple(value, step):
+        return value
+    nearest_units = (value / step).to_integral_value(rounding=ROUND_HALF_EVEN)
+    nearest = nearest_units * step
+    as_float = float(value)
+    if not math.isfinite(as_float):
+        return None
+    tolerance = Decimal(str(math.ulp(as_float)))
+    return nearest if abs(value - nearest) <= tolerance else None
 
 
 def _client_id(execution_id: str, action: str, index: int = 0) -> str:
@@ -233,16 +247,31 @@ class OkxAdapter:
             raise PreflightError(
                 f"OKX 数量 {plan.quantity} 必须不小于 {minimum} 且为 {lot} 的整数倍"
             )
-        for label, price in (
-            ("入场价", plan.entry_price),
-            ("止盈1", plan.take_profit_1),
-            ("止盈2", plan.take_profit_2),
-            ("止损价", plan.stop_loss),
+        aligned_prices: dict[str, Decimal] = {}
+        for field, label, price in (
+            ("entry_price", "入场价", plan.entry_price),
+            ("take_profit_1", "止盈1", plan.take_profit_1),
+            ("take_profit_2", "止盈2", plan.take_profit_2),
+            ("stop_loss", "止损价", plan.stop_loss),
         ):
-            if not _is_multiple(price, tick):
+            aligned = _align_float_artifact(price, tick)
+            if aligned is None:
                 raise PreflightError(
                     f"OKX {label} {price} 不是价格跳动 {tick} 的整数倍"
                 )
+            aligned_prices[field] = aligned
+        entry_price = aligned_prices["entry_price"]
+        take_profit_1 = aligned_prices["take_profit_1"]
+        take_profit_2 = aligned_prices["take_profit_2"]
+        stop_loss = aligned_prices["stop_loss"]
+        if plan.direction == "long" and not (
+            stop_loss < entry_price < take_profit_1 <= take_profit_2
+        ):
+            raise PreflightError("OKX 价格按最小跳动对齐后不满足做多价格顺序")
+        if plan.direction == "short" and not (
+            stop_loss > entry_price > take_profit_1 >= take_profit_2
+        ):
+            raise PreflightError("OKX 价格按最小跳动对齐后不满足做空价格顺序")
 
         account_config = self._client.account_config()
         account_identity = self._identity_from_config(plan, account_config)
@@ -254,7 +283,7 @@ class OkxAdapter:
             raise PreflightError(f"不支持的 OKX 持仓模式：{position_mode}")
 
         price_for_max = (
-            str(plan.entry_price) if plan.entry_type in {"limit", "breakout"} else None
+            str(entry_price) if plan.entry_type in {"limit", "breakout"} else None
         )
         maximum = self._client.max_order_size(
             instrument=plan.instrument,
@@ -295,16 +324,16 @@ class OkxAdapter:
             leverage = ""
 
         warnings: list[str] = []
-        if plan.take_profit_1 == plan.take_profit_2:
+        if take_profit_1 == take_profit_2:
             warnings.append("两档止盈相同，将只建立一档保护")
         return PreflightResult(
             selected_account="okx",
             account_identity=account_identity,
             quantity=plan.quantity,
-            entry_price=plan.entry_price,
-            take_profit_1=plan.take_profit_1,
-            take_profit_2=plan.take_profit_2,
-            stop_loss=plan.stop_loss,
+            entry_price=entry_price,
+            take_profit_1=take_profit_1,
+            take_profit_2=take_profit_2,
+            stop_loss=stop_loss,
             price_tick=tick,
             quantity_step=lot,
             minimum_quantity=minimum,
@@ -753,8 +782,10 @@ class OkxAdapter:
             )
         if pending.get("state") == "unknown":
             try:
-                found = self._client.get_algo_order(
-                    client_algo_id=str(pending["client_algo_id"])
+                found = self._client.find_algo_order_by_client_id(
+                    client_algo_id=str(pending["client_algo_id"]),
+                    order_type="oco",
+                    instrument=record.plan.instrument,
                 )
             except (BrokerApiError, BrokerTransportError) as exc:
                 return record.model_copy(
@@ -764,13 +795,33 @@ class OkxAdapter:
                         "state_reason": "OKX 保护单提交状态未知，正在只读对账",
                     }
                 )
+            if found is None:
+                for target in targets:
+                    if target["client_algo_id"] == pending["client_algo_id"]:
+                        target["state"] = "confirmed_absent"
+                        target.pop("submit_runtime_id", None)
+                        break
+                state["protection_targets"] = targets
+                state.pop("write_unknown", None)
+                state.pop("risk_reducing_writes_blocked", None)
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "needs_attention": True,
+                        "last_error": "",
+                        "state_reason": (
+                            "已确认 OKX 保护单未创建；"
+                            "等待人工离场或明确重建保护"
+                        ),
+                    }
+                )
             algo_id = str(found.get("algoId") or "")
             if not algo_id:
                 return record.model_copy(
                     update={
                         "needs_attention": True,
                         "state_reason": (
-                            "OKX 保护单提交状态未知；未查到原订单，禁止自动重发"
+                            "OKX 保护单查询结果缺少 algoId，禁止自动重发"
                         ),
                     }
                 )
@@ -2167,6 +2218,24 @@ class OkxAdapter:
                 or interrupted_submit
             ):
                 return self._place_one_protection(record)
+            if (
+                pending is not None
+                and pending.get("state") == "confirmed_absent"
+            ):
+                broker_state = dict(record.broker_state)
+                broker_state.pop("write_unknown", None)
+                broker_state.pop("risk_reducing_writes_blocked", None)
+                broker_state.pop("identity_or_route_blocked", None)
+                return record.model_copy(
+                    update={
+                        "broker_state": broker_state,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "已确认 OKX 保护单未创建；"
+                            "禁止自动重发，等待人工离场或明确重建保护"
+                        ),
+                    }
+                )
             if not allow_writes:
                 return record.model_copy(
                     update={
@@ -2204,6 +2273,7 @@ class OkxAdapter:
                 "broker_state": state,
                 "state_reason": "准备撤销 OKX 保护单并主动离场",
                 "needs_attention": False,
+                "last_error": "",
             }
         )
 

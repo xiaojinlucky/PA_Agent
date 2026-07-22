@@ -23,6 +23,10 @@ _LONGBRIDGE_SYMBOL_RE = re.compile(
     r"^[A-Za-z0-9][A-Za-z0-9._!-]*\.[A-Za-z]{2,4}$"
 )
 
+# OKX 现货 / 永续合约默认代码；公共行情不需要 API 凭据。
+OKX_DEFAULT_SYMBOL = "XAU-USDT-SWAP"
+_OKX_SYMBOL_RE = re.compile(r"^[A-Za-z0-9]+(?:-[A-Za-z0-9]+){1,2}$")
+
 # Exchange → correct gold symbol on TradingView (do not use XAUUSD on TVC)
 TV_GOLD_SYMBOL_BY_EXCHANGE: dict[str, str] = {
     "OANDA": "XAUUSD",
@@ -107,6 +111,13 @@ def normalize_gold_symbol_for_kind(kind: str, symbol: str) -> str:
     from pa_agent.data.ashare_common import normalize_ashare_symbol
 
     sym = (symbol or "").strip()
+    if kind == "okx":
+        normalized = sym.upper()
+        if _OKX_SYMBOL_RE.fullmatch(normalized):
+            parts = normalized.split("-")
+            if len(parts) == 2 or (len(parts) == 3 and parts[-1] == "SWAP"):
+                return normalized
+        return OKX_DEFAULT_SYMBOL
     if kind == "longbridge":
         return sym.upper() if _LONGBRIDGE_SYMBOL_RE.fullmatch(sym) else LONGBRIDGE_DEFAULT_SYMBOL
     if kind in ("akshare", "eastmoney", "tushare"):

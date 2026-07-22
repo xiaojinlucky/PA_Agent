@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 from pathlib import Path
+from typing import Literal
 
 from pa_agent.execution.models import (
     ACTIVE_EXECUTION_STATES,
@@ -18,6 +19,7 @@ from pa_agent.execution.models import (
 )
 
 _SCHEMA_VERSION = 2
+_SchemaMode = Literal["auto", "defer", "require_current"]
 _CLAIM_RELEASABLE_STATES = frozenset(
     {
         ExecutionState.CLOSED,
@@ -32,14 +34,36 @@ _CLAIM_RELEASABLE_STATES = frozenset(
 class ExecutionStore:
     """Persist every execution transition before or after broker side effects."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        schema_mode: _SchemaMode = "auto",
+    ) -> None:
         if path is None:
             from pa_agent.config.paths import EXECUTION_DB_PATH
 
             path = EXECUTION_DB_PATH
         self._path = Path(path)
         self._lock = threading.RLock()
-        self._initialise()
+        if schema_mode not in {"auto", "defer", "require_current"}:
+            raise ValueError(f"未知 execution schema_mode: {schema_mode}")
+        if schema_mode == "auto" or not self._path.exists():
+            self._initialise()
+        else:
+            version = self._read_schema_version()
+            if version not in {1, _SCHEMA_VERSION}:
+                raise RuntimeError(
+                    "不支持的 execution.sqlite3 schema 版本"
+                )
+            if (
+                schema_mode == "require_current"
+                and version != _SCHEMA_VERSION
+            ):
+                raise RuntimeError(
+                    "execution.sqlite3 需要显式迁移到 schema v2；"
+                    "当前进程未获准自动修改生产账本"
+                )
 
     @property
     def path(self) -> Path:
@@ -56,6 +80,26 @@ class ExecutionStore:
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA synchronous = FULL")
         return connection
+
+    def _read_schema_version(self) -> int:
+        with self._lock, self._connect() as connection:
+            try:
+                row = connection.execute(
+                    "SELECT value FROM execution_meta "
+                    "WHERE key='schema_version'"
+                ).fetchone()
+            except sqlite3.Error as exc:
+                raise RuntimeError(
+                    "execution.sqlite3 缺少有效 schema 元数据"
+                ) from exc
+        if row is None:
+            raise RuntimeError("execution.sqlite3 缺少 schema 版本")
+        try:
+            return int(row["value"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(
+                "execution.sqlite3 schema 版本无效"
+            ) from exc
 
     def _initialise(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

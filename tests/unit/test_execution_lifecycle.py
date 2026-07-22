@@ -15,7 +15,12 @@ from tests.unit.test_okx_adapter import FakeOkxClient
 
 
 def _service(tmp_path, monkeypatch, *, settings, adapter):
-    analysis = _record()
+    route = (
+        settings.execution.longbridge
+        if settings.execution.selected_broker == "longbridge"
+        else settings.execution.okx
+    )
+    analysis = _record(symbol=route.source_symbol)
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
     path = _persist(analysis, tmp_path)
     service = ExecutionService(
@@ -35,7 +40,7 @@ def _okx_settings() -> Settings:
     settings = Settings()
     settings.execution.enabled = True
     settings.execution.selected_broker = "okx"
-    settings.execution.okx.source_symbol = "XAUUSD"
+    settings.execution.okx.source_symbol = "XAU-USDT-SWAP"
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.quantity = "2"
     settings.execution.okx.product = "swap"
@@ -46,7 +51,7 @@ def _longbridge_settings() -> Settings:
     settings = Settings()
     settings.execution.enabled = True
     settings.execution.selected_broker = "longbridge"
-    settings.execution.longbridge.source_symbol = "XAUUSD"
+    settings.execution.longbridge.source_symbol = "GLD.US"
     settings.execution.longbridge.instrument = "GLD.US"
     settings.execution.longbridge.quantity = "2"
     settings.execution.longbridge.preferred_account = "intraday"
@@ -141,6 +146,7 @@ def test_okx_spot_analysis_to_oco_monitoring_and_active_exit(
 ):
     settings = _okx_settings()
     settings.execution.okx.product = "spot"
+    settings.execution.okx.source_symbol = "XAUT-USDT"
     settings.execution.okx.instrument = "XAUT-USDT"
     client = FakeOkxClient()
     adapter = OkxAdapter(client)

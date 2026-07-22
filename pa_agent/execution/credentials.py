@@ -197,23 +197,63 @@ def load_longbridge_account_credentials(
     raise CredentialError(f"未找到 {profile} 账户的完整 Longbridge 凭据（需要 {expected}）")
 
 
-def load_okx_credentials(*, env_file: Path | None = None) -> OkxCredentials:
-    values = merged_environment(env_file)
-    api_key = str(values.get("OKX_API_KEY", "") or "").strip()
-    secret_key = str(
-        values.get("OKX_SECRET_KEY", "")
-        or values.get("OKX_API_SECRET", "")
-        or ""
-    ).strip()
-    passphrase = str(values.get("OKX_PASSPHRASE", "") or "").strip()
+def _okx_credentials_for_prefix(
+    values: Mapping[str, str],
+    *,
+    prefix: str,
+) -> OkxCredentials | None:
+    api_key_name = f"{prefix}_API_KEY"
+    secret_names = (f"{prefix}_SECRET_KEY", f"{prefix}_API_SECRET")
+    passphrase_name = f"{prefix}_PASSPHRASE"
+    api_key = str(values.get(api_key_name, "") or "").strip()
+    secret_key = next(
+        (
+            str(values.get(name, "") or "").strip()
+            for name in secret_names
+            if str(values.get(name, "") or "").strip()
+        ),
+        "",
+    )
+    passphrase = str(values.get(passphrase_name, "") or "").strip()
     present = (bool(api_key), bool(secret_key), bool(passphrase))
-    if not all(present):
-        labels = ("OKX_API_KEY", "OKX_SECRET_KEY", "OKX_PASSPHRASE")
+    if all(present):
+        return OkxCredentials(api_key, secret_key, passphrase)
+    if any(present):
+        labels = (api_key_name, secret_names[0], passphrase_name)
         missing = [
-            label for label, configured in zip(labels, present, strict=True) if not configured
+            label
+            for label, configured in zip(labels, present, strict=True)
+            if not configured
         ]
-        raise CredentialError(f"OKX 凭据不完整，缺少：{', '.join(missing)}")
-    return OkxCredentials(api_key, secret_key, passphrase)
+        raise CredentialError(
+            f"{prefix}_* 凭据不完整，缺少：{', '.join(missing)}"
+        )
+    return None
+
+
+def load_okx_credentials(
+    environment: str,
+    *,
+    env_file: Path | None = None,
+) -> OkxCredentials:
+    """按 Demo/Live 严格选择凭据，绝不跨环境兜底。"""
+    values = merged_environment(env_file)
+    normalized = str(environment or "").strip().lower()
+    if normalized == "demo":
+        # 现有项目的旧 OKX_* 三元组已由用户明确指定为 Demo；只在 Demo 路由兼容。
+        prefixes = ("OKX_DEMO", "OKX")
+    elif normalized == "live":
+        prefixes = ("OKX_LIVE",)
+    else:
+        raise CredentialError("OKX 凭据必须明确选择 demo 或 live 环境")
+    for prefix in prefixes:
+        credentials = _okx_credentials_for_prefix(values, prefix=prefix)
+        if credentials is not None:
+            return credentials
+    expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
+    raise CredentialError(
+        f"未找到 OKX {normalized} 的完整凭据（需要 {expected}）"
+    )
 
 
 def hard_live_gate_enabled(*, env_file: Path | None = None) -> bool:

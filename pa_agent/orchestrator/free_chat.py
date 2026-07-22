@@ -7,8 +7,8 @@ Design reference: design.md §B.17
 """
 from __future__ import annotations
 
-import logging
 import json
+import logging
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
@@ -19,7 +19,11 @@ if TYPE_CHECKING:
     from pa_agent.records.pending_writer import PendingWriter
 
 from pa_agent.ai.deepseek_client import AIReply
-from pa_agent.records.schema import AnalysisRecord, FollowupTurn
+from pa_agent.records.schema import (
+    AnalysisRecord,
+    ConversationCheckpoint,
+    FollowupTurn,
+)
 from pa_agent.util.threading import CancelToken
 from pa_agent.util.timefmt import now_local_ms
 
@@ -104,6 +108,31 @@ class FreeChatSession:
 
         # Derived record ID used as the JSONL sidecar basename.
         self._record_id: str = _derive_record_id(base_record)
+        self._native_thread_id = ""
+        self._native_provider_adapter = ""
+        self._native_model = ""
+        self._uses_native_thread = (
+            getattr(client, "supports_native_threading", False) is True
+            and callable(getattr(client, "stream_chat_in_thread", None))
+        )
+        if self._uses_native_thread and settings is not None:
+            provider = settings.provider
+            self._native_provider_adapter = str(
+                getattr(provider, "adapter_id", "") or ""
+            ).strip()
+            self._native_model = str(
+                getattr(provider, "model", "") or "auto"
+            ).strip()
+            checkpoint = pending_writer.load_conversation_checkpoint(
+                self._record_id
+            )
+            if (
+                isinstance(checkpoint, ConversationCheckpoint)
+                and checkpoint.provider_adapter == self._native_provider_adapter
+                and checkpoint.model == self._native_model
+            ):
+                self._native_thread_id = checkpoint.thread_id
+                self._turn = checkpoint.last_turn
 
         # ── Pre-build stable prefix (cached for all turns in this session) ────
         # These three messages are byte-for-byte identical across every turn of
@@ -157,6 +186,7 @@ class FreeChatSession:
                     "4) 不要编造数据；以用户消息附带的「当前图表K线数据」为准（与发送追问时屏幕上冻结的图表一致）。\n"
                     "5) K线棒型描述（上影线/下影线/实体大小/涨跌方向）必须以「K1数据·程序计算」字段中的数值为准，\n"
                     "   禁止凭记忆或猜测描述棒型特征——程序计算的 upper_wick/lower_wick/body 是唯一可信来源。\n"
+                    "6) 追问只能解释和讨论，不具备下单、改单、撤单或平仓权限。\n"
                 ),
             }
         )
@@ -254,6 +284,28 @@ class FreeChatSession:
 
         return prefix
 
+    def _native_resume_messages(self, user_content: str) -> list[dict]:
+        """每轮重申程序真值，Compact 后也不能只依赖模型生成的摘要。"""
+        meta = self._base_record.meta
+        authoritative = {
+            "record_id": self._record_id,
+            "symbol": meta.symbol,
+            "timeframe": meta.timeframe,
+            "decision_stance": meta.decision_stance,
+            "stage2_decision": self._base_record.stage2_decision or {},
+        }
+        return [
+            {
+                "role": "user",
+                "content": (
+                    "以下 JSON 是 PA 程序保存的权威分析状态；即使线程发生 Compact，"
+                    "也必须以它为准，不得用摘要覆盖它。你只能回答追问，不能执行交易。\n"
+                    f"```json\n{json.dumps(authoritative, ensure_ascii=False)}\n```\n\n"
+                    f"{user_content}"
+                ),
+            }
+        ]
+
     def send(
         self,
         user_text: str,
@@ -287,24 +339,25 @@ class FreeChatSession:
         history_for_api: list[dict] = list(self._cached_prefix)  # copy stable prefix
 
         # Previous free-chat turns from history_full
-        preserve_mimo = False
+        preserve_provider_reasoning = False
         if self._settings is not None:
-            from pa_agent.ai.mimo_compat import is_mimo_provider
+            from pa_agent.ai.provider_capabilities import (
+                should_preserve_reasoning_history,
+            )
 
             provider = getattr(self._settings, "provider", None)
             if provider is not None:
-                preserve_mimo = is_mimo_provider(
-                    getattr(provider, "base_url", ""),
-                    getattr(provider, "model", ""),
+                preserve_provider_reasoning = should_preserve_reasoning_history(
+                    provider
                 )
         for msg in self._history_full:
             if msg["role"] == "user":
                 history_for_api.append({"role": "user", "content": msg["content"]})
             elif msg["role"] == "assistant":
                 assistant_msg: dict = {"role": "assistant", "content": msg["content"]}
-                if (self.keep_reasoning_in_resend or preserve_mimo) and msg.get(
-                    "reasoning_content"
-                ):
+                if (
+                    self.keep_reasoning_in_resend or preserve_provider_reasoning
+                ) and msg.get("reasoning_content"):
                     assistant_msg["reasoning_content"] = msg["reasoning_content"]
                 history_for_api.append(assistant_msg)
 
@@ -355,13 +408,42 @@ class FreeChatSession:
 
         # ── 4. Call the API (streaming) ───────────────────────────────────────
         try:
-            reply = self._client.stream_chat(
-                history_for_api,
-                on_reasoning_token=on_reasoning_token,
-                on_content_token=on_content_token,
-                cancel_token=cancel_token,
-                reasoning_effort=reasoning_effort,
-            )
+            if self._uses_native_thread:
+                native_messages = (
+                    history_for_api
+                    if not self._native_thread_id
+                    else self._native_resume_messages(user_content)
+                )
+                reply = self._client.stream_chat_in_thread(
+                    native_messages,
+                    thread_id=self._native_thread_id,
+                    on_reasoning_token=on_reasoning_token,
+                    on_content_token=on_content_token,
+                    cancel_token=cancel_token,
+                    reasoning_effort=reasoning_effort,
+                )
+                returned_thread_id = str(reply.request_id or "").strip()
+                if not returned_thread_id:
+                    raise RuntimeError("Codex 没有返回可恢复的线程 ID。")
+                self._native_thread_id = returned_thread_id
+                self._pending_writer.save_conversation_checkpoint(
+                    ConversationCheckpoint(
+                        record_id=self._record_id,
+                        provider_adapter=self._native_provider_adapter,
+                        model=self._native_model,
+                        thread_id=returned_thread_id,
+                        last_turn=turn_number,
+                        updated_at_ms=now_local_ms(),
+                    )
+                )
+            else:
+                reply = self._client.stream_chat(
+                    history_for_api,
+                    on_reasoning_token=on_reasoning_token,
+                    on_content_token=on_content_token,
+                    cancel_token=cancel_token,
+                    reasoning_effort=reasoning_effort,
+                )
         except CancelledError:
             # Persist a cancelled turn and re-raise
             cancelled_turn = FollowupTurn(

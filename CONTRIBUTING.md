@@ -15,7 +15,7 @@
    copy config\settings.example.json config\settings.json
    ```
 
-4. 在 GUI **设置** 中配置 API Key，或仅跑不依赖网络的测试。
+4. 在 GUI **AI 模型设置** 中选择接入方式：Codex ChatGPT 订阅使用官方 `codex login`，不填写 API Key；Kimi、DeepSeek 等 API 档案从仓库外环境读取密钥。也可以只运行不依赖网络的测试。
 
 ## 提交代码前
 

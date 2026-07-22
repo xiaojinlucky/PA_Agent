@@ -7,6 +7,10 @@ from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from pa_agent.ai.provider_capabilities import resolve_provider_capability
+from pa_agent.ai.provider_registry import (
+    resolve_provider_runtime_settings,
+    validate_provider_usage,
+)
 from pa_agent.config.settings import AIProviderSettings
 
 
@@ -37,18 +41,25 @@ def create_ai_client(
 ) -> Any:
     """Construct the client declared by the provider's resolved adapter."""
     log = logger_ or logging.getLogger(__name__)
-    capability = resolve_provider_capability(settings)
+    resolved = resolve_provider_runtime_settings(settings)
+    validate_provider_usage(resolved)
+    capability = resolve_provider_capability(resolved)
+    if capability.client_kind == "codex_cli":
+        from pa_agent.ai.codex_subscription_client import CodexSubscriptionClient
+
+        log.info("AI client route: Codex subscription (model=%s)", resolved.model)
+        return CodexSubscriptionClient(settings=resolved, logger_=log)
     if capability.client_kind == "cursor_sdk":
         from pa_agent.ai.cursor_sdk_client import CursorSdkClient
 
-        log.info("AI client route: Cursor SDK (model=%s)", settings.model)
-        return CursorSdkClient(settings=settings, logger_=log)
+        log.info("AI client route: Cursor SDK (model=%s)", resolved.model)
+        return CursorSdkClient(settings=resolved, logger_=log)
 
     from pa_agent.ai.deepseek_client import DeepSeekClient
 
     log.info(
         "AI client route: OpenAI-compatible (model=%s base_url=%s)",
-        settings.model,
-        _safe_base_url_for_log(settings.base_url),
+        resolved.model,
+        _safe_base_url_for_log(resolved.base_url),
     )
-    return DeepSeekClient(settings=settings, logger_=log)
+    return DeepSeekClient(settings=resolved, logger_=log)

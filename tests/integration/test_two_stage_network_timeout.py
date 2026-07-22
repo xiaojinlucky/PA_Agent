@@ -84,3 +84,21 @@ def test_network_timeout_stage1(frame, pending_writer, assembler, exp_reader):
     call_args = pending_writer.save_partial.call_args
     reason = call_args[0][1] if len(call_args[0]) > 1 else call_args[1].get("reason", "")
     assert reason == "network_error"
+
+
+def test_permanent_api_status_is_not_a_network_error():
+    class PermanentStatus(openai.APIStatusError):
+        def __init__(self):
+            Exception.__init__(self, "authentication failed")
+            self.status_code = 401
+
+    assert TwoStageOrchestrator._is_network_error(PermanentStatus()) is False
+
+
+def test_transient_api_status_is_a_network_error():
+    class TransientStatus(openai.APIStatusError):
+        def __init__(self):
+            Exception.__init__(self, "upstream unavailable")
+            self.status_code = 503
+
+    assert TwoStageOrchestrator._is_network_error(TransientStatus()) is True

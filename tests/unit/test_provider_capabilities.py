@@ -6,6 +6,7 @@ import pytest
 
 from pa_agent.ai.provider_capabilities import (
     REQUIRED_PROVIDER_VERIFICATION_CHECKS,
+    fixed_model_context_window,
     get_provider_capability,
     infer_provider_adapter_id,
     normalise_reasoning_effort,
@@ -23,6 +24,7 @@ from pa_agent.config.settings import AIProviderSettings
         ("https://proxy.example/v1", "claude-opus-4-5", "anthropic_budget"),
         ("https://api.minimax.io/v1", "MiniMax-M3", "minimax_m3"),
         ("https://api.minimax.io/v1", "MiniMax-M2.7", "minimax_m2"),
+        ("https://api.moonshot.cn/v1", "kimi-k2.6", "kimi"),
         ("https://api.xiaomimimo.com/v1", "mimo-v2.5-pro", "mimo"),
         ("", "openclaw_cs/main", "cursor_agent"),
     ],
@@ -67,9 +69,80 @@ def test_official_capability_semantics() -> None:
     assert mimo.thinking_transport == "mimo_toggle"
     assert mimo.supported_efforts == ()
 
+    kimi = get_provider_capability("kimi")
+    assert kimi.thinking_transport == "kimi_toggle"
+    assert kimi.max_tokens_parameter == "max_tokens"
+
+    codex = get_provider_capability("codex_subscription")
+    assert codex.client_kind == "codex_cli"
+    assert codex.supported_efforts == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    )
+
+    codex_56 = resolve_provider_capability(
+        AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="gpt-5.6-sol",
+        )
+    )
+    assert codex_56.supported_efforts == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+        "ultra",
+    )
+    codex_luna = resolve_provider_capability(
+        AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="gpt-5.6-luna",
+        )
+    )
+    assert codex_luna.supported_efforts == (
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    )
+
     cursor = get_provider_capability("cursor_agent")
     assert cursor.client_kind == "cursor_sdk"
     assert cursor.supports_thinking_on is False
+
+
+def test_codex_context_window_requires_an_exact_known_model() -> None:
+    assert (
+        fixed_model_context_window(
+            AIProviderSettings(
+                adapter_id="codex_subscription",
+                model="gpt-5.6-sol",
+            )
+        )
+        == 272_000
+    )
+    assert (
+        fixed_model_context_window(
+            AIProviderSettings(
+                adapter_id="codex_subscription",
+                model="gpt-5.5",
+            )
+        )
+        == 272_000
+    )
+    assert (
+        fixed_model_context_window(
+            AIProviderSettings(
+                adapter_id="codex_subscription",
+                model="auto",
+            )
+        )
+        is None
+    )
 
 
 @pytest.mark.parametrize(
@@ -110,6 +183,27 @@ def test_generic_chat_defaults_to_no_thinking_parameters() -> None:
     assert plain.thinking_transport == "none"
     assert plain.supported_efforts == ()
     assert reasoning.thinking_transport == "reasoning_effort"
+
+
+def test_kimi_model_specific_thinking_matrix() -> None:
+    k3 = resolve_provider_capability(
+        AIProviderSettings(adapter_id="kimi", model="kimi-k3")
+    )
+    assert k3.supports_thinking_off is False
+    assert k3.thinking_transport == "reasoning_effort"
+    assert k3.supported_efforts == ("max",)
+
+    k26 = resolve_provider_capability(
+        AIProviderSettings(adapter_id="kimi", model="kimi-k2.6")
+    )
+    assert k26.supports_thinking_off is True
+    assert k26.thinking_transport == "kimi_toggle"
+
+    k27 = resolve_provider_capability(
+        AIProviderSettings(adapter_id="kimi", model="kimi-k2.7-code")
+    )
+    assert k27.supports_thinking_off is False
+    assert k27.thinking_transport == "kimi_preserved"
 
 
 @pytest.mark.parametrize(

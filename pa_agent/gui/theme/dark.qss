@@ -144,8 +144,14 @@ QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBo
     border-color: #38bdf8;
 }
 QComboBox::drop-down {
+    background-color: #161b22;
     border: none;
-    width: 20px;
+    border-left: 1px solid #30363d;
+    width: 28px;
+}
+QComboBox::down-arrow {
+    width: 10px;
+    height: 10px;
 }
 QComboBox QAbstractItemView {
     background-color: #161b22;

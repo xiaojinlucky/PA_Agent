@@ -9,6 +9,8 @@ Official references (checked 2026-07-15):
 - Anthropic thinking/effort: https://platform.claude.com/docs/en/build-with-claude/effort
 - MiniMax OpenAI API: https://platform.minimax.io/docs/api-reference/text-chat-openai
 - MiMo OpenAI API: https://mimo.mi.com/docs/api/chat/openai-api
+- Kimi Chat API: https://platform.kimi.com/docs/api/chat
+- Codex CLI: https://developers.openai.com/codex/noninteractive
 """
 
 from __future__ import annotations
@@ -18,8 +20,8 @@ from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any, Literal
 
-ClientKind = Literal["openai_chat", "cursor_sdk"]
-CAPABILITY_SCHEMA_VERSION = 3
+ClientKind = Literal["openai_chat", "cursor_sdk", "codex_cli"]
+CAPABILITY_SCHEMA_VERSION = 4
 REQUIRED_PROVIDER_VERIFICATION_CHECKS = (
     "connection_auth",
     "parameter_acceptance",
@@ -34,6 +36,8 @@ ThinkingTransport = Literal[
     "anthropic_budget",
     "minimax_adaptive",
     "mimo_toggle",
+    "kimi_toggle",
+    "kimi_preserved",
 ]
 
 
@@ -57,6 +61,16 @@ _CAPABILITIES = {
         supports_thinking_on=True,
         supports_thinking_off=True,
         supported_efforts=("high", "max"),
+        max_tokens_parameter="max_tokens",
+        reasoning_response_fields=("reasoning_content",),
+    ),
+    "kimi": ProviderCapability(
+        adapter_id="kimi",
+        client_kind="openai_chat",
+        thinking_transport="kimi_toggle",
+        supports_thinking_on=True,
+        supports_thinking_off=True,
+        supported_efforts=(),
         max_tokens_parameter="max_tokens",
         reasoning_response_fields=("reasoning_content",),
     ),
@@ -130,6 +144,16 @@ _CAPABILITIES = {
         max_tokens_parameter="max_completion_tokens",
         reasoning_response_fields=("reasoning_content",),
     ),
+    "codex_subscription": ProviderCapability(
+        adapter_id="codex_subscription",
+        client_kind="codex_cli",
+        thinking_transport="reasoning_effort",
+        supports_thinking_on=True,
+        supports_thinking_off=False,
+        supported_efforts=("low", "medium", "high", "xhigh"),
+        max_tokens_parameter=None,
+        reasoning_response_fields=(),
+    ),
     "cursor_agent": ProviderCapability(
         adapter_id="cursor_agent",
         client_kind="cursor_sdk",
@@ -189,6 +213,12 @@ def infer_provider_adapter_id(base_url: str, model: str) -> str:
         return "cursor_agent"
     if not _is_openclaw_alias(model_id) and ("deepseek.com" in base or "deepseek" in model_id):
         return "deepseek"
+    if (
+        "moonshot.cn" in base
+        or "moonshot.ai" in base
+        or model_id.startswith(("kimi-", "moonshot-"))
+    ):
+        return "kimi"
     if "minimax" in base or model_id.startswith("minimax-"):
         return "minimax_m3" if "minimax-m3" in model_id else "minimax_m2"
     if "xiaomimimo.com" in base or ("mimo" in model_id and not _is_openclaw_alias(model_id)):
@@ -228,11 +258,107 @@ def resolve_provider_capability(settings: Any) -> ProviderCapability:
     )
 
 
+def fixed_model_context_window(settings: Any) -> int | None:
+    """Return a documented model limit when PA has an exact capability entry."""
+    capability = resolve_provider_capability(settings)
+    model = str(getattr(settings, "model", "") or "").strip().lower()
+    if capability.adapter_id == "deepseek":
+        if model.startswith("deepseek-v4"):
+            return 1_000_000
+        if model in {"deepseek-chat", "deepseek-reasoner"}:
+            return 1_000_000
+    if capability.adapter_id == "kimi":
+        if model.startswith("kimi-k3"):
+            return 1_048_576
+        if model.startswith(("kimi-k2.5", "kimi-k2.6", "kimi-k2.7-code")):
+            return 262_144
+        if model.startswith(("kimi-k2-0905", "kimi-k2-turbo", "kimi-k2-thinking")):
+            return 262_144
+        if model.startswith("kimi-k2-0711"):
+            return 131_072
+        if model.startswith("moonshot-v1-128k"):
+            return 131_072
+        if model.startswith("moonshot-v1-32k"):
+            return 32_768
+        if model.startswith("moonshot-v1-8k"):
+            return 8_192
+    if capability.adapter_id == "codex_subscription":
+        if model.startswith("gpt-5.6"):
+            return 272_000
+        if model.startswith(("gpt-5.5", "gpt-5.4", "gpt-5.2")):
+            return 272_000
+        if model.startswith("gpt-5.3-codex-spark"):
+            return 128_000
+        return None
+    return None
+
+
 def _model_specific_capability(
     capability: ProviderCapability,
     model: str,
 ) -> ProviderCapability:
     """收紧官方已知模型的原生 Thinking/effort 取值。"""
+    if capability.adapter_id == "codex_subscription":
+        if model.startswith("gpt-5.6-luna"):
+            return replace(
+                capability,
+                supported_efforts=("low", "medium", "high", "xhigh", "max"),
+            )
+        if model in {"gpt-5.6", "gpt-5.6-sol"} or model.startswith(
+            ("gpt-5.6-sol-", "gpt-5.6-terra")
+        ):
+            return replace(
+                capability,
+                supported_efforts=(
+                    "low",
+                    "medium",
+                    "high",
+                    "xhigh",
+                    "max",
+                    "ultra",
+                ),
+            )
+        return capability
+
+    if capability.adapter_id == "kimi":
+        if model.startswith("kimi-k3"):
+            return replace(
+                capability,
+                thinking_transport="reasoning_effort",
+                supports_thinking_off=False,
+                supported_efforts=("max",),
+            )
+        if model.startswith("kimi-k2.7-code"):
+            return replace(
+                capability,
+                thinking_transport="kimi_preserved",
+                supports_thinking_off=False,
+            )
+        if model.startswith(("kimi-k2-thinking", "kimi-k2.7-code")):
+            return replace(
+                capability,
+                thinking_transport="kimi_preserved",
+                supports_thinking_on=True,
+                supports_thinking_off=False,
+                supported_efforts=(),
+            )
+        if model.startswith(("kimi-k2-0905", "kimi-k2-0711", "kimi-k2-turbo")):
+            return replace(
+                capability,
+                thinking_transport="none",
+                supports_thinking_on=False,
+                supports_thinking_off=True,
+                supported_efforts=(),
+            )
+        if model.startswith("moonshot-v1-"):
+            return replace(
+                capability,
+                thinking_transport="none",
+                supports_thinking_on=False,
+                supports_thinking_off=True,
+                supported_efforts=(),
+            )
+
     if capability.adapter_id == "openai":
         responses_only_models = (
             "gpt-5-pro",
@@ -317,6 +443,21 @@ def _model_specific_capability(
         )
 
     return capability
+
+
+def should_preserve_reasoning_history(settings: Any) -> bool:
+    """按供应商原生多轮合同判断是否回传历史 reasoning_content。"""
+    capability = resolve_provider_capability(settings)
+    if capability.adapter_id == "mimo":
+        return True
+    if capability.adapter_id != "kimi":
+        return False
+    model = str(getattr(settings, "model", "") or "").strip().lower()
+    if capability.thinking_transport in {"kimi_preserved", "reasoning_effort"}:
+        return True
+    return model.startswith("kimi-k2.6") and bool(
+        getattr(settings, "thinking", False)
+    )
 
 
 def normalise_reasoning_effort(

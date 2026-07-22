@@ -22,6 +22,7 @@ scratch/
 config/settings.json
 config/settings.local.json
 config/.*.tmp
+config/.*.lock
 config/exception_state.json
 config/secret.key
 config/tv_symbol_aliases.json

@@ -4,7 +4,7 @@ from decimal import Decimal
 
 import pytest
 
-from pa_agent.execution.errors import BrokerTransportError
+from pa_agent.execution.errors import BrokerTransportError, PreflightError
 from pa_agent.execution.models import (
     ExecutionPlan,
     ExecutionRecord,
@@ -30,6 +30,7 @@ class FakeOkxClient:
         self.orders = {}
         self.fills_by_order = {}
         self.fills_error = None
+        self.algo_absence_confirmed = False
         self.account_config_row = {
             "posMode": "net_mode",
             "uid": "1001",
@@ -180,6 +181,38 @@ class FakeOkxClient:
                 return dict(found)
         return {"state": "live"}
 
+    def find_algo_order_by_client_id(
+        self,
+        *,
+        client_algo_id,
+        order_type,
+        instrument,
+    ):
+        self.calls.append(
+            (
+                "find_algo_order_by_client_id",
+                client_algo_id,
+                order_type,
+                instrument,
+            )
+        )
+        found = next(
+            (
+                row
+                for row in self.algo_orders.values()
+                if row.get("algoClOrdId") == client_algo_id
+            ),
+            None,
+        )
+        if found:
+            return dict(found)
+        if self.algo_absence_confirmed:
+            return None
+        raise BrokerTransportError(
+            "算法单完整查询尚未成功",
+            write_may_have_reached=False,
+        )
+
     def cancel_algo_orders(self, orders):
         self.calls.append(("cancel_algo_orders", orders))
         if self.cancel_algo_error:
@@ -228,6 +261,86 @@ def test_preflight_uses_live_instrument_specs_and_account_maximum():
     assert result.broker_metadata["position_mode"] == "net_mode"
     assert result.broker_metadata["current_leverage"] == "5"
     assert ("instruments", "SWAP") in client.calls
+
+
+def test_preflight_rejects_existing_swap_position_instead_of_merging_it():
+    client = FakeOkxClient()
+    client.positions_rows = [
+        {
+            "instId": "XAU-USDT-SWAP",
+            "pos": "10",
+            "posSide": "net",
+        }
+    ]
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(PreflightError, match="已有持仓"):
+        adapter.preflight(_plan())
+
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_rejected_cancel_terminal_marker_stays_read_only_after_restart():
+    client = FakeOkxClient()
+    first = OkxAdapter(
+        client,
+        margin_mode="cross",
+        runtime_id="runtime-before-restart",
+    )
+    plan = _plan()
+    preflight = first.preflight(plan)
+    prepared = first.prepare_submit(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.READY,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    submitted = first.submit_entry(prepared)
+    broker_state = dict(submitted.broker_state)
+    broker_state["entry_cancel_status"] = "rejected"
+    broker_state["risk_reducing_writes_blocked"] = "cancel_entry_rejected"
+    rejected = submitted.model_copy(
+        update={
+            "broker_state": broker_state,
+            "needs_attention": True,
+        }
+    )
+    restarted = OkxAdapter(
+        client,
+        margin_mode="cross",
+        runtime_id="runtime-after-restart",
+    )
+
+    reconciled = restarted.reconcile(rejected, allow_writes=False)
+
+    assert reconciled.state is ExecutionState.ENTRY_PENDING
+    assert reconciled.needs_attention is False
+    assert "write_unknown" not in reconciled.broker_state
+    assert not [call for call in client.calls if call[0] == "cancel_order"]
+
+
+def test_preflight_aligns_only_binary_float_price_artifacts():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client, margin_mode="cross")
+    plan = _plan().model_copy(
+        update={"stop_loss": Decimal("95.00000000000001")}
+    )
+
+    result = adapter.preflight(plan)
+
+    assert result.stop_loss == Decimal("95.0")
+
+
+def test_preflight_still_rejects_material_off_tick_price():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client, margin_mode="cross")
+    plan = _plan().model_copy(update={"stop_loss": Decimal("95.01")})
+
+    with pytest.raises(PreflightError, match="不是价格跳动"):
+        adapter.preflight(plan)
 
 
 def test_okx_preflight_identity_changes_with_actual_account_config():
@@ -979,6 +1092,72 @@ def test_restart_after_protection_intent_never_resubmits_okx_protection():
     assert unknown.broker_state["protection_targets"][0]["state"] == "unknown"
     assert unknown.broker_state["write_unknown"] == "protection"
     assert not [call for call in client.calls if call[0] == "place_algo_order"]
+
+
+def test_confirmed_absent_protection_requires_explicit_exit_and_is_not_retried():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.PROTECTING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "protection_base_quantity": "2",
+            "write_unknown": "protection",
+            "risk_reducing_writes_blocked": "broker_write_unknown",
+            "protection_targets": [
+                {
+                    "index": 1,
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "client_algo_id": "client-protection",
+                    "algo_id": "",
+                    "state": "unknown",
+                }
+            ],
+        },
+        needs_attention=True,
+    )
+    client.algo_absence_confirmed = True
+
+    resolved = adapter.reconcile(record, allow_writes=False)
+    still_waiting = adapter.reconcile(resolved, allow_writes=True)
+
+    assert resolved.broker_state["protection_targets"][0]["state"] == (
+        "confirmed_absent"
+    )
+    assert "write_unknown" not in resolved.broker_state
+    assert "risk_reducing_writes_blocked" not in resolved.broker_state
+    assert resolved.needs_attention is True
+    assert still_waiting.needs_attention is True
+    assert not [call for call in client.calls if call[0] == "place_algo_order"]
+
+    reblocked_state = dict(still_waiting.broker_state)
+    reblocked_state["risk_reducing_writes_blocked"] = (
+        "identity_or_route_blocked"
+    )
+    reblocked = still_waiting.model_copy(
+        update={"broker_state": reblocked_state}
+    )
+    cleared = adapter.reconcile(reblocked, allow_writes=False)
+
+    assert "risk_reducing_writes_blocked" not in cleared.broker_state
+
+    requested = adapter.request_exit(
+        cleared,
+        reason="campaign_expired",
+    )
+
+    assert requested.state == ExecutionState.EXIT_PENDING
+    assert requested.needs_attention is False
+    assert requested.last_error == ""
 
 
 def test_restart_after_exit_intent_never_resubmits_okx_exit():

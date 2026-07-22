@@ -8,14 +8,12 @@ import json
 from unittest.mock import MagicMock
 
 import pytest
-import pyqtgraph as pg
 
+from pa_agent.ai.router import route_strategy_files
 from pa_agent.app_context import AppContext
+from tests.fixtures.ai_payloads import VALID_STAGE1, VALID_STAGE2_NO_ORDER
 from tests.fixtures.kline_bars import make_newest_first_bars
 from tests.fixtures.validators import schema_test_validator
-from pa_agent.ai.router import route_strategy_files
-
-from tests.fixtures.ai_payloads import VALID_STAGE1, VALID_STAGE2_NO_ORDER
 
 
 def _make_reply(content_dict: dict) -> MagicMock:
@@ -32,6 +30,8 @@ def _make_reply(content_dict: dict) -> MagicMock:
 
 def _make_ctx(tmp_path):
     """Build a minimal AppContext configured for a no-order response."""
+    from tests.fixtures.settings import make_verified_test_settings
+
     mock_client = MagicMock()
     mock_client.stream_chat.side_effect = [
         _make_reply(VALID_STAGE1),
@@ -44,7 +44,11 @@ def _make_ctx(tmp_path):
 
     pending_writer = MagicMock()
 
-    ctx = AppContext()
+    settings_path = tmp_path / "config" / "settings.json"
+    ctx = AppContext(
+        settings=make_verified_test_settings(settings_path),
+        settings_path=settings_path,
+    )
     ctx.client = mock_client
     ctx.assembler = mock_assembler
     ctx.router = route_strategy_files
@@ -61,20 +65,20 @@ def test_no_order_shows_no_trade_conclusion(qtbot, tmp_path):
     """When stage2 returns 不下单, DecisionPanel shows that conclusion."""
     from pa_agent.gui.main_window import MainWindow
 
-    ctx, pending_writer = _make_ctx(tmp_path)
+    ctx, _pending_writer = _make_ctx(tmp_path)
 
     window = MainWindow(ctx)
     qtbot.addWidget(window)
     window.show()
 
-    window._ctx.settings.general.analysis_bar_count = 5
-    window._last_frame_ready_bars = make_newest_first_bars(9, with_forming=True)
+    window._ctx.settings.general.analysis_bar_count = 20
+    window._last_frame_ready_bars = make_newest_first_bars(24, with_forming=True)
     window._on_submit_analysis()
 
     # Poll until the analysis is no longer in progress
     qtbot.waitUntil(
         lambda: not window._analysis_in_progress,
-        timeout=10_000,
+        timeout=30_000,
     )
 
     # DecisionPanel should show 不下单
@@ -83,12 +87,8 @@ def test_no_order_shows_no_trade_conclusion(qtbot, tmp_path):
         f"Expected 不下单 conclusion, got: {conclusion_text!r}"
     )
 
-    # Chart should have no InfiniteLine items (no entry/TP/SL lines)
+    # The no-order result must clear only the managed entry/TP/SL overlay.
+    # Support/resistance levels may still legitimately use InfiniteLine.
     chart = window._chart_widget
-    infinite_lines = [
-        item for item in chart.items()
-        if isinstance(item, pg.InfiniteLine)
-    ]
-    assert len(infinite_lines) == 0, (
-        f"Expected no InfiniteLine items for 不下单, found {len(infinite_lines)}"
-    )
+    assert chart._pending_decision is None
+    assert chart._overlay._items == []

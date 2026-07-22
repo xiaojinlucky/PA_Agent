@@ -9,7 +9,7 @@
 - 操作系统：Windows。
 - 项目路径：`D:\Desktop\Quant\PA_Agent`。
 - Python：项目 `.venv`，当前验证版本 Python 3.12.12、pytest 9.1.1。
-- Git：私有仓库 `Jinqingchang/PA_Agent`，`main` 跟踪 `origin/main`。
+- GitHub 当前用户名为 `xiaojinlucky`。2026-07-22 用户已明确接受 `xiaojinlucky/PA_Agent` 为 `PUBLIC` 并授权公开发布。本地 `origin` 已改为当前规范地址；正式暂存前已实时核对登录账号、`ADMIN` 权限，以及本地、跟踪分支和 GitHub API 的基线 SHA 一致。
 - 本机共享环境文件：`D:\Desktop\Quant\env`；含真实凭据，不进入 Git 或外部文件包。
 - MT5 数据访问依赖本机终端与会话状态；外部模型不能假设终端已启动或已登录。
 
@@ -23,11 +23,11 @@
 
 PA_Agent 不是 `open-xquant` 项目；不得把仅适用于 open-xquant 的回测、规则或实盘 skills 当成现成 PA 实现。
 
-## 与本项目有关的 Memory/既定决定
+## 与本项目有关的 Memory/既定决定（2026-07-20 校正）
 
 - 用户要求执行真实文件、真实测试和真实运行检查，不接受只给抽象建议。
-- PA 前端重设计已全部废弃，当前专注交易正确性。
-- Longbridge 当前只读行情已实现；真实下单层尚未实现。
+- 用户已重新授权 PA 前端改版，但必须先由 Stitch → Pencil → Figma 设计；当前仅有 PRD 与 Stitch 参考图，生产 PyQt 视觉尚未重做。
+- Longbridge 行情与 Longbridge/OKX 执行闭环已经实现；券商写入已从 GUI 移到 WinSW 托管的单实例 `ExecutionWorker`。更完整的券商侧启动扫描、持续持仓/保护真值对账、Longbridge 私有推送和全局限速仍未完成，因此不能把它描述成可长期无人值守的完整实盘系统。
 - OKX 第一阶段优先黄金现货类产品与永续，但架构必须可扩展其他品种，不能永久硬拒绝非黄金品种。
 - 实盘默认关闭；开发和测试绝不发真实订单。
 - 用户偏好一次只处理一个关键业务分叉，并要求给出推荐项和理由。
@@ -41,14 +41,14 @@ PA_Agent 不是 `open-xquant` 项目；不得把仅适用于 open-xquant 的回�
 3. 检查计划是否调用本机不存在或仅适用于其他项目的 skill/命令。
 4. 对 Longbridge、OKX、MT5 和模型 API 的方法/字段重新查官方资料。
 5. 把外部模型遗漏的凭据隔离、幂等、未知状态对账、重启恢复和真实订单禁令补回。
-6. 删除超出当前需求的重构、前端改版、跨项目集成和未授权自动化。
+6. 删除超出当前需求的重构、未经 Stitch/Pencil/Figma 验收的前端改版、跨项目集成和未授权自动化。
 7. 形成可执行的小阶段，每阶段写清入口、禁止行为、测试证据、人工确认点和回退。
 8. 由用户确认真正业务分叉后，才进入本地代码实现。
 
 ## 人工总控闭环
 
 1. 用户在网页版 GPT 的 Pro Extended Thinking 模式粘贴 `GPT_WEB_PRO_EXTENDED_TASK.md`。
-2. 网页版 GPT 通过 GitHub 读取私有仓库，输出总控路线图、工单队列和硬验收。
+2. 网页版 GPT 先报告实际仓库全名、公开性和 `main` SHA，再读取仓库并输出总控路线图、工单队列和硬验收。
 3. 用户把外部输出交回本地 Codex。
 4. 本地 Codex逐条核对 skills、memory、Windows/MT5/进程、当前 Git 状态、实际模块与测试；将不可执行、越界或过时内容修正，并说明差异。
 5. 用户确认真正业务分叉和本地化后的首张工单。

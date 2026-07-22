@@ -13,6 +13,7 @@ from pa_agent.ai.deepseek_client import (
     _effort_budget_tokens,
     _is_deepseek_model,
     _openclaw_agent_request_extra,
+    _resolve_thinking_params,
 )
 from pa_agent.config.settings import AIProviderSettings
 
@@ -83,6 +84,73 @@ def test_chat_extra_body_thinking_enabled():
     kwargs = call_kwargs.kwargs
     assert kwargs["extra_body"]["thinking"]["type"] == "enabled"
     assert kwargs["reasoning_effort"] == "max"
+
+
+def test_kimi_non_thinking_does_not_send_invalid_temperature_zero():
+    settings = _make_settings()
+    settings.adapter_id = "kimi"
+    settings.base_url = "https://api.moonshot.cn/v1"
+    settings.model = "kimi-k2.6"
+    settings.thinking = False
+    client = DeepSeekClient(settings)
+
+    mock_resp = _make_mock_response()
+    mock_openai = MagicMock()
+    mock_openai.return_value.chat.completions.create.return_value = mock_resp
+
+    with patch("pa_agent.ai.deepseek_client._OpenAI", mock_openai):
+        client.chat([{"role": "user", "content": "hi"}])
+
+    kwargs = mock_openai.return_value.chat.completions.create.call_args.kwargs
+    assert kwargs["extra_body"]["thinking"]["type"] == "disabled"
+    assert "temperature" not in kwargs
+
+
+@pytest.mark.parametrize(
+    ("model", "thinking", "expected_body", "expected_effort"),
+    [
+        (
+            "kimi-k2.5",
+            True,
+            {"thinking": {"type": "enabled"}},
+            None,
+        ),
+        (
+            "kimi-k2.6",
+            True,
+            {"thinking": {"type": "enabled", "keep": "all"}},
+            None,
+        ),
+        (
+            "kimi-k2.6",
+            False,
+            {"thinking": {"type": "disabled"}},
+            None,
+        ),
+        ("kimi-k2.7-code", True, {}, None),
+        ("kimi-k3", True, {}, "max"),
+    ],
+)
+def test_kimi_model_specific_thinking_request(
+    model,
+    thinking,
+    expected_body,
+    expected_effort,
+):
+    settings = _make_settings()
+    settings.adapter_id = "kimi"
+    settings.base_url = "https://api.moonshot.cn/v1"
+    settings.model = model
+    settings.thinking = thinking
+
+    extra_body, effort = _resolve_thinking_params(
+        settings,
+        thinking=None,
+        reasoning_effort=None,
+    )
+
+    assert extra_body == expected_body
+    assert effort == expected_effort
 
 
 def test_completion_max_tokens_deepseek_cap():
@@ -275,6 +343,31 @@ def test_chat_yunwu_opus_47_sends_adaptive_thinking():
     assert kwargs["extra_body"]["thinking"] == {"type": "adaptive"}
     assert kwargs["extra_body"]["output_config"] == {"effort": "high"}
     assert "reasoning_effort" not in kwargs
+
+
+def test_kimi_k26_uses_native_thinking_toggle() -> None:
+    from pa_agent.ai.deepseek_client import _resolve_thinking_params
+
+    settings = AIProviderSettings(
+        adapter_id="kimi",
+        model="kimi-k2.6",
+        base_url="https://api.moonshot.cn/v1",
+    )
+    enabled, enabled_effort = _resolve_thinking_params(
+        settings,
+        thinking=True,
+        reasoning_effort="high",
+    )
+    disabled, disabled_effort = _resolve_thinking_params(
+        settings,
+        thinking=False,
+        reasoning_effort="high",
+    )
+
+    assert enabled == {"thinking": {"type": "enabled", "keep": "all"}}
+    assert enabled_effort is None
+    assert disabled == {"thinking": {"type": "disabled"}}
+    assert disabled_effort is None
 
 
 def test_chat_yunwu_thinking_off_sends_nothing():

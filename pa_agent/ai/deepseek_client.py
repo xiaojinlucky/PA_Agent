@@ -358,7 +358,8 @@ def _resolve_thinking_params(
         )
 
     if transport == "reasoning_effort":
-        if _thinking:
+        effective_thinking = _thinking or not capability.supports_thinking_off
+        if effective_thinking:
             return {}, _effort
         if capability.adapter_id == "openai" and capability.supports_thinking_off:
             return {}, "none"
@@ -383,6 +384,20 @@ def _resolve_thinking_params(
         return {
             "thinking": {"type": "enabled" if _thinking else "disabled"}
         }, None
+
+    if transport == "kimi_toggle":
+        effective_thinking = _thinking or not capability.supports_thinking_off
+        thinking_body: dict[str, str] = {
+            "type": "enabled" if effective_thinking else "disabled"
+        }
+        model = str(settings.model or "").strip().lower()
+        if model.startswith("kimi-k2.6") and effective_thinking:
+            thinking_body["keep"] = "all"
+        return {"thinking": thinking_body}, None
+
+    if transport == "kimi_preserved":
+        # K2.7 Code 固定开启保留式思考，官方明确要求不要传 thinking 参数。
+        return {}, None
 
     if not _thinking or transport == "none":
         return {}, None
@@ -445,7 +460,11 @@ class DeepSeekClient:
         api_messages, system_param = _prepare_api_messages(self._settings, messages)
         if system_param:
             extra_body = {**extra_body, "system": system_param}
-        _thinking_on = _thinking_enabled(extra_body, _effort)
+        capability = resolve_provider_capability(self._settings)
+        _thinking_on = (
+            _thinking_enabled(extra_body, _effort)
+            or not capability.supports_thinking_off
+        )
         _max_tokens = _bounded_output_tokens(
             _completion_max_tokens(
                 self._settings,
@@ -488,10 +507,9 @@ class DeepSeekClient:
             create_kwargs["extra_body"] = extra_body
         if _effort is not None:
             create_kwargs["reasoning_effort"] = _effort
-        # When thinking mode is OFF, set temperature=0 for maximum instruction-following
-        # fidelity and JSON format compliance.  Thinking mode is incompatible with
-        # temperature (DeepSeek/Anthropic spec), so we only inject it when safe.
-        if not _thinking_on:
+        # Kimi K2.5/K2.6 的温度由官方按 Thinking 模式固定；显式传 0 会被拒绝。
+        # 其他现有适配器在关闭 Thinking 时继续使用 0，以保持 JSON 指令稳定性。
+        if not _thinking_on and capability.adapter_id != "kimi":
             create_kwargs["temperature"] = 0
         try:
             response = client.chat.completions.create(
@@ -631,7 +649,11 @@ class DeepSeekClient:
         api_messages, system_param = _prepare_api_messages(self._settings, messages)
         if system_param:
             extra_body = {**extra_body, "system": system_param}
-        _thinking_on = _thinking_enabled(extra_body, _effort)
+        capability = resolve_provider_capability(self._settings)
+        _thinking_on = (
+            _thinking_enabled(extra_body, _effort)
+            or not capability.supports_thinking_off
+        )
         _max_tokens = _bounded_output_tokens(
             _completion_max_tokens(
                 self._settings,

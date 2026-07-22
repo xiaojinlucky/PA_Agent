@@ -7,11 +7,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
 
+from pa_agent.config.settings import Settings
 from pa_agent.orchestrator.free_chat import FreeChatSession
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 from pa_agent.util.threading import CancelToken
-
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -77,6 +78,27 @@ def _make_session_with_toggle(client: MagicMock) -> FreeChatSession:
     return session
 
 
+def _make_kimi_session(
+    client: MagicMock,
+    *,
+    model: str,
+    thinking: bool,
+) -> FreeChatSession:
+    settings = Settings()
+    settings.provider.adapter_id = "kimi"
+    settings.provider.base_url = "https://api.moonshot.cn/v1"
+    settings.provider.model = model
+    settings.provider.thinking = thinking
+    return FreeChatSession(
+        base_record=_make_base_record(),
+        client=client,
+        assembler=MagicMock(),
+        pending_writer=MagicMock(),
+        ledger=MagicMock(),
+        settings=settings,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -98,9 +120,13 @@ class TestFreeChatKeepsReasoningWhenToggled:
         session.send("q2", cancel)
 
         messages: list[dict] = client.stream_chat.call_args_list[1][0][0]
-        assert messages[3]["role"] == "assistant"
-        assert messages[3]["content"] == "reply 1"
-        assert messages[3].get("reasoning_content") == "reasoning 1"
+        followup_assistant = next(
+            message
+            for message in messages
+            if message.get("role") == "assistant"
+            and message.get("content") == "reply 1"
+        )
+        assert followup_assistant.get("reasoning_content") == "reasoning 1"
 
     def test_previous_turns_keep_reasoning_in_api(self):
         """On the second send, the first assistant turn in history_for_api
@@ -117,10 +143,14 @@ class TestFreeChatKeepsReasoningWhenToggled:
         session.send("question 2", cancel)
 
         messages: list[dict] = client.stream_chat.call_args_list[1][0][0]
-        assert len(messages) == 5
-        assert messages[3]["role"] == "assistant"
-        assert messages[3]["content"] == "reply 1"
-        assert messages[3].get("reasoning_content") == "reasoning 1"
+        assert len(messages) == 6
+        followup_assistant = next(
+            message
+            for message in messages
+            if message.get("role") == "assistant"
+            and message.get("content") == "reply 1"
+        )
+        assert followup_assistant.get("reasoning_content") == "reasoning 1"
 
     def test_three_turns_all_assistant_messages_have_reasoning_in_api(self):
         """After 3 sends with toggle on, every assistant message in every
@@ -141,7 +171,10 @@ class TestFreeChatKeepsReasoningWhenToggled:
         for call_args in client.stream_chat.call_args_list:
             messages: list[dict] = call_args[0][0]
             for msg in messages:
-                if msg.get("role") == "assistant":
+                if (
+                    msg.get("role") == "assistant"
+                    and str(msg.get("content") or "").startswith("reply")
+                ):
                     assert "reasoning_content" in msg, (
                         f"reasoning_content missing from assistant message: {msg}"
                     )
@@ -247,5 +280,82 @@ class TestFreeChatKeepsReasoningWhenToggled:
         session.keep_reasoning_in_resend = True
         session.send("q2", cancel)
         msgs_second: list[dict] = client.stream_chat.call_args_list[1][0][0]
-        followup_asst = next(m for m in msgs_second if m.get("role") == "assistant")
+        followup_asst = next(
+            message
+            for message in msgs_second
+            if message.get("role") == "assistant"
+            and message.get("content") == "reply 1"
+        )
         assert followup_asst.get("reasoning_content") == "reasoning 1"
+
+
+def test_kimi_k26_thinking_history_keeps_all_prior_reasoning() -> None:
+    client = MagicMock()
+    client.stream_chat.side_effect = [
+        _make_reply("reply 1", "reasoning 1"),
+        _make_reply("reply 2", "reasoning 2"),
+        _make_reply("reply 3", "reasoning 3"),
+    ]
+    session = _make_kimi_session(client, model="kimi-k2.6", thinking=True)
+    cancel = CancelToken()
+
+    session.send("q1", cancel)
+    session.send("q2", cancel)
+    session.send("q3", cancel)
+
+    third_call = client.stream_chat.call_args_list[2][0][0]
+    assistant_messages = [
+        message
+        for message in third_call
+        if message.get("role") == "assistant"
+        and str(message.get("content") or "").startswith("reply")
+    ]
+    assert [message.get("reasoning_content") for message in assistant_messages] == [
+        "reasoning 1",
+        "reasoning 2",
+    ]
+
+
+def test_kimi_k26_non_thinking_history_does_not_resend_reasoning() -> None:
+    client = MagicMock()
+    client.stream_chat.side_effect = [
+        _make_reply("reply 1", "unexpected reasoning 1"),
+        _make_reply("reply 2", "unexpected reasoning 2"),
+    ]
+    session = _make_kimi_session(client, model="kimi-k2.6", thinking=False)
+    cancel = CancelToken()
+
+    session.send("q1", cancel)
+    session.send("q2", cancel)
+
+    second_call = client.stream_chat.call_args_list[1][0][0]
+    assistant_message = next(
+        message
+        for message in second_call
+        if message.get("role") == "assistant"
+        and message.get("content") == "reply 1"
+    )
+    assert "reasoning_content" not in assistant_message
+
+
+@pytest.mark.parametrize("model", ("kimi-k2.7-code", "kimi-k3"))
+def test_kimi_fixed_thinking_models_keep_reasoning_history(model: str) -> None:
+    client = MagicMock()
+    client.stream_chat.side_effect = [
+        _make_reply("reply 1", "reasoning 1"),
+        _make_reply("reply 2", "reasoning 2"),
+    ]
+    session = _make_kimi_session(client, model=model, thinking=False)
+    cancel = CancelToken()
+
+    session.send("q1", cancel)
+    session.send("q2", cancel)
+
+    second_call = client.stream_chat.call_args_list[1][0][0]
+    assistant_message = next(
+        message
+        for message in second_call
+        if message.get("role") == "assistant"
+        and message.get("content") == "reply 1"
+    )
+    assert assistant_message.get("reasoning_content") == "reasoning 1"

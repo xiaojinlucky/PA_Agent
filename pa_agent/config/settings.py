@@ -6,26 +6,33 @@ import json
 import logging
 import os
 import tempfile
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager, suppress
+from copy import deepcopy
 from pathlib import Path
-from typing import Literal
+from threading import RLock
+from typing import BinaryIO, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from pa_agent.ai.provider_capabilities import (
     CAPABILITY_SCHEMA_VERSION,
     REQUIRED_PROVIDER_VERIFICATION_CHECKS,
+    fixed_model_context_window,
     resolve_provider_capability,
 )
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal[
-    "mt5", "tradingview", "longbridge", "akshare", "eastmoney", "tushare"
+    "mt5", "tradingview", "longbridge", "okx", "akshare", "eastmoney", "tushare"
 ]
 NormalizationMode = Literal["strict", "lenient"]
 ExecutionBroker = Literal["longbridge", "okx"]
 LongbridgeAccountProfile = Literal["paper", "comprehensive", "intraday"]
 OkxProduct = Literal["spot", "swap"]
 OkxMarginMode = Literal["cross", "isolated"]
+_SETTINGS_PROCESS_LOCK = RLock()
 
 
 class AIProviderSettings(BaseModel):
@@ -40,27 +47,75 @@ class AIProviderSettings(BaseModel):
     adapter_id: str = "auto"
     thinking: bool = True
     reasoning_effort: Literal[
-        "minimal", "low", "medium", "high", "xhigh", "max"
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
     ] = "high"
-    context_window: int = Field(default=2_000_000, ge=1_024, le=100_000_000)
+    service_tier: str = "default"
+    context_window: int | None = Field(
+        default=None,
+        ge=1_024,
+        le=100_000_000,
+    )
+    context_window_source: Literal["unknown", "catalog", "builtin"] = "unknown"
 
     @field_validator("adapter_id", mode="before")
     @classmethod
     def _normalise_adapter_id(cls, value: object) -> str:
         return str(value or "auto").strip().lower() or "auto"
 
+    @field_validator("service_tier", mode="before")
+    @classmethod
+    def _normalise_service_tier(cls, value: object) -> str:
+        tier = str(value or "default").strip().lower() or "default"
+        if not tier.replace("-", "").replace("_", "").isalnum():
+            raise ValueError("invalid AI provider service tier")
+        return tier
+
+    @model_validator(mode="after")
+    def _remove_unused_codex_credentials(self) -> AIProviderSettings:
+        """Codex 订阅只走本机 CLI，禁止遗留 API 地址或密钥。"""
+        if self.adapter_id == "codex_subscription":
+            self.base_url = ""
+            self.api_key = ""
+            self.api_key_encrypted = ""
+        return self
+
+
+def _apply_fixed_context_window(provider: AIProviderSettings) -> None:
+    # 账号实时目录是最高优先级真值。设置保存/重载时必须保留它，
+    # 不能再被内置的离线兜底值覆盖。
+    if (
+        provider.context_window_source == "catalog"
+        and provider.context_window is not None
+    ):
+        return
+    context_window = fixed_model_context_window(provider)
+    if context_window is not None:
+        provider.context_window = context_window
+        provider.context_window_source = "builtin"
+        return
+    if resolve_provider_capability(provider).adapter_id in {
+        "codex_subscription",
+        "deepseek",
+        "kimi",
+    }:
+        provider.context_window = None
+        provider.context_window_source = "unknown"
+
 
 def provider_config_fingerprint(provider: AIProviderSettings) -> str:
     """Return a stable verification fingerprint without exposing credential text."""
+    from pa_agent.ai.provider_registry import resolve_provider_runtime_settings
+
+    runtime_provider = resolve_provider_runtime_settings(provider)
     payload = {
         "model": provider.model,
         "base_url": provider.base_url.rstrip("/"),
-        "api_key": provider.api_key,
+        "api_key": runtime_provider.api_key,
         "api_key_encrypted": provider.api_key_encrypted,
         "adapter_id": provider.adapter_id,
         "thinking": provider.thinking,
         "reasoning_effort": provider.reasoning_effort,
-        "context_window": provider.context_window,
+        "service_tier": provider.service_tier,
     }
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
@@ -324,6 +379,7 @@ class Settings(BaseModel):
     """Root settings object persisted to config/settings.json."""
     model_config = ConfigDict(extra="ignore")
 
+    revision: int = Field(default=0, ge=0)
     #: Legacy-compatible mirror of the active profile. Profiles remain canonical.
     provider: AIProviderSettings = Field(default_factory=AIProviderSettings)
     active_ai_profile_id: str = "default"
@@ -339,6 +395,7 @@ class Settings(BaseModel):
     @model_validator(mode="after")
     def _normalise_ai_profiles(self) -> "Settings":
         if not self.ai_profiles:
+            _apply_fixed_context_window(self.provider)
             profile = AIProviderProfile(
                 id="default",
                 display_name="默认配置",
@@ -354,6 +411,7 @@ class Settings(BaseModel):
             if not profile_id:
                 raise ValueError("AI profile id must not be blank")
             profile.id = profile_id
+            _apply_fixed_context_window(profile.provider)
             if profile_id in normalised:
                 raise ValueError(f"duplicate AI profile id: {profile_id}")
             profile.invalidate_stale_verification()
@@ -378,6 +436,7 @@ class Settings(BaseModel):
         if profile is None:
             raise KeyError(f"unknown active AI profile: {self.active_ai_profile_id}")
         provider = self.provider.model_copy(deep=True)
+        _apply_fixed_context_window(provider)
         profile.provider = provider
         profile.invalidate_stale_verification()
         return profile
@@ -397,10 +456,12 @@ class Settings(BaseModel):
             raise ValueError("profile id and display name must not be blank")
         if profile_id in self.ai_profiles and not replace:
             raise ValueError(f"AI profile already exists: {profile_id}")
+        provider_copy = provider.model_copy(deep=True)
+        _apply_fixed_context_window(provider_copy)
         profile = AIProviderProfile(
             id=profile_id,
             display_name=display_name,
-            provider=provider.model_copy(deep=True),
+            provider=provider_copy,
         )
         self.ai_profiles[profile_id] = profile
         if profile_id == self.active_ai_profile_id:
@@ -486,11 +547,30 @@ class Settings(BaseModel):
         return self.provider
 
 
-def provider_api_key_configured(settings: Settings | None) -> bool:
-    """Return True when a non-empty API key is loaded in memory."""
+def active_provider_auth_configured(settings: Settings | None) -> bool:
+    """Return True when the active provider has a usable authentication path."""
     if settings is None:
         return False
-    return bool((settings.provider.api_key or "").strip())
+    from pa_agent.ai.provider_registry import (
+        provider_auth_configured as runtime_auth_configured,
+    )
+
+    return runtime_auth_configured(settings.provider)
+
+
+def active_provider_verification_current(settings: Settings | None) -> bool:
+    """Require the active profile and provider mirror to share a current probe."""
+    if settings is None:
+        return False
+    profile = settings.ai_profiles.get(settings.active_ai_profile_id)
+    if profile is None or profile.provider != settings.provider:
+        return False
+    return profile.verification.is_current_for(profile.provider)
+
+
+def provider_api_key_configured(settings: Settings | None) -> bool:
+    """兼容旧调用；订阅制认证不要求 API Key。"""
+    return active_provider_auth_configured(settings)
 
 
 # ── Persistence ───────────────────────────────────────────────────────────────
@@ -591,16 +671,107 @@ def load_settings(path: Path | None = None) -> "Settings":
 
 
 def save_settings(settings: "Settings", path: Path | None = None) -> None:
-    """Persist settings to *path* (default: SETTINGS_JSON_PATH)."""
+    """Persist settings using a cross-process lock and revision check."""
     from pa_agent.config.paths import SETTINGS_JSON_PATH
 
     path = path or SETTINGS_JSON_PATH
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    settings.sync_active_ai_profile()
-    data = settings.model_dump()
+    candidate = settings.model_copy(deep=True)
+    candidate.sync_active_ai_profile()
 
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
+    with _settings_file_lock(path):
+        disk_revision = _read_settings_revision(path)
+        if disk_revision is not None and disk_revision != settings.revision:
+            raise SettingsConflictError(
+                "settings changed in another window or process; reload before saving"
+            )
+        candidate.revision = settings.revision + 1
+        _write_settings_candidate(path, candidate)
+    settings.revision = candidate.revision
+    settings.provider = candidate.provider.model_copy(deep=True)
+    settings.ai_profiles = {
+        key: value.model_copy(deep=True)
+        for key, value in candidate.ai_profiles.items()
+    }
+
+
+def save_ai_profile_activation(
+    baseline: "Settings",
+    candidate: "Settings",
+    path: Path | None = None,
+) -> "Settings":
+    """保存 AI 档案切换，并安全合并同时发生的非 AI 设置更新。
+
+    模型连接测试可能持续数十秒。这段时间内，行情界面或另一个后台模块
+    可能刚好保存品种、周期等普通设置，导致 ``candidate`` 的 revision
+    过期。只要磁盘上的 AI 档案本身没有变化，就保留最新普通设置并仅合并
+    本次已验证的 AI 档案；若 AI 档案也被其他窗口修改，则继续抛出冲突，
+    绝不静默覆盖。
+    """
+
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    path = path or SETTINGS_JSON_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    requested = candidate.model_copy(deep=True)
+    requested.sync_active_ai_profile()
+
+    with _settings_file_lock(path):
+        disk_revision = _read_settings_revision(path)
+        if disk_revision is None or disk_revision == candidate.revision:
+            requested.revision = candidate.revision + 1
+            _write_settings_candidate(path, requested)
+            return requested
+
+        latest = _read_settings_snapshot(path)
+        if _ai_profile_persistence_state(latest) != _ai_profile_persistence_state(
+            baseline
+        ):
+            raise SettingsConflictError(
+                "AI settings changed in another window or process"
+            )
+
+        merged = latest.model_copy(deep=True)
+        merged.ai_profiles = {
+            key: value.model_copy(deep=True)
+            for key, value in requested.ai_profiles.items()
+        }
+        merged.active_ai_profile_id = requested.active_ai_profile_id
+        merged.provider = requested.provider.model_copy(deep=True)
+        merged.sync_active_ai_profile()
+        merged.revision = latest.revision + 1
+        _write_settings_candidate(path, merged)
+        return merged
+
+
+def _ai_profile_persistence_state(settings: "Settings") -> dict[str, object]:
+    """返回用于并发冲突判断的完整 AI 设置，不包含 revision。"""
+
+    return {
+        "provider": settings.provider.model_dump(mode="json"),
+        "active_ai_profile_id": settings.active_ai_profile_id,
+        "ai_profiles": {
+            key: value.model_dump(mode="json")
+            for key, value in settings.ai_profiles.items()
+        },
+    }
+
+
+def _read_settings_snapshot(path: Path) -> "Settings":
+    """在调用方已持有设置锁时读取一个无副作用的完整快照。"""
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return Settings.model_validate(raw)
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise OSError("cannot read current settings snapshot") from exc
+
+
+def _write_settings_candidate(path: Path, candidate: "Settings") -> None:
+    """在调用方已持有设置锁时原子替换设置文件。"""
+
+    payload = json.dumps(candidate.model_dump(), ensure_ascii=False, indent=2)
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -618,8 +789,108 @@ def save_settings(settings: "Settings", path: Path | None = None) -> None:
         os.replace(temp_path, path)
     except Exception:
         if temp_path is not None:
-            try:
+            with suppress(OSError):
                 temp_path.unlink(missing_ok=True)
-            except OSError:
-                pass
         raise
+
+
+def apply_settings_snapshot(target: "Settings", source: "Settings") -> None:
+    """把完整设置快照同步到现有对象，同时保留嵌套模型的对象身份。"""
+
+    def _apply_model(target_model: BaseModel, source_model: BaseModel) -> None:
+        if type(target_model) is not type(source_model):
+            raise TypeError("settings snapshot model types do not match")
+        for field_name in type(target_model).model_fields:
+            current = getattr(target_model, field_name)
+            incoming = getattr(source_model, field_name)
+            if (
+                isinstance(current, BaseModel)
+                and isinstance(incoming, BaseModel)
+                and type(current) is type(incoming)
+            ):
+                _apply_model(current, incoming)
+            else:
+                setattr(target_model, field_name, deepcopy(incoming))
+
+    _apply_model(target, source)
+
+
+class SettingsConflictError(RuntimeError):
+    """A stale Settings snapshot attempted to overwrite newer on-disk state."""
+
+
+def _read_settings_revision(path: Path) -> int | None:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return max(0, int(raw.get("revision", 0)))
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+        raise OSError("cannot read current settings revision") from exc
+
+
+@contextmanager
+def _settings_file_lock(path: Path, *, timeout_s: float = 5.0) -> Iterator[None]:
+    """同时串行化同一 PA 进程的线程与外部进程设置写入。"""
+
+    with _SETTINGS_PROCESS_LOCK:
+        lock_path = path.with_name(f".{path.name}.lock")
+        handle = lock_path.open("a+b")
+        try:
+            _acquire_settings_lock(handle, timeout_s=timeout_s)
+            yield
+        finally:
+            _release_settings_lock(handle)
+            handle.close()
+
+
+def _acquire_settings_lock(handle: BinaryIO, *, timeout_s: float) -> None:
+    deadline = time.monotonic() + timeout_s
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        if handle.read(1) == b"":
+            handle.seek(0)
+            handle.write(b"0")
+            handle.flush()
+        while True:
+            try:
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                return
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "timed out waiting for settings lock"
+                    ) from exc
+                time.sleep(0.05)
+    else:
+        import fcntl
+
+        while True:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        "timed out waiting for settings lock"
+                    ) from exc
+                time.sleep(0.05)
+
+
+def _release_settings_lock(handle: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        try:
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        except OSError:
+            pass
+    else:
+        import fcntl
+
+        with suppress(OSError):
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

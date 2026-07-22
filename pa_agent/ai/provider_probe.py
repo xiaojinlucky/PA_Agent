@@ -21,6 +21,10 @@ from typing import Any
 from pa_agent.ai.client_factory import create_ai_client
 from pa_agent.ai.deepseek_client import CancelledError
 from pa_agent.ai.provider_capabilities import resolve_provider_capability
+from pa_agent.ai.provider_registry import (
+    provider_auth_configured,
+    resolve_provider_runtime_settings,
+)
 from pa_agent.config.settings import AIProviderSettings
 from pa_agent.util.threading import CancelToken
 
@@ -362,6 +366,7 @@ def probe_ai_provider(
         )
 
     try:
+        provider = resolve_provider_runtime_settings(provider)
         capability = resolve_provider_capability(provider)
     except ValueError as exc:
         return _exception_result(
@@ -380,14 +385,14 @@ def probe_ai_provider(
             error_code="invalid_timeout",
             message="探测超时必须大于 0 秒。",
         )
-    if not provider.api_key.strip():
+    if not provider_auth_configured(provider):
         return _result(
             adapter_id=adapter_id,
             tested_at=tested_at,
             connection_auth=ProbeStatus.FAILED,
             parameter_acceptance=ProbeStatus.UNKNOWN,
             error_code="credential_missing",
-            message="当前档案没有可供客户端使用的 API key。",
+            message="当前档案没有可用的 API Key 或 Codex ChatGPT 登录。",
         )
     if capability.client_kind == "openai_chat" and not provider.base_url.strip():
         return _result(

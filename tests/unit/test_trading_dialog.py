@@ -1,11 +1,22 @@
 from __future__ import annotations
 
+import threading
+from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
 from pa_agent.config.settings import Settings
-from pa_agent.execution.models import AccountSnapshot, PositionSnapshot
+from pa_agent.execution.models import (
+    AccountSnapshot,
+    ExecutionEvent,
+    ExecutionPlan,
+    ExecutionRecord,
+    ExecutionState,
+    PositionSnapshot,
+)
+from pa_agent.execution.worker_protocol import WorkerCommandStatus
 from pa_agent.gui.trading_dialog import TradingDialog
 
 
@@ -23,8 +34,34 @@ class FakeService:
         self.store = EmptyStore()
         self.disarm_calls = 0
         self.reload_calls = 0
+        self.refresh_account_calls = []
+        self.health_snapshot = {
+            "available": False,
+            "process_healthy": False,
+            "reconcile_healthy": False,
+            "state": "missing",
+            "last_successful_reconcile_at": None,
+            "last_error_code": "",
+        }
 
     def latest_execution(self):
+        rows = self.store.list_recent(limit=1)
+        return rows[0] if rows else None
+
+    def get_execution(self, execution_id):
+        return self.store.get(execution_id)
+
+    def list_recent(self, *, limit=30):
+        return self.store.list_recent(limit=limit)
+
+    def events(self, execution_id):
+        method = getattr(self.store, "events", None)
+        return method(execution_id) if callable(method) else []
+
+    def latest_account_snapshot(self, broker, account_profile):
+        method = getattr(self.store, "latest_account_snapshot", None)
+        if callable(method):
+            return method(broker, account_profile)
         return None
 
     def disarm(self):
@@ -34,6 +71,136 @@ class FakeService:
     def reload_settings(self, _settings):
         self.is_armed = False
         self.reload_calls += 1
+
+    def refresh_account(self, execution_id=None):
+        self.refresh_account_calls.append(execution_id)
+
+    def worker_health_snapshot(self):
+        return self.health_snapshot
+
+
+class _ErrorBus:
+    def __init__(self):
+        self.errors = []
+        self.event = threading.Event()
+
+    def emit_execution_error(self, message):
+        self.errors.append(message)
+        self.event.set()
+
+
+class _CommandService(FakeService):
+    def __init__(self, result=None, error=None):
+        super().__init__()
+        self.result = result
+        self.error = error
+
+    def refresh_account(self, execution_id=None):
+        super().refresh_account(execution_id)
+        return SimpleNamespace(id="command-1")
+
+    def wait_for_command(self, command_id, *, timeout):
+        assert command_id == "command-1"
+        assert timeout == 30.0
+        if self.error:
+            raise self.error
+        return self.result
+
+
+def _execution(
+    execution_id: str,
+    *,
+    broker: str = "okx",
+    environment: str = "demo",
+    account: str = "okx",
+    error: str = "",
+) -> ExecutionRecord:
+    product = "swap" if broker == "okx" else "securities"
+    instrument = "XAU-USDT-SWAP" if broker == "okx" else "GLD.US"
+    plan = ExecutionPlan(
+        id=f"plan-{execution_id}",
+        analysis_digest=f"digest-{execution_id}",
+        analysis_record_path=f"records/{execution_id}.json",
+        broker=broker,
+        environment=environment,
+        product=product,
+        requested_account=account,
+        source_symbol="XAUUSD",
+        instrument=instrument,
+        direction="long",
+        entry_type="limit",
+        quantity=Decimal("2"),
+        entry_price=Decimal("100"),
+        take_profit_1=Decimal("110"),
+        take_profit_2=Decimal("120"),
+        stop_loss=Decimal("95"),
+        trade_confidence=88,
+        created_at="2026-07-18T00:00:00+00:00",
+        config_fingerprint=f"fingerprint-{execution_id}",
+        okx_margin_mode="cross" if broker == "okx" else "",
+    )
+    broker_state = (
+        {
+            "protection_targets": [
+                {"algo_id": "algo-1", "state": "live"},
+                {"client_order_id": "protect-2", "state": "planned"},
+            ],
+            "exit_order": {
+                "client_order_id": "exit-client",
+                "state": "submitting",
+            },
+        }
+        if broker == "okx"
+        else {
+            "stop_order": {"order_id": "stop-1", "state": "submitted"},
+            "partial_exit": {"order_id": "exit-1", "state": "pending"},
+        }
+    )
+    return ExecutionRecord(
+        id=execution_id,
+        plan=plan,
+        state=ExecutionState.UNKNOWN if error else ExecutionState.OPEN,
+        selected_account=account,
+        client_order_id=f"client-{execution_id}",
+        broker_order_id=f"broker-{execution_id}",
+        filled_quantity=Decimal("1.5"),
+        remaining_quantity=Decimal("0.5"),
+        broker_state=broker_state,
+        state_reason="等待只读对账" if error else "保护已建立",
+        last_error=error,
+        needs_attention=bool(error),
+    )
+
+
+class LifecycleStore:
+    def __init__(self, records, snapshots):
+        self._records = list(records)
+        self._snapshots = {
+            (snapshot.broker, snapshot.account_profile): snapshot
+            for snapshot in snapshots
+        }
+
+    def list_recent(self, limit=30):
+        return self._records[:limit]
+
+    def get(self, execution_id):
+        return next(
+            (
+                record
+                for record in self._records
+                if record.id == execution_id
+            ),
+            None,
+        )
+
+    def events(self, execution_id):
+        return [
+            ExecutionEvent(execution_id=execution_id, kind="plan_ready"),
+            ExecutionEvent(execution_id=execution_id, kind="reconciled"),
+        ]
+
+    def latest_account_snapshot(self, broker, account_profile):
+        return self._snapshots.get((broker, account_profile))
 
 
 def test_dialog_round_trips_longbridge_route_without_credentials(qtbot):
@@ -62,6 +229,58 @@ def test_dialog_round_trips_longbridge_route_without_credentials(qtbot):
     assert settings.execution.longbridge.quantity == "10"
     assert settings.execution.longbridge.preferred_account == "intraday"
     assert settings.execution.longbridge.allow_comprehensive_fallback is True
+
+
+@pytest.mark.parametrize(
+    ("result", "error", "expected"),
+    [
+        (
+            SimpleNamespace(
+                status=WorkerCommandStatus.FAILED,
+                failure_code="hard_gate_closed",
+            ),
+            None,
+            "hard_gate_closed",
+        ),
+        (
+            SimpleNamespace(
+                status=WorkerCommandStatus.UNCERTAIN,
+                failure_code="",
+            ),
+            None,
+            "禁止重复提交",
+        ),
+        (
+            None,
+            TimeoutError("still running"),
+            "结果尚未确定",
+        ),
+    ],
+)
+def test_async_command_terminal_state_is_visible(
+    qtbot,
+    result,
+    error,
+    expected,
+):
+    bus = _ErrorBus()
+    service = _CommandService(result=result, error=error)
+    dialog = TradingDialog(
+        settings=Settings(),
+        service=service,
+    )
+    dialog._event_bus = bus
+    qtbot.addWidget(dialog)
+
+    dialog._run_async(
+        lambda: service.refresh_account(),
+        "账户刷新失败",
+    )
+
+    assert bus.event.wait(2)
+    assert expected in bus.errors[-1]
+    if error is not None:
+        assert "command-1" in bus.errors[-1]
 
 
 def test_dialog_switches_paper_live_profiles_without_cross_environment_options(qtbot):
@@ -113,8 +332,8 @@ def test_unsaved_profile_switch_disarms_and_blocks_trade_actions(
     assert service.is_armed is False
     assert dialog._arm_button.isEnabled() is False
     assert dialog._execute_button.isEnabled() is False
-    assert dialog._cancel_button.isEnabled() is False
-    assert dialog._exit_button.isEnabled() is False
+    assert dialog._cancel_button.isEnabled() is True
+    assert dialog._exit_button.isEnabled() is True
     assert "请先保存配置" in dialog._arm_label.text()
 
 
@@ -161,6 +380,47 @@ def test_dialog_switches_okx_product_and_margin_controls(qtbot):
     dialog._okx_product.setCurrentIndex(dialog._okx_product.findData("swap"))
     dialog._sync_okx_margin_enabled()
     assert dialog._okx_margin.isEnabled() is True
+
+
+def test_okx_demo_is_clearly_labelled_as_simulated(qtbot):
+    settings = Settings()
+    dialog = TradingDialog(settings=settings, service=FakeService())
+    qtbot.addWidget(dialog)
+
+    dialog._broker.setCurrentIndex(dialog._broker.findData("okx"))
+    dialog._okx_simulated.setChecked(True)
+
+    assert dialog._arm_button.text() == "启用本次模拟会话"
+    dialog._configuration_dirty = False
+    dialog._update_arm_state(True)
+    assert dialog._arm_label.text() == "本次会话：已启用模拟写操作"
+
+
+def test_dialog_separates_worker_heartbeat_from_reconciliation_health(qtbot):
+    settings = Settings()
+    service = FakeService()
+    service.health_snapshot = {
+        "available": True,
+        "process_healthy": True,
+        "reconcile_healthy": False,
+        "state": "running",
+        "last_successful_reconcile_at": datetime(
+            2026,
+            7,
+            20,
+            8,
+            30,
+            tzinfo=UTC,
+        ),
+        "last_error_code": "",
+    }
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+
+    assert "心跳正常 / running" in dialog._worker_health_label.text()
+    assert "最近成功对账：2026-07-20T08:30:00+00:00（已陈旧）" in (
+        dialog._worker_health_label.text()
+    )
 
 
 def test_invalid_route_edit_does_not_partially_mutate_saved_settings(qtbot):
@@ -214,3 +474,68 @@ def test_account_update_renders_and_clears_positions(qtbot):
         snapshot.model_copy(update={"positions": []})
     )
     assert dialog._positions_table.rowCount() == 0
+
+
+def test_selected_execution_shows_lifecycle_error_and_matching_account(qtbot):
+    settings = Settings()
+    okx_record = _execution("okx-demo")
+    longbridge_record = _execution(
+        "lb-live",
+        broker="longbridge",
+        environment="live",
+        account="comprehensive",
+        error="券商返回状态未知",
+    )
+    service = FakeService()
+    service.store = LifecycleStore(
+        [okx_record, longbridge_record],
+        [
+            AccountSnapshot(
+                broker="okx",
+                account_profile="okx-demo",
+                base_currency="USDT",
+                equity=Decimal("5000"),
+            ),
+            AccountSnapshot(
+                broker="longbridge",
+                account_profile="comprehensive",
+                base_currency="USD",
+                equity=Decimal("1200"),
+            ),
+        ],
+    )
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+
+    dialog._execution_table.selectRow(1)
+
+    assert "成交：1.5" in dialog._execution_detail.text()
+    assert "剩余：0.5" in dialog._execution_detail.text()
+    assert "stop-1" in dialog._execution_detail.text()
+    assert "exit-1" in dialog._execution_detail.text()
+    assert "券商返回状态未知" in dialog._execution_detail.text()
+    assert dialog._account_profile_label.text() == "longbridge / comprehensive"
+    assert dialog._equity_label.text() == "1200 USD"
+    assert dialog._execution_table.item(1, 10).text() == "券商返回状态未知"
+
+
+def test_refresh_account_uses_selected_historical_execution_route(qtbot):
+    settings = Settings()
+    settings.execution.selected_broker = "okx"
+    longbridge_record = _execution(
+        "lb-live",
+        broker="longbridge",
+        environment="live",
+        account="intraday",
+    )
+    service = FakeService()
+    service.store = LifecycleStore([longbridge_record], [])
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+    dialog._configuration_dirty = False
+    dialog._run_async = lambda action, _label: action()
+
+    dialog._execution_table.selectRow(0)
+    dialog._refresh_account()
+
+    assert service.refresh_account_calls == ["lb-live"]

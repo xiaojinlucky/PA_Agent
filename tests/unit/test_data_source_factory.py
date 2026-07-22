@@ -13,6 +13,7 @@ from pa_agent.data.factory import (
 )
 from pa_agent.data.longbridge_source import LongbridgeSource
 from pa_agent.data.mt5 import MT5Source
+from pa_agent.data.okx_source import OkxSource
 from pa_agent.data.tradingview import TradingViewSource
 from pa_agent.data.tushare_source import TushareSource
 
@@ -44,10 +45,15 @@ def test_longbridge_is_visible_in_ui_choices():
     assert "longbridge" in {k for k, _ in DATA_SOURCE_CHOICES}
 
 
+def test_okx_is_visible_in_ui_choices():
+    assert "okx" in {k for k, _ in DATA_SOURCE_CHOICES}
+
+
 def test_create_data_source_returns_expected_types():
     assert isinstance(create_data_source("mt5"), MT5Source)
     assert isinstance(create_data_source("tradingview"), TradingViewSource)
     assert isinstance(create_data_source("longbridge"), LongbridgeSource)
+    assert isinstance(create_data_source("okx"), OkxSource)
     assert isinstance(create_data_source("eastmoney"), EastMoneySource)
     assert isinstance(create_data_source("tushare"), TushareSource)
 
@@ -56,12 +62,14 @@ def test_default_symbols_per_kind():
     assert default_symbol_for_kind("mt5") == "XAUUSDm"
     assert default_symbol_for_kind("tradingview") == "XAUUSD"
     assert default_symbol_for_kind("longbridge") == "AAPL.US"
+    assert default_symbol_for_kind("okx") == "XAU-USDT-SWAP"
     assert default_symbol_for_kind("eastmoney") == "000001"
     assert default_symbol_for_kind("tushare") == "000001"
 
 
 def test_longbridge_analysis_limit_reserves_refresh_warmup():
     assert max_analysis_bars_for_kind("longbridge") == 945
+    assert max_analysis_bars_for_kind("okx") == 245
     assert max_analysis_bars_for_kind("mt5") == 5_000
 
 

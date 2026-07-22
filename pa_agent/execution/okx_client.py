@@ -68,6 +68,9 @@ class UrlLibTransport:
 class OkxRestClient:
     """Authenticated/private and public OKX V5 requests with bounded timeouts."""
 
+    _ALGO_PAGE_LIMIT = 100
+    _MAX_ALGO_PAGES = 100
+
     def __init__(
         self,
         credentials: OkxCredentials,
@@ -265,6 +268,33 @@ class OkxRestClient:
         )
         return [dict(item) for item in payload.get("data") or []]
 
+    def candles(
+        self,
+        *,
+        instrument: str,
+        bar: str,
+        limit: int,
+    ) -> list[list[str]]:
+        payload = self._request(
+            "GET",
+            "/api/v5/market/candles",
+            params={
+                "instId": instrument,
+                "bar": bar,
+                "limit": max(1, min(int(limit), 300)),
+            },
+            private=False,
+        )
+        rows: list[list[str]] = []
+        for item in payload.get("data") or []:
+            if not isinstance(item, list) or len(item) < 9:
+                raise BrokerTransportError(
+                    "OKX K 线响应格式无效",
+                    write_may_have_reached=False,
+                )
+            rows.append([str(value) for value in item[:9]])
+        return rows
+
     def max_order_size(
         self,
         *,
@@ -389,6 +419,95 @@ class OkxRestClient:
         )
         data = payload.get("data") or []
         return dict(data[0]) if data else {}
+
+    def find_algo_order_by_client_id(
+        self,
+        *,
+        client_algo_id: str,
+        order_type: str,
+        instrument: str,
+    ) -> dict[str, Any] | None:
+        """查找算法单；全部权威只读查询成功后，None 才表示确认不存在。"""
+        try:
+            found = self.get_algo_order(client_algo_id=client_algo_id)
+        except BrokerApiError as exc:
+            if exc.code != "51603":
+                raise
+        else:
+            if found:
+                return found
+
+        pending = self._find_algo_order_in_pages(
+            path="/api/v5/trade/orders-algo-pending",
+            params={"ordType": order_type, "instId": instrument},
+            client_algo_id=client_algo_id,
+        )
+        if pending is not None:
+            return pending
+
+        for state in ("effective", "canceled", "order_failed"):
+            history = self._find_algo_order_in_pages(
+                path="/api/v5/trade/orders-algo-history",
+                params={
+                    "ordType": order_type,
+                    "state": state,
+                    "instId": instrument,
+                },
+                client_algo_id=client_algo_id,
+            )
+            if history is not None:
+                return history
+        return None
+
+    def _find_algo_order_in_pages(
+        self,
+        *,
+        path: str,
+        params: dict[str, Any],
+        client_algo_id: str,
+    ) -> dict[str, Any] | None:
+        """完整翻页查找算法单；任何分页异常都不能降级成“查无”。"""
+        after = ""
+        seen_cursors: set[str] = set()
+        for _page_number in range(self._MAX_ALGO_PAGES):
+            page_params = dict(params)
+            page_params.update({"limit": self._ALGO_PAGE_LIMIT, "after": after})
+            payload = self._request(
+                "GET",
+                path,
+                params=page_params,
+                private=True,
+            )
+            rows = payload.get("data") or []
+            if len(rows) > self._ALGO_PAGE_LIMIT:
+                raise BrokerTransportError(
+                    "OKX 算法单分页返回数量超过官方上限",
+                    write_may_have_reached=False,
+                )
+            for item in rows:
+                if not isinstance(item, dict):
+                    raise BrokerTransportError(
+                        "OKX 算法单分页项目不是对象",
+                        write_may_have_reached=False,
+                    )
+                if str(item.get("algoClOrdId") or "") == client_algo_id:
+                    return dict(item)
+            if len(rows) < self._ALGO_PAGE_LIMIT:
+                return None
+
+            cursor = str(rows[-1].get("algoId") or "").strip()
+            if not cursor or cursor in seen_cursors:
+                raise BrokerTransportError(
+                    "OKX 算法单分页游标缺失或重复",
+                    write_may_have_reached=False,
+                )
+            seen_cursors.add(cursor)
+            after = cursor
+
+        raise BrokerTransportError(
+            "OKX 算法单分页超过安全上限，不能确认订单不存在",
+            write_may_have_reached=False,
+        )
 
     def cancel_algo_orders(self, orders: list[dict[str, str]]) -> list[dict[str, Any]]:
         payload = self._request(

@@ -493,7 +493,7 @@ class AIStreamPanel(QWidget):
         self._input_edit.clear()
         self.set_input_enabled(False)
         self._red_warned = False
-        context_window = 1_000_000
+        context_window = None
         if self._settings is not None:
             context_window = self._settings.provider.context_window
         self.update_token_display(
@@ -509,15 +509,22 @@ class AIStreamPanel(QWidget):
 
     def update_token_display(self, data: dict) -> None:
         context_used = data.get("context_used", 0)
-        context_window = data.get("context_window", 1_000_000)
+        context_window = data.get("context_window")
         total_input = data.get("total_input", 0)
         total_output = data.get("total_output", 0)
         total_cached = data.get("total_cached_input", 0)
-        pct = (context_used / context_window * 100.0) if context_window > 0 else 0.0
-        pct_int = min(100, int(pct))
+        context_known = isinstance(context_window, (int, float)) and context_window > 0
+        pct = (
+            context_used / context_window * 100.0
+            if context_known
+            else None
+        )
+        pct_int = min(100, int(pct)) if pct is not None else 0
         self._progress_bar.setValue(pct_int)
-        self._progress_bar.setFormat(f"{pct:.1f}%")
-        if pct >= _RED_PCT:
+        self._progress_bar.setFormat(
+            f"{pct:.1f}%" if pct is not None else "上限未知"
+        )
+        if pct is not None and pct >= _RED_PCT:
             self._progress_bar.setStyleSheet(_STYLE_RED)
             if not self._red_warned:
                 self._red_warned = True
@@ -526,10 +533,11 @@ class AIStreamPanel(QWidget):
                     "上下文用量警告",
                     f"上下文用量已达 {pct:.1f}%，接近上限。",
                 )
-        elif pct >= _YELLOW_PCT:
+        elif pct is not None and pct >= _YELLOW_PCT:
             self._progress_bar.setStyleSheet(_STYLE_YELLOW)
         else:
             self._progress_bar.setStyleSheet(_STYLE_NORMAL)
+            self._red_warned = False
 
         cache_hit_pct = (total_cached / total_input * 100.0) if total_input > 0 else 0.0
         if total_cached > 0:
@@ -537,9 +545,10 @@ class AIStreamPanel(QWidget):
         else:
             cache_str = ""
 
+        context_limit = f"{context_window:,}" if context_known else "上限未知"
         self._token_label.setText(
-            f"{context_used:,} / {context_window:,} · "
-            f"in {total_input:,} / out {total_output:,}{cache_str}"
+            f"当前 {context_used:,} / {context_limit} · "
+            f"累计 in {total_input:,} / out {total_output:,}{cache_str}"
         )
         self._token_label.setToolTip(
             f"输入 token：{total_input:,}\n"

@@ -9,12 +9,14 @@ from pa_agent.data.market_defaults import (
     GOLD_MT5_SYMBOL,
     GOLD_TV_SYMBOL,
     LONGBRIDGE_DEFAULT_SYMBOL,
+    OKX_DEFAULT_SYMBOL,
 )
 
 DataSourceKind = Literal[
     "mt5",
     "tradingview",
     "longbridge",
+    "okx",
     "akshare",
     "eastmoney",
     "tushare",
@@ -26,6 +28,7 @@ DATA_SOURCE_CHOICES: tuple[tuple[DataSourceKind, str], ...] = (
     ("mt5", "MT5"),
     ("tradingview", "TradingView"),
     ("longbridge", "Longbridge"),
+    ("okx", "OKX 行情"),
 )
 
 _HIDDEN_KINDS: frozenset[DataSourceKind] = frozenset(
@@ -36,6 +39,7 @@ _DEFAULT_SYMBOLS: dict[DataSourceKind, str] = {
     "mt5": GOLD_MT5_SYMBOL,
     "tradingview": GOLD_TV_SYMBOL,
     "longbridge": LONGBRIDGE_DEFAULT_SYMBOL,
+    "okx": OKX_DEFAULT_SYMBOL,
     "akshare": A_SHARE_DEFAULT_SYMBOL,
     "eastmoney": A_SHARE_DEFAULT_SYMBOL,
     "tushare": A_SHARE_DEFAULT_SYMBOL,
@@ -85,6 +89,10 @@ def max_analysis_bars_for_kind(kind: str | None) -> int:
         from pa_agent.data.longbridge_source import LONGBRIDGE_MAX_ANALYSIS_BARS
 
         return LONGBRIDGE_MAX_ANALYSIS_BARS
+    if normalize_data_source_kind(kind) == "okx":
+        from pa_agent.data.okx_source import OKX_MAX_ANALYSIS_BARS
+
+        return OKX_MAX_ANALYSIS_BARS
     return 5_000
 
 
@@ -99,6 +107,10 @@ def create_data_source(kind: str | None) -> DataSource:
         from pa_agent.data.longbridge_source import LongbridgeSource
 
         return LongbridgeSource()
+    if normalized == "okx":
+        from pa_agent.data.okx_source import OkxSource
+
+        return OkxSource()
     if normalized == "eastmoney":
         from pa_agent.data.eastmoney_source import EastMoneySource
 

@@ -1176,13 +1176,12 @@ class TwoStageOrchestrator:
 
             if isinstance(
                 exc,
-                (
-                    openai.APITimeoutError,
-                    openai.APIConnectionError,
-                    openai.APIStatusError,
-                ),
+                (openai.APITimeoutError, openai.APIConnectionError),
             ):
                 return True
+            if isinstance(exc, openai.APIStatusError):
+                status = int(getattr(exc, "status_code", 0) or 0)
+                return status in {408, 409, 425, 429} or status >= 500
         except ImportError:
             pass
 

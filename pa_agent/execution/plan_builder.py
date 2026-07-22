@@ -208,6 +208,12 @@ def build_execution_plan(
     instrument = str(route.instrument or "").strip().upper()
     if not instrument:
         raise PlanBlocked("route_incomplete", "执行配置缺少券商品种")
+    if source_symbol != instrument:
+        raise PlanBlocked(
+            "price_basis_mismatch",
+            "PA 的入场、止盈、止损价格只能直接用于同一个券商品种；"
+            f"当前分析 {source_symbol}，下单 {instrument}",
+        )
     quantity = _positive_decimal(route.quantity, "quantity")
 
     digest = _verify_durable_record(record, record_path)

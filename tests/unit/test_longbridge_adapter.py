@@ -28,6 +28,7 @@ class FakeLongbridgeSession:
         self.cancel_error = None
         self.executions_by_order = {}
         self.executions_error = None
+        self.positions_error = None
 
     def static_info(self, symbol):
         self.calls.append(("static_info", symbol))
@@ -42,7 +43,24 @@ class FakeLongbridgeSession:
 
     def positions(self, symbol=None):
         self.calls.append(("positions", symbol))
-        return list(self.positions_rows)
+        if self.positions_error:
+            raise self.positions_error
+        if self.positions_rows:
+            return list(self.positions_rows)
+        net_quantity = Decimal("0")
+        for order in self.orders.values():
+            filled = Decimal(str(order.get("filled_quantity") or "0"))
+            side = str(order.get("side") or "").lower()
+            net_quantity += filled if side == "buy" else -filled
+        if net_quantity == 0:
+            return []
+        return [
+            {
+                "symbol": symbol or "GLD.US",
+                "quantity": str(net_quantity),
+                "available_quantity": str(abs(net_quantity)),
+            }
+        ]
 
     def estimate_max_quantity(self, **kwargs):
         self.calls.append(("estimate", kwargs))
@@ -57,6 +75,7 @@ class FakeLongbridgeSession:
         self.orders[order_id] = {
             "order_id": order_id,
             "state": "pending",
+            "side": body["side"],
             "quantity": body["submitted_quantity"],
             "filled_quantity": "0",
             "average_fill_price": "",
@@ -165,6 +184,46 @@ def test_intraday_capacity_shortage_falls_back_before_submit():
 
     assert result.selected_account == "comprehensive"
     assert result.warnings and "回退综合账户" in result.warnings[0]
+
+
+def test_rejected_cancel_terminal_marker_stays_read_only_after_restart():
+    intraday = FakeLongbridgeSession()
+    first = LongbridgeAdapter(
+        lambda _profile: intraday,
+        runtime_id="runtime-before-restart",
+    )
+    plan = _plan()
+    preflight = first.preflight(plan)
+    prepared = first.prepare_submit(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.READY,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    submitted = first.submit_entry(prepared)
+    broker_state = dict(submitted.broker_state)
+    broker_state["entry_cancel_status"] = "rejected"
+    broker_state["risk_reducing_writes_blocked"] = "cancel_entry_rejected"
+    rejected = submitted.model_copy(
+        update={
+            "broker_state": broker_state,
+            "needs_attention": True,
+        }
+    )
+    restarted = LongbridgeAdapter(
+        lambda _profile: intraday,
+        runtime_id="runtime-after-restart",
+    )
+
+    reconciled = restarted.reconcile(rejected, allow_writes=False)
+
+    assert reconciled.state is ExecutionState.ENTRY_PENDING
+    assert reconciled.needs_attention is False
+    assert "write_unknown" not in reconciled.broker_state
+    assert not [call for call in intraday.calls if call[0] == "cancel_order"]
 
 
 @pytest.mark.parametrize(
@@ -985,6 +1044,121 @@ def test_stop_cancel_race_reduces_followup_exit_to_actual_remainder():
     assert submit_phase.broker_state["partial_exit"]["quantity"] == "1"
     assert body["submitted_quantity"] == "1"
     assert pending.broker_state["partial_exit"]["phase"] == "wait_exit"
+
+
+def test_manual_broker_reduction_clamps_exit_before_submit():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = adapter.submit_entry(
+        ExecutionRecord(
+            id=plan.id,
+            plan=plan,
+            state=ExecutionState.SUBMITTING,
+            preflight=preflight,
+            remaining_quantity=plan.quantity,
+        )
+    )
+    intraday.orders[record.broker_order_id].update(
+        {"state": "filled", "filled_quantity": "2", "average_fill_price": "100"}
+    )
+    record = adapter.reconcile(record, allow_writes=True)
+    record = adapter.reconcile(record, allow_writes=True)
+    stop_id = record.broker_state["stop_order"]["order_id"]
+    record = adapter.request_exit(record, reason="manual")
+    record = adapter.reconcile(record, allow_writes=True)
+    intraday.orders[stop_id]["state"] = "canceled"
+    submit_intent = adapter.reconcile(record, allow_writes=True)
+    intraday.positions_rows = [
+        {
+            "symbol": plan.instrument,
+            "quantity": "1",
+            "available_quantity": "1",
+        }
+    ]
+
+    clamped = adapter.reconcile(submit_intent, allow_writes=True)
+    submitted = adapter.reconcile(clamped, allow_writes=True)
+
+    exit_body = [
+        call[1]
+        for call in intraday.calls
+        if call[0] == "submit_order"
+    ][-1]
+    assert clamped.broker_state["partial_exit"]["quantity"] == "1"
+    assert clamped.needs_attention is True
+    assert exit_body["submitted_quantity"] == "1"
+    assert submitted.broker_state["partial_exit"]["phase"] == "wait_exit"
+
+
+def test_position_read_failure_blocks_exit_submit():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=Decimal("2"),
+        broker_state={
+            "partial_exit": {
+                "phase": "submit_exit",
+                "quantity": "2",
+                "request_id": "request",
+                "remark": "remark",
+                "submit_runtime_id": adapter._runtime_id,
+            }
+        },
+    )
+    intraday.positions_error = BrokerTransportError(
+        "positions unavailable",
+        write_may_have_reached=False,
+    )
+
+    blocked = adapter.reconcile(record, allow_writes=True)
+
+    assert blocked.needs_attention is True
+    assert "实际可用持仓" in blocked.state_reason
+    assert not [call for call in intraday.calls if call[0] == "submit_order"]
+
+
+def test_manual_broker_reduction_clamps_stop_before_submit():
+    intraday = FakeLongbridgeSession()
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.PROTECTING,
+        selected_account="intraday",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+    )
+    initialised = adapter.reconcile(record, allow_writes=True)
+    intraday.positions_rows = [
+        {
+            "symbol": plan.instrument,
+            "quantity": "1",
+            "available_quantity": "1",
+        }
+    ]
+
+    clamped = adapter.reconcile(initialised, allow_writes=True)
+    protected = adapter.reconcile(clamped, allow_writes=True)
+
+    stop_body = [
+        call[1]
+        for call in intraday.calls
+        if call[0] == "submit_order"
+    ][-1]
+    assert clamped.broker_state["stop_order"]["quantity"] == "1"
+    assert clamped.needs_attention is True
+    assert stop_body["submitted_quantity"] == "1"
+    assert protected.needs_attention is True
 
 
 def test_terminal_stop_without_confirmed_fill_quantity_stays_open_and_stops_writes():

@@ -4,7 +4,7 @@ from __future__ import annotations
 import threading
 from decimal import Decimal
 
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -28,10 +28,62 @@ from PyQt6.QtWidgets import (
 from pa_agent.config.paths import SETTINGS_JSON_PATH
 from pa_agent.config.settings import save_settings
 from pa_agent.execution.models import AccountSnapshot, ExecutionRecord
+from pa_agent.execution.worker_protocol import WorkerCommandStatus
 
 
 def _decimal_text(value: Decimal | None) -> str:
     return "—" if value is None else format(value, "f")
+
+
+def _order_reference(order: object) -> str:
+    if not isinstance(order, dict) or not order:
+        return "—"
+    order_id = next(
+        (
+            str(order.get(key) or "").strip()
+            for key in (
+                "order_id",
+                "algo_id",
+                "broker_order_id",
+                "client_order_id",
+                "request_id",
+            )
+            if str(order.get(key) or "").strip()
+        ),
+        "",
+    )
+    state = str(order.get("state") or "").strip()
+    if order_id and state:
+        return f"{order_id} / {state}"
+    return order_id or state or "已计划"
+
+
+def _protection_text(record: ExecutionRecord) -> str:
+    state = record.broker_state
+    targets = state.get("protection_targets")
+    if isinstance(targets, list) and targets:
+        summaries = [
+            _order_reference(target)
+            for target in targets
+            if isinstance(target, dict)
+        ]
+        return f"{len(targets)} 笔：" + "；".join(summaries)
+    stop = state.get("stop_order")
+    if isinstance(stop, dict) and stop:
+        return f"止损：{_order_reference(stop)}"
+    return "—"
+
+
+def _exit_text(record: ExecutionRecord) -> str:
+    state = record.broker_state
+    for key in ("exit_order", "partial_exit"):
+        order = state.get(key)
+        if isinstance(order, dict) and order:
+            return _order_reference(order)
+    completed = state.get("take_profit_completed")
+    if isinstance(completed, list) and completed:
+        return f"已完成止盈：{len(completed)} 笔"
+    return "—"
 
 
 class TradingDialog(QDialog):
@@ -51,14 +103,23 @@ class TradingDialog(QDialog):
         self._connect_configuration_guard()
         self._refresh_recent()
         self._update_arm_state(self._service.is_armed)
+        self._refresh_worker_health()
+        self._health_timer = QTimer(self)
+        self._health_timer.setInterval(1000)
+        self._health_timer.timeout.connect(self._refresh_worker_health)
+        self._health_timer.start()
 
     def _setup_ui(self) -> None:
         root = QVBoxLayout(self)
 
         gate_group = QGroupBox("运行状态")
         gate_layout = QHBoxLayout(gate_group)
+        labels = QVBoxLayout()
         self._arm_label = QLabel()
-        gate_layout.addWidget(self._arm_label, 1)
+        labels.addWidget(self._arm_label)
+        self._worker_health_label = QLabel()
+        labels.addWidget(self._worker_health_label)
+        gate_layout.addLayout(labels, 1)
         self._arm_button = QPushButton("启用本次实盘会话")
         self._arm_button.clicked.connect(self._arm_session)
         gate_layout.addWidget(self._arm_button)
@@ -129,15 +190,33 @@ class TradingDialog(QDialog):
 
         lifecycle_group = QGroupBox("PA 执行生命周期")
         lifecycle_layout = QVBoxLayout(lifecycle_group)
-        self._execution_table = QTableWidget(0, 7)
+        self._execution_table = QTableWidget(0, 11)
         self._execution_table.setHorizontalHeaderLabels(
-            ["时间", "券商/账户", "产品", "品种", "方向/数量", "状态", "盈亏"]
+            [
+                "时间",
+                "券商/账户",
+                "产品",
+                "品种",
+                "方向/数量",
+                "成交/剩余",
+                "入场单",
+                "保护/离场",
+                "状态",
+                "盈亏",
+                "错误",
+            ]
         )
         self._execution_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
+        self._execution_table.setSelectionMode(
+            QTableWidget.SelectionMode.SingleSelection
+        )
         self._execution_table.setEditTriggers(
             QTableWidget.EditTrigger.NoEditTriggers
+        )
+        self._execution_table.itemSelectionChanged.connect(
+            self._show_selected_execution
         )
         self._execution_table.horizontalHeader().setStretchLastSection(True)
         lifecycle_layout.addWidget(self._execution_table)
@@ -210,6 +289,9 @@ class TradingDialog(QDialog):
         self._okx_margin.addItem("逐仓", "isolated")
         form.addRow("永续保证金模式:", self._okx_margin)
         self._okx_simulated = QCheckBox("使用 OKX 模拟交易环境")
+        self._okx_simulated.toggled.connect(
+            self._sync_longbridge_profile_controls
+        )
         form.addRow("环境:", self._okx_simulated)
         self._okx_base_url = QLineEdit()
         form.addRow("API 地址:", self._okx_base_url)
@@ -268,7 +350,7 @@ class TradingDialog(QDialog):
         QMessageBox.warning(
             self,
             "配置尚未保存",
-            "交易配置已有未保存变更。请先点击“保存配置”，再启用或操作订单。",
+            "交易配置已有未保存变更。请先点击“保存配置”，再启用新增风险或刷新所选账户。",
         )
         return True
 
@@ -347,7 +429,7 @@ class TradingDialog(QDialog):
         if self._reject_unsaved_action():
             return
         confirmation = self._service.arm_confirmation_text()
-        paper = self._is_longbridge_paper_route()
+        paper = self._is_demo_route()
         text, accepted = QInputDialog.getText(
             self,
             "启用本次模拟交易会话" if paper else "启用本次实盘会话",
@@ -371,19 +453,8 @@ class TradingDialog(QDialog):
     def _refresh_account(self) -> None:
         if self._reject_unsaved_action():
             return
-        try:
-            self._service.reload_settings(self._settings)
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, "账户读取失败", str(exc))
-            return
         execution = self._selected_execution()
-        execution_id = (
-            execution.id
-            if execution is not None
-            and execution.plan.broker
-            == self._settings.execution.selected_broker
-            else None
-        )
+        execution_id = execution.id if execution is not None else None
         self._run_async(
             lambda: self._service.refresh_account(execution_id),
             "账户读取失败",
@@ -396,7 +467,7 @@ class TradingDialog(QDialog):
             if item is not None:
                 execution_id = item.data(Qt.ItemDataRole.UserRole)
                 if execution_id:
-                    return self._service.store.get(str(execution_id))
+                    return self._service.get_execution(str(execution_id))
         return self._service.latest_execution()
 
     def _submit_selected(self) -> None:
@@ -412,8 +483,6 @@ class TradingDialog(QDialog):
         )
 
     def _cancel_selected(self) -> None:
-        if self._reject_unsaved_action():
-            return
         execution = self._selected_execution()
         if execution is None:
             return
@@ -423,8 +492,6 @@ class TradingDialog(QDialog):
         )
 
     def _exit_selected(self) -> None:
-        if self._reject_unsaved_action():
-            return
         execution = self._selected_execution()
         if execution is None:
             return
@@ -445,8 +512,39 @@ class TradingDialog(QDialog):
         """Run broker I/O without freezing the Qt event loop."""
 
         def _run() -> None:
+            command_id = ""
             try:
-                action()
+                command = action()
+                command_id = str(
+                    getattr(command, "id", "") or ""
+                ).strip()
+                waiter = getattr(self._service, "wait_for_command", None)
+                if command_id and callable(waiter):
+                    result = waiter(command_id, timeout=30.0)
+                    if result.status is WorkerCommandStatus.UNCERTAIN:
+                        raise RuntimeError(
+                            "后台返回结果不明，禁止重复提交；"
+                            "请先等待券商对账或人工核对"
+                        )
+                    if result.status is WorkerCommandStatus.FAILED:
+                        raise RuntimeError(
+                            result.failure_code or "交易后台拒绝了该请求"
+                        )
+                    if result.status is not WorkerCommandStatus.SUCCEEDED:
+                        raise RuntimeError(
+                            f"交易后台命令状态异常：{result.status.value}"
+                        )
+            except TimeoutError:
+                bus = self._event_bus
+                action_name = label.removesuffix("失败")
+                message = (
+                    f"{action_name}结果尚未确定：等待交易后台超时，"
+                    "请勿重复操作；继续观察订单与对账状态"
+                )
+                if command_id:
+                    message += f"（命令 {command_id}）"
+                if bus is not None and hasattr(bus, "emit_execution_error"):
+                    bus.emit_execution_error(message)
             except Exception as exc:  # noqa: BLE001
                 bus = self._event_bus
                 message = f"{label}：{exc}"
@@ -465,11 +563,10 @@ class TradingDialog(QDialog):
         )
         self._sync_longbridge_profile_controls()
 
-    def _is_longbridge_paper_route(self) -> bool:
-        return (
-            self._broker.currentData() == "longbridge"
-            and self._lb_account.currentData() == "paper"
-        )
+    def _is_demo_route(self) -> bool:
+        if self._broker.currentData() == "longbridge":
+            return self._lb_account.currentData() == "paper"
+        return bool(self._okx_simulated.isChecked())
 
     def _sync_longbridge_profile_controls(self) -> None:
         profile = self._lb_account.currentData()
@@ -483,7 +580,7 @@ class TradingDialog(QDialog):
             if profile == "paper"
             else "以账户与品种权限为准"
         )
-        paper = self._is_longbridge_paper_route()
+        paper = self._is_demo_route()
         self._arm_button.setText(
             "启用本次模拟会话" if paper else "启用本次实盘会话"
         )
@@ -497,13 +594,13 @@ class TradingDialog(QDialog):
             self._arm_button.setEnabled(False)
             self._disarm_button.setEnabled(False)
             self._execute_button.setEnabled(False)
-            self._cancel_button.setEnabled(False)
-            self._exit_button.setEnabled(False)
+            self._cancel_button.setEnabled(True)
+            self._exit_button.setEnabled(True)
             return
         if armed:
             self._arm_label.setText(
                 "本次会话：已启用模拟写操作"
-                if self._is_longbridge_paper_route()
+                if self._is_demo_route()
                 else "本次会话：已启用实盘写操作"
             )
         else:
@@ -514,16 +611,66 @@ class TradingDialog(QDialog):
         self._cancel_button.setEnabled(True)
         self._exit_button.setEnabled(True)
 
-    def _on_execution_update(self, record: ExecutionRecord) -> None:
-        self._execution_detail.setText(
-            f"{record.plan.broker} / {record.selected_account or record.plan.requested_account} / "
-            f"{record.plan.instrument} / {record.state.value}\n"
-            f"{record.state_reason}"
-            + (f"\n需要处理：{record.last_error}" if record.last_error else "")
+    def _refresh_worker_health(self) -> None:
+        snapshot_method = getattr(
+            self._service,
+            "worker_health_snapshot",
+            None,
         )
+        if not callable(snapshot_method):
+            self._worker_health_label.setText(
+                "交易后台：当前运行方式未提供健康状态"
+            )
+            return
+        try:
+            snapshot = snapshot_method()
+        except Exception as exc:  # noqa: BLE001
+            self._worker_health_label.setText(
+                f"交易后台：状态读取失败（{type(exc).__name__}）"
+            )
+            return
+        if not bool(snapshot.get("available")):
+            self._worker_health_label.setText(
+                "交易后台：尚未启动；最近成功对账：无"
+            )
+            return
+        process_text = (
+            "心跳正常"
+            if bool(snapshot.get("process_healthy"))
+            else "心跳已停止"
+        )
+        reconcile_at = snapshot.get("last_successful_reconcile_at")
+        if reconcile_at is None:
+            reconcile_text = "无"
+        else:
+            isoformat = getattr(reconcile_at, "isoformat", None)
+            reconcile_text = (
+                isoformat(timespec="seconds")
+                if callable(isoformat)
+                else str(reconcile_at)
+            )
+            if not bool(snapshot.get("reconcile_healthy")):
+                reconcile_text += "（已陈旧）"
+        state = str(snapshot.get("state") or "unknown")
+        error_code = str(snapshot.get("last_error_code") or "")
+        error_text = f"；最近错误：{error_code}" if error_code else ""
+        self._worker_health_label.setText(
+            f"交易后台：{process_text} / {state}；"
+            f"最近成功对账：{reconcile_text}{error_text}"
+        )
+
+    def _on_execution_update(self, record: ExecutionRecord) -> None:
         self._refresh_recent()
 
     def _on_account_update(self, snapshot: AccountSnapshot) -> None:
+        selected = self._selected_execution()
+        if selected is not None:
+            expected_broker, expected_profile = self._snapshot_route(selected)
+            if (
+                snapshot.broker != expected_broker
+                or snapshot.account_profile != expected_profile
+            ):
+                return
         currency = snapshot.base_currency
         suffix = f" {currency}" if currency else ""
         self._account_profile_label.setText(
@@ -569,21 +716,93 @@ class TradingDialog(QDialog):
     def _on_execution_error(self, message: str) -> None:
         self._execution_detail.setText(message)
 
+    @staticmethod
+    def _snapshot_route(record: ExecutionRecord) -> tuple[str, str]:
+        if record.plan.broker == "okx":
+            return "okx", (
+                "okx-demo" if record.plan.environment == "demo" else "okx-live"
+            )
+        return "longbridge", (
+            record.selected_account or record.plan.requested_account
+        )
+
+    def _show_selected_execution(self) -> None:
+        record = self._selected_execution()
+        if record is None:
+            self._execution_detail.setText("尚无执行记录")
+            return
+        events_method = getattr(self._service, "events", None)
+        events = events_method(record.id) if callable(events_method) else []
+        event_kinds = " → ".join(event.kind for event in events[-8:]) or "—"
+        account = record.selected_account or record.plan.requested_account
+        environment = "模拟" if record.plan.environment == "demo" else "实盘"
+        attention = "是" if record.needs_attention else "否"
+        detail = [
+            (
+                f"{record.plan.broker} / {account} / {environment} / "
+                f"{record.plan.product} / {record.plan.instrument}"
+            ),
+            (
+                f"状态：{record.state.value}；成交：{_decimal_text(record.filled_quantity)}；"
+                f"剩余：{_decimal_text(record.remaining_quantity)}；需要人工处理：{attention}"
+            ),
+            (
+                f"入场单：客户单号 {record.client_order_id or '—'}；"
+                f"券商单号 {record.broker_order_id or '—'}"
+            ),
+            f"保护：{_protection_text(record)}",
+            f"离场：{_exit_text(record)}",
+            f"最近事件：{event_kinds}",
+            f"状态说明：{record.state_reason or '—'}",
+            f"错误：{record.last_error or '—'}",
+        ]
+        self._execution_detail.setText("\n".join(detail))
+
+        snapshot_method = getattr(
+            self._service,
+            "latest_account_snapshot",
+            None,
+        )
+        if callable(snapshot_method):
+            broker, profile = self._snapshot_route(record)
+            snapshot = snapshot_method(broker, profile)
+            if snapshot is not None:
+                self._on_account_update(snapshot)
+
     def _refresh_recent(self) -> None:
-        records = self._service.store.list_recent(limit=30)
+        selected = self._selected_execution()
+        selected_id = selected.id if selected is not None else ""
+        records = self._service.list_recent(limit=30)
+        self._execution_table.blockSignals(True)
         self._execution_table.setRowCount(len(records))
+        selected_row = -1
         for row, record in enumerate(records):
+            if record.id == selected_id:
+                selected_row = row
             values = [
                 record.created_at[:19].replace("T", " "),
                 f"{record.plan.broker}/{record.selected_account or record.plan.requested_account}",
                 record.plan.product,
                 record.plan.instrument,
                 f"{record.plan.direction}/{record.plan.quantity}",
+                (
+                    f"{_decimal_text(record.filled_quantity)} / "
+                    f"{_decimal_text(record.remaining_quantity)}"
+                ),
+                (
+                    f"{record.client_order_id or '—'} / "
+                    f"{record.broker_order_id or '—'}"
+                ),
+                (
+                    f"保护 {_protection_text(record)}；"
+                    f"离场 {_exit_text(record)}"
+                ),
                 record.state.value,
                 (
                     f"R {_decimal_text(record.realized_pnl)} / "
                     f"U {_decimal_text(record.unrealized_pnl)}"
                 ),
+                record.last_error or "—",
             ]
             for column, text in enumerate(values):
                 item = QTableWidgetItem(text)
@@ -592,3 +811,10 @@ class TradingDialog(QDialog):
                 if record.needs_attention:
                     item.setToolTip(record.last_error or record.state_reason)
                 self._execution_table.setItem(row, column, item)
+        self._execution_table.blockSignals(False)
+        if records:
+            self._execution_table.selectRow(
+                selected_row if selected_row >= 0 else 0
+            )
+        else:
+            self._show_selected_execution()

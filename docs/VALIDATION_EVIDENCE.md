@@ -2,7 +2,7 @@
 
 ## 发布事实
 
-- 私有仓库：`Jinqingchang/PA_Agent`
+- 用户当前 GitHub 用户名：`xiaojinlucky`。2026-07-22 已明确授权 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布。本地 `origin` 已改为 `git@github.com:xiaojinlucky/PA_Agent.git`；登录账号为 `xiaojinlucky`，权限为 `ADMIN`。正式暂存前，本地 `main`、`origin/main` 和 GitHub API 返回的基线 SHA 均为 `3ae95321eef706889cf901c63a1c293f11f7608d`。
 - 分支：`main`
 - 多模型与 Longbridge 只读行情功能提交：`3d9353f8579e6d661fd314ab6b9e91016d9fdd96`
 - 该提交发布后已验证本地 `HEAD`、`origin/main` 与 GitHub 实时分支 SHA 完全一致。
@@ -52,7 +52,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 44 文件功能提交的暂存快照由 Gitleaks 8.30.1 扫描：0 命中。
 - Git pre-commit 安全钩子原样通过，没有使用 `--no-verify`。
 - 安全源码 ZIP 排除 `.git`、真实 `.env`/配置/凭据、根目录日志与记录、行情/训练数据、模型、第三方反馈/打赏图和探针结果。
-- `tests/unit/test_debug_widget_masks_key.py` 故意包含高熵合成假钥匙用于遮蔽测试，私有仓库原文件保留；为使 GPT 安全包达到 0 命中，仅从安全 ZIP 副本排除。
+- `tests/unit/test_debug_widget_masks_key.py` 故意包含高熵合成假钥匙用于遮蔽测试，原文件保留；它不是实际凭据。为使历史 GPT 安全包达到 0 命中，仅从当时的安全 ZIP 副本排除。
 - 最终 ZIP 名称、成员数和 SHA-256 以 PA_Agent 独立移交包内 `PACKAGE_MANIFEST.json` 与 `SHA256SUMS.txt` 为准。
 
 ## 2026-07-17 实盘生命周期工作区验收
@@ -126,7 +126,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 基线为 `main` / `origin/main` 的 `9e5c6ccd0b04136514bdd84b7ae55276b8d92a78`；本节对应的安全加固仍是未提交工作区改动。
 - 网页版 GPT 的审核先按本机项目规则、Longbridge skill、实际 SDK/API、现有 SQLite 账本与运行配置重新核对；只采纳有代码证据且属于原始交易闭环范围的问题。
 - 没有调用 Longbridge 或 OKX 写接口，没有发送模拟或真实订单。OKX 私有只读仍被缺失的 `OKX_PASSPHRASE` 阻断。
-- 生产 `records/execution.sqlite3` 保持 schema v1、0 条 execution、0 条活动记录；v1 → v2 迁移只在副本验证，未触碰生产账本。
+- 截至该轮验收（2026-07-17），生产 `records/execution.sqlite3` 为 schema v1、0 条 execution、0 条活动记录；当时 v1 → v2 迁移只在副本验证，未触碰生产账本。当前状态以本文后面的“2026-07-20”小节为准。
 
 ### 主线程回归
 
@@ -179,3 +179,101 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 8. 入场提交结果未知且 UNKNOWN 状态保存失败时，服务可能在停写前抛出。
 
 主线程仅修复上述阻塞项并增加反例；可选重构均保留原方案。最终三个审查线程从需求完整性、逻辑正确性、边界情况、代码质量、测试覆盖和实际运行结果六方面均给出 **PASS**，阻塞落地的问题为 0。独立线程复跑的交易与交易控制范围为 159 通过、0 失败；审查线程没有修改源码、配置、数据库或 Git。
+
+## 2026-07-20 断线任务链复核
+
+- 模型上下文上限已改为账号/官方目录驱动的只读元数据；界面不允许手工输入。Thinking、推理强度和速度控件按模型能力显示。
+- 账号目录真实刷新结果为 Codex 6、Kimi 12、DeepSeek 2；刷新失败保留原列表，不把离线兜底模型混入成功返回的账号目录。
+- Codex 官方 CLI 已确认使用 ChatGPT 订阅登录。Codex、Kimi、DeepSeek 均通过 PA 的真实随机挑战探测并以仓库外凭据保存为当前有效档案。
+- Codex 自由追问使用可恢复的官方持久线程，允许客户端在达到阈值时原生 Compact；正式两阶段分析是一次性无历史请求。线程恢复已验证，实际超长 Compact 事件尚未观察。
+- 修复设置窗口在激活保存失败后自动重开，以及已测试但未激活候选被静默丢弃的问题。AI 设置定向回归 36 通过、0 失败；独立审查复验 3 通过、0 失败，阻塞项 0。
+- 用户将 Codex 从 Sol 切换为 Terra 时出现的“测试通过、激活失败”已定位为设置 revision 并发冲突，不是订阅登录或 Terra 模型无效。激活保存现在会在同一进程锁与文件锁保护下检查 AI 状态、合并最新普通设置并原子写入；另一个窗口同时修改 AI 配置时仍明确拒绝。Terra 真实随机挑战四项通过，当时正式配置成功激活 `gpt-5.6-terra` 并重载为 revision 26；相关回归 59 通过、0 失败，独立六维审查结论为 PASS、阻塞项 0。用户后来把活动档案改为 `gpt-5.6-luna`；2026-07-22 当前持久配置 revision 为 61。
+- XAUUSD 形成中 K 线取决于券商交易时段。周末 MetaQuotes-Demo 最后 tick 停在周五，程序不画过期伪 K 线；OKX `XAU-USDT-SWAP` 同一逻辑可识别真实形成中 K 线。形成棒相关回归 29 通过、0 失败。
+- 本轮没有控制用户鼠标。Codex“检测登录 → 测试并保存 → 激活”的持久化路径已由真实 Terra 探测与直接运行时调用验证，PA 可见窗口当时也按已激活的 Terra 配置重启；用户后来改用 Luna。用户在界面内再次切换档案的纯手工点击体验仍需可见验收，不得描述成已经看见用户操作通过。
+
+## 2026-07-20 独立交易后台与权限拆分验收
+
+### 代码范围与安全边界
+
+- GUI 和 OKX Demo 实验只通过 `ExecutionController` 创建计划、管理短期新增风险租约并写入持久命令；只有单实例 `ExecutionWorker` 构造 `ExecutionService`、连接券商和执行命令。
+- `records/execution_control.sqlite3` 只保存命令、租约、后台心跳和最后成功对账；`records/execution.sqlite3` 仍是唯一交易真值。
+- 本轮没有连接券商写接口，没有发送模拟或真实订单，也没有打开或迁移生产执行账本。
+
+### 回归与故障注入
+
+- 执行控制、Worker、生命周期、两券商适配器、OKX Demo 实验和实盘窗口共 13 个测试文件：258 通过、0 失败。
+- 覆盖新增风险租约与 Worker/请求者/配置/账户路由绑定、首次成功对账门禁、心跳与对账陈旧、命令崩溃恢复、读命令可重试例外、GUI/实验不直连券商、账户快照失败、身份漂移、部分成交、保护、离场、持久停写和清标恢复。
+- 定向 Ruff、`compileall` 和 `git diff --check`：通过；只有 Windows LF/CRLF 提示，没有空白错误。
+
+### 对抗式审查
+
+- 首轮只读审查发现：券商明确拒绝撤单后遗留旧 `entry_cancel_runtime_id`，重启会把确定拒绝误判为未知写入，导致以后无法再次撤单。
+- 修复后，确定性拒绝会清除本次撤单意图和运行实例标记并写入 `rejected` 终态。Longbridge 与 OKX 的真实适配器配合 Fake Broker 均验证：重启后的对账只查询、不撤单、不产生 `write_unknown`。
+- 同一独立审查线程复跑相关范围 204 通过、0 失败；Longbridge 与 OKX 两条完整“拒绝 → 重启 → 只读对账 → 清标 → 再次显式撤单”链均通过，查询阶段券商写调用增量为 0，最终六维结论为 **PASS**，阻塞落地的问题 0。审查线程未修改项目文件。
+
+### 2026-07-20 生产账本与 WinSW 部署验收
+
+- 生产 `records/execution.sqlite3` 实际已经是 schema v2，`PRAGMA quick_check=ok`；因此没有重复执行 v1 → v2 迁移。
+- 操作前备份：`records/backups/execution-schema-v2-before-winsw-20260720-102721.sqlite3`；大小 1,155,072 字节；SHA-256 `cd8e4652a37b54c2c6ae52b7233307e1efae46ac27e2b395b271e56423a8e771`。创建时备份与生产库计数一致；当前复核时，备份仍是生产库的精确历史前缀：事件 1–128、账户快照 1–2288 逐行一致，11 条 execution 的 ID 与摘要一致，1 条路由占用记录一致；两库 schema SHA-256 均为 `9f827a2cc7acaba22d974bd5079b755a2917439a0f0675993e5a1fc0da4186ce`。
+- 官方 WinSW 2.12.0 已安装为 Windows 服务 `PAAgentExecutionWorker`。可执行文件 SHA-256 为 `05b82d46ad331cc16bdc00de5c6332c1ef818df8ceefcd49c726553209b3a0da`；服务为 `Running`、自动延迟启动、账户 `NT AUTHORITY\LocalService`。
+- 安装验收当时，服务 XML 与共享环境均设置 `PA_AGENT_LIVE_TRADING_ENABLED=false`、`OKX_LIVE_ENABLED=false`、`PA_AGENT_PAPER_TRADING_ENABLED=false`。后续经用户授权只开启模拟门；PA Live 与 OKX Live 始终保持关闭。
+- 安装验收当时，生产库有一条活动 OKX Demo `XAU-USDT-SWAP` execution，状态 `protecting/needs_attention`。该记录后续的权威查无与安全收口见本文最后的“历史 OKX Demo 安全收口”。
+- Windows 服务重启后旧心跳进入 `stopping`、新 Worker ID/PID 接管；第二个 Worker 由单实例锁以退出码 2 拒绝。
+- GUI 在已安装 WinSW 时只请求 Windows 启动服务；只有 `sc query` 明确返回 1060（服务不存在）才允许开发态 Python fallback。`sc.exe` 缺失、查询/启动超时、权限拒绝、未知错误和 1056 已运行均已覆盖并禁止绕过服务。
+- 交易后端定向回归：235 通过、0 失败。Qt E2E 与切换集成：8 通过、0 失败。两组测试前后正式 `config/settings.json` 的 SHA-256 完全一致。
+- 非 live 全量现状扫描：347 通过、20 失败后按上限停止；失败集中在旧预测面板、旧校验器和连续性预期，不属于本部署阶段，也未被误报为全绿。交易后端与 Qt 测试若放在同一 pytest 进程，Qt 无界面绘图资源销毁会触发 Windows 原生访问冲突，因此最终证据采用两个独立进程。
+
+### 仍未完成
+
+- 管理员权限脚本在修复隐藏 PowerShell 日志方式和 Windows PowerShell 5.1 语法兼容后，于 2026-07-20 16:00 成功执行；`pa_agent`、`records`、`logs` 中 `Authenticated Users: Modify/Write/FullControl` 文件复扫为 0。WinSW 服务重启后为 `Running`、自动启动、`NT AUTHORITY\LocalService`；GUI 保持响应，GUI 进程树下没有执行 Worker，服务 Worker 仍在独立 WinSW 进程树。因此旧文件 ACL 已完成，不再列为剩余阻塞项。
+- 完整券商侧启动扫描、持续持仓/保护真值核对、Longbridge 私有推送和全局限速仍属于长期无人值守实盘的后续阻塞项。
+- 历史活动 Demo execution 已于后续“历史 OKX Demo 安全收口”阶段关闭。长期无人值守的券商启动扫描、持续真值核对、Longbridge 私有推送和全局限速仍未完成；任何未来实盘写入仍需要新的明确授权。
+
+## 2026-07-20 历史 OKX Demo 安全收口
+
+### 保护单真值与代码修复
+
+- 使用确定的客户算法订单号查询精确结果；收到 OKX `51603` 后，继续查询未触发列表以及 `effective`、`canceled`、`order_failed` 三个月历史。所有读取成功且均无记录，确认保护单没有创建。
+- 适配器进入 `confirmed_absent` 后清除不确定写标记，但保持 `needs_attention`，禁止自动重发保护，只允许明确离场或重建保护。
+- Worker 心跳状态与业务状态写入使用同一把锁，旧的 `reconciling` 心跳不能覆盖更新后的 `needs_attention`。
+
+### 运行态收口
+
+- 共享环境与 WinSW 服务仅开启 `PA_AGENT_PAPER_TRADING_ENABLED=true`；`PA_AGENT_LIVE_TRADING_ENABLED=false`、`OKX_LIVE_ENABLED=false`。
+- WinSW 服务重启后加载最新代码，历史持久停写标记被成功的只读对账清除。
+- 持久命令 `08c2e0a4-4eec-447e-8d22-f9921f95defa` 仅对 execution `cc94657a-d4b3-5ba3-b4d4-0d6fd62ae595` 请求减险离场；命令 `succeeded`，execution 为 `closed`、剩余数量 0、`needs_attention=false`。
+- OKX Demo 券商侧最终只读核对：`XAU-USDT-SWAP` 持仓 0、普通挂单 0、条件单 0；USDT 权益 `4999.99488722`、可用权益 `4999.99488722`、未实现盈亏 0。
+- 执行账本最终账户快照为无持仓，活动 execution 为 0；有效新增风险租约为 0。
+
+### 回归
+
+- 交易执行相关分组：281 通过、0 失败。
+- AI 模型接入分组：237 通过、0 失败。
+- Qt E2E 四文件隔离运行：4 通过、0 失败。
+- 切换、网络超时和快照性质测试：11 通过、0 失败。
+- 当前高负载 Windows 环境中一条完整两阶段界面分析实测约 14 秒；E2E 等待上限从 10 秒改为 30 秒，仍要求流程实际完成，未改变生产逻辑或断言。
+
+## 2026-07-22 分页、后台重载与当前账户复验
+
+### OKX 保护单分页
+
+- 精确查询 `51603` 后，未触发列表和 `effective`、`canceled`、`order_failed` 历史均按官方单页上限 100 完整翻页。
+- 第二页命中、超过 100 条后确认不存在、第二页 API 失败、重复游标四类用例均已覆盖。API 或游标异常只会保持状态未知，不会进入 `confirmed_absent`，也不会自动补发保护单。
+- OKX 客户端与适配器定向回归：62 通过、0 失败。交易执行、券商、数据源与交易窗口范围：374 通过、0 失败。
+
+### Worker 运行态
+
+- 在活动 execution 0、风险租约 0、待执行/执行中命令 0、Live 双硬门关闭的前提下重启 WinSW 服务。
+- 新 Worker 的 `started_at` 晚于 `worker.py` 修改时间；心跳状态为 `running`，`last_seen_at` 与 `last_successful_reconcile_at` 持续更新，错误码为空。
+- 服务重启前后持久命令计数保持 `succeeded=4`、`failed=1`，没有新增交易命令。
+
+### OKX Demo 当前账户真值
+
+- 券商只读查询发现一笔外部 `XAU-USDT-SWAP` 10 张净多仓，2026-07-21 13:46（北京时间）成交，客户订单号为空。PA 本实验固定 1 张，且本地活动 execution 与新命令均为 0，因此它不属于 PA 本次运行。
+- 普通挂单 0、算法挂单 0。PA 不接管该外部仓；适配器预检在发现同品种既有仓位时直接拒绝，并新增回归测试证明不会调用下单接口。
+
+### 模型与全仓现状
+
+- Codex 订阅、Kimi、DeepSeek、档案保存/激活、模型目录与能力范围：247 通过、0 失败；Qt E2E：4 通过、0 失败；风险指标语义：51 通过、0 失败。
+- 全仓现状：1251 通过、32 失败、3 跳过。4 项为 AkShare 真实联网超时；27 项由两个独立只读审查者确认属于 HEAD 既有测试契约或旧测试数据，不是本轮回归；1 项日志遮罩测试因为日志文件为空而失败，没有发现明文密钥。不得将该结果描述为全仓全绿。
+- 全部变更 Python 文件的 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。

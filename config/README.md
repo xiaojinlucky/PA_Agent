@@ -12,7 +12,7 @@
    copy config\settings.example.json config\settings.json
    ```
 
-2. 启动程序，在 **AI 模型设置** 中填写连接信息。API Key 输入框默认隐藏；点击“测试并保存”后，配置才会成为可切换档案。
+2. 启动程序，在 **AI 模型设置** 中选择接入方式。Codex 订阅通过官方 ChatGPT 登录，不填写 Base URL 或 API Key；DeepSeek、Kimi 等 API 档案填写各自连接信息。API Key 输入框默认隐藏；点击“测试并保存”并通过真实连接测试后，配置才会成为可切换档案。
 
    当前上游存储格式会把 Key 明文写入被 Git 忽略的 `config/settings.json`，并未实现凭据加密。不要共享该文件；若需要更高安全级别，应改用系统密钥库后再保存。
 
@@ -55,7 +55,17 @@
    LONGBRIDGE_INTRADAY_ACCESS_TOKEN=...
    LONGBRIDGE_INTRADAY_ACCOUNT_ID=...
 
-   # OKX
+   # OKX 模拟账户
+   OKX_DEMO_API_KEY=...
+   OKX_DEMO_SECRET_KEY=...
+   OKX_DEMO_PASSPHRASE=...
+
+   # OKX 实盘账户（必须与模拟账户分开）
+   OKX_LIVE_API_KEY=...
+   OKX_LIVE_SECRET_KEY=...
+   OKX_LIVE_PASSPHRASE=...
+
+   # 旧变量只作为 OKX 模拟账户的兼容输入，绝不会回退给实盘
    OKX_API_KEY=...
    OKX_SECRET_KEY=...
    OKX_PASSPHRASE=...
@@ -70,7 +80,7 @@
    OKX_LIVE_ENABLED=false
    ```
 
-   真实写开关默认保持 `false`。Longbridge 模拟账户只读取 `PA_AGENT_PAPER_TRADING_ENABLED`，不要求也不会开启实盘总开关；每次重启后仍需输入 `启用模拟交易`。综合账户、日内账户及 OKX Live 仍要求输入 `启用实盘交易`，会话状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
+   真实写开关默认保持 `false`。Longbridge 模拟账户和 OKX Demo 只读取 `PA_AGENT_PAPER_TRADING_ENABLED`，不要求也不会开启实盘总开关；每次重启后仍需输入 `启用模拟交易`。综合账户、日内账户及 OKX Live 仍要求输入 `启用实盘交易`，会话状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。Demo 与 Live 按执行计划的环境选择独立凭据；Live 缺少 `OKX_LIVE_*` 时直接阻断，不会误用 Demo Key。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
 
 ## `settings.json` 字段说明
 
@@ -92,13 +102,28 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `provider.model` | string | `"deepseek-v4-flash"` | 模型名称（须与网关支持的名称一致） |
-| `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；MiMo：`https://api.xiaomimimo.com/v1`（程序自动处理 `enable_thinking` 与 `reasoning_content` 回放） |
-| `provider.api_key` | string | `""` | 当前活动档案的 API Key；会明文持久化到本地 `settings.json`，该文件默认被 Git 忽略 |
+| `provider.base_url` | string | `"https://api.deepseek.com"` | OpenAI 兼容 API 根地址。DeepSeek：`https://api.deepseek.com`；Kimi：`https://api.moonshot.cn/v1`；MiMo：`https://api.xiaomimimo.com/v1`；Codex 订阅留空 |
+| `provider.api_key` | string | `""` | 档案内临时 API Key；非空时会明文持久化到本地 `settings.json`。推荐留空，改从仓库外的 `Quant\env` 读取；Codex 订阅不使用此字段 |
 | `provider.api_key_encrypted` | string | `""` | 兼容保留字段；当前实现不使用它提供加密存储 |
-| `provider.adapter_id` | string | `"auto"` | 请求适配器：`deepseek`、`openai`、`anthropic_adaptive`、`anthropic_budget`、`minimax_m3`、`minimax_m2`、`mimo`、`cursor_agent`、`generic_openai_compatible`、`generic_reasoning_compatible`；`auto` 仅用于旧配置迁移/识别 |
+| `provider.adapter_id` | string | `"auto"` | 请求适配器：`codex_subscription`、`deepseek`、`kimi`、`mimo`、`openai`、`anthropic_adaptive`、`anthropic_budget`、`minimax_m3`、`minimax_m2`、`cursor_agent`、`generic_openai_compatible`、`generic_reasoning_compatible`；`auto` 仅用于旧配置迁移/识别 |
 | `provider.thinking` | bool | `true` | Thinking 开关；界面会按适配器决定是否可切换，固定 Thinking 模型不能关闭 |
-| `provider.reasoning_effort` | string | `"high"` | 推理深度：`minimal` / `low` / `medium` / `high` / `xhigh` / `max`；界面只开放当前模型适配器声明支持的档位 |
-| `provider.context_window` | int | `2000000` | 该档案独立的上下文窗口（1,024–100,000,000 tokens），用于用量提示和预警；在 AI 模型窗口按供应商官方模型文档填写，未知模型不会自动猜测 |
+| `provider.reasoning_effort` | string | `"high"` | 推理深度：`minimal` / `low` / `medium` / `high` / `xhigh` / `max` / `ultra`；界面只开放当前模型适配器声明支持的档位 |
+| `provider.context_window` | int / null | `null` | 模型上下文上限的持久化镜像，用于用量提示和预警；界面只读。当前账号或本机官方目录返回值是最高优先级真值，保存和重启后仍保留；内置目录只在无法在线读取时兜底。`auto` 或未知模型保持 `null` 并显示“尚未确认”，不能手工调大 |
+| `provider.context_window_source` | string | `"unknown"` | 上下文元数据来源：`catalog` 表示账号实时目录，`builtin` 表示离线内置兜底，`unknown` 表示尚未确认；这是程序内部来源标记，不是用户可编辑能力 |
+
+### 供应商环境变量
+
+推荐把以下字段放在仓库外的 `D:\Desktop\Quant\env`。进程环境变量优先于该文件；Key 只在运行内存中补齐，不写回 `settings.json`。
+
+| 供应商 | Key | 模型（可选） | Base URL（可选） |
+|------|------|------|------|
+| DeepSeek | `DEEPSEEK_API_KEY` | `DEEPSEEK_MODEL` | `DEEPSEEK_BASE_URL` |
+| Kimi | `MOONSHOT_API_KEY`（也接受 `KIMI_API_KEY`） | `MOONSHOT_MODEL` | `MOONSHOT_BASE_URL` |
+| Codex 订阅 | 不需要 | 档案填 `auto` 可使用 CLI 默认模型 | 不需要；可在模型设置中使用“网页登录”或“设备码登录”，两者都调用官方 Codex CLI |
+
+本轮实际验收范围是 DeepSeek API、Kimi API 与 Codex ChatGPT 订阅。其他适配器代码保留，但不作为当前已打通能力对外宣称。
+
+DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点击“刷新模型”成功后，当前账号接口返回的列表是可选真值，基础目录只为相同模型补齐 Thinking、推理强度和速度等缺失元数据；账号实时返回的上下文上限不会被内置值覆盖，账号未返回的旧模型不会混入。刷新失败时保留刷新前列表。只有模型 ID、连接、认证或请求参数发生变化才需要重新测试；单纯刷新到新的上下文元数据不会让已通过的认证失效。
 
 ### general — 通用设置
 
@@ -174,12 +199,52 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 
 保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。券商、账户、品种、数量、保证金模式和开关全部来自本地配置；大模型输出中的同名字段会被忽略。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
 
+执行窗口按选中的持久化记录显示成交/剩余数量、入场单号、保护与离场状态、直接错误、事件流以及该记录所属账户的最新资金快照。刷新历史记录时以选中记录的券商、环境和账户为准，不会改读当前配置中的另一个账户。
+
 Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
+
+### 24 小时 OKX Demo 黄金实验
+
+该实验使用独立进程内设置，不覆盖日常 `settings.json`。固定范围是
+`OKX XAU-USDT-SWAP / 30m` → `OKX Demo XAU-USDT-SWAP / cross / 1 张`，PA 倾向为
+`extreme_aggressive`，执行置信度门槛为 `30`。
+
+实验固定使用官方 `https://www.okx.com` API 地址与模拟交易标头。全局配置中的其他
+OKX 地址不会被沿用。分析形成执行计划后，运行器先耐久记录本实验的 execution id，再
+显式提交模拟订单；监控和到期收口只处理这些归属于本实验的 execution id。
+分析行情同样读取 OKX 官方公共 K 线，确保 PA 的入场、止盈和止损价格与实际执行产品属于
+同一价格体系，不把 OANDA XAUUSD 的绝对价格直接套用到 OKX 永续。
+
+先完成只读预检：
+
+```powershell
+.\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign preflight
+```
+
+预检必须使用 OKX 模拟 API 的完整 `API Key + Secret + Passphrase`。通过后才能启动真实的
+模拟订单写入：
+
+```powershell
+.\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign run
+```
+
+另一个终端可读取不含密钥的运行状态：
+
+```powershell
+.\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign status
+```
+
+截止时间首次启动时写入 `records/okx_demo_campaign.json`，重启不会重新计算 24 小时。到期后
+运行器停止新分析，撤销未成交入场并对已有模拟持仓请求离场；若仍有未知状态则明确保留为
+`needs_attention`，不会伪报完成。
 
 ## 安全提醒
 
 - **不要**将 `config/settings.json`、`config/exception_state.json`、`config/tv_symbol_aliases.json` 提交到 Git。
 - API Key 在输入框中默认以圆点隐藏，但这只是界面遮罩，不代表磁盘加密。
+- Codex 订阅只调用官方 `codex` 命令，不读取、复制或保存 Codex 登录文件；“网页登录”调用 `codex login`，“设备码登录”调用 `codex login --device-auth`。每次分析禁用 Shell、网页、应用、MCP 和子 Agent，并使用空临时目录。
+- AI 档案只有在当前认证仍有效且当前配置的真实挑战测试仍有效时才能激活和提交分析。模型、地址、Key、Thinking、推理强度或服务线路发生变化后必须重新测试；账号目录更新的只读上下文上限不属于认证变化。
+- Codex 订阅可以分析并驱动模拟交易；用于 Live 时只生成待人工复核的计划，不会自动把投资订单提交到真实券商。
 - 若曾误提交 API Key，请立即在服务商处**作废并轮换**密钥。
 - 建议在仓库根目录执行：`powershell -ExecutionPolicy Bypass -File tools\setup_git_secrets.ps1`
 

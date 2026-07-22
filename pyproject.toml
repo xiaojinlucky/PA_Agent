@@ -19,6 +19,7 @@ dependencies = [
     "tiktoken>=0.7",
     "jsonschema>=4.22",
     "pydantic>=2.7",
+    "filelock>=3.15",
     "MetaTrader5>=5.0; sys_platform == 'win32'",
     "tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git",
     "cryptography>=42",
@@ -42,6 +43,7 @@ dev = [
 
 [project.scripts]
 pa-agent = "pa_agent.main:main"
+pa-execution-worker = "pa_agent.execution.worker:main"
 
 [tool.setuptools.packages.find]
 include = ["pa_agent*"]

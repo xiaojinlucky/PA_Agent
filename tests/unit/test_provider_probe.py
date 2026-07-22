@@ -9,8 +9,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from pa_agent.ai.deepseek_client import CancelledError
 from pa_agent.ai import provider_probe
+from pa_agent.ai.deepseek_client import CancelledError
 from pa_agent.ai.provider_probe import ProbeStatus, probe_ai_provider
 from pa_agent.config.settings import AIProviderSettings
 from pa_agent.util.threading import CancelToken
@@ -287,7 +287,10 @@ def test_invalid_adapter_and_missing_fields_fail_before_network() -> None:
         (_settings(model=""), "model_missing"),
     ]
 
-    with patch("pa_agent.ai.provider_probe.create_ai_client") as create:
+    with (
+        patch("pa_agent.ai.provider_probe.create_ai_client") as create,
+        patch("pa_agent.ai.provider_registry.merged_environment", return_value={}),
+    ):
         results = [probe_ai_provider(settings) for settings, _ in cases]
 
     create.assert_not_called()
