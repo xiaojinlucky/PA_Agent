@@ -1,5 +1,7 @@
 # 网页版 GPT Pro Extended Thinking — PA_Agent 总控任务
 
+> 当前交接入口（2026-07-23）：先读取 `docs/CODEX_HANDOFF.md` 和 `docs/WEB_GPT_CONTROLLER_PROMPT.md`。本文件保留历史完整任务格式，具体当前事实以交接总账、`CONTEXT.md`、代码和最新 GitHub `main` 为准；不要把旧快照、旧配置或旧运行态当成当前确认事实。
+
 ## 你的访问方式
 
 请使用已连接的 GitHub 工具读取对应仓库：

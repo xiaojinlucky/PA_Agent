@@ -129,6 +129,33 @@ def test_stage2_user_prompt_includes_gate_trace(assembler: PromptAssembler):
     assert "## 阶段一闸门路径" not in user
 
 
+def test_stage2_execution_guidance_is_opt_in(tmp_path: Path):
+    """运行器专用执行指令不得泄漏到默认提示词。"""
+    for fname in [
+        "提示词大纲_人设与思维方式.txt",
+        "二元决策.txt",
+        "逐棒分析检查单.txt",
+        "文件16-K线信号识别.txt",
+        "文件17-止损和止盈与仓位管理.txt",
+        "文件23-MeasuredMove与结构目标.txt",
+    ]:
+        (tmp_path / fname).write_text("test", encoding="utf-8")
+    stage1_json = {"cycle_position": "spike", "direction": "bearish"}
+    default = PromptAssembler(prompt_dir=tmp_path).build_stage2(
+        _make_frame(), stage1_json, [], []
+    )[1]["content"]
+    scoped = PromptAssembler(
+        prompt_dir=tmp_path,
+        stage2_execution_guidance="RUNNER_ONLY_MARKET_MODE",
+    ).build_stage2(_make_frame(), stage1_json, [], [])[1]["content"]
+
+    assert "RUNNER_ONLY_MARKET_MODE" not in default
+    assert "RUNNER_ONLY_MARKET_MODE" in scoped
+    assert scoped.rfind("RUNNER_ONLY_MARKET_MODE") > scoped.rfind(
+        "重要规则：当 order_type"
+    )
+
+
 def test_stage2_system_prompt_order(assembler: PromptAssembler):
     """Stage 2 system reuses stage-1 system (persona + binary); user: strategy → risk."""
     frame = _make_frame()

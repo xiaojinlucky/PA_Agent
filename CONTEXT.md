@@ -1,13 +1,14 @@
 # PA_Agent Context
 
-## 当前状态（2026-07-22）
+## 当前状态（2026-07-23）
 
-- 用户当前 GitHub 用户名为 `xiaojinlucky`；2026-07-22 已明确授权 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布。本地 `origin` 已改为规范地址 `git@github.com:xiaojinlucky/PA_Agent.git`。实时核对确认登录账号为 `xiaojinlucky`、权限为 `ADMIN`，本地 `main`、`origin/main` 与 GitHub API 返回的基线 SHA 均为 `3ae95321eef706889cf901c63a1c293f11f7608d`。交易执行与大模型供应商接入是同一批待发布工作区改动，但环境文件、密钥、数据库、日志和运行态记录一律排除。
+- 用户当前 GitHub 用户名为 `xiaojinlucky`；2026-07-22 已明确授权 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布。本地 `origin` 已改为规范地址 `git@github.com:xiaojinlucky/PA_Agent.git`。实时核对确认登录账号为 `xiaojinlucky`、权限为 `ADMIN`，本地 `main`、`origin/main` 与 GitHub API 返回的当前基线 SHA 均为 `1a04c144f810ffb486280ed8a1875ff0130bb070`。交易执行与大模型供应商接入是同一批待发布工作区改动，但环境文件、密钥、数据库、日志和运行态记录一律排除。
 - 用户已重新授权前端改版，但明确要求先由 Gemini Stitch 设计。`docs/FRONTEND_REDESIGN_PRD.md` 已完成，生产视觉改版、Pencil 状态流和 Figma 组件库尚未完成；OmicOS 只参考“订阅登录/API 接入”分组与信息层级，不照抄品牌风格。
-- 已把交易写入从 GUI 和 24 小时实验中移出：`ExecutionController` 只创建计划、发放短期新增风险租约和写入持久命令，单实例 `ExecutionWorker` 是唯一构造 `ExecutionService`、连接券商和执行命令的进程。命令状态、后台心跳与最后成功对账分别落在 `records/execution_control.sqlite3`，交易真值仍只有 `records/execution.sqlite3`；减险写入不依赖新增风险租约，但继续受环境硬门、不可变账户路由和持久停写标记约束。生产账本检查时已是 schema v2，因此没有重复迁移；已先创建一致性备份。WinSW 服务已安装为 `LocalService`、自动延迟启动并保持运行。当前共享环境与服务均保持 PA Live、OKX Live 为 `false`；经用户授权，模拟写入门 `PA_AGENT_PAPER_TRADING_ENABLED` 为 `true`。GUI 检测到该服务时只请求 Windows 启动服务；除系统明确返回服务不存在（1060）外，服务控制程序缺失、超时、权限或状态不明均禁止备用 Python Worker。
+- 已把交易写入从 GUI 与自动循环中移出：`ExecutionController` 只创建计划、发放短期新增风险租约和写入持久命令，单实例 `ExecutionWorker` 是唯一构造 `ExecutionService`、连接券商和执行命令的进程。命令状态、后台心跳与最后成功对账分别落在 `records/execution_control.sqlite3`，交易真值仍只有 `records/execution.sqlite3`；减险写入不依赖新增风险租约，但继续受环境硬门、不可变账户路由和持久停写标记约束。生产账本检查时已是 schema v2，因此没有重复迁移；已先创建一致性备份。WinSW 服务已安装为 `LocalService`、自动延迟启动并保持运行。用户已明确打开 PA Live、OKX Live 与 Demo 写门；Live 私有只读核验通过，但当前可买、可卖容量均为 0，尚未提交任何 Live 订单。GUI 检测到该服务时只请求 Windows 启动服务；除系统明确返回服务不存在（1060）外，服务控制程序缺失、超时、权限或状态不明均禁止备用 Python Worker。
 - Longbridge 行情数据源仍仅使用 `QuoteContext`；三个交易档案分别创建独立上下文。模拟账户绝不回退实盘且不允许盘前/盘后；日内账户只在提交前明确最大数量不足时回退综合账户，任何网络/认证/未知/已提交状态均不回退。
 - OKX 不硬编码黄金；动态规格测试覆盖 `XAUT-USDT`、`XAU-USDT-SWAP`、`BTC-USDT`、`BTC-USDT-SWAP`。现货与永续有独立数量、保护和盈亏语义。
-- 所有真实写操作要求 `PA_AGENT_LIVE_TRADING_ENABLED=true`、当前进程会话确认；OKX Live 还要求 `OKX_LIVE_ENABLED=true`。Longbridge 与 OKX Demo 的模拟写操作改用独立 `PA_AGENT_PAPER_TRADING_ENABLED` 和 `启用模拟交易`。当前实盘开关保持关闭；本轮只对历史 OKX Demo execution 执行了用户授权的减险离场，没有新增风险订单。
+- 所有真实写操作要求 `PA_AGENT_LIVE_TRADING_ENABLED=true`、当前进程会话确认；OKX Live 还要求 `OKX_LIVE_ENABLED=true`。Longbridge 与 OKX Demo 的模拟写操作改用独立 `PA_AGENT_PAPER_TRADING_ENABLED` 和 `启用模拟交易`。当前两项 Live 开关已按用户要求打开；Live 账户容量为 0，因此没有 Live 订单。Demo 5 分钟自动循环已获模拟写入权限并实际提交 PA 订单。
+- 2026-07-23 02:47，旧版 5 分钟 Demo 运行器已完成 7 笔 `10` 张限价空单的真实 OKX Demo 提交；7 笔均被券商接受、成交量均为 `0`，在 `270` 秒内未回到挂单价后均已撤销，当前无仓位。为验证即时执行路径，已将运行器专用阶段二提示切为 `market_when_valid`：仅当能在最新已收盘 K1 附近构造合法三价时输出市价单，否则如实不下单；该规则不影响 GUI 和日常 PA 分析。新 campaign `c928e2bf...` 已连续完成 8 根 5 分钟 K 线的真实分析（0 失败、0 新 execution）；均因尖峰追单/下沿支撑/无回撤确认或区间转换被模型判为不下单。Runner、`ExecutionWorker`、心跳、账本和 OKX Demo 私有回查一致且正常。策略运行器短暂停止后，已通过同一 Controller/Worker 链路完成独立 `okx_demo_lifecycle_canary`：Demo `10` 张市价入场、成交回读、两笔原生保护、受控离场，最终 `closed`、剩余 `0`，Demo 无非零仓位；随后策略运行器已恢复。
 - `docs/GPT5_6SOL_HANDOFF.md` 与 `docs/LOCAL_EXECUTION_CONTEXT.md` 是开发前历史快照，已加醒目标记；当前实现真值以本文件与 `docs/LIVE_TRADING_DESIGN.md` 为准。
 - AI 模型首轮范围已按用户最新决定收敛为 Codex ChatGPT 订阅、Kimi API、DeepSeek API；小米 MiMo 暂不纳入本轮可用性验收。当前配置有 Codex Luna、Codex Terra、Kimi、DeepSeek 四个已验证档案，活动档案为 `codex-subscription` / `gpt-5.6-luna`；Luna 与 Terra 是同一 Codex 订阅通道下的两个模型档案，不是新增供应商。
 - Codex 登录故障根因是程序误选了 WindowsApps 中存在但不可执行的无后缀资源。现在每个 `.exe` 候选都必须实际通过 `--version`，当前使用 `C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\codex.exe`；ChatGPT 登录状态和独立随机挑战均通过。
@@ -20,18 +21,18 @@
 ## 当前验证
 
 - 2026-07-22 交易执行、OKX/Longbridge、数据源和交易窗口相关分组为 374 通过、0 失败；Codex/Kimi/DeepSeek、档案、目录和模型能力相关分组为 247 通过、0 失败；四个 Qt E2E 为 4 通过、0 失败；取消程序擅自扩大止损的直接风险指标回归为 51 通过、0 失败。全仓现状为 1251 通过、32 失败、3 跳过；其中 4 项是 AkShare 真实联网超时，27 项经两名独立审查者确认属于 HEAD 既有测试契约/旧输入而非本轮回归，1 项日志遮罩性质测试是日志为空而非明文泄漏。不能把全仓描述为全绿。
-- 生产 `records/execution.sqlite3` 已是 schema v2，`quick_check=ok`；共 11 条历史 execution。历史 OKX Demo execution `cc94657a-d4b3-5ba3-b4d4-0d6fd62ae595` 的保护单经精确查询、未触发列表和三个月历史确认不存在；系统没有自动重发保护。2026-07-20 使用持久命令 `08c2e0a4-4eec-447e-8d22-f9921f95defa` 只执行减险离场，命令为 `succeeded`，execution 已为 `closed`、剩余数量 0、`needs_attention=false`，当前活动 execution 为 0。2026-07-22 又补齐算法单未触发/历史接口的完整分页：只有精确查询和全部分页都成功且没有命中时才能标为 `confirmed_absent`；第二页失败、游标缺失/重复或超过安全上限均保持未知并禁止自动补发。安装前备份大小 1,155,072 字节、SHA-256 为 `cd8e4652a37b54c2c6ae52b7233307e1efae46ac27e2b395b271e56423a8e771`，已复核为生产账本的精确历史前缀。
-- WinSW 服务当前为 `Running`、自动延迟启动、`NT AUTHORITY\LocalService`；2026-07-22 Worker 已重启加载本轮最新代码，心跳与最后成功对账持续更新。PA 活动 execution 为 0、有效新增风险租约为 0、待执行/执行中命令为 0。OKX Demo 券商侧现在另有一笔不属于 PA 的 `XAU-USDT-SWAP` 10 张净多仓：2026-07-21 13:46（北京时间）成交，客户订单号为空，而 PA 本实验固定为 1 张且本地没有相应 execution/命令。账户普通挂单 0、条件单 0。PA 不接管该外部仓，且 OKX 预检会因既有同品种持仓拒绝新开仓；用户自行关闭或明确处理该仓前，PA 无法在同账户继续开该永续品种。
+- 生产 `records/execution.sqlite3` 已是 schema v2，`quick_check=ok`；截至 2026-07-22 有 11 条历史 execution。历史 OKX Demo execution `cc94657a-d4b3-5ba3-b4d4-0d6fd62ae595` 的保护单经精确查询、未触发列表和三个月历史确认不存在；系统没有自动重发保护。2026-07-20 使用持久命令 `08c2e0a4-4eec-447e-8d22-f9921f95defa` 只执行减险离场，命令为 `succeeded`，execution 已为 `closed`、剩余数量 0、`needs_attention=false`。2026-07-23 的 5 分钟 Demo 循环已完成首次 AI→计划→Worker→OKX Demo 提交：第一笔 10 张限价空单因旧的 120 秒超时未成交而撤销，随即把快速循环的入场有效期改为 270 秒。新运行器随后提交第二笔 10 张限价空单，先越过旧的 120 秒节点保持 `live`，随后在约 270 秒后未成交撤销；券商只读回查与账本一致。后续成交、保护和离场以执行账本的实时状态为准。2026-07-22 又补齐算法单未触发/历史接口的完整分页：只有精确查询和全部分页都成功且没有命中时才能标为 `confirmed_absent`；第二页失败、游标缺失/重复或超过安全上限均保持未知并禁止自动补发。安装前备份大小 1,155,072 字节、SHA-256 为 `cd8e4652a37b54c2c6ae52b7233307e1efae46ac27e2b395b271e56423a8e771`，已复核为生产账本的精确历史前缀。
+- WinSW 服务当前为 `Running`、自动延迟启动、`NT AUTHORITY\LocalService`；2026-07-23 Worker 心跳与最后成功对账持续更新。用户已明确授权关闭 Demo 中不属于 PA 的 `XAU-USDT-SWAP` 10 张净多仓，市价平仓后只读回查确认该外部仓已不存在。Demo 自动循环现在独占 PA 自己创建的订单与执行账本，不接管外部仓位。
 - 权限目录层和旧文件已按“代码/WinSW 只读执行、共享 env 只读、records/logs 可写”收紧。管理员脚本先修复了隐藏 PowerShell 不支持终端录屏、Windows PowerShell 5.1 不支持换行管道两项兼容问题，于 2026-07-20 16:00 成功完成；`pa_agent`、`records`、`logs` 中保留 `Authenticated Users: Modify/Write/FullControl` 的文件复扫为 0。GUI 不承载执行 Worker；WinSW 服务与 GUI 保持独立进程边界。2026-07-22 实时复核服务仍为 `Running`、自动启动，账户仍为 `NT AUTHORITY\LocalService`。
-- Longbridge 综合、日内和 paper 三档均完成真实只读账户/行情/容量检查；综合与日内当前无持仓且 GLD.US 最大数量为 0，paper 容量非零。OKX Demo 私有只读和四个动态品种规格可用，Live 硬门关闭。
+- Longbridge 综合、日内和 paper 三档均完成真实只读账户/行情/容量检查；综合与日内当前无持仓且 GLD.US 最大数量为 0，paper 容量非零。OKX Demo 私有只读和四个动态品种规格可用；OKX Live 双开关已打开，私有读核验通过，但当前容量为 0。
 - Codex、Kimi、DeepSeek 三条通道均通过真实随机挑战；当前活动模型后来改为 Codex Luna，Terra 仍为另一个已验证档案。Codex 已完成一次隔离的 PA 两阶段真实分析，未连接执行服务、未下单。模型目录、API Key 遮罩、按模型显示能力、只读上下文上限和 Codex 持久追问线程均已实现；用户可在 Luna/Terra 之间切换，但纯手工点击链路仍由用户完成，Codex 不控制鼠标。
 - Terra 激活并发回归与设置持久化回归共 59 通过、0 失败；静态未定义名/语法检查通过。独立只读复验六维全部通过、阻塞问题 0。更宽的 AI 现状套件另有 1 个与本次无关的既有 `openclaw_cs` 路由失败，未纳入本次 Terra 修复。
-- OKX Demo 巡检已修复价格步长浮点尾差、程序改写模型止损、恢复门禁、过期 `READY` 计划补提、保护单权威查无和 Worker 心跳覆盖新状态的问题；实验始终限定 Demo、`XAU-USDT-SWAP`、30m、cross、1 张。历史仓位已经按上述减险命令安全收口。
+- OKX Demo 巡检已修复价格步长浮点尾差、程序改写模型止损、恢复门禁、过期 `READY` 计划补提、保护单权威查无和 Worker 心跳覆盖新状态的问题；自动循环始终限定 Demo、`XAU-USDT-SWAP`、5m、cross、10 张，限价入场有效期 270 秒。历史仓位已经按上述减险命令安全收口。
 - MT5 是否显示形成中 XAUUSD K 线取决于券商当前是否开市；2026-07-20 周末无新 tick 时不画过期虚线属于正确行为，仍需开市后可见复验。上游仅 AkShare 字符串时间解析修复值得以后小范围移植，不能整体合并。
 
 ## 已知边界
 
-- OKX Demo Passphrase 已配置且私有只读链路可用；24 小时实验只允许 Demo 环境。用户提供的 API 页面曾显示提币权限且未设置 IP 白名单，因此任何未来 OKX Live 启用仍必须重新核对权限并移除提币权限。
+- OKX Demo 私有只读链路可用；5 分钟自动循环只允许 Demo 环境。Live 双开关虽已打开，但当前 Live 账户容量为 0；任何 Live 订单仍必须经独立路由、实时容量和券商预检。
 - Longbridge 两账户当前 GLD.US 可交易数量为 0；在账户资金/资格变化前，真实预检会阻断。
 - Longbridge paper 的撮合和现金规则与实盘不同，且美股只支持常规交易时段；模拟结果不能替代综合/日内账户的真实可交易验收。
 - Longbridge Legacy Token 更新时必须来自同一绑定账户；类型或账户 ID 不一致会在创建交易会话前失败，不能通过修改档案名称绕过。
@@ -42,5 +43,15 @@
 - PA 后端信息架构只有在提交边界核清并安全推送后，才交给网页版 ChatGPT 通过 GitHub 只读审查；仓库公开性已由用户明确接受。网页版工单仍必须由本机 Codex 按真实 skills、memory、运行态和交易安全边界校正后才能执行。
 - 用户给出的网页版 ChatGPT 项目对话需要登录态；本机内置浏览器当前被引导到登录页，因此本轮无法重新读取原文。已有 PRD/加固计划只可视为之前整理出的结果，不能冒充本轮已经重新核对过该对话。
 - 当前代码和 WinSW 验收不等于可以打开实盘。数据库备份、schema v2 核对、独立守护、GUI/Worker 进程树隔离、旧运行态文件 ACL 和历史 Demo execution 安全收口已经完成；更完整的券商启动扫描、持续持仓/保护真值核对、Longbridge 私有推送与全局限速仍未完成，因此不能宣称长期无人值守实盘已完成。
-- 当前持久交易配置后来变为 OKX、自动执行开启，但品种为空且数量字段含非法文本，因此计划构建会失败关闭；它不是可用交易配置。用户实际启用前必须在界面保存明确的券商、环境、品种和数量，系统不会猜测或修复下单参数。Longbridge paper 的共享模拟门和 Worker 健康链路此前已用一份不落盘的有效路由完成“启用 → 停用”复验。
-- 当前 OKX Demo 外部 10 张 `XAU-USDT-SWAP` 仓位没有 PA 客户订单号且无保护算法单。PA 不会自动接管、补保护或离场；同品种新计划会在预检阶段被拒绝。这是账户当前状态，不是 PA execution，若要处理必须由用户明确授权具体动作。
+- 当前持久交易配置经本地 `config/settings.json` 核对为 OKX、自动执行开启、`XAU-USDT-SWAP`、`15m`、cross、`10` 张、Demo，设置 revision 为 `63`；字段已经通过 `plan_builder` 的品种/数量校验。此前的 5 分钟快速运行器属于历史 Demo 实验记录，不能覆盖当前 15 分钟产品配置；它使用的执行置信度门槛为 30、推理强度为 medium、入场有效期为 270 秒。Longbridge paper 的共享模拟门和 Worker 健康链路此前已用一份不落盘的有效路由完成“启用 → 停用”复验。
+- 2026-07-23 已按用户授权关闭原有的外部 Demo 10 张仓位；当前由 PA 自动循环创建、监控和收口自己的订单，不再存在阻塞同品种新计划的外部仓位。
+
+## 接手后最新运行态（2026-07-23 UTC）
+
+- 用户已把当前 PA 模式固定为 `aggressive`、最低交易置信度 `30`、周期 `15m`。本地持久设置当前已核对为 revision `63`；专用运行器同样固定为该三项，并继续限定 `OKX Demo`、`XAU-USDT-SWAP`、`cross`、有效即时方案只能市价入场、动态使用当前 Demo USDT 总权益的 10% 计算合约数。此配置不改变任何 OKX Live 路由。
+- 在启动新运行器前已完成只读核验：Demo 无非零 XAU-USDT-SWAP 仓位、无普通挂单、无 OCO/触发保护单；本地无活动 execution/命令；`PAAgentExecutionWorker` 服务运行且心跳、最后成功对账均正常。实时预检成功，最近一次按约 5,000 USDT 权益、约 4,136 USDT 价格解析为 `120` 张；这是容量计算结果，不是策略下单。
+- 上次只读快照记录 Campaign `6c7bc424-6d00-4bd8-9c67-fca1cfa62b39` 于 `2026-07-22T20:12:56Z` 启动，并完成前两根 15 分钟 K 线真实两阶段分析（2 成功、0 失败、0 strategy execution）：第一根交易置信度 45、价格在下方支撑附近、信号 K 线无效且没有可定义的即时止损；第二根交易置信度 35、外包阳线没有确认跟随。两次订单类型都明确为“不下单”，Controller 均因 `no_order` 正确未创建计划。这不是漏单，也不是 canary 或策略绩效；本轮实时状态探针超时，当前是否仍 active 待重查。
+- 自动巡检 `okx-24` 已迁移为“PA Agent OKX Demo 5 分钟只读巡检”，绑定当前 PA 审查线程，到本 Campaign 到期前只读检查 Campaign、进程、Worker、账本和 Demo 仓位/订单/保护摘要。它不得写券商、改配置、启停进程、运行 canary 或修复代码。
+- 2026-07-23 已完成统一路线图阶段 0 文档基线：当前 main 为 `1a04c144f810ffb486280ed8a1875ff0130bb070`；三份外部 PRD 原文归档到 `docs/prd/`，并明确旧基线来源与当前代码优先；`docs/ROADMAP.md`、`docs/SAFETY_INVARIANTS.md` 和 `docs/BASELINE_AUDIT.md` 已建立。阶段 0 未修改 `pa_agent/execution/` 下任何 Python 行为，未执行交易；文档目录密钥扫描通过。工作区仍保留上一轮 Demo/配置任务的混合未提交改动，不能把本阶段文档视为已提交或已推送。
+- 2026-07-23 已推进统一路线图阶段 1 的第一块可验收实现：`pa_agent/gui/read_models.py` 只读组合行情连接/订阅、Worker 心跳与对账、账户快照和执行账本；`AppContext` 复用现有两个 SQLite 存储，主窗口状态条显示每个字段的“已确认/计划/规划/未知”语义，数据源事务切换后读取对象同步更新；字段映射见 `docs/READ_MODEL_MAPPING.md`。读取层不发网络请求、不创建计划、不写券商；完整导航页面、截图和 OKX 端到端链路验收仍未完成。读取层 3 项、主窗口状态 2 项、执行控制器/Worker 33 项、账本/服务/生命周期 56 项定向测试通过。工作区仍为混合未提交状态。
+- 2026-07-23 已新增 GitHub 交接总账 `docs/CODEX_HANDOFF.md` 和网页版 GPT 启动指令 `docs/WEB_GPT_CONTROLLER_PROMPT.md`，用于把本项目规则、历史需求、已发现问题、已完成修改、未完成事项和硬验收边界交给外部总控；它们不包含凭据、数据库、日志或运行态文件。

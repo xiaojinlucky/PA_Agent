@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -18,29 +19,57 @@ from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.plan_builder import build_execution_plan
 from pa_agent.execution.worker_protocol import WorkerCommandStatus
 from pa_agent.okx_demo_campaign import (
+    CAMPAIGN_BOOTSTRAP_QUANTITY,
     CAMPAIGN_DURATION,
+    CAMPAIGN_ENTRY_TIMEOUT_SECONDS,
+    CAMPAIGN_EQUITY_FRACTION,
+    CAMPAIGN_EXECUTION_STYLE,
+    CAMPAIGN_FAST_EXECUTION_GUIDANCE,
     CAMPAIGN_INSTRUMENT,
     CAMPAIGN_MIN_CONFIDENCE,
     CAMPAIGN_OKX_API_BASE_URL,
     CAMPAIGN_STANCE,
     CAMPAIGN_SYMBOL,
     CAMPAIGN_TIMEFRAME,
+    CANARY_ORIGIN,
+    CANARY_TIMEFRAME,
     CampaignError,
     CampaignProcessLock,
     CampaignRuntime,
+    CampaignSizing,
     CampaignStateStore,
     OkxCampaignSource,
     OkxDemoCampaign,
+    _canary_price_triplet,
     build_campaign_settings,
+    build_demo_canary_record,
     campaign_config_fingerprint,
     okx_demo_private_preflight,
+    resolve_campaign_sizing,
     validate_campaign_settings,
 )
+from pa_agent.records.analysis_history import find_latest_successful_record
+from pa_agent.records.pending_writer import PendingWriter
 from tests.unit.test_execution_plan_builder import _persist, _record
 
 
-def _settings():
-    return build_campaign_settings(Settings())
+def _settings(quantity="120"):
+    return build_campaign_settings(Settings(), quantity=quantity)
+
+
+def _sizing(quantity="120"):
+    resolved = Decimal(quantity)
+    return CampaignSizing(
+        quantity=resolved,
+        equity_usdt=Decimal("5000"),
+        target_notional_usdt=Decimal("500"),
+        reference_price_usdt=Decimal("4000"),
+        contract_notional_usdt=Decimal("4"),
+        minimum_quantity=Decimal("1"),
+        quantity_step=Decimal("1"),
+        max_buy=Decimal("10000"),
+        max_sell=Decimal("10000"),
+    )
 
 
 def _frame(bar_ms: int) -> KlineFrame:
@@ -258,6 +287,7 @@ def _runtime(orchestrator, service):
         writer=SimpleNamespace(),
         orchestrator=orchestrator,
         execution_service=service,
+        sizing_resolver=_sizing,
     )
 
 
@@ -279,17 +309,33 @@ def test_campaign_settings_are_isolated_and_exact():
     assert base.execution.selected_broker == original_broker
     assert base.execution.min_trade_confidence == original_threshold
     assert settings.general.decision_stance == CAMPAIGN_STANCE
+    assert settings.provider.reasoning_effort == "medium"
     assert settings.general.last_symbol == CAMPAIGN_SYMBOL
     assert settings.general.last_timeframe == CAMPAIGN_TIMEFRAME
     assert settings.execution.min_trade_confidence == CAMPAIGN_MIN_CONFIDENCE
+    assert settings.execution.entry_timeout_seconds == CAMPAIGN_ENTRY_TIMEOUT_SECONDS
     assert settings.execution.selected_broker == "okx"
     assert settings.execution.auto_execute is False
     assert settings.execution.okx.instrument == CAMPAIGN_INSTRUMENT
-    assert settings.execution.okx.quantity == "1"
+    assert settings.execution.okx.quantity == CAMPAIGN_BOOTSTRAP_QUANTITY
     assert settings.execution.okx.product == "swap"
     assert settings.execution.okx.simulated is True
     assert settings.execution.okx.api_base_url == CAMPAIGN_OKX_API_BASE_URL
     assert base.execution.okx.api_base_url == "https://attacker.invalid"
+
+
+def test_campaign_config_records_its_fast_execution_style():
+    payload = campaign_module._campaign_config_payload()
+
+    assert CAMPAIGN_TIMEFRAME == "15m"
+    assert CAMPAIGN_STANCE == "aggressive"
+    assert CAMPAIGN_MIN_CONFIDENCE == 30
+    assert payload["timeframe"] == "15m"
+    assert payload["decision_stance"] == "aggressive"
+    assert payload["min_trade_confidence"] == 30
+    assert payload["execution_style"] == CAMPAIGN_EXECUTION_STYLE
+    assert "市价单" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
+    assert "最高优先级覆盖" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
 
 
 def test_campaign_settings_reject_live_route():
@@ -325,6 +371,120 @@ def test_campaign_plan_uses_fixed_official_demo_endpoint(
     assert plan.okx_api_base_url == CAMPAIGN_OKX_API_BASE_URL
 
 
+def test_demo_canary_record_is_explicitly_non_strategy_and_builds_demo_plan(
+    tmp_path,
+    monkeypatch,
+):
+    bar = KlineBar(
+        seq=1,
+        ts_open=1_784_304_000_000,
+        open=4000,
+        high=4010,
+        low=3990,
+        close=4005,
+        volume=100,
+        amount=400500,
+        closed=True,
+    )
+    record = build_demo_canary_record(
+        entry=Decimal("4005.0"),
+        tp1=Decimal("4025.1"),
+        tp2=Decimal("4045.2"),
+        stop=Decimal("3984.9"),
+        bar=bar,
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+    )
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    writer = PendingWriter(pending_dir=tmp_path)
+    writer.save_full_durable(record)
+
+    plan = build_execution_plan(
+        record,
+        _settings(),
+        record_path=writer.full_path(record),
+    )
+
+    assert record.meta.timeframe == CANARY_TIMEFRAME
+    assert record.stage2_decision["origin"] == CANARY_ORIGIN
+    assert "不是 PA 策略信号" in record.stage2_decision["decision"]["reason"]
+    assert plan.environment == "demo"
+    assert plan.entry_type == "market"
+    assert str(plan.quantity) == "120"
+
+
+def test_demo_canary_record_is_never_reused_as_a_15m_strategy_record(tmp_path):
+    bar = KlineBar(
+        seq=1,
+        ts_open=1_784_304_000_000,
+        open=4000,
+        high=4010,
+        low=3990,
+        close=4005,
+        volume=100,
+        amount=400500,
+        closed=True,
+    )
+    record = build_demo_canary_record(
+        entry=Decimal("4005.0"),
+        tp1=Decimal("4025.1"),
+        tp2=Decimal("4045.2"),
+        stop=Decimal("3984.9"),
+        bar=bar,
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+    )
+    writer = PendingWriter(pending_dir=tmp_path)
+    writer.save_full_durable(record)
+
+    latest = find_latest_successful_record(
+        symbol=CAMPAIGN_SYMBOL,
+        timeframe=CAMPAIGN_TIMEFRAME,
+        directory=tmp_path,
+    )
+
+    assert latest is None
+
+
+def test_demo_canary_prices_use_closed_bar_and_okx_tick(monkeypatch):
+    bar = KlineBar(
+        seq=1,
+        ts_open=1_784_304_000_000,
+        open=4000,
+        high=4010,
+        low=3990,
+        close=4005.13,
+        volume=100,
+        amount=400500,
+        closed=True,
+    )
+
+    class _Source:
+        def latest_snapshot(self, count):
+            assert count == 3
+            return [bar]
+
+    class _Client:
+        def __init__(self, credentials, *, base_url, simulated):
+            del credentials
+            assert base_url == CAMPAIGN_OKX_API_BASE_URL
+            assert simulated is True
+
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [{"instId": CAMPAIGN_INSTRUMENT, "tickSz": "0.1"}]
+
+    monkeypatch.setattr(campaign_module, "load_okx_credentials", lambda _: object())
+    monkeypatch.setattr(campaign_module, "OkxRestClient", _Client)
+
+    entry, tp1, tp2, stop, returned_bar = _canary_price_triplet(
+        SimpleNamespace(source=_Source())
+    )
+
+    assert returned_bar is bar
+    assert entry == Decimal("4005.1")
+    assert stop < entry < tp1 < tp2
+    assert all(value % Decimal("0.1") == 0 for value in (entry, tp1, tp2, stop))
+
+
 def test_campaign_state_resume_never_extends_deadline(tmp_path):
     store = CampaignStateStore(tmp_path / "campaign.json")
     started = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
@@ -349,6 +509,26 @@ def test_completed_campaign_cannot_restart_automatically(tmp_path):
         store.create_or_resume(now=datetime(2026, 7, 18, tzinfo=UTC))
 
 
+def test_explicit_restart_archives_an_idle_campaign(monkeypatch, tmp_path):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(original)
+    history = tmp_path / "history"
+    monkeypatch.setattr(campaign_module, "CAMPAIGN_HISTORY_DIR", history)
+
+    restarted = store.restart(
+        reason="configuration changed",
+        now=datetime(2026, 7, 17, 1, tzinfo=UTC),
+    )
+
+    assert restarted.campaign_id != original.campaign_id
+    archives = list(history.glob("*.json"))
+    assert len(archives) == 1
+    archived = campaign_module.json.loads(archives[0].read_text(encoding="utf-8"))
+    assert archived["reason"] == "configuration changed"
+    assert archived["state"]["campaign_id"] == original.campaign_id
+
+
 def test_campaign_process_lock_rejects_second_runner(tmp_path):
     path = tmp_path / "campaign.lock"
 
@@ -358,6 +538,41 @@ def test_campaign_process_lock_rejects_second_runner(tmp_path):
         CampaignProcessLock(path),
     ):
         raise AssertionError("第二个实验进程不应取得文件锁")
+
+
+def test_dynamic_sizing_uses_ten_percent_of_demo_usdt_equity():
+    class _Client:
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "state": "live",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "ctVal": "0.001",
+                    "ctMult": "1",
+                }
+            ]
+
+        def balance(self):
+            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+
+        def ticker(self, instrument):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            return {"last": "4000"}
+
+        def max_order_size(self, *, instrument, trade_mode):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            assert trade_mode == "cross"
+            return {"maxBuy": "500", "maxSell": "500"}
+
+    sizing = resolve_campaign_sizing(_Client())
+
+    assert sizing.equity_usdt == Decimal("5000")
+    assert sizing.target_notional_usdt == Decimal("500")
+    assert sizing.contract_notional_usdt == Decimal("4")
+    assert sizing.quantity == Decimal("125")
 
 
 def test_private_preflight_always_uses_demo_header(monkeypatch):
@@ -384,16 +599,22 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
                     "state": "live",
                     "minSz": "1",
                     "lotSz": "1",
+                    "ctVal": "0.001",
+                    "ctMult": "1",
                 }
             ]
 
         def max_order_size(self, *, instrument, trade_mode):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
-            return {"maxBuy": "100", "maxSell": "100"}
+            return {"maxBuy": "500", "maxSell": "500"}
 
         def balance(self):
-            return [{"details": []}]
+            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+
+        def ticker(self, instrument):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            return {"last": "4000"}
 
         def positions(self, *, instrument):
             assert instrument == CAMPAIGN_INSTRUMENT
@@ -438,6 +659,8 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
     assert result["simulated"] is True
     assert result["max_buy_sufficient"] is True
     assert result["max_sell_sufficient"] is True
+    assert result["equity_fraction"] == str(CAMPAIGN_EQUITY_FRACTION)
+    assert result["resolved_quantity"] == "125"
 
 
 def test_okx_campaign_source_uses_execution_instrument_prices():
@@ -515,6 +738,7 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     assert runner.state.last_completed_bar_ms == bar_ms
     assert runner.state.executions_prepared == 1
     assert runner.state.execution_ids == ["execution-1"]
+    assert runner.runtime.settings.execution.okx.quantity == "120"
 
 
 def test_campaign_rearms_only_after_demo_read_check(monkeypatch, tmp_path):

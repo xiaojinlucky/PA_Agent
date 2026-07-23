@@ -1,5 +1,5 @@
 # Configure local git hooks and verify sensitive paths are ignored.
-# Run from repo root:  powershell -ExecutionPolicy Bypass -File tools\setup_git_secrets.ps1
+# Run from repo root:  pwsh -ExecutionPolicy Bypass -File tools\setup_git_secrets.ps1
 
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)

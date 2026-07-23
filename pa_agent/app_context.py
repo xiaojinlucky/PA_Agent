@@ -28,6 +28,7 @@ class AppContext:
     exp_reader: Any = None        # ExperienceReader
     ledger: Any = None            # SessionTokenLedger
     execution_service: Any = None # GUI-side ExecutionController
+    workbench_read_model: Any = None  # 只读工作台读取层
 
     @classmethod
     def bootstrap(cls) -> "AppContext":
@@ -138,6 +139,15 @@ class AppContext:
             logger=app_logger,
         )
 
+        from pa_agent.gui.read_models import WorkbenchReadModel
+
+        workbench_read_model = WorkbenchReadModel(
+            settings=settings,
+            data_source=data_source,
+            execution_store=execution_service.execution_store,
+            worker_store=execution_service.worker_store,
+        )
+
         return cls(
             settings=settings,
             settings_path=SETTINGS_JSON_PATH,
@@ -152,4 +162,5 @@ class AppContext:
             exp_reader=exp_reader,
             ledger=ledger,
             execution_service=execution_service,
+            workbench_read_model=workbench_read_model,
         )

@@ -97,6 +97,16 @@ class ExecutionController:
         self._last_worker_warning = ""
         self._lock = threading.RLock()
 
+    @property
+    def execution_store(self) -> ExecutionStore:
+        """只读暴露现有执行账本，供工作台读取层使用。"""
+        return self._store
+
+    @property
+    def worker_store(self) -> WorkerStore:
+        """只读暴露现有 Worker 控制库，供工作台读取层使用。"""
+        return self._worker_store
+
     def _selected_route_identity(self) -> tuple[str, str, str]:
         execution = self._settings.execution
         broker = str(execution.selected_broker)

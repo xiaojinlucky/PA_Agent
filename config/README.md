@@ -182,7 +182,7 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.selected_broker` | string | `"longbridge"` | 当前写操作只允许 `longbridge` 或 `okx` 之一 |
 | `execution.min_trade_confidence` | int | `70` | 独立于提示弹窗的执行置信度门槛 |
 | `execution.poll_interval_seconds` | float | `2.0` | 活动订单/保护/盈亏轮询间隔 |
-| `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量 |
+| `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量；15 分钟 OKX Demo 运行器为恢复/收口历史限价记录固定覆盖为 `270` |
 | `execution.longbridge.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
 | `execution.longbridge.instrument` | string | `""` | Longbridge 精确证券代码，如 `GLD.US` |
 | `execution.longbridge.quantity` | string | `""` | 下单数量；按券商实时 lot size 校验 |
@@ -203,15 +203,29 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 
 Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
 
-### 24 小时 OKX Demo 黄金实验
+### OKX Demo 黄金 5 分钟自动循环
 
-该实验使用独立进程内设置，不覆盖日常 `settings.json`。固定范围是
-`OKX XAU-USDT-SWAP / 30m` → `OKX Demo XAU-USDT-SWAP / cross / 1 张`，PA 倾向为
-`extreme_aggressive`，执行置信度门槛为 `30`。
+该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
+`OKX XAU-USDT-SWAP / 15m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
+10% 的动态张数`，PA 倾向为 `aggressive`，执行置信度门槛为 `30`。该运行器另有仅自身使用的快速执行提示：
+当模型能以最新已收盘 K1 附近构造合法三价时，只输出市价单；否则如实不下单，
+不会新建限价单或突破单。日常 GUI / PA 分析不继承此规则。`270` 秒的限价超时仍用于
+恢复或收口历史限价记录。
 
-实验固定使用官方 `https://www.okx.com` API 地址与模拟交易标头。全局配置中的其他
-OKX 地址不会被沿用。分析形成执行计划后，运行器先耐久记录本实验的 execution id，再
-显式提交模拟订单；监控和到期收口只处理这些归属于本实验的 execution id。
+当策略连续返回“不下单”而需要单独验证技术闭环时，可运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign canary
+```
+
+它固定使用 Demo、`XAU-USDT-SWAP`、cross、`10` 张，经既有
+`ExecutionController → ExecutionWorker` 完成一次市价入场、成交回读、原生保护和受控
+离场。耐久记录会标记为 `okx_demo_lifecycle_canary` / `demo_canary`，不属于 PA 策略信号，
+不会改变普通分析或 GUI 规则；自动循环与该命令共用一把进程锁，不能同时发起新增风险。
+
+运行器固定使用官方 `https://www.okx.com` API 地址与模拟交易标头。全局配置中的其他
+OKX 地址不会被沿用。分析形成执行计划后，运行器先耐久记录本次运行的 execution id，再
+显式提交模拟订单；监控和到期收口只处理这些归属于本次运行的 execution id。
 分析行情同样读取 OKX 官方公共 K 线，确保 PA 的入场、止盈和止损价格与实际执行产品属于
 同一价格体系，不把 OANDA XAUUSD 的绝对价格直接套用到 OKX 永续。
 
@@ -234,7 +248,7 @@ OKX 地址不会被沿用。分析形成执行计划后，运行器先耐久记�
 .\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign status
 ```
 
-截止时间首次启动时写入 `records/okx_demo_campaign.json`，重启不会重新计算 24 小时。到期后
+截止时间首次启动时写入 `records/okx_demo_campaign.json`，重启不会重新计算最长运行窗口。到期后
 运行器停止新分析，撤销未成交入场并对已有模拟持仓请求离场；若仍有未知状态则明确保留为
 `needs_attention`，不会伪报完成。
 

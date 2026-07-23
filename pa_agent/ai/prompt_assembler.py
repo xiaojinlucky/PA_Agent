@@ -896,10 +896,14 @@ class PromptAssembler:
         experience_reader: Any = None,
         *,
         prompt_settings: Any = None,
+        stage2_execution_guidance: str = "",
     ) -> None:
         self._prompt_dir = prompt_dir
         self._experience_reader = experience_reader
         self._prompt_settings = prompt_settings
+        # 某个受控运行器可以额外补充阶段二执行语义；日常 GUI 和普通
+        # 分析不传此参数，因此不会继承运行器的专用行为。
+        self._stage2_execution_guidance = str(stage2_execution_guidance or "").strip()
         self._txt_cache: dict[str, str] = {}
 
     def _load_full_strategy_library(self) -> bool:
@@ -1664,6 +1668,10 @@ class PromptAssembler:
         stage2_parts.append(
             _build_next_cycle_prediction_instruction(enable_next_bar=enable_next_bar_prediction)
         )
+        # 受控运行器的专用执行语义必须位于通用策略资料、输出契约和
+        # 预测要求之后，才能明确覆盖仅该运行器不适用的挂单路径。默认
+        # 调用不传此字段，故不会改变 GUI 或日常分析的提示词。
+        stage2_parts.append(self._stage2_execution_guidance)
         # Static strategy / contract blocks first → better KV prefix reuse across runs.
         stage2_context = "\n\n---\n\n".join(p for p in stage2_parts if p)
 

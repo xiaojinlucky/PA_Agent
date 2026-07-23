@@ -297,6 +297,7 @@ class MainWindow(QMainWindow):
         )
         self.resize(1440, 900)
         self._ctx = ctx
+        self._workbench_read_model = getattr(ctx, "workbench_read_model", None)
         self._worker: _AnalysisWorker | None = None
         self._analysis_worker_id: object | None = None
         self._prep_worker: Any = None
@@ -690,6 +691,10 @@ class MainWindow(QMainWindow):
         outer_layout.addWidget(self._disclaimer_label)
 
         status_row = QHBoxLayout()
+        self._workbench_read_model_status_label = QLabel("只读层：未接入")
+        self._workbench_read_model_status_label.setObjectName("mutedLabel")
+        self._workbench_read_model_status_label.setWordWrap(False)
+        status_row.addWidget(self._workbench_read_model_status_label)
         status_row.addStretch()
         self._last_refresh_ts: float = 0.0
         self._refresh_elapsed_label = QLabel("距上次刷新: —")
@@ -701,6 +706,15 @@ class MainWindow(QMainWindow):
         self._elapsed_ticker.setInterval(1000)
         self._elapsed_ticker.timeout.connect(self._update_refresh_elapsed)
         self._elapsed_ticker.start()
+
+        if self._workbench_read_model is not None:
+            self._read_model_timer = _QTimer(tab)
+            self._read_model_timer.setInterval(2_000)
+            self._read_model_timer.timeout.connect(
+                self._refresh_workbench_read_model_status
+            )
+            self._read_model_timer.start()
+            self._refresh_workbench_read_model_status()
 
         outer_layout.addLayout(status_row)
 
@@ -830,6 +844,51 @@ class MainWindow(QMainWindow):
             label.setToolTip("\n".join(item for item in (reason, error) if item))
         except RuntimeError:
             return
+
+    def _refresh_workbench_read_model_status(self) -> None:
+        """显示只读读取层快照，不把计划状态伪装成券商确认。"""
+        label = getattr(self, "_workbench_read_model_status_label", None)
+        model = getattr(self, "_workbench_read_model", None)
+        if label is None or model is None:
+            return
+
+        from pa_agent.gui.read_models import FactCertainty
+
+        certainty_labels = {
+            FactCertainty.CONFIRMED: "已确认",
+            FactCertainty.PLAN: "计划",
+            FactCertainty.PLANNING: "规划",
+            FactCertainty.UNKNOWN: "未知",
+        }
+
+        def display(fact: Any) -> str:
+            return f"{fact.value}[{certainty_labels[fact.certainty]}]"
+
+        snapshot = model.capture()
+        label.setText(
+            "只读："
+            f"行情 {display(snapshot.connection)} "
+            f"{display(snapshot.source_kind)}/"
+            f"{display(snapshot.symbol)}/"
+            f"{display(snapshot.timeframe)} · "
+            f"Worker {display(snapshot.worker_state)} · "
+            f"对账 {display(snapshot.reconcile)} · "
+            f"账户 {display(snapshot.account)} · "
+            f"活动执行 {display(snapshot.active_execution_count)}"
+        )
+        label.setToolTip(
+            "\n".join(
+                (
+                    f"读取时间：{snapshot.captured_at}",
+                    f"行情来源：{snapshot.source_kind.source}",
+                    f"连接状态：{snapshot.connection.source}",
+                    f"Worker 状态：{snapshot.worker_state.source}",
+                    f"账户快照：{snapshot.account.source}",
+                    f"执行账本：{snapshot.active_execution_count.source}",
+                    f"最新执行状态：{display(snapshot.latest_execution_state)}",
+                )
+            )
+        )
 
     def _on_execution_error(self, message: str) -> None:
         label = getattr(self, "_execution_status_label", None)
@@ -1508,6 +1567,8 @@ class MainWindow(QMainWindow):
             self._last_frame_ready_bars = None
 
             self._ctx.data_source = new_source
+            if self._workbench_read_model is not None:
+                self._workbench_read_model.set_data_source(new_source)
             self._active_data_source_kind = kind
             committed = True
             self._sync_tv_exchange_visibility()
@@ -1593,6 +1654,8 @@ class MainWindow(QMainWindow):
                 except Exception as rollback_exc:  # noqa: BLE001
                     logger.debug("Failed to stop new RefreshLoop: %s", rollback_exc)
                 self._ctx.data_source = old_source
+                if self._workbench_read_model is not None:
+                    self._workbench_read_model.set_data_source(old_source)
                 self._active_data_source_kind = previous_kind
                 self._last_frame_ready_bars = previous_frame_bars
                 try:
