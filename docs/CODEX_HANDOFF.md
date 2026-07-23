@@ -26,6 +26,7 @@
 - 仓库：`xiaojinlucky/PA_Agent`
 - 目标远程：`origin = git@github.com:xiaojinlucky/PA_Agent.git`
 - 可见性：GitHub 实时核验为 `public`
+- 公开性是用户明确的长期决定：网页版 GPT 可以读取，BioMNI 读取仓库也依赖公开访问；给外部总控的指令必须明确这一点，不得要求把仓库改回私有。
 - 默认分支：`main`
 - 发布前 `main` 与 `origin/main`：`1a04c144f810ffb486280ed8a1875ff0130bb070`
 - 上一次交接包发布基线：`38876644430302f0e2ac3310f072b31f95252469`；本轮后续改动的本地/远程 SHA 必须重新实时核对，不能沿用该旧值。
