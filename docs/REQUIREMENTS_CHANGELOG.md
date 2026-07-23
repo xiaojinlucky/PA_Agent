@@ -73,7 +73,7 @@
 - OKX 保护单提交未知现在使用确定客户算法订单号依次查询精确结果、未触发列表和历史状态；全部查询成功且无记录时进入 `confirmed_absent`，禁止自动重发。Worker 的心跳与业务状态写入改为同一把锁，旧心跳不能覆盖更新后的 `needs_attention`。
 - OKX 保护单权威查无已补齐全部分页；第二页命中可恢复订单，超过 100 条后仍会继续查询。任一后续页失败、分页游标缺失/重复或超过安全上限时继续保持未知，不能误判不存在，也不能自动补发保护单。
 - 历史 OKX Demo execution 已通过独立 Worker 的持久减险命令安全离场：命令成功、execution 为 `closed`、剩余数量 0、活动 execution 0；券商侧只读复核为持仓 0、普通挂单 0、条件单 0，并保存了最终无持仓账户快照。
-- Longbridge paper 共享环境门和 WinSW 服务环境已统一为启用；PA Live 与 OKX Live 继续关闭。使用不落盘的有效路由完成模拟会话“启用 → 停用”复验，授权租约最终为 0。
+- 历史验证曾统一启用 Longbridge paper 共享环境门和 WinSW 服务环境，并保持 PA Live 与 OKX Live 关闭；该状态不代表本轮现场配置。使用不落盘的有效路由完成过模拟会话“启用 → 停用”复验，授权租约最终为 0。
 
 ## 5. 尚未实现或尚未完成最终验收
 
@@ -85,9 +85,24 @@
 - 当前持久交易配置后来改成 OKX 自动执行，但品种为空、数量为非法文本；计划构建会失败关闭。用户必须重新保存合法品种和数量，程序不能猜测。
 - OKX Demo 账户当前有一笔外部 10 张 `XAU-USDT-SWAP` 仓位，客户订单号为空且没有 PA execution。PA 不接管它，并会阻断同品种新增仓位；任何处理该外部仓的写操作都需要用户单独明确授权。
 - 生产前端视觉重做、Pencil 状态流和 Figma 组件库尚未实现；现有 `FRONTEND_REDESIGN_PRD.md` 只是设计输入。
-- OKX Live 最小权限整改仍未完成：启用前必须移除提币权限并确认 IP 白名单；当前 Live 双硬门保持关闭。
+- OKX Live 最小权限整改仍未完成：启用前必须移除提币权限并确认 IP 白名单；Live 双硬门状态本轮未重新核验。
 - Longbridge 综合与日内账户当前 GLD.US 最大数量均为 0；paper 只读容量验证已通过。最小受控真实 Canary 仍需对具体券商、账户、品种、方向和数量另行授权。
 
 ## 6. 当前交付原则
 
 用户手动启动网页版 GPT Pro Extended Thinking，让它通过 GitHub 读取并提出需求冻结、总控路线图、工单和硬验收；本地 Codex 再根据实际 skills、memory、代码、环境和测试结果进行适配。未经本地适配、用户确认与独立审查，不直接按外部工单修改代码或启用实盘。
+
+## 7. 2026-07-23 本机适配的 WO-S2A-01
+
+外部规划无法看到本机 skills、memory、Windows 服务、真实配置和当前代码，因此本工单按本机事实改写后执行：复用现有 `ExecutionController` / `ExecutionWorker`，不新增执行写入链，不改 `pa_agent/execution/`，只在无界面 OKX Demo Campaign 的计划前增加一道监督门。
+
+已完成：
+
+- 严格输出只有 `allow_entry` / `block_entry` 的 `SupervisorDecision`；多余字段、非法动作、非 JSON 和空正文都不能放行。
+- 主模型失败时，备用监督模型收到同一 frozen snapshot；两者都失败时确定性阻断。
+- 输入包含 PA 完整结构化决策、最近收盘 K 线、Campaign ID、活动 execution 数量和脱敏账户/数量摘要；结论先耐久落盘，再进入计划构建。
+- 同一 Campaign、K 线和 PA 分析摘要的监督结论重启复用；拒绝不建 execution、不提交 Worker 命令；放行只沿用现有 Controller/Worker。
+- 四个 AI 角色绑定字段已加入设置。当前 Campaign 采用 PA 主档案与已配置的监督主档案；监督备用档案需要本机设置明确绑定，未绑定时主模型失败直接确定性阻断；PA 备用档案只做独立验证，完整 PA 分析备用切换不在本工单偷渡实现。
+- 使用真实生产 `ExecutionController`、`ExecutionWorker` 和内存 FakeAdapter 的离线测试已证明：拒绝为 0 命令，放行为恰好 1 条 Demo `SUBMIT`，重启无重复模型调用和命令。
+
+明确未完成：当前 Demo 的 `equity_10pct_notional` 仍只是技术名义仓位算法，不是正式 10% 止损风险定仓；真实 OKX Demo 端到端运行和 Live 均不在本轮验收范围。

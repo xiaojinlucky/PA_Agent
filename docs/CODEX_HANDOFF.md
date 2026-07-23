@@ -28,6 +28,7 @@
 - 可见性：GitHub 实时核验为 `public`
 - 默认分支：`main`
 - 发布前 `main` 与 `origin/main`：`1a04c144f810ffb486280ed8a1875ff0130bb070`
+- 上一次交接包发布基线：`38876644430302f0e2ac3310f072b31f95252469`；本轮后续改动的本地/远程 SHA 必须重新实时核对，不能沿用该旧值。
 - 当前 GitHub 身份：`xiaojinlucky`；权限：`ADMIN` / `push`
 
 本次发布包包含：
@@ -87,11 +88,22 @@
 
 ### 5.3 OKX Demo 与当前工作台
 
+> 本节的运行态字段来自上一轮现场快照；本轮 WO-S2A-01 只重新验证 Demo/离线代码链路，不能据此断言当前进程、账户、仓位或券商状态。
+
 - 旧版 5 分钟 Demo 实验、7 笔限价单和生命周期 canary 已有历史证据；它们不能被解释成当前 15 分钟产品配置或实盘绩效。
 - 当前本地安全配置字段（不代表交易授权）：revision `63`、数据源 `okx`、品种 `XAU-USDT-SWAP`、周期 `15m`、决策 stance `aggressive`、最低置信度 `30`、OKX Demo、自动执行配置开启、数量 `10`。
 - 新增 `pa_agent/gui/read_models.py`：只读组合行情连接/订阅、Worker 心跳与对账、账户快照和执行账本；不发网络请求、不建计划、不入队命令、不写券商。
 - `AppContext` 复用现有 `ExecutionStore` 和 `WorkerStore`；主窗口状态条显示“已确认/计划/规划/未知”，数据源事务切换和回滚会同步读取对象。
 - 当前只完成读取层基础和状态条；完整导航页面、订单/保护/分析统一读取模型、截图和 OKX 端到端验收仍未完成。
+
+### 5.4 WO-S2A-01 双智能体 Demo 入场门控
+
+- `pa_agent/agents/supervisor_models.py` 定义严格 `SupervisorDecision`、frozen 输入快照和可追溯结论记录；只允许 `allow_entry` / `block_entry`。
+- `pa_agent/agents/supervisor.py` 读取已验证的监督主档案和可选备用档案。若备用档案明确绑定，主模型失败时备用模型使用完全相同输入快照；两者失败、未配置备用或活动 execution 已存在时确定性 `block_entry`。
+- `pa_agent/records/supervisor_writer.py` 按 `campaign_id + closed_bar_ts_open_ms + analysis_digest` 原子保存，重启复用同一结论，冲突和损坏直接失败。
+- `pa_agent/okx_demo_campaign.py` 在 `prepare_analysis()` 前接入监督门；拒绝不创建 execution、不入队命令，放行继续沿用既有 Controller/Worker。新增提交后崩溃恢复，避免同一 K 线重建第二笔 execution。
+- 设置增加 PA 主/备、监督主/备四个档案绑定字段。当前 Campaign 使用 PA 主档案和已配置的监督主档案；监督备用需在本机设置明确绑定，PA 备用档案先独立验证，完整 PA 分析备用切换属于后续工单。
+- 明确不修改 `pa_agent/execution/`，不改当前 Demo `equity_10pct_notional` 技术仓位算法，不触碰 OKX Live。
 
 ## 6. 当前验证证据
 
@@ -106,6 +118,9 @@
 - `git diff --check`：通过；仅有 Git 的 LF/CRLF 提示。
 - 活动文档旧基线号检查：通过。
 - `docs/` 密钥扫描：0 命中。
+- 本轮 `WO-S2A-01` 定向套件为 156 通过 / 0 失败，包含监督模型、监督落盘、Campaign、AI 档案、Controller、Worker、ExecutionService、OKX 数据源和真实 Controller/Worker 离线链路。
+- 本轮全量 `tests/unit` 收集 1225 项，发现 20 项既有非本工单失败；失败集中在旧的连续性、数据源切换替身、决策面板、提示归一化和 openclaw 兼容契约，新增监督/Campaign 测试没有失败。全量不能描述为全绿。
+- 新增代码的 `ruff --select E,F,I,UP,B,SIM`、`compileall` 和 `git diff --check` 通过；本轮没有连接真实券商和发送真实订单。
 
 历史全仓测试和运行态证据必须以 `CONTEXT.md`、`docs/VALIDATION_EVIDENCE.md` 的具体记录为准；本次没有重新把全仓结果或自动 Campaign 运行状态说成当前已确认。此前运行态探针曾超时，因此 Web GPT 不得据旧快照断言策略仍在运行。
 

@@ -1,8 +1,17 @@
 # PA_Agent 移交验证证据
 
+> **历史快照（截至 2026-07-22；不代表当前状态）**：本文件记录当时的发布、测试和运行验证。当前代码与 Git 基线以根目录 `CONTEXT.md`、`docs/CODEX_HANDOFF.md` 和最新 GitHub `main` 为准；本文件中的历史 SHA、测试数字和运行态只在各自时间点成立。
+
+## 本轮后续验证（2026-07-23）
+
+- `WO-S2A-01` 定向套件：156 通过、0 失败。覆盖严格监督输出、主备同快照、确定性拒绝、原子落盘、重启复用、Campaign 门控、真实 `ExecutionController` / `ExecutionWorker` 离线 Demo 命令链，以及指定的 AI 档案、执行域和 OKX 数据源回归。
+- 全量 `tests/unit`：本轮收集 1225 项，20 项失败；失败均位于本轮新增监督/Campaign 定向套件之外，仍按既有仓库失败处理，不能宣称全量绿。
+- 新增代码选择性 Ruff（`E,F,I,UP,B,SIM`）、`compileall` 和 `git diff --check`：通过。
+- 本轮没有连接真实券商、没有发送真实订单；监督离线测试使用内存 FakeAdapter，只验证生产 Controller/Worker 的命令接缝。
+
 ## 发布事实
 
-- 用户当前 GitHub 用户名：`xiaojinlucky`。2026-07-22 已明确授权 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布。本地 `origin` 已改为 `git@github.com:xiaojinlucky/PA_Agent.git`；登录账号为 `xiaojinlucky`，权限为 `ADMIN`。当前 `main`、`origin/main` 和 GitHub 实时分支基线 SHA 为 `1a04c144f810ffb486280ed8a1875ff0130bb070`；旧版基线仅作为归档来源信息保留在 `docs/prd/` 的落库说明中。
+- 用户当前 GitHub 用户名：`xiaojinlucky`。2026-07-22 已明确授权 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布。本地 `origin` 已改为 `git@github.com:xiaojinlucky/PA_Agent.git`；登录账号为 `xiaojinlucky`，权限为 `ADMIN`。截至本文件记录时，`main`、`origin/main` 和 GitHub 实时分支基线 SHA 为 `1a04c144f810ffb486280ed8a1875ff0130bb070`；该 SHA 是历史证据，不代表当前基线。
 - 分支：`main`
 - 多模型与 Longbridge 只读行情功能提交：`3d9353f8579e6d661fd314ab6b9e91016d9fdd96`
 - 该提交发布后已验证本地 `HEAD`、`origin/main` 与 GitHub 实时分支 SHA 完全一致。

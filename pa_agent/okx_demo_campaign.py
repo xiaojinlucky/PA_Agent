@@ -33,6 +33,11 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from pa_agent.agents.supervisor import (
+    SupervisorGate,
+    build_supervisor_gate,
+    resolve_verified_profile,
+)
 from pa_agent.ai.client_factory import create_ai_client
 from pa_agent.ai.json_validator import JsonValidator
 from pa_agent.ai.prompt_assembler import PromptAssembler
@@ -65,6 +70,7 @@ from pa_agent.records.analysis_history import (
 from pa_agent.records.experience_reader import ExperienceReader
 from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
+from pa_agent.records.supervisor_writer import SupervisorWriter
 from pa_agent.util.logging import configure_logging
 from pa_agent.util.threading import CancelToken
 
@@ -145,7 +151,9 @@ class CampaignState(BaseModel):
     analyses_failed: int = Field(default=0, ge=0)
     executions_prepared: int = Field(default=0, ge=0)
     execution_ids: list[str] = Field(default_factory=list)
+    supervisor_record_ids: list[str] = Field(default_factory=list)
     last_execution_id: str = ""
+    last_supervisor_action: str = ""
     last_plan_result: str = ""
     last_error: str = ""
     updated_at: str
@@ -954,6 +962,7 @@ class CampaignRuntime:
     writer: PendingWriter
     orchestrator: TwoStageOrchestrator
     execution_service: ExecutionController
+    supervisor: SupervisorGate
     sizing_resolver: Callable[[], CampaignSizing] = resolve_campaign_sizing
 
 
@@ -968,6 +977,18 @@ def build_runtime(
         else resolve_campaign_sizing().quantity
     )
     settings = build_campaign_settings(base_settings, quantity=sizing_quantity)
+    pa_primary_id, pa_primary_profile = resolve_verified_profile(
+        settings,
+        settings.ai_roles.pa_primary_profile_id,
+        "PA 主模型",
+    )
+    pa_backup_id = str(settings.ai_roles.pa_backup_profile_id or "").strip()
+    if pa_backup_id:
+        if pa_backup_id == pa_primary_id:
+            raise CampaignError("PA 主模型和备用模型不能绑定同一档案")
+        resolve_verified_profile(settings, pa_backup_id, "PA 备用模型")
+    settings.provider = pa_primary_profile.provider.model_copy(deep=True)
+    settings.provider.reasoning_effort = "medium"
     configure_logging(api_key=settings.provider.api_key)
 
     exp_reader = ExperienceReader(experience_dir=EXPERIENCE_DIR, logger=logger)
@@ -990,6 +1011,15 @@ def build_runtime(
         exp_reader=exp_reader,
         settings=settings,
     )
+    supervisor_writer = SupervisorWriter(
+        RECORDS_PENDING_DIR.parent / "supervisor"
+    )
+    supervisor = build_supervisor_gate(
+        settings,
+        prompt_path=PROMPT_DIR / "交易监督智能体.txt",
+        writer=supervisor_writer,
+        logger_=logger,
+    )
     service = ExecutionController(
         settings=settings,
         pending_writer=writer,
@@ -1004,6 +1034,7 @@ def build_runtime(
         writer=writer,
         orchestrator=orchestrator,
         execution_service=service,
+        supervisor=supervisor,
     )
 
 
@@ -1173,6 +1204,44 @@ class OkxDemoCampaign:
         )
         return True
 
+    def _recover_owned_execution_for_bar(self, bar_ms: int) -> bool:
+        """崩溃发生在提交后时，复用已有 execution，绝不重建第二笔。"""
+        for execution_id in self.state.execution_ids:
+            execution = self.runtime.execution_service.get_execution(
+                execution_id
+            )
+            if execution is None:
+                raise CampaignError(
+                    f"实验 execution {execution_id} 不存在于执行账本"
+                )
+            if getattr(execution, "state", None) is ExecutionState.READY:
+                continue
+            if getattr(execution, "plan", None) is None:
+                # 纯单元测试替身没有真实 ExecutionPlan；不能从替身猜 K 线归属。
+                continue
+            execution_bar_ms = self._execution_bar_ms(execution)
+            if execution_bar_ms != bar_ms:
+                continue
+            state = execution.state
+            if state is ExecutionState.UNKNOWN:
+                raise CampaignError(
+                    f"execution {execution.id} 的提交结果未知，禁止自动重试"
+                )
+            self._save_state(
+                inflight_bar_ms=None,
+                last_completed_bar_ms=bar_ms,
+                last_execution_id=execution.id,
+                last_plan_result=f"execution:{state.value}",
+                last_error="",
+            )
+            logger.info(
+                "恢复同一根 K 线已有 execution: id=%s state=%s",
+                execution.id,
+                state.value,
+            )
+            return True
+        return False
+
     def _expire_owned_ready(self, *, reason: str) -> None:
         for execution in self._owned_ready_executions():
             self.runtime.execution_service.expire_unsubmitted(
@@ -1200,6 +1269,38 @@ class OkxDemoCampaign:
         )
         return sizing
 
+    @staticmethod
+    def _is_supervision_candidate(record: Any) -> bool:
+        if getattr(record, "exception", None) is not None:
+            return False
+        stage2 = getattr(record, "stage2_decision", None)
+        if not isinstance(stage2, dict) or stage2.get("gate_shortcircuited"):
+            return False
+        decision = stage2.get("decision")
+        if not isinstance(decision, dict):
+            return False
+        return str(decision.get("order_type") or "").strip() not in {
+            "",
+            "不下单",
+        }
+
+    def _analysis_digest(self, record: AnalysisRecord) -> str:
+        """Use the exact durable analysis bytes consumed by plan_builder."""
+        full_path = getattr(self.runtime.writer, "full_path", None)
+        if callable(full_path):
+            path = Path(full_path(record))
+            if path.is_file():
+                return hashlib.sha256(path.read_bytes()).hexdigest()
+        if hasattr(record, "model_dump"):
+            payload = json.dumps(
+                record.model_dump(mode="json"),
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            return hashlib.sha256(payload).hexdigest()
+        raise CampaignError("无法为监督结论建立 PA 分析摘要")
+
     def _consume_record(self, record, bar_ms: int, *, reused: bool) -> None:
         completed_count = self.state.analyses_completed + (0 if reused else 1)
         if _utc_now() >= self.state.expires_at_utc:
@@ -1213,8 +1314,51 @@ class OkxDemoCampaign:
             logger.info("PA 分析返回时实验已到期, 不创建执行计划")
             return
 
+        sizing: CampaignSizing | None = None
+        if self._is_supervision_candidate(record):
+            active_execution_count = len(
+                self.runtime.execution_service.list_active()
+            )
+            sizing = self._refresh_order_quantity()
+            supervision = self.runtime.supervisor.review(
+                campaign_id=self.state.campaign_id,
+                record=record,
+                bar_ms=bar_ms,
+                analysis_digest=self._analysis_digest(record),
+                active_execution_count=active_execution_count,
+                sizing=sizing,
+            )
+            supervisor_ids = list(
+                dict.fromkeys(
+                    [*self.state.supervisor_record_ids, supervision.record_id]
+                )
+            )
+            self._save_state(
+                supervisor_record_ids=supervisor_ids,
+                last_supervisor_action=supervision.action,
+                last_error="",
+            )
+            if supervision.action != "allow_entry":
+                self._save_state(
+                    inflight_bar_ms=None,
+                    last_completed_bar_ms=bar_ms,
+                    analyses_completed=completed_count,
+                    last_plan_result=(
+                        f"blocked:supervisor:{supervision.fallback_level}"
+                    ),
+                    last_error="",
+                )
+                logger.info(
+                    "监督智能体阻断入场: action=%s fallback=%s reason=%s",
+                    supervision.action,
+                    supervision.fallback_level,
+                    supervision.reason,
+                )
+                return
+
         try:
-            self._refresh_order_quantity()
+            if sizing is None:
+                self._refresh_order_quantity()
             execution = self.runtime.execution_service.prepare_analysis(record)
         except PlanBlocked as exc:
             result = f"blocked:{exc.code}"
@@ -1278,6 +1422,8 @@ class OkxDemoCampaign:
             raise DataSourceTransientError("XAU-USDT-SWAP 15m 已收盘 K 线不足")
         bar_ms = int(ts_open_to_ms(frame.bars[0].ts_open))
         if self._recover_owned_ready_for_bar(bar_ms):
+            return True
+        if self._recover_owned_execution_for_bar(bar_ms):
             return True
         if (
             self.state.last_completed_bar_ms is not None

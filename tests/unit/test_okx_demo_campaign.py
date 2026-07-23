@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 import pa_agent.okx_demo_campaign as campaign_module
+from pa_agent.agents.supervisor import SupervisorAgent, SupervisorGate
 from pa_agent.config.settings import Settings
 from pa_agent.data.base import (
     DataSourceTransientError,
@@ -50,6 +52,7 @@ from pa_agent.okx_demo_campaign import (
 )
 from pa_agent.records.analysis_history import find_latest_successful_record
 from pa_agent.records.pending_writer import PendingWriter
+from pa_agent.records.supervisor_writer import SupervisorWriter
 from tests.unit.test_execution_plan_builder import _persist, _record
 
 
@@ -274,6 +277,72 @@ class _FakeExecutionService:
         return None
 
 
+class _FakeSupervisor:
+    def __init__(self, action="allow_entry"):
+        self.action = action
+        self.calls = []
+
+    def review(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            record_id=f"supervisor-{len(self.calls)}",
+            action=self.action,
+            fallback_level="primary",
+            reason="测试监督结论",
+        )
+
+
+class _SupervisorClient:
+    def __init__(self, content):
+        self.content = content
+        self.calls = []
+
+    def chat(self, messages, **kwargs):
+        self.calls.append((messages, kwargs))
+        return SimpleNamespace(content=self.content)
+
+
+def _supervised_runtime(tmp_path, decision):
+    record = _record(symbol=CAMPAIGN_SYMBOL).model_copy(
+        update={
+            "kline_data": [
+                {
+                    "seq": 1,
+                    "ts_open": 1_784_300_400_000,
+                    "open": 4000,
+                    "high": 4010,
+                    "low": 3990,
+                    "close": 4005,
+                    "volume": 100,
+                    "closed": True,
+                }
+            ]
+        }
+    )
+    client = _SupervisorClient(
+        json.dumps({"action": decision, "reason": "测试监督结论"})
+    )
+    agent = SupervisorAgent(
+        primary_client=client,
+        primary_profile_id="test-supervisor",
+        primary_model_id="test-model",
+        prompt_text="只返回严格 JSON。",
+    )
+    writer = PendingWriter(tmp_path / "pending")
+    gate = SupervisorGate(agent, SupervisorWriter(tmp_path / "supervisor"))
+    service = _FakeExecutionService()
+    runtime = CampaignRuntime(
+        settings=_settings(),
+        source=_FakeSource(),
+        writer=writer,
+        orchestrator=_FakeOrchestrator(record),
+        execution_service=service,
+        supervisor=gate,
+        sizing_resolver=_sizing,
+    )
+    return runtime, service, client, record
+
+
 def _state(store: CampaignStateStore, now: datetime):
     state = store.create_or_resume(now=now)
     store.save(state)
@@ -287,6 +356,7 @@ def _runtime(orchestrator, service):
         writer=SimpleNamespace(),
         orchestrator=orchestrator,
         execution_service=service,
+        supervisor=_FakeSupervisor(),
         sizing_resolver=_sizing,
     )
 
@@ -739,6 +809,58 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     assert runner.state.executions_prepared == 1
     assert runner.state.execution_ids == ["execution-1"]
     assert runner.runtime.settings.execution.okx.quantity == "120"
+
+
+def test_supervisor_block_prevents_plan_and_worker_command(monkeypatch, tmp_path):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, client, record = _supervised_runtime(tmp_path, "block_entry")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert client.calls
+    assert service.prepared == []
+    assert service.submitted == []
+    assert runner.state.last_plan_result == "blocked:supervisor:primary"
+    persisted = list((tmp_path / "supervisor").glob("*.json"))
+    assert len(persisted) == 1
+    assert json.loads(persisted[0].read_text(encoding="utf-8"))["action"] == "block_entry"
+    assert record.stage2_decision["decision"]["order_type"] == "限价单"
+
+
+def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, client, _ = _supervised_runtime(tmp_path, "allow_entry")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert len(client.calls) == 1
+
+    restarted_state = store.load()
+    assert restarted_state is not None
+    restarted = OkxDemoCampaign(runtime, store, restarted_state)
+    assert restarted.process_latest_closed_bar() is False
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert len(client.calls) == 1
 
 
 def test_campaign_rearms_only_after_demo_read_check(monkeypatch, tmp_path):

@@ -10,6 +10,12 @@
     "context_window": 2000000
   },
   "active_ai_profile_id": "default",
+  "ai_roles": {
+    "pa_primary_profile_id": "default",
+    "pa_backup_profile_id": "",
+    "supervisor_primary_profile_id": "default",
+    "supervisor_backup_profile_id": ""
+  },
   "ai_profiles": {
     "default": {
       "id": "default",

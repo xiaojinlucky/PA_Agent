@@ -189,6 +189,17 @@ class AIProviderProfile(BaseModel):
         return True
 
 
+class AIRoleBindings(BaseModel):
+    """把已验证的 AI 档案绑定到 PA 与监督角色。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pa_primary_profile_id: str = ""
+    pa_backup_profile_id: str = ""
+    supervisor_primary_profile_id: str = ""
+    supervisor_backup_profile_id: str = ""
+
+
 class PromptSettings(BaseModel):
     """Prompt assembly tuning (accuracy-oriented defaults)."""
     model_config = ConfigDict(extra="ignore")
@@ -384,6 +395,7 @@ class Settings(BaseModel):
     provider: AIProviderSettings = Field(default_factory=AIProviderSettings)
     active_ai_profile_id: str = "default"
     ai_profiles: dict[str, AIProviderProfile] = Field(default_factory=dict)
+    ai_roles: AIRoleBindings = Field(default_factory=AIRoleBindings)
     general: GeneralSettings = Field(default_factory=GeneralSettings)
     prompt: PromptSettings = Field(default_factory=PromptSettings)
     validation: ValidationSettings = Field(default_factory=ValidationSettings)

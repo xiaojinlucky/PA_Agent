@@ -97,6 +97,15 @@ AI 档案由 `active_ai_profile_id` 与 `ai_profiles` 管理；`provider` 是当
 | `ai_profiles.<id>.verification.checks` | object | 真实探测的连接认证、参数接受、有效正文与随机挑战值匹配结果 |
 | `ai_profiles.<id>.verification.observations` | object | 是否观察到 reasoning 等非门禁信息；未返回可见 reasoning 不等于模型不可用 |
 
+### `ai_roles` — AI 角色绑定
+
+| 字段 | 说明 |
+|------|------|
+| `pa_primary_profile_id` / `pa_backup_profile_id` | PA 分析主档案和备用档案；空值沿用当前活动档案。角色绑定只引用已有档案，不复制 Key。 |
+| `supervisor_primary_profile_id` / `supervisor_backup_profile_id` | 交易监督主档案和备用档案；监督备用档案必须与主档案不同，并且两者都必须通过当前配置验证。 |
+
+本阶段真正启用的是监督门：监督主档案必须通过验证；只有在本机明确绑定并验证监督备用档案时，主模型失败或严格 JSON 校验失败才调用备用模型，备用模型接收同一个不可变输入摘要；备用未配置或两个模型都失败时确定性 `block_entry`。PA 备用角色先落配置契约，后续工单再接入 PA 分析链路。
+
 ### provider — 当前活动档案镜像
 
 | 字段 | 类型 | 默认值 | 说明 |
@@ -203,9 +212,9 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 
 Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
 
-### OKX Demo 黄金 5 分钟自动循环
+### OKX Demo 黄金 15 分钟自动循环
 
-该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
+当前产品运行器固定使用 15 分钟；此前的 5 分钟循环、7 笔限价单和生命周期 canary 只属于历史 Demo 实验，不是当前产品周期或实盘绩效。该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
 `OKX XAU-USDT-SWAP / 15m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
 10% 的动态张数`，PA 倾向为 `aggressive`，执行置信度门槛为 `30`。该运行器另有仅自身使用的快速执行提示：
 当模型能以最新已收盘 K1 附近构造合法三价时，只输出市价单；否则如实不下单，
