@@ -26,7 +26,11 @@ from pa_agent.execution.credentials import (
     okx_live_gate_enabled,
     paper_trading_gate_enabled,
 )
-from pa_agent.execution.errors import LiveTradingDisabled, PreflightError
+from pa_agent.execution.errors import (
+    LiveTradingDisabled,
+    NewRiskLeaseUnavailable,
+    PreflightError,
+)
 from pa_agent.execution.models import ExecutionRecord, ExecutionState
 from pa_agent.execution.plan_builder import (
     build_execution_plan,
@@ -233,7 +237,7 @@ class ExecutionController:
                 ttl_seconds=_LEASE_TTL_SECONDS,
             )
             if lease is None:
-                raise LiveTradingDisabled(
+                raise NewRiskLeaseUnavailable(
                     "已有其他 PA 会话持有新增风险授权，请先停用或等待其短租约到期"
                 )
             self._lease_id = lease.lease_id

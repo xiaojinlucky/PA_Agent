@@ -4,11 +4,12 @@ from __future__ import annotations
 import threading
 from decimal import Decimal
 
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDoubleSpinBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -144,6 +145,55 @@ class TradingDialog(QDialog):
         self._min_confidence.setSuffix(" %")
         common_form.addRow("实盘置信度门槛:", self._min_confidence)
         root.addWidget(common_group)
+
+        order_group = QGroupBox("入场 / 主动离场下单方式")
+        order_form = QFormLayout(order_group)
+        self._entry_order_mode = QComboBox()
+        self._entry_order_mode.addItem("跟随 PA 信号（保持原行为）", "signal")
+        self._entry_order_mode.addItem("限价单（按 PA 价格挂单）", "limit")
+        self._entry_order_mode.addItem("限价单 + 允许滑点", "limit_with_slippage")
+        self._entry_order_mode.addItem("市价单", "market")
+        self._entry_order_mode.setToolTip(
+            "入场独立选择：限价单保持 PA 产生的价格；限价+滑点按方向把价格向成交侧移动；"
+            "市价单直接成交。跟随 PA 信号只为兼容旧配置。"
+        )
+        order_form.addRow("入场方式:", self._entry_order_mode)
+
+        self._exit_order_mode = QComboBox()
+        self._exit_order_mode.addItem("限价单", "limit")
+        self._exit_order_mode.addItem("限价单 + 允许滑点", "limit_with_slippage")
+        self._exit_order_mode.addItem("市价单", "market")
+        self._exit_order_mode.setToolTip(
+            "只控制主动离场/收口单。原生止盈止损保护单仍由券商按保护价托管。"
+        )
+        order_form.addRow("主动离场方式:", self._exit_order_mode)
+
+        self._entry_slippage_atr = QDoubleSpinBox()
+        self._entry_slippage_atr.setRange(0, 5)
+        self._entry_slippage_atr.setDecimals(2)
+        self._entry_slippage_atr.setSingleStep(0.05)
+        self._entry_slippage_atr.setSuffix(" × ATR")
+        self._entry_slippage_atr.setToolTip(
+            "仅在入场选择“限价单 + 允许滑点”时生效；按分析时最新已收盘 ATR14 移动价格。"
+        )
+        order_form.addRow("入场 ATR 滑点:", self._entry_slippage_atr)
+
+        self._exit_slippage_atr = QDoubleSpinBox()
+        self._exit_slippage_atr.setRange(0, 5)
+        self._exit_slippage_atr.setDecimals(2)
+        self._exit_slippage_atr.setSingleStep(0.05)
+        self._exit_slippage_atr.setSuffix(" × ATR")
+        self._exit_slippage_atr.setToolTip(
+            "仅在主动离场选择“限价单 + 允许滑点”时生效；使用该执行计划捕获的 ATR14。"
+        )
+        order_form.addRow("离场 ATR 滑点:", self._exit_slippage_atr)
+        self._entry_order_mode.currentIndexChanged.connect(
+            self._sync_order_slippage_controls
+        )
+        self._exit_order_mode.currentIndexChanged.connect(
+            self._sync_order_slippage_controls
+        )
+        root.addWidget(order_group)
 
         self._route_stack = QStackedWidget()
         self._route_stack.addWidget(self._build_longbridge_page())
@@ -319,6 +369,8 @@ class TradingDialog(QDialog):
             self._lb_account,
             self._okx_product,
             self._okx_margin,
+            self._entry_order_mode,
+            self._exit_order_mode,
         )
         line_edits = (
             self._lb_source,
@@ -336,6 +388,8 @@ class TradingDialog(QDialog):
         for line_edit in line_edits:
             line_edit.textChanged.connect(self._mark_configuration_dirty)
         self._min_confidence.valueChanged.connect(self._mark_configuration_dirty)
+        self._entry_slippage_atr.valueChanged.connect(self._mark_configuration_dirty)
+        self._exit_slippage_atr.valueChanged.connect(self._mark_configuration_dirty)
 
     def _mark_configuration_dirty(self, *_args) -> None:
         if self._configuration_dirty:
@@ -359,6 +413,20 @@ class TradingDialog(QDialog):
         self._enabled.setChecked(execution.enabled)
         self._auto_execute.setChecked(execution.auto_execute)
         self._min_confidence.setValue(execution.min_trade_confidence)
+        entry_mode_index = self._entry_order_mode.findData(
+            getattr(execution, "entry_order_mode", "signal")
+        )
+        self._entry_order_mode.setCurrentIndex(max(0, entry_mode_index))
+        exit_mode_index = self._exit_order_mode.findData(
+            getattr(execution, "exit_order_mode", "market")
+        )
+        self._exit_order_mode.setCurrentIndex(max(0, exit_mode_index))
+        self._entry_slippage_atr.setValue(
+            float(getattr(execution, "entry_slippage_atr_multiple", Decimal("0.50")))
+        )
+        self._exit_slippage_atr.setValue(
+            float(getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50")))
+        )
         broker_index = self._broker.findData(execution.selected_broker)
         self._broker.setCurrentIndex(max(0, broker_index))
 
@@ -383,6 +451,7 @@ class TradingDialog(QDialog):
         self._okx_base_url.setText(okx.api_base_url)
         self._on_broker_changed()
         self._sync_okx_margin_enabled()
+        self._sync_order_slippage_controls()
 
     def _apply_widgets(self) -> None:
         execution = self._settings.execution.model_copy(deep=True)
@@ -390,6 +459,14 @@ class TradingDialog(QDialog):
         execution.auto_execute = self._auto_execute.isChecked()
         execution.selected_broker = self._broker.currentData()
         execution.min_trade_confidence = self._min_confidence.value()
+        execution.entry_order_mode = self._entry_order_mode.currentData()
+        execution.exit_order_mode = self._exit_order_mode.currentData()
+        execution.entry_slippage_atr_multiple = Decimal(
+            str(self._entry_slippage_atr.value())
+        )
+        execution.exit_slippage_atr_multiple = Decimal(
+            str(self._exit_slippage_atr.value())
+        )
 
         lb = execution.longbridge
         lb.source_symbol = self._lb_source.text().strip()
@@ -408,6 +485,14 @@ class TradingDialog(QDialog):
         okx.simulated = self._okx_simulated.isChecked()
         okx.api_base_url = self._okx_base_url.text().strip()
         self._settings.execution = execution
+
+    def _sync_order_slippage_controls(self) -> None:
+        self._entry_slippage_atr.setEnabled(
+            self._entry_order_mode.currentData() == "limit_with_slippage"
+        )
+        self._exit_slippage_atr.setEnabled(
+            self._exit_order_mode.currentData() == "limit_with_slippage"
+        )
 
     def _save_configuration(self) -> None:
         try:
@@ -749,6 +834,12 @@ class TradingDialog(QDialog):
             (
                 f"入场单：客户单号 {record.client_order_id or '—'}；"
                 f"券商单号 {record.broker_order_id or '—'}"
+            ),
+            (
+                f"方式：入场 {record.plan.entry_order_mode}；主动离场 {record.plan.exit_order_mode}；"
+                f"ATR14 {record.plan.entry_atr or '—'}；"
+                f"ATR 倍数 {record.plan.entry_slippage_atr_multiple}/"
+                f"{record.plan.exit_slippage_atr_multiple}"
             ),
             f"保护：{_protection_text(record)}",
             f"离场：{_exit_text(record)}",

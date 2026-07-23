@@ -22,6 +22,10 @@ class LiveTradingDisabled(ExecutionError):
     """A write was requested while the hard gate or session gate is disabled."""
 
 
+class NewRiskLeaseUnavailable(LiveTradingDisabled):
+    """The single new-risk lease is temporarily held by another session."""
+
+
 class PreflightError(ExecutionError):
     """A deterministic broker preflight rejected the proposed order."""
 

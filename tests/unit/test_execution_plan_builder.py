@@ -36,6 +36,7 @@ def _record(
         ),
         kline_data=[],
         htf_text="",
+        analysis_atr14=2.0,
         stage1_messages=[],
         stage1_response={},
         stage1_diagnosis={"gate_result": "proceed"},
@@ -248,3 +249,44 @@ def test_plan_blocks_cross_instrument_price_reuse(tmp_path, monkeypatch):
         build_execution_plan(record, settings, record_path=path)
 
     assert exc.value.code == "price_basis_mismatch"
+
+
+@pytest.mark.parametrize(
+    ("mode", "entry_type"),
+    [
+        ("limit", "limit"),
+        ("limit_with_slippage", "limit"),
+        ("market", "market"),
+    ],
+)
+def test_plan_stores_independent_order_modes_and_applies_entry_override(
+    tmp_path,
+    monkeypatch,
+    mode,
+    entry_type,
+):
+    record = _record(order_type="突破单")
+    settings = _settings()
+    settings.execution.entry_order_mode = mode
+    settings.execution.exit_order_mode = "limit_with_slippage"
+    settings.execution.entry_slippage_atr_multiple = 0.75
+    settings.execution.exit_slippage_atr_multiple = 1.25
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    plan = build_execution_plan(record, settings, record_path=path)
+
+    assert plan.entry_type == entry_type
+    assert plan.entry_order_mode == mode
+    assert plan.exit_order_mode == "limit_with_slippage"
+    assert plan.entry_slippage_atr_multiple == 0.75
+    assert plan.exit_slippage_atr_multiple == 1.25
+    assert plan.entry_atr == 2
+
+
+def test_route_fingerprint_changes_when_order_mode_changes():
+    settings = _settings()
+    original = execution_route_fingerprint(settings)
+    settings.execution.entry_order_mode = "market"
+    settings.execution.exit_order_mode = "limit"
+    assert execution_route_fingerprint(settings) != original

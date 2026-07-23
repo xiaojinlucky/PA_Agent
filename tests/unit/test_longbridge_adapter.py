@@ -867,6 +867,48 @@ def test_restart_after_exit_intent_never_resubmits_longbridge_exit():
     assert not [call for call in intraday.calls if call[0] == "submit_order"]
 
 
+def test_longbridge_plain_limit_exit_does_not_require_atr():
+    intraday = FakeLongbridgeSession()
+    intraday.positions_rows = [
+        {
+            "symbol": "GLD.US",
+            "quantity": "2",
+            "available_quantity": "2",
+        }
+    ]
+    adapter, _ = _adapter(intraday, FakeLongbridgeSession())
+    plan = _plan().model_copy(
+        update={
+            "entry_atr": None,
+            "exit_order_mode": "limit",
+        }
+    )
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="intraday",
+        remaining_quantity=plan.quantity,
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "partial_exit": {
+                "phase": "submit_exit",
+                "quantity": "2",
+                "request_id": "request",
+                "remark": "remark",
+                "submit_runtime_id": adapter._runtime_id,
+            }
+        },
+    )
+
+    submitted = adapter.reconcile(record, allow_writes=True)
+
+    body = next(call[1] for call in intraday.calls if call[0] == "submit_order")
+    assert body["order_type"] == "LO"
+    assert body["submitted_price"] == "100"
+    assert submitted.broker_state["partial_exit"]["submitted_price"] == "100"
+
+
 def test_active_exit_unknown_never_retries_and_recovers_by_remark():
     intraday = FakeLongbridgeSession()
     adapter, _ = _adapter(intraday, FakeLongbridgeSession())

@@ -1039,12 +1039,36 @@ class PromptAssembler:
             return prompt
         return inject_market_features_section(prompt, block)
 
+    @staticmethod
+    def _render_higher_timeframe_block(text: str) -> str:
+        """Render higher-timeframe evidence as context, not a hard veto."""
+        value = str(text or "").strip()
+        if not value:
+            return ""
+        return (
+            "## 多周期背景证据（程序抓取；只作方向、波动和冲突背景）\n\n"
+            "下列周期与主周期使用同一品种和同一价格源。先判断主周期，再用高周期解释背景；"
+            "高周期只作背景，不直接否决主周期方向，也不能凭空否决主周期已经成立的近期信号；"
+            "冲突必须写入风险说明。\n\n"
+            f"{value}"
+        )
+
     # ── Stage 1 ───────────────────────────────────────────────────────────────
 
-    def build_stage1(self, frame: KlineFrame, *, analysis_mode: str = "original") -> list[dict]:
+    def build_stage1(
+        self,
+        frame: KlineFrame,
+        *,
+        analysis_mode: str = "original",
+        higher_timeframe_text: str = "",
+    ) -> list[dict]:
         """Build the message list for Stage 1 (market diagnosis)."""
         system_content = self._build_stage1_system_prompt()
-        user_content = self._build_stage1_user_prompt(frame, analysis_mode=analysis_mode)
+        user_content = self._build_stage1_user_prompt(
+            frame,
+            analysis_mode=analysis_mode,
+            higher_timeframe_text=higher_timeframe_text,
+        )
 
         return [
             {"role": "system", "content": system_content},
@@ -1082,6 +1106,7 @@ class PromptAssembler:
         *,
         analysis_mode: str = "original",
         provider_settings: Any | None = None,
+        higher_timeframe_text: str = "",
     ) -> list[dict]:
         """Build Stage 1 as a continuation-based incremental update.
 
@@ -1166,6 +1191,7 @@ class PromptAssembler:
             previous_record,
             new_bar_count,
             analysis_mode=analysis_mode,
+            higher_timeframe_text=higher_timeframe_text,
         )
 
         return [
@@ -1268,7 +1294,13 @@ class PromptAssembler:
             logger.warning("_render_program_prefill_hint failed: %s", exc)
             return ""
 
-    def _build_stage1_user_prompt(self, frame: KlineFrame, *, analysis_mode: str = "original") -> str:
+    def _build_stage1_user_prompt(
+        self,
+        frame: KlineFrame,
+        *,
+        analysis_mode: str = "original",
+        higher_timeframe_text: str = "",
+    ) -> str:
         """Build the Stage 1 task turn; stage-specific rules stay out of system."""
         pattern_block = self._stage1_pattern_supplement()
         prefill_hint = self._render_program_prefill_hint(frame)
@@ -1281,6 +1313,9 @@ class PromptAssembler:
         kline_table = self._render_kline_table(frame)
         feature_table = self._render_kline_feature_table(frame)
         simple_features_block = self._render_simple_market_features_block(frame)
+        higher_timeframe_block = self._render_higher_timeframe_block(
+            higher_timeframe_text
+        )
         n_bars = len(frame.bars)
         if n_bars > 40:
             bg_window = f"**长程背景 K{n_bars}–K41**（较老部分）：\n"
@@ -1298,6 +1333,7 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars}\n"
             f"（K线序号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
+            f"{higher_timeframe_block + chr(10) + chr(10) if higher_timeframe_block else ''}"
             f"## ⚠️ 分析窗口分层规则（与程序 §2.2/§2.3/§2.4 预填一致，必须遵守）\n\n"
             f"你收到全部 {n_bars} 根 K 线数据；下列分层与 `市场诊断框架.txt`、程序三窗口摘要**同一标准**：\n\n"
             f"{bg_window}"
@@ -1402,6 +1438,7 @@ class PromptAssembler:
         new_bar_count: int,
         *,
         analysis_mode: str = "original",
+        higher_timeframe_text: str = "",
     ) -> str:
         """Build the incremental continuation user turn (message [3] in 4-message mode).
 
@@ -1453,6 +1490,7 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars} 新增已收盘K线:{new_count}\n"
             f"（K线序号已重新编号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
+            f"{self._render_higher_timeframe_block(higher_timeframe_text) + chr(10) + chr(10) if higher_timeframe_text else ''}"
             "## 上一轮已完成分析（仅作为延续上下文）\n\n"
             f"```json\n{json.dumps(previous_summary, ensure_ascii=False, indent=2)}\n```\n\n"
             f"## 新增 K线数据(共{new_count}根，序号1=最新已收盘；含阳阴列)\n\n"
@@ -1556,6 +1594,7 @@ class PromptAssembler:
         provider_settings: Any | None = None,
         use_prefix_chain: bool | None = None,
         structure_flip_cooldown_bars: int = 3,
+        higher_timeframe_text: str = "",
     ) -> list[dict]:
         """Build Stage 2 messages, optionally chaining after Stage 1 for KV cache.
 
@@ -1581,6 +1620,7 @@ class PromptAssembler:
             enable_next_bar_prediction=enable_next_bar_prediction,
             omit_kline_block=chain_after_s1,
             structure_flip_cooldown_bars=structure_flip_cooldown_bars,
+            higher_timeframe_text=higher_timeframe_text,
         )
 
         if chain_after_s1:
@@ -1611,6 +1651,7 @@ class PromptAssembler:
         enable_next_bar_prediction: bool = False,
         omit_kline_block: bool = False,
         structure_flip_cooldown_bars: int = 3,
+        higher_timeframe_text: str = "",
     ) -> str:
         """Build the Stage 2 task turn for standalone or prefix-chain mode."""
         from pa_agent.ai.decision_continuity import (
@@ -1629,8 +1670,12 @@ class PromptAssembler:
         conflict_block = self._render_trend_conflict_guidance(stage1_json)
         transition_block = self._render_transition_guidance(stage1_json)
         planned_limit_block = self._render_planned_limit_hint(stage1_json, frame)
+        higher_timeframe_block = self._render_higher_timeframe_block(
+            higher_timeframe_text
+        )
         stage2_parts = [
             stance_block,
+            higher_timeframe_block,
             continuity_block,
             conflict_block,
             transition_block,

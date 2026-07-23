@@ -8,6 +8,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from pa_agent.execution.order_modes import EntryOrderMode, ExitOrderMode
+
 
 def utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -71,6 +73,17 @@ class ExecutionPlan(BaseModel):
     okx_margin_mode: Literal["", "cross", "isolated"] = ""
     longbridge_allow_outside_rth: bool = False
     entry_timeout_seconds: int = Field(default=120, ge=10, le=86_400)
+    # signal 只用于兼容历史计划；界面提供的实际选择是其余三种方式。
+    entry_order_mode: EntryOrderMode = "signal"
+    exit_order_mode: ExitOrderMode = "market"
+    # limit_with_slippage 使用分析节点捕获的 ATR 快照，不使用固定基点。
+    entry_atr: Decimal | None = Field(default=None, gt=0)
+    entry_slippage_atr_multiple: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=5
+    )
+    exit_slippage_atr_multiple: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=5
+    )
 
 
 class PreflightResult(BaseModel):

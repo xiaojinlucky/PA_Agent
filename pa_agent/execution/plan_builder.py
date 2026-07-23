@@ -10,6 +10,11 @@ from pathlib import Path
 
 from pa_agent.execution.errors import PlanBlocked
 from pa_agent.execution.models import ExecutionPlan, utc_now_iso
+from pa_agent.execution.order_modes import (
+    effective_entry_type,
+    normalise_entry_order_mode,
+    normalise_exit_order_mode,
+)
 from pa_agent.records.schema import AnalysisRecord
 
 
@@ -20,6 +25,16 @@ def _positive_decimal(value: object, field_name: str) -> Decimal:
         raise PlanBlocked("invalid_number", f"{field_name} 不是有效数字") from exc
     if not parsed.is_finite() or parsed <= 0:
         raise PlanBlocked("invalid_number", f"{field_name} 必须是有限正数")
+    return parsed
+
+
+def _nonnegative_decimal(value: object, field_name: str) -> Decimal:
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, ValueError, TypeError) as exc:
+        raise PlanBlocked("invalid_number", f"{field_name} 不是有效数字") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise PlanBlocked("invalid_number", f"{field_name} 必须是有限非负数")
     return parsed
 
 
@@ -85,6 +100,14 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
             "longbridge_outside_rth": bool(route.allow_outside_rth) and not is_paper,
             "min_trade_confidence": int(execution.min_trade_confidence),
             "entry_timeout_seconds": int(execution.entry_timeout_seconds),
+            "entry_order_mode": str(getattr(execution, "entry_order_mode", "signal")),
+            "exit_order_mode": str(getattr(execution, "exit_order_mode", "market")),
+            "entry_slippage_atr_multiple": str(
+                getattr(execution, "entry_slippage_atr_multiple", Decimal("0.50"))
+            ),
+            "exit_slippage_atr_multiple": str(
+                getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50"))
+            ),
         }
     elif target == "okx":
         route = execution.okx
@@ -102,6 +125,14 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
             "longbridge_outside_rth": False,
             "min_trade_confidence": int(execution.min_trade_confidence),
             "entry_timeout_seconds": int(execution.entry_timeout_seconds),
+            "entry_order_mode": str(getattr(execution, "entry_order_mode", "signal")),
+            "exit_order_mode": str(getattr(execution, "exit_order_mode", "market")),
+            "entry_slippage_atr_multiple": str(
+                getattr(execution, "entry_slippage_atr_multiple", Decimal("0.50"))
+            ),
+            "exit_slippage_atr_multiple": str(
+                getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50"))
+            ),
         }
     else:
         raise PlanBlocked("unknown_broker", f"未知执行券商：{target}")
@@ -135,9 +166,41 @@ def build_execution_plan(
     if order_type_raw == "不下单":
         raise PlanBlocked("no_order", "PA 决策为不下单")
     entry_type_map = {"限价单": "limit", "市价单": "market", "突破单": "breakout"}
-    entry_type = entry_type_map.get(order_type_raw)
-    if entry_type is None:
+    signal_entry_type = entry_type_map.get(order_type_raw)
+    if signal_entry_type is None:
         raise PlanBlocked("unsupported_order_type", f"不支持的 PA 入场类型：{order_type_raw}")
+    try:
+        entry_order_mode = normalise_entry_order_mode(
+            getattr(execution, "entry_order_mode", "signal")
+        )
+        exit_order_mode = normalise_exit_order_mode(
+            getattr(execution, "exit_order_mode", "market")
+        )
+    except ValueError as exc:
+        raise PlanBlocked("invalid_execution_mode", str(exc)) from exc
+    entry_type = effective_entry_type(signal_entry_type, entry_order_mode)
+    entry_slippage_atr_multiple = _nonnegative_decimal(
+        getattr(execution, "entry_slippage_atr_multiple", Decimal("0.50")),
+        "入场 ATR 滑点倍数",
+    )
+    exit_slippage_atr_multiple = _nonnegative_decimal(
+        getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50")),
+        "离场 ATR 滑点倍数",
+    )
+    if entry_slippage_atr_multiple > 5 or exit_slippage_atr_multiple > 5:
+        raise PlanBlocked("invalid_slippage", "ATR 滑点倍数必须在 0 到 5 之间")
+
+    entry_atr: Decimal | None = None
+    if record.analysis_atr14 is not None:
+        entry_atr = _positive_decimal(record.analysis_atr14, "analysis_atr14")
+    if (
+        entry_order_mode == "limit_with_slippage"
+        or exit_order_mode == "limit_with_slippage"
+    ) and entry_atr is None:
+        raise PlanBlocked(
+            "missing_atr_for_slippage",
+            "选择 ATR 滑点时，分析记录必须包含最新已收盘主周期 ATR14",
+        )
 
     direction_raw = str(decision.get("order_direction") or "").strip()
     direction_map = {"做多": "long", "做空": "short"}
@@ -243,4 +306,9 @@ def build_execution_plan(
         okx_margin_mode=okx_margin_mode,
         longbridge_allow_outside_rth=longbridge_allow_outside_rth,
         entry_timeout_seconds=int(execution.entry_timeout_seconds),
+        entry_order_mode=entry_order_mode,
+        exit_order_mode=exit_order_mode,
+        entry_atr=entry_atr,
+        entry_slippage_atr_multiple=entry_slippage_atr_multiple,
+        exit_slippage_atr_multiple=exit_slippage_atr_multiple,
     )

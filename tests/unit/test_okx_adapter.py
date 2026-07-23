@@ -247,6 +247,7 @@ def _plan(*, product="swap", direction="long", instrument=None) -> ExecutionPlan
         trade_confidence=90,
         created_at=utc_now_iso(),
         config_fingerprint="config",
+        entry_atr=Decimal("2"),
     )
 
 
@@ -394,6 +395,111 @@ def test_regular_swap_entry_has_deterministic_client_id_and_position_side():
     assert body["clOrdId"] == submitted.client_order_id
     assert len(body["clOrdId"]) <= 32
     assert submitted.state == ExecutionState.ENTRY_PENDING
+
+
+def test_okx_entry_limit_with_slippage_moves_price_towards_fill():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan().model_copy(
+        update={
+            "entry_order_mode": "limit_with_slippage",
+            "entry_slippage_atr_multiple": Decimal("0.5"),
+        }
+    )
+    preflight = adapter.preflight(plan)
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.SUBMITTING,
+        preflight=preflight,
+        remaining_quantity=plan.quantity,
+    )
+
+    adapter.submit_entry(record)
+
+    body = next(call[1] for call in client.calls if call[0] == "place_order")
+    assert body["ordType"] == "limit"
+    assert body["px"] == "101.0"
+    assert preflight.broker_metadata["requested_entry_price"] == "100"
+    assert preflight.broker_metadata["effective_entry_price"] == "101.0"
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected_type", "expected_price"),
+    [
+        ("limit", "limit", "105"),
+        ("limit_with_slippage", "limit", "104.0"),
+        ("market", "market", None),
+    ],
+)
+def test_okx_active_exit_uses_selected_order_mode(mode, expected_type, expected_price):
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan().model_copy(
+        update={
+            "exit_order_mode": mode,
+            "exit_slippage_atr_multiple": Decimal("0.5"),
+        }
+    )
+    preflight = adapter.preflight(plan)
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=plan.quantity,
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_order": {
+                "client_order_id": "client-exit",
+                "quantity": str(plan.quantity),
+            }
+        },
+    )
+
+    submitted = adapter._submit_exit(record)
+
+    body = next(call[1] for call in client.calls if call[0] == "place_order")
+    assert body["ordType"] == expected_type
+    if expected_price is None:
+        assert "px" not in body
+    else:
+        assert body["px"] == expected_price
+        assert submitted.broker_state["exit_order"]["submitted_price"] == expected_price
+
+
+def test_okx_plain_limit_exit_does_not_require_atr():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan().model_copy(
+        update={
+            "entry_atr": None,
+            "exit_order_mode": "limit",
+        }
+    )
+    preflight = adapter.preflight(plan)
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        remaining_quantity=plan.quantity,
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_order": {
+                "client_order_id": "client-exit-plain-limit",
+                "quantity": str(plan.quantity),
+            }
+        },
+    )
+
+    adapter._submit_exit(record)
+
+    body = next(call[1] for call in client.calls if call[0] == "place_order")
+    assert body["ordType"] == "limit"
+    assert body["px"] == "105"
 
 
 def test_unknown_entry_recovers_by_persisted_client_id_without_resubmit():

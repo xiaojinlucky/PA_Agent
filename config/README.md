@@ -192,6 +192,10 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.min_trade_confidence` | int | `70` | 独立于提示弹窗的执行置信度门槛 |
 | `execution.poll_interval_seconds` | float | `2.0` | 活动订单/保护/盈亏轮询间隔 |
 | `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量；15 分钟 OKX Demo 运行器为恢复/收口历史限价记录固定覆盖为 `270` |
+| `execution.entry_order_mode` | string | `"signal"` | 入场方式：`signal` 跟随 PA 原始类型；`limit` 原价挂限价；`limit_with_slippage` 向成交侧移动限价；`market` 市价 |
+| `execution.exit_order_mode` | string | `"market"` | 主动离场方式：`limit`、`limit_with_slippage` 或 `market`；原生止盈止损保护单不受此字段改写 |
+| `execution.entry_slippage_atr_multiple` | decimal | `0.50` | 入场限价+滑点使用分析时主周期 ATR14 的倍数；只在对应模式下生效 |
+| `execution.exit_slippage_atr_multiple` | decimal | `0.50` | 主动离场限价+滑点使用该执行计划捕获的 ATR14 倍数；只在对应模式下生效 |
 | `execution.longbridge.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
 | `execution.longbridge.instrument` | string | `""` | Longbridge 精确证券代码，如 `GLD.US` |
 | `execution.longbridge.quantity` | string | `""` | 下单数量；按券商实时 lot size 校验 |
@@ -216,7 +220,8 @@ Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Leg
 
 当前产品运行器固定使用 15 分钟；此前的 5 分钟循环、7 笔限价单和生命周期 canary 只属于历史 Demo 实验，不是当前产品周期或实盘绩效。该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
 `OKX XAU-USDT-SWAP / 15m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
-10% 的动态张数`，PA 倾向为 `aggressive`，执行置信度门槛为 `30`。该运行器另有仅自身使用的快速执行提示：
+10% 的动态张数`，PA 倾向为 `extreme_aggressive`，执行置信度门槛为 `40`。当前运行器固定使用
+市价入场/市价主动离场；普通 GUI 可以独立选择入场和主动离场的三种方式。该运行器另有仅自身使用的快速执行提示：
 当模型能以最新已收盘 K1 附近构造合法三价时，只输出市价单；否则如实不下单，
 不会新建限价单或突破单。日常 GUI / PA 分析不继承此规则。`270` 秒的限价超时仍用于
 恢复或收口历史限价记录。
@@ -227,9 +232,17 @@ Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Leg
 .\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign canary
 ```
 
-它固定使用 Demo、`XAU-USDT-SWAP`、cross、`10` 张，经既有
-`ExecutionController → ExecutionWorker` 完成一次市价入场、成交回读、原生保护和受控
-离场。耐久记录会标记为 `okx_demo_lifecycle_canary` / `demo_canary`，不属于 PA 策略信号，
+它固定使用 Demo、`XAU-USDT-SWAP`、cross 和当前风险引擎张数，经既有
+`ExecutionController → ExecutionWorker` 完成一次入场、成交回读、原生保护和受控主动
+离场。可用参数分别测试入场/离场方式和 ATR 滑点，例如：
+
+```powershell
+.\.venv\Scripts\python.exe -m pa_agent.okx_demo_campaign canary `
+  --entry-mode limit_with_slippage --exit-mode limit_with_slippage `
+  --entry-slippage-atr 0.50 --exit-slippage-atr 0.50
+```
+
+耐久记录会标记为 `okx_demo_lifecycle_canary` / `demo_canary`，不属于 PA 策略信号，
 不会改变普通分析或 GUI 规则；自动循环与该命令共用一把进程锁，不能同时发起新增风险。
 
 运行器固定使用官方 `https://www.okx.com` API 地址与模拟交易标头。全局配置中的其他

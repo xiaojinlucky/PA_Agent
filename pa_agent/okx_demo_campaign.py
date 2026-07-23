@@ -3,8 +3,8 @@
 该入口故意固定交易范围，运行时不采纳日常交易路由中的品种和券商字段：
 
 - OKX XAU-USDT-SWAP / 15m
-- PA 激进
-- 执行置信度门槛 30
+- PA 极度激进
+- 执行置信度门槛 40
 - OKX Demo XAU-USDT-SWAP / cross / 当前 Demo 权益 10% 的动态张数
 - 运行窗口 24 小时
 """
@@ -50,12 +50,17 @@ from pa_agent.config.paths import (
 from pa_agent.config.settings import load_settings
 from pa_agent.data.base import DataSourceTransientError, KlineBar
 from pa_agent.data.datetime_ts import ts_open_to_ms
+from pa_agent.data.multi_timeframe import (
+    higher_timeframes_for,
+    render_higher_timeframe_context,
+)
 from pa_agent.data.snapshot import build_analysis_frame
 from pa_agent.execution.controller import ExecutionController
 from pa_agent.execution.credentials import load_okx_credentials
 from pa_agent.execution.errors import (
     BrokerApiError,
     BrokerTransportError,
+    NewRiskLeaseUnavailable,
     PlanBlocked,
 )
 from pa_agent.execution.models import ACTIVE_EXECUTION_STATES, ExecutionState
@@ -88,8 +93,21 @@ CAMPAIGN_SLIPPAGE_RATE = Decimal("0.0010")
 CAMPAIGN_SIZING_MODE = "equity_10pct_stop_loss_risk"
 CAMPAIGN_BOOTSTRAP_QUANTITY = "1"
 CAMPAIGN_OKX_API_BASE_URL = "https://www.okx.com"
-CAMPAIGN_STANCE = "aggressive"
-CAMPAIGN_MIN_CONFIDENCE = 30
+CAMPAIGN_STANCE = "extreme_aggressive"
+CAMPAIGN_MIN_CONFIDENCE = 40
+# 当前 Demo 首轮直接用市价入场/离场验证持续交易；普通界面可独立切换三种方式。
+CAMPAIGN_ENTRY_ORDER_MODE = "market"
+CAMPAIGN_EXIT_ORDER_MODE = "market"
+# 允许滑点不是固定基点，而是分析时主周期 ATR14 的倍数。0.50 ATR
+# 故意设得足够大，先让 Demo 真实检验“更容易成交但价格更差”的边界。
+CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE = Decimal("0.50")
+CAMPAIGN_EXIT_SLIPPAGE_ATR_MULTIPLE = Decimal("0.50")
+CAMPAIGN_HIGHER_TIMEFRAMES = higher_timeframes_for(CAMPAIGN_TIMEFRAME)
+_CAMPAIGN_TIMEFRAME_TO_OKX_BAR = {
+    "15m": "15m",
+    "1h": "1H",
+    "4h": "4H",
+}
 # 本轮只用于 Demo 15 分钟闭环验收。它只改变模型在本运行器中的下单方式，
 # 不写入日常设置，也不改变 GUI / 普通分析的提示词。
 CAMPAIGN_EXECUTION_STYLE = "market_when_valid"
@@ -204,6 +222,11 @@ def _campaign_config_payload() -> dict[str, Any]:
         "decision_stance": CAMPAIGN_STANCE,
         "execution_style": CAMPAIGN_EXECUTION_STYLE,
         "min_trade_confidence": CAMPAIGN_MIN_CONFIDENCE,
+        "entry_order_mode": CAMPAIGN_ENTRY_ORDER_MODE,
+        "exit_order_mode": CAMPAIGN_EXIT_ORDER_MODE,
+        "entry_slippage_atr_multiple": str(CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE),
+        "exit_slippage_atr_multiple": str(CAMPAIGN_EXIT_SLIPPAGE_ATR_MULTIPLE),
+        "higher_timeframes": list(CAMPAIGN_HIGHER_TIMEFRAMES),
         "entry_timeout_seconds": CAMPAIGN_ENTRY_TIMEOUT_SECONDS,
         "environment": "demo",
         "duration_seconds": int(CAMPAIGN_DURATION.total_seconds()),
@@ -224,6 +247,10 @@ def build_campaign_settings(
     base_settings,
     *,
     quantity: Decimal | str = CAMPAIGN_BOOTSTRAP_QUANTITY,
+    entry_order_mode: str | None = None,
+    exit_order_mode: str | None = None,
+    entry_slippage_atr_multiple: Decimal | float | str | None = None,
+    exit_slippage_atr_multiple: Decimal | float | str | None = None,
 ):
     """复制设置并只在内存中应用实验路由。"""
     settings = copy.deepcopy(base_settings)
@@ -238,6 +265,18 @@ def build_campaign_settings(
     settings.execution.selected_broker = "okx"
     settings.execution.min_trade_confidence = CAMPAIGN_MIN_CONFIDENCE
     settings.execution.entry_timeout_seconds = CAMPAIGN_ENTRY_TIMEOUT_SECONDS
+    settings.execution.entry_order_mode = entry_order_mode or CAMPAIGN_ENTRY_ORDER_MODE
+    settings.execution.exit_order_mode = exit_order_mode or CAMPAIGN_EXIT_ORDER_MODE
+    settings.execution.entry_slippage_atr_multiple = (
+        CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE
+        if entry_slippage_atr_multiple is None
+        else Decimal(str(entry_slippage_atr_multiple))
+    )
+    settings.execution.exit_slippage_atr_multiple = (
+        CAMPAIGN_EXIT_SLIPPAGE_ATR_MULTIPLE
+        if exit_slippage_atr_multiple is None
+        else Decimal(str(exit_slippage_atr_multiple))
+    )
     settings.execution.okx.source_symbol = CAMPAIGN_SYMBOL
     settings.execution.okx.instrument = CAMPAIGN_INSTRUMENT
     resolved_quantity = _positive_decimal(quantity)
@@ -266,6 +305,16 @@ def validate_campaign_settings(settings) -> None:
             int(settings.execution.entry_timeout_seconds)
             == CAMPAIGN_ENTRY_TIMEOUT_SECONDS
         ),
+        "execution.entry_order_mode": settings.execution.entry_order_mode
+        in {"signal", "limit", "limit_with_slippage", "market"},
+        "execution.exit_order_mode": settings.execution.exit_order_mode
+        in {"limit", "limit_with_slippage", "market"},
+        "execution.entry_slippage_atr_multiple": 0
+        <= Decimal(str(settings.execution.entry_slippage_atr_multiple))
+        <= 5,
+        "execution.exit_slippage_atr_multiple": 0
+        <= Decimal(str(settings.execution.exit_slippage_atr_multiple))
+        <= 5,
         "general.decision_stance": settings.general.decision_stance == CAMPAIGN_STANCE,
         "general.last_symbol": settings.general.last_symbol == CAMPAIGN_SYMBOL,
         "general.last_timeframe": settings.general.last_timeframe == CAMPAIGN_TIMEFRAME,
@@ -603,7 +652,9 @@ def _align_to_tick(
     return (value / tick).to_integral_value(rounding=rounding) * tick
 
 
-def _canary_price_triplet(runtime: CampaignRuntime) -> tuple[Decimal, Decimal, Decimal, Decimal, KlineBar]:
+def _canary_price_triplet(
+    runtime: CampaignRuntime,
+) -> tuple[Decimal, Decimal, Decimal, Decimal, KlineBar, float | None]:
     """只读取行情和合约规格，构造短时间内不易触发保护的 Demo 三价。"""
     bars = runtime.source.latest_snapshot(3)
     latest_closed = next((bar for bar in bars if bar.closed), None)
@@ -653,7 +704,29 @@ def _canary_price_triplet(runtime: CampaignRuntime) -> tuple[Decimal, Decimal, D
         tp2 = entry - buffer * Decimal("2")
     if min(entry, stop, tp1, tp2) <= 0:
         raise CampaignError("Demo 生命周期验收三价必须为正数")
-    return entry, tp1, tp2, stop, latest_closed
+    analysis_atr14: float | None = None
+    execution_settings = getattr(
+        getattr(runtime, "settings", None), "execution", None
+    )
+    selected_modes = {
+        str(getattr(execution_settings, "entry_order_mode", "")),
+        str(getattr(execution_settings, "exit_order_mode", "")),
+    }
+    if "limit_with_slippage" in selected_modes:
+        atr_bars = runtime.source.latest_snapshot(100)
+        atr_frame = build_analysis_frame(
+            atr_bars,
+            min(50, max(20, len(atr_bars))),
+            CAMPAIGN_SYMBOL,
+            CAMPAIGN_TIMEFRAME,
+        )
+        if atr_frame is None or not atr_frame.indicators.atr14:
+            raise CampaignError("Demo ATR 滑点验收缺少足够的主周期 ATR14 数据")
+        value = atr_frame.indicators.atr14[0]
+        if value is None or not float(value) > 0:
+            raise CampaignError("Demo ATR 滑点验收的 ATR14 无效")
+        analysis_atr14 = float(value)
+    return entry, tp1, tp2, stop, latest_closed, analysis_atr14
 
 
 def build_demo_canary_record(
@@ -663,15 +736,22 @@ def build_demo_canary_record(
     tp2: Decimal,
     stop: Decimal,
     bar: KlineBar,
+    entry_order_mode: str = CAMPAIGN_ENTRY_ORDER_MODE,
+    analysis_atr14: float | None = None,
     now: datetime | None = None,
 ) -> AnalysisRecord:
     """生成可审计、明确非策略信号的耐久执行授权记录。"""
     current = (now or datetime.now().astimezone()).astimezone()
     timestamp_ms = int(current.timestamp() * 1000)
     direction_text = "做多" if CANARY_DIRECTION == "long" else "做空"
+    canary_order_type = (
+        "限价单"
+        if entry_order_mode in {"limit", "limit_with_slippage"}
+        else "市价单"
+    )
     decision = {
         "order_direction": direction_text,
-        "order_type": "市价单",
+        "order_type": canary_order_type,
         "entry_price": str(entry),
         "take_profit_price": str(tp1),
         "take_profit_price_2": str(tp2),
@@ -704,6 +784,7 @@ def build_demo_canary_record(
             }
         ],
         htf_text="Demo 生命周期验收，不生成策略观点。",
+        analysis_atr14=analysis_atr14,
         stage1_messages=[
             {"role": "system", "content": CANARY_ORIGIN},
         ],
@@ -786,13 +867,24 @@ def _attempt_canary_cleanup(
         service.request_exit(execution_id, reason="Demo 生命周期验收异常收口")
 
 
-def run_demo_lifecycle_canary() -> dict[str, str]:
+def run_demo_lifecycle_canary(
+    *,
+    entry_order_mode: str | None = None,
+    exit_order_mode: str | None = None,
+    entry_slippage_atr_multiple: Decimal | float | str | None = None,
+    exit_slippage_atr_multiple: Decimal | float | str | None = None,
+) -> dict[str, str]:
     """通过现有 Controller/Worker 完成一次明确标记的 Demo 闭环验收。"""
     okx_demo_private_preflight()
     runtime: CampaignRuntime | None = None
     execution_id = ""
     try:
-        runtime = build_runtime()
+        runtime = build_runtime(
+            entry_order_mode=entry_order_mode,
+            exit_order_mode=exit_order_mode,
+            entry_slippage_atr_multiple=entry_slippage_atr_multiple,
+            exit_slippage_atr_multiple=exit_slippage_atr_multiple,
+        )
         validate_campaign_settings(runtime.settings)
         service = runtime.execution_service
         service.start_monitoring()
@@ -801,13 +893,15 @@ def run_demo_lifecycle_canary() -> dict[str, str]:
             raise CampaignError("存在活动执行，Demo 生命周期验收不能与其并行")
         service.arm(service.arm_confirmation_text())
 
-        entry, tp1, tp2, stop, bar = _canary_price_triplet(runtime)
+        entry, tp1, tp2, stop, bar, analysis_atr14 = _canary_price_triplet(runtime)
         record = build_demo_canary_record(
             entry=entry,
             tp1=tp1,
             tp2=tp2,
             stop=stop,
             bar=bar,
+            entry_order_mode=runtime.settings.execution.entry_order_mode,
+            analysis_atr14=analysis_atr14,
         )
         runtime.writer.save_full_durable(record)
         sizing = runtime.sizing_resolver(record)
@@ -966,12 +1060,22 @@ class OkxCampaignSource:
         self._subscribed = True
 
     def latest_snapshot(self, n: int) -> list[KlineBar]:
+        return self.latest_snapshot_for_timeframe(CAMPAIGN_TIMEFRAME, n)
+
+    def latest_snapshot_for_timeframe(
+        self,
+        timeframe: str,
+        n: int,
+    ) -> list[KlineBar]:
+        """Read another OKX public timeframe for background-only context."""
         if not self._subscribed:
             raise CampaignError("OKX Demo 行情源尚未订阅")
+        if timeframe not in {CAMPAIGN_TIMEFRAME, *CAMPAIGN_HIGHER_TIMEFRAMES}:
+            raise CampaignError(f"OKX Demo 不允许读取实验外周期：{timeframe}")
         try:
             rows = self._client.candles(
                 instrument=CAMPAIGN_INSTRUMENT,
-                bar=CAMPAIGN_TIMEFRAME,
+                bar=_CAMPAIGN_TIMEFRAME_TO_OKX_BAR[timeframe],
                 limit=n,
             )
         except (BrokerApiError, BrokerTransportError) as exc:
@@ -992,7 +1096,7 @@ class OkxCampaignSource:
                 amount = Decimal(row[7])
                 confirm = row[8]
             except (IndexError, InvalidOperation, TypeError, ValueError) as exc:
-                raise CampaignError("OKX K 线字段无法解析") from exc
+                raise CampaignError(f"OKX {timeframe} K 线字段无法解析") from exc
             numeric_values = (
                 open_price,
                 high_price,
@@ -1002,20 +1106,20 @@ class OkxCampaignSource:
                 amount,
             )
             if not all(value.is_finite() for value in numeric_values):
-                raise CampaignError("OKX K 线包含非有限数值")
+                raise CampaignError(f"OKX {timeframe} K 线包含非有限数值")
             if min(open_price, high_price, low_price, close_price) <= 0:
-                raise CampaignError("OKX K 线价格必须为正数")
+                raise CampaignError(f"OKX {timeframe} K 线价格必须为正数")
             if volume < 0 or amount < 0:
-                raise CampaignError("OKX K 线成交量不能为负数")
+                raise CampaignError(f"OKX {timeframe} K 线成交量不能为负数")
             if high_price < max(open_price, close_price):
-                raise CampaignError("OKX K 线最高价低于开盘价或收盘价")
+                raise CampaignError(f"OKX {timeframe} K 线最高价低于开盘价或收盘价")
             if low_price > min(open_price, close_price):
-                raise CampaignError("OKX K 线最低价高于开盘价或收盘价")
+                raise CampaignError(f"OKX {timeframe} K 线最低价高于开盘价或收盘价")
             if previous_ts is not None and timestamp >= previous_ts:
-                raise CampaignError("OKX K 线时间必须严格从新到旧")
+                raise CampaignError(f"OKX {timeframe} K 线时间必须严格从新到旧")
             previous_ts = timestamp
             if confirm not in {"0", "1"}:
-                raise CampaignError("OKX K 线收盘标记无效")
+                raise CampaignError(f"OKX {timeframe} K 线收盘标记无效")
             closed = confirm == "1"
             if closed:
                 closed_seq += 1
@@ -1023,7 +1127,7 @@ class OkxCampaignSource:
             else:
                 forming_count += 1
                 if forming_count > 1:
-                    raise CampaignError("OKX K 线包含多根未收盘数据")
+                    raise CampaignError(f"OKX {timeframe} K 线包含多根未收盘数据")
                 seq = 0
             bars.append(
                 KlineBar(
@@ -1071,12 +1175,23 @@ def _apply_campaign_sizing(
 def build_runtime(
     *,
     resolved_quantity: Decimal | str | None = None,
+    entry_order_mode: str | None = None,
+    exit_order_mode: str | None = None,
+    entry_slippage_atr_multiple: Decimal | float | str | None = None,
+    exit_slippage_atr_multiple: Decimal | float | str | None = None,
 ) -> CampaignRuntime:
     base_settings = load_settings(SETTINGS_JSON_PATH)
     # 分析结果尚未产生时没有 entry/stop，不能预先猜数量；只用合法的内存
     # 启动值，真正创建计划前必须由风险引擎覆盖。
     sizing_quantity = resolved_quantity or CAMPAIGN_BOOTSTRAP_QUANTITY
-    settings = build_campaign_settings(base_settings, quantity=sizing_quantity)
+    settings = build_campaign_settings(
+        base_settings,
+        quantity=sizing_quantity,
+        entry_order_mode=entry_order_mode,
+        exit_order_mode=exit_order_mode,
+        entry_slippage_atr_multiple=entry_slippage_atr_multiple,
+        exit_slippage_atr_multiple=exit_slippage_atr_multiple,
+    )
     pa_primary_id, pa_primary_profile = resolve_verified_profile(
         settings,
         settings.ai_roles.pa_primary_profile_id,
@@ -1537,12 +1652,53 @@ class OkxDemoCampaign:
                 self._consume_record(recovered, bar_ms, reused=True)
                 return True
 
+        higher_frames = {}
+        higher_reader = getattr(
+            self.runtime.source,
+            "latest_snapshot_for_timeframe",
+            None,
+        )
+        if callable(higher_reader):
+            higher_count = min(
+                50,
+                max(20, int(self.runtime.settings.general.analysis_bar_count)),
+            )
+            higher_fetch_count = min(245, higher_count + 50)
+            for higher_timeframe in higher_timeframes_for(CAMPAIGN_TIMEFRAME):
+                higher_bars = higher_reader(higher_timeframe, higher_fetch_count)
+                higher_frame = build_analysis_frame(
+                    higher_bars,
+                    higher_count,
+                    CAMPAIGN_SYMBOL,
+                    higher_timeframe,
+                )
+                if higher_frame is None:
+                    raise DataSourceTransientError(
+                        f"XAU-USDT-SWAP {higher_timeframe} 已收盘 K 线不足，不能生成多周期背景"
+                    )
+                higher_frames[higher_timeframe] = higher_frame
+        else:
+            logger.warning(
+                "当前行情源没有多周期读取接口；本轮只保留主周期分析，未伪造高周期背景"
+            )
+        higher_timeframe_text = (
+            render_higher_timeframe_context(frame, higher_frames)
+            if callable(higher_reader)
+            else ""
+        )
+
         self._save_state(inflight_bar_ms=bar_ms, last_error="")
         events: list[str] = []
+        submit_kwargs = (
+            {"higher_timeframe_text": higher_timeframe_text}
+            if higher_timeframe_text
+            else {}
+        )
         record = self.runtime.orchestrator.submit(
             frame,
             CancelToken(),
             lambda event: events.append(event.name),
+            **submit_kwargs,
         )
         if record.exception is not None:
             exception_type = str(record.exception.get("type") or "unknown")
@@ -1592,9 +1748,14 @@ class OkxDemoCampaign:
                 f"OKX Demo 私有只读检查未通过：{type(exc).__name__}"
             ) from exc
         if not self.runtime.execution_service.is_armed:
-            self.runtime.execution_service.arm(
-                self.runtime.execution_service.arm_confirmation_text()
-            )
+            try:
+                self.runtime.execution_service.arm(
+                    self.runtime.execution_service.arm_confirmation_text()
+                )
+            except NewRiskLeaseUnavailable as exc:
+                raise DataSourceTransientError(
+                    "OKX Demo 新增风险租约暂时被其他会话占用"
+                ) from exc
         if not self.runtime.execution_service.is_armed:
             raise DataSourceTransientError(
                 "OKX Demo 新增风险短租约未能生效"
@@ -1617,8 +1778,6 @@ class OkxDemoCampaign:
 
     def run(self) -> bool:
         validate_campaign_settings(self.runtime.settings)
-        # 硬门必须由共享 env 预先开启；实验进程绝不自行提升交易权限。
-        self._ensure_demo_write_session()
         self._save_state(status="active", last_error="")
         logger.info(
             "OKX Demo 实验开始: campaign_id=%s expires_at=%s",
@@ -1741,6 +1900,30 @@ def _build_parser() -> argparse.ArgumentParser:
             "canary=明确标记的 Demo 成交-保护-离场验收; status=读取状态"
         ),
     )
+    parser.add_argument(
+        "--entry-mode",
+        choices=("signal", "limit", "limit_with_slippage", "market"),
+        default=None,
+        help="仅 canary 使用；覆盖本次 Demo 验收入场方式",
+    )
+    parser.add_argument(
+        "--exit-mode",
+        choices=("limit", "limit_with_slippage", "market"),
+        default=None,
+        help="仅 canary 使用；覆盖本次 Demo 验收主动离场方式",
+    )
+    parser.add_argument(
+        "--entry-slippage-atr",
+        type=Decimal,
+        default=None,
+        help="仅 canary 使用；入场限价滑点的 ATR14 倍数",
+    )
+    parser.add_argument(
+        "--exit-slippage-atr",
+        type=Decimal,
+        default=None,
+        help="仅 canary 使用；主动离场限价滑点的 ATR14 倍数",
+    )
     return parser
 
 
@@ -1767,7 +1950,12 @@ def main(argv: list[str] | None = None) -> int:
             # 与 24 小时策略运行器共用同一把锁，避免两个模块同时拿新增风险租约。
             runtime_lock = CampaignProcessLock()
             runtime_lock.__enter__()
-            result = run_demo_lifecycle_canary()
+            result = run_demo_lifecycle_canary(
+                entry_order_mode=args.entry_mode,
+                exit_order_mode=args.exit_mode,
+                entry_slippage_atr_multiple=args.entry_slippage_atr,
+                exit_slippage_atr_multiple=args.exit_slippage_atr,
+            )
             print(json.dumps(result, ensure_ascii=False, indent=2))
             return 0
         except KeyboardInterrupt:

@@ -26,6 +26,10 @@ from pa_agent.execution.models import (
     PreflightResult,
     utc_now_iso,
 )
+from pa_agent.execution.order_modes import (
+    apply_entry_atr_slippage,
+    apply_exit_atr_slippage,
+)
 
 
 def _decimal(value: object, default: Decimal | None = None) -> Decimal | None:
@@ -243,10 +247,21 @@ class LongbridgeAdapter:
                 f"Longbridge {profile} 账户已有 {plan.instrument} 持仓；"
                 "PA 当前不与既有仓位合并"
             )
+        effective_entry_price = plan.entry_price
+        if plan.entry_order_mode == "limit_with_slippage":
+            try:
+                effective_entry_price = apply_entry_atr_slippage(
+                    plan.entry_price,
+                    plan.direction,
+                    plan.entry_atr,
+                    plan.entry_slippage_atr_multiple,
+                )
+            except ValueError as exc:
+                raise PreflightError(f"Longbridge 入场滑点配置无效：{exc}") from exc
         estimate = session.estimate_max_quantity(
             symbol=plan.instrument,
             side=_entry_side(plan),
-            price=plan.entry_price,
+            price=effective_entry_price,
         )
         maximum = self._max_quantity(estimate)
         if maximum < plan.quantity:
@@ -261,7 +276,7 @@ class LongbridgeAdapter:
                 account_profile=profile,
             ),
             quantity=plan.quantity,
-            entry_price=plan.entry_price,
+            entry_price=effective_entry_price,
             take_profit_1=plan.take_profit_1,
             take_profit_2=plan.take_profit_2,
             stop_loss=plan.stop_loss,
@@ -272,6 +287,13 @@ class LongbridgeAdapter:
                 "lot_size": str(lot_size),
                 "max_quantity": str(maximum),
                 "outside_rth": self._allow_outside_rth,
+                "entry_order_mode": plan.entry_order_mode,
+                "entry_atr": str(plan.entry_atr) if plan.entry_atr is not None else "",
+                "entry_slippage_atr_multiple": str(
+                    plan.entry_slippage_atr_multiple
+                ),
+                "requested_entry_price": str(plan.entry_price),
+                "effective_entry_price": str(effective_entry_price),
             },
         )
 
@@ -1389,15 +1411,52 @@ class LongbridgeAdapter:
                         ),
                     }
                 )
+            exit_mode = record.plan.exit_order_mode
             body = {
                 "symbol": record.plan.instrument,
                 "side": "Sell" if record.plan.direction == "long" else "Buy",
-                "order_type": "MO",
+                "order_type": "MO" if exit_mode == "market" else "LO",
                 "submitted_quantity": str(action["quantity"]),
                 "time_in_force": "Day",
                 "remark": str(action["remark"]),
                 "client_request_id": str(action["request_id"]),
             }
+            if exit_mode != "market":
+                try:
+                    reference_price = session.current_price(record.plan.instrument)
+                    if exit_mode == "limit_with_slippage":
+                        submitted_price = apply_exit_atr_slippage(
+                            reference_price,
+                            record.plan.direction,
+                            record.plan.entry_atr,
+                            record.plan.exit_slippage_atr_multiple,
+                        )
+                    else:
+                        submitted_price = reference_price
+                except (BrokerApiError, BrokerTransportError) as exc:
+                    return record.model_copy(
+                        update={
+                            "needs_attention": True,
+                            "last_error": str(exc),
+                            "state_reason": "Longbridge 主动离场限价缺少最新价，暂不提交",
+                        }
+                    )
+                except ValueError as exc:
+                    return record.model_copy(
+                        update={
+                            "needs_attention": True,
+                            "last_error": str(exc),
+                            "state_reason": "Longbridge 主动离场限价配置无效，暂不提交",
+                        }
+                    )
+                body["submitted_price"] = str(submitted_price)
+                action["reference_price"] = str(reference_price)
+                action["submitted_price"] = str(submitted_price)
+            action["order_mode"] = exit_mode
+            action["atr_reference"] = str(record.plan.entry_atr or "")
+            action["slippage_atr_multiple"] = str(
+                record.plan.exit_slippage_atr_multiple
+            )
             try:
                 order_id = self._write(lambda: session.submit_order(body))
             except BrokerApiError as exc:

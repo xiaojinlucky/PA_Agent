@@ -16,7 +16,11 @@ from pa_agent.data.base import (
     KlineBar,
     KlineFrame,
 )
-from pa_agent.execution.errors import BrokerTransportError, PlanBlocked
+from pa_agent.execution.errors import (
+    BrokerTransportError,
+    NewRiskLeaseUnavailable,
+    PlanBlocked,
+)
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.plan_builder import build_execution_plan
 from pa_agent.execution.worker_protocol import WorkerCommandStatus
@@ -27,6 +31,7 @@ from pa_agent.okx_demo_campaign import (
     CAMPAIGN_EQUITY_FRACTION,
     CAMPAIGN_EXECUTION_STYLE,
     CAMPAIGN_FAST_EXECUTION_GUIDANCE,
+    CAMPAIGN_HIGHER_TIMEFRAMES,
     CAMPAIGN_INSTRUMENT,
     CAMPAIGN_MIN_CONFIDENCE,
     CAMPAIGN_OKX_API_BASE_URL,
@@ -406,11 +411,14 @@ def test_campaign_config_records_its_fast_execution_style():
     payload = campaign_module._campaign_config_payload()
 
     assert CAMPAIGN_TIMEFRAME == "15m"
-    assert CAMPAIGN_STANCE == "aggressive"
-    assert CAMPAIGN_MIN_CONFIDENCE == 30
+    assert CAMPAIGN_HIGHER_TIMEFRAMES == ("1h", "4h")
+    assert CAMPAIGN_STANCE == "extreme_aggressive"
+    assert CAMPAIGN_MIN_CONFIDENCE == 40
     assert payload["timeframe"] == "15m"
-    assert payload["decision_stance"] == "aggressive"
-    assert payload["min_trade_confidence"] == 30
+    assert payload["decision_stance"] == "extreme_aggressive"
+    assert payload["min_trade_confidence"] == 40
+    assert payload["entry_order_mode"] == "market"
+    assert payload["exit_order_mode"] == "market"
     assert payload["execution_style"] == CAMPAIGN_EXECUTION_STYLE
     assert "市价单" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
     assert "最高优先级覆盖" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
@@ -553,7 +561,7 @@ def test_demo_canary_prices_use_closed_bar_and_okx_tick(monkeypatch):
     monkeypatch.setattr(campaign_module, "load_okx_credentials", lambda _: object())
     monkeypatch.setattr(campaign_module, "OkxRestClient", _Client)
 
-    entry, tp1, tp2, stop, returned_bar = _canary_price_triplet(
+    entry, tp1, tp2, stop, returned_bar, analysis_atr14 = _canary_price_triplet(
         SimpleNamespace(source=_Source())
     )
 
@@ -561,6 +569,7 @@ def test_demo_canary_prices_use_closed_bar_and_okx_tick(monkeypatch):
     assert entry == Decimal("4005.1")
     assert stop < entry < tp1 < tp2
     assert all(value % Decimal("0.1") == 0 for value in (entry, tp1, tp2, stop))
+    assert analysis_atr14 is None
 
 
 def test_campaign_state_resume_never_extends_deadline(tmp_path):
@@ -809,11 +818,17 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
     source.subscribe(CAMPAIGN_SYMBOL, CAMPAIGN_TIMEFRAME)
 
     bars = source.latest_snapshot(150)
+    bars_1h = source.latest_snapshot_for_timeframe("1h", 150)
+    bars_4h = source.latest_snapshot_for_timeframe("4h", 150)
 
     assert client.calls == [
-        (CAMPAIGN_INSTRUMENT, CAMPAIGN_TIMEFRAME, 150)
+        (CAMPAIGN_INSTRUMENT, "15m", 150),
+        (CAMPAIGN_INSTRUMENT, "1H", 150),
+        (CAMPAIGN_INSTRUMENT, "4H", 150),
     ]
     assert len(bars) == 2
+    assert len(bars_1h) == 2
+    assert len(bars_4h) == 2
     assert bars[0].seq == 0
     assert bars[0].closed is False
     assert bars[1].seq == 1
@@ -848,6 +863,76 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     assert runner.state.executions_prepared == 1
     assert runner.state.execution_ids == ["execution-1"]
     assert runner.runtime.settings.execution.okx.quantity == "120"
+
+
+def test_new_bar_passes_thin_higher_timeframe_context(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+
+    def _build_frame(*args, **kwargs):
+        del kwargs
+        base = _frame(bar_ms)
+        return KlineFrame(
+            symbol=base.symbol,
+            timeframe=args[3],
+            bars=base.bars,
+            indicators=base.indicators,
+            snapshot_ts_local_ms=base.snapshot_ts_local_ms,
+        )
+
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        _build_frame,
+    )
+
+    class _MtfSource:
+        def __init__(self):
+            self.calls = []
+
+        def latest_snapshot(self, count):
+            self.calls.append(("15m", count))
+            return [object()]
+
+        def latest_snapshot_for_timeframe(self, timeframe, count):
+            self.calls.append((timeframe, count))
+            return [object()]
+
+        def disconnect(self):
+            return None
+
+    class _MtfOrchestrator:
+        def __init__(self):
+            self.context = ""
+
+        def submit(self, frame, token, on_event, **kwargs):
+            del frame, token, on_event
+            self.context = kwargs["higher_timeframe_text"]
+            return SimpleNamespace(exception=None)
+
+    source = _MtfSource()
+    orchestrator = _MtfOrchestrator()
+    service = _FakeExecutionService()
+    runtime = CampaignRuntime(
+        settings=_settings(),
+        source=source,
+        writer=SimpleNamespace(),
+        orchestrator=orchestrator,
+        execution_service=service,
+        supervisor=_FakeSupervisor(),
+        sizing_resolver=_sizing,
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert source.calls == [("15m", 150), ("1h", 100), ("4h", 100)]
+    assert "主周期=15m" in orchestrator.context
+    assert "背景 1h" in orchestrator.context
+    assert "背景 4h" in orchestrator.context
 
 
 def test_supervisor_block_prevents_plan_and_worker_command(monkeypatch, tmp_path):
@@ -955,6 +1040,53 @@ def test_campaign_does_not_rearm_when_demo_read_check_is_unreachable(
 
     assert service.arm_calls == []
     assert service.is_armed is False
+
+
+def test_campaign_retries_temporary_new_risk_lease_collision(
+    monkeypatch,
+    tmp_path,
+):
+    service = _FakeExecutionService()
+    arm_attempts = 0
+
+    def arm(confirmation):
+        nonlocal arm_attempts
+        arm_attempts += 1
+        if arm_attempts == 1:
+            raise NewRiskLeaseUnavailable("租约暂时被其他会话占用")
+        service.is_armed = True
+
+    service.arm = arm
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: {},
+    )
+    clock = {"now": datetime(2026, 7, 17, 1, tzinfo=UTC)}
+    monkeypatch.setattr(campaign_module, "_utc_now", lambda: clock["now"])
+    monkeypatch.setattr(
+        campaign_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(
+            "now", clock["now"] + timedelta(seconds=seconds)
+        ),
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, clock["now"])
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    monkeypatch.setattr(
+        runner,
+        "process_latest_closed_bar",
+        lambda: clock.__setitem__("now", runner.state.expires_at_utc) or True,
+    )
+    monkeypatch.setattr(runner, "close_out", lambda: True)
+
+    assert runner.run() is True
+    assert arm_attempts == 2
 
 
 def test_same_or_older_bar_is_never_processed(monkeypatch, tmp_path):

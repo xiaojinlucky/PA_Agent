@@ -318,6 +318,20 @@ def test_stage1_message_roles(assembler: PromptAssembler):
     assert messages[1]["role"] == "user"
 
 
+def test_stage1_includes_thin_higher_timeframe_context(assembler: PromptAssembler):
+    messages = assembler.build_stage1(
+        _make_frame(),
+        higher_timeframe_text=(
+            "主周期=15m\n- 背景 1h: 标签=偏多；EMA20=100；ATR14=3"
+        ),
+    )
+
+    user = messages[1]["content"]
+    assert "多周期背景证据" in user
+    assert "背景 1h" in user
+    assert "不直接否决主周期方向" in user
+
+
 def test_stage2_message_roles(assembler: PromptAssembler):
     """build_stage2 must return exactly [system, user] messages."""
     frame = _make_frame()

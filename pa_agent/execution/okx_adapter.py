@@ -5,7 +5,7 @@ import math
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
-from decimal import ROUND_HALF_EVEN, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Any
 
 from pa_agent.execution.credentials import account_identity_fingerprint
@@ -27,6 +27,10 @@ from pa_agent.execution.models import (
     utc_now_iso,
 )
 from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.order_modes import (
+    apply_entry_atr_slippage,
+    apply_exit_atr_slippage,
+)
 
 
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal | None:
@@ -261,6 +265,23 @@ class OkxAdapter:
                 )
             aligned_prices[field] = aligned
         entry_price = aligned_prices["entry_price"]
+        if plan.entry_order_mode == "limit_with_slippage":
+            try:
+                shifted_entry = apply_entry_atr_slippage(
+                    entry_price,
+                    plan.direction,
+                    plan.entry_atr,
+                    plan.entry_slippage_atr_multiple,
+                )
+            except ValueError as exc:
+                raise PreflightError(f"OKX 入场滑点配置无效：{exc}") from exc
+            aligned_shifted_entry = _align_float_artifact(shifted_entry, tick)
+            if aligned_shifted_entry is None:
+                # 滑点调整后的价格不是浮点尾差，按成交侧向上/向下对齐一个最小价位。
+                units = shifted_entry / tick
+                rounding = ROUND_CEILING if plan.direction == "long" else ROUND_FLOOR
+                aligned_shifted_entry = units.to_integral_value(rounding=rounding) * tick
+            entry_price = aligned_shifted_entry
         take_profit_1 = aligned_prices["take_profit_1"]
         take_profit_2 = aligned_prices["take_profit_2"]
         stop_loss = aligned_prices["stop_loss"]
@@ -348,6 +369,13 @@ class OkxAdapter:
                 "contract_value": str(instrument.get("ctVal") or ""),
                 "contract_type": str(instrument.get("ctType") or ""),
                 "current_leverage": leverage,
+                "entry_order_mode": plan.entry_order_mode,
+                "entry_atr": str(plan.entry_atr) if plan.entry_atr is not None else "",
+                "entry_slippage_atr_multiple": str(
+                    plan.entry_slippage_atr_multiple
+                ),
+                "requested_entry_price": str(aligned_prices["entry_price"]),
+                "effective_entry_price": str(entry_price),
             },
         )
 
@@ -1857,14 +1885,59 @@ class OkxAdapter:
         client_id = str(exit_order.get("client_order_id") or "")
         if not client_id:
             raise ReconciliationError("OKX 主动离场客户订单号尚未持久化")
+        exit_mode = record.plan.exit_order_mode
+        exit_order_type = "market" if exit_mode == "market" else "limit"
         body: dict[str, Any] = {
             "instId": record.plan.instrument,
             "tdMode": str(preflight.broker_metadata["trade_mode"]),
             "clOrdId": client_id,
             "side": _exit_side(record.plan),
-            "ordType": "market",
+            "ordType": exit_order_type,
             "sz": str(exit_order.get("quantity") or record.remaining_quantity),
         }
+        if exit_order_type == "limit":
+            try:
+                ticker = self._client.ticker(record.plan.instrument)
+                reference_price = _positive_decimal(ticker.get("last"), "最新价")
+                if exit_mode == "limit_with_slippage":
+                    effective_price = apply_exit_atr_slippage(
+                        reference_price,
+                        record.plan.direction,
+                        record.plan.entry_atr,
+                        record.plan.exit_slippage_atr_multiple,
+                    )
+                else:
+                    effective_price = reference_price
+            except (BrokerApiError, BrokerTransportError):
+                raise
+            except ValueError as exc:
+                raise PreflightError(f"OKX 主动离场限价无效：{exc}") from exc
+            tick = preflight.price_tick
+            if tick is None or tick <= 0:
+                raise PreflightError("OKX 主动离场缺少有效价格跳动")
+            # 卖出向下、买入向上对齐，保证“允许滑点”仍然朝成交侧。
+            rounding = ROUND_FLOOR if record.plan.direction == "long" else ROUND_CEILING
+            aligned = _align_float_artifact(effective_price, tick)
+            if aligned is None:
+                aligned = (
+                    (effective_price / tick).to_integral_value(rounding=rounding) * tick
+                )
+            if aligned <= 0:
+                raise PreflightError("OKX 主动离场限价调整后必须为正数")
+            body["px"] = str(aligned)
+            exit_order["reference_price"] = str(reference_price)
+            exit_order["submitted_price"] = str(aligned)
+            exit_order["order_mode"] = exit_mode
+            exit_order["atr_reference"] = str(record.plan.entry_atr or "")
+            exit_order["slippage_atr_multiple"] = str(
+                record.plan.exit_slippage_atr_multiple
+            )
+        else:
+            exit_order["order_mode"] = exit_mode
+            exit_order["slippage_atr_multiple"] = str(
+                record.plan.exit_slippage_atr_multiple
+            )
+        state["exit_order"] = exit_order
         if record.plan.product == "spot":
             body["tgtCcy"] = "base_ccy"
         else:

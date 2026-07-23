@@ -197,6 +197,8 @@ def _emit_buffered_stream(
 def _build_empty_record(
     frame: KlineFrame,
     settings: Optional["Settings"],
+    *,
+    htf_text: str = "",
 ) -> AnalysisRecord:
     """Build a partial AnalysisRecord with meta populated from the frame."""
     ts_ms = now_local_ms()
@@ -242,10 +244,21 @@ def _build_empty_record(
         decision_stance=decision_stance,
     )
 
+    atr14 = None
+    if frame.indicators.atr14:
+        candidate = frame.indicators.atr14[0]
+        if candidate is not None:
+            try:
+                if float(candidate) > 0 and float(candidate) == float(candidate):
+                    atr14 = float(candidate)
+            except (TypeError, ValueError, OverflowError):
+                atr14 = None
+
     return AnalysisRecord(
         meta=meta,
         kline_data=kline_data,
-        htf_text="",
+        htf_text=htf_text,
+        analysis_atr14=atr14,
         stage1_messages=[],
         stage1_response=None,
         stage1_diagnosis=None,
@@ -350,6 +363,7 @@ class TwoStageOrchestrator:
         on_stage2_files: Callable[[list[str]], None] | None = None,
         previous_record: AnalysisRecord | None = None,
         incremental_new_bar_count: int | None = None,
+        higher_timeframe_text: str = "",
     ) -> AnalysisRecord:
         """Run the two-stage analysis pipeline and return an AnalysisRecord.
 
@@ -373,7 +387,11 @@ class TwoStageOrchestrator:
             Fully or partially populated record.
         """
         # ── Step 1: Build partial record ──────────────────────────────────────
-        record = _build_empty_record(frame, self._settings)
+        record = _build_empty_record(
+            frame,
+            self._settings,
+            htf_text=higher_timeframe_text,
+        )
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────
         if cancel_token.is_set():
@@ -415,9 +433,14 @@ class TwoStageOrchestrator:
                 incremental_new_bar_count,
                 analysis_mode=analysis_mode,
                 provider_settings=getattr(self._settings, "provider", None),
+                higher_timeframe_text=higher_timeframe_text,
             )
         else:
-            messages_s1 = self._assembler.build_stage1(frame, analysis_mode=analysis_mode)
+            messages_s1 = self._assembler.build_stage1(
+                frame,
+                analysis_mode=analysis_mode,
+                higher_timeframe_text=higher_timeframe_text,
+            )
 
         # ── Step 5: Call AI for Stage 1 ───────────────────────────────────────
         logger.debug("\n" + "="*80)
@@ -708,6 +731,7 @@ class TwoStageOrchestrator:
             enable_next_bar_prediction=_enable_next_bar,
             provider_settings=getattr(self._settings, "provider", None),
             structure_flip_cooldown_bars=_flip_cooldown,
+            higher_timeframe_text=higher_timeframe_text,
         )
 
         # ── Step 15: Call AI for Stage 2 ──────────────────────────────────────

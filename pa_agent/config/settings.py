@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from copy import deepcopy
+from decimal import Decimal
 from pathlib import Path
 from threading import RLock
 from typing import BinaryIO, Literal
@@ -32,6 +33,8 @@ ExecutionBroker = Literal["longbridge", "okx"]
 LongbridgeAccountProfile = Literal["paper", "comprehensive", "intraday"]
 OkxProduct = Literal["spot", "swap"]
 OkxMarginMode = Literal["cross", "isolated"]
+EntryOrderMode = Literal["signal", "limit", "limit_with_slippage", "market"]
+ExitOrderMode = Literal["limit", "limit_with_slippage", "market"]
 _SETTINGS_PROCESS_LOCK = RLock()
 
 
@@ -380,6 +383,16 @@ class ExecutionSettings(BaseModel):
     min_trade_confidence: int = Field(default=70, ge=0, le=100)
     poll_interval_seconds: float = Field(default=2.0, ge=1.0, le=30.0)
     entry_timeout_seconds: int = Field(default=120, ge=10, le=86_400)
+    # signal 保持 PA 原始入场类型；其余三项是用户明确指定的实际下单方式。
+    entry_order_mode: EntryOrderMode = "signal"
+    exit_order_mode: ExitOrderMode = "market"
+    # limit_with_slippage 使用分析节点捕获的 ATR 快照，不使用固定基点。
+    entry_slippage_atr_multiple: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=5
+    )
+    exit_slippage_atr_multiple: Decimal = Field(
+        default=Decimal("0.50"), ge=0, le=5
+    )
     longbridge: LongbridgeExecutionSettings = Field(
         default_factory=LongbridgeExecutionSettings
     )

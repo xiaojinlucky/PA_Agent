@@ -48,6 +48,8 @@ class AnalysisRecord(BaseModel):
     meta: RecordMeta
     kline_data: list[dict]              # Same data as sent to AI
     htf_text: str
+    # 最新已收盘主周期 K 线对应的 ATR14 快照；执行滑点由它乘以用户倍数得到。
+    analysis_atr14: float | None = None
     stage1_messages: list[dict]
     stage1_response: Optional[dict]     # Raw response (includes reasoning_content)
     stage1_diagnosis: Optional[dict]
