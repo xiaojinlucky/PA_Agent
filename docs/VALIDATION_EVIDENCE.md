@@ -4,9 +4,13 @@
 
 ## 本轮后续验证（2026-07-23）
 
+- `WO-RISK-02` 定向套件：52 通过、0 失败。覆盖纯风险定仓、长短方向、费用/滑点、`lotSz`/`minSz`、最大可开张数、`net_mode` 硬门、缺失输入、Campaign 动态规格适配、监督门、计划构建和真实 `ExecutionController` / `ExecutionWorker` + FakeAdapter 离线链路。
+- `ExecutionWorker` 与 `pa_agent/execution/` 本轮没有修改；风险结果通过现有设置快照进入 `ExecutionPlan.quantity`，没有新增券商写入者。
+- 本轮没有连接真实券商、没有发送 Demo 或 Live 订单；`okx_demo_private_preflight()` 在没有 PA entry/stop 时只做账户/规格/容量/行情只读检查，明确报告风险数量需要入场和止损。
+- 本轮全量 `tests/unit` 收集 1239 项：1219 通过、20 失败；20 项均位于本轮风险/监督/Campaign/执行定向范围之外，不能宣称全量绿。
 - `WO-S2A-01` 定向套件：156 通过、0 失败。覆盖严格监督输出、主备同快照、确定性拒绝、原子落盘、重启复用、Campaign 门控、真实 `ExecutionController` / `ExecutionWorker` 离线 Demo 命令链，以及指定的 AI 档案、执行域和 OKX 数据源回归。
 - 全量 `tests/unit`：本轮收集 1225 项，20 项失败；失败均位于本轮新增监督/Campaign 定向套件之外，仍按既有仓库失败处理，不能宣称全量绿。
-- 新增代码选择性 Ruff（`E,F,I,UP,B,SIM`）、`compileall` 和 `git diff --check`：通过。
+- 新增代码选择性 Ruff（`E,F,I,UP,B,SIM`；忽略仓库既有长中文行和中文全角标点提示）、`compileall` 和 `git diff --check`：通过。
 - 本轮没有连接真实券商、没有发送真实订单；监督离线测试使用内存 FakeAdapter，只验证生产 Controller/Worker 的命令接缝。
 
 ## 发布事实

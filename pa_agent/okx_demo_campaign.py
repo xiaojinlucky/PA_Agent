@@ -23,7 +23,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import (
     ROUND_CEILING,
-    ROUND_DOWN,
     ROUND_HALF_UP,
     Decimal,
     InvalidOperation,
@@ -71,6 +70,7 @@ from pa_agent.records.experience_reader import ExperienceReader
 from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 from pa_agent.records.supervisor_writer import SupervisorWriter
+from pa_agent.risk.sizing import RiskCalculationFailure, calculate_risk_size
 from pa_agent.util.logging import configure_logging
 from pa_agent.util.threading import CancelToken
 
@@ -79,11 +79,13 @@ CAMPAIGN_SYMBOL = CAMPAIGN_INSTRUMENT
 CAMPAIGN_TIMEFRAME = "15m"
 CAMPAIGN_PRODUCT = "swap"
 CAMPAIGN_MARGIN_MODE = "cross"
-# 每一笔以 Demo USDT 总权益的 10% 换算合约数。数量在每次准备新计划前
-# 重新读取 OKX ticker、合约 ctVal/ctMult 与账户 USDT 权益，不把旧的固定数量
-# 当成仓位管理规则。
+# 每个单仓生命周期的首仓最多使用 Demo USDT 总权益的 10% 止损风险。
+# 数量在每次准备新计划前重新读取账户权益、合约规格和最大可开张数；
+# 费用和滑点是假设输入，不是券商返回的已确认成交费用。
 CAMPAIGN_EQUITY_FRACTION = Decimal("0.10")
-CAMPAIGN_SIZING_MODE = "equity_10pct_notional"
+CAMPAIGN_FEE_RATE = Decimal("0.0005")
+CAMPAIGN_SLIPPAGE_RATE = Decimal("0.0010")
+CAMPAIGN_SIZING_MODE = "equity_10pct_stop_loss_risk"
 CAMPAIGN_BOOTSTRAP_QUANTITY = "1"
 CAMPAIGN_OKX_API_BASE_URL = "https://www.okx.com"
 CAMPAIGN_STANCE = "aggressive"
@@ -191,8 +193,11 @@ def _campaign_config_payload() -> dict[str, Any]:
         "margin_mode": CAMPAIGN_MARGIN_MODE,
         "sizing": {
             "mode": CAMPAIGN_SIZING_MODE,
-            "equity_fraction": str(CAMPAIGN_EQUITY_FRACTION),
-            "price_source": "okx_public_ticker_last",
+            "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+            "fee_rate": str(CAMPAIGN_FEE_RATE),
+            "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
+            "price_source": "pa_stage2_entry_price",
+            "stop_source": "pa_stage2_stop_loss_price",
             "contract_value_source": "okx_swap_ctVal_x_ctMult",
         },
         "api_base_url": CAMPAIGN_OKX_API_BASE_URL,
@@ -427,13 +432,20 @@ def _positive_decimal(value: object) -> Decimal:
 
 @dataclass(frozen=True)
 class CampaignSizing:
-    """一次 Demo 新开仓所需的不可变数量快照。"""
+    """一次 Demo 新开仓所需的不可变风险数量快照。"""
 
     quantity: Decimal
     equity_usdt: Decimal
-    target_notional_usdt: Decimal
+    risk_budget_usdt: Decimal
+    risk_used_usdt: Decimal
     reference_price_usdt: Decimal
     contract_notional_usdt: Decimal
+    stop_distance_usdt: Decimal
+    worst_case_loss_per_contract_usdt: Decimal
+    fee_per_contract_usdt: Decimal
+    slippage_per_contract_usdt: Decimal
+    fee_rate: Decimal
+    slippage_rate: Decimal
     minimum_quantity: Decimal
     quantity_step: Decimal
     max_buy: Decimal
@@ -477,13 +489,20 @@ def _demo_usdt_equity(balance_rows: list[dict[str, Any]]) -> Decimal:
 
 def resolve_campaign_sizing(
     client: OkxRestClient | None = None,
+    *,
+    entry_price: object | None = None,
+    stop_loss_price: object | None = None,
+    side: object | None = None,
 ) -> CampaignSizing:
-    """把当前 Demo USDT 总权益的 10% 精确换算为永续合约张数。"""
+    """用 PA 的入场/止损和 OKX 实时规格计算 Demo 首仓张数。"""
     active_client = client or OkxRestClient(
         load_okx_credentials("demo"),
         base_url=CAMPAIGN_OKX_API_BASE_URL,
         simulated=True,
     )
+    account_config = active_client.account_config()
+    if str(account_config.get("posMode") or "") != "net_mode":
+        raise CampaignError("OKX Demo 首发风险定仓只允许 net_mode 净持仓")
     instrument = _campaign_instrument(active_client)
     minimum = _positive_decimal(instrument.get("minSz"))
     lot = _positive_decimal(instrument.get("lotSz"))
@@ -493,44 +512,83 @@ def resolve_campaign_sizing(
         raise CampaignError("OKX 黄金永续缺少有效的合约规格")
 
     equity_usdt = _demo_usdt_equity(active_client.balance())
-    ticker = active_client.ticker(CAMPAIGN_INSTRUMENT)
-    reference_price = _positive_decimal(ticker.get("last"))
-    if reference_price <= 0:
-        raise CampaignError("OKX 黄金永续当前市价无效")
-    contract_notional = contract_value * contract_multiplier * reference_price
-    if contract_notional <= 0:
-        raise CampaignError("OKX 黄金永续单张名义价值无效")
-
-    target_notional = equity_usdt * CAMPAIGN_EQUITY_FRACTION
-    raw_quantity = target_notional / contract_notional
-    quantity = (
-        (raw_quantity / lot).to_integral_value(rounding=ROUND_DOWN) * lot
-    )
-    if quantity < minimum:
-        raise CampaignError(
-            "OKX Demo 总权益的 10% 小于该永续的最小可交易名义金额"
-        )
-
     maximum = active_client.max_order_size(
         instrument=CAMPAIGN_INSTRUMENT,
         trade_mode=CAMPAIGN_MARGIN_MODE,
     )
     max_buy = _positive_decimal(maximum.get("maxBuy"))
     max_sell = _positive_decimal(maximum.get("maxSell"))
-    if quantity > max_buy or quantity > max_sell:
-        raise CampaignError(
-            "OKX Demo 当前可买/可卖数量不足以覆盖权益 10% 的计划仓位"
+    if max_buy <= 0 or max_sell <= 0:
+        raise CampaignError("OKX Demo 当前最大可开张数无效")
+    if not isinstance(side, str) or side not in {"long", "short"}:
+        raise CampaignError("PA 方向不是可计算风险的 long/short")
+    selected_max = max_buy if side == "long" else max_sell
+    try:
+        result = calculate_risk_size(
+            account_equity=equity_usdt,
+            risk_percent=CAMPAIGN_EQUITY_FRACTION,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            side=side,
+            ct_val=contract_value,
+            ct_mult=contract_multiplier,
+            lot_sz=lot,
+            min_sz=minimum,
+            max_sz=selected_max,
+            fee_rate=CAMPAIGN_FEE_RATE,
+            slippage_rate=CAMPAIGN_SLIPPAGE_RATE,
         )
+    except RiskCalculationFailure as exc:
+        raise CampaignError(f"风险定仓失败[{exc.code}]: {exc}") from exc
     return CampaignSizing(
-        quantity=quantity,
+        quantity=result.target_contract_size,
         equity_usdt=equity_usdt,
-        target_notional_usdt=target_notional,
-        reference_price_usdt=reference_price,
-        contract_notional_usdt=contract_notional,
-        minimum_quantity=minimum,
-        quantity_step=lot,
+        risk_budget_usdt=result.risk_budget_usdt,
+        risk_used_usdt=result.risk_used_usdt,
+        reference_price_usdt=_positive_decimal(entry_price),
+        contract_notional_usdt=result.contract_notional_usdt,
+        stop_distance_usdt=result.stop_distance_usdt,
+        worst_case_loss_per_contract_usdt=result.worst_case_loss_per_contract_usdt,
+        fee_per_contract_usdt=result.fee_per_contract_usdt,
+        slippage_per_contract_usdt=result.slippage_per_contract_usdt,
+        fee_rate=CAMPAIGN_FEE_RATE,
+        slippage_rate=CAMPAIGN_SLIPPAGE_RATE,
+        minimum_quantity=result.minimum_size,
+        quantity_step=result.lot_size,
         max_buy=max_buy,
         max_sell=max_sell,
+    )
+
+
+def _record_risk_inputs(record: AnalysisRecord) -> tuple[Decimal, Decimal, str]:
+    """从已持久化的 PA 决策取风险引擎唯一需要的三项输入。"""
+    stage2 = record.stage2_decision
+    decision = stage2.get("decision") if isinstance(stage2, dict) else None
+    if not isinstance(decision, dict):
+        raise CampaignError("PA 阶段二缺少风险定仓所需的决策")
+    direction = {"做多": "long", "做空": "short"}.get(
+        str(decision.get("order_direction") or "").strip()
+    )
+    if direction is None:
+        raise CampaignError("PA 决策缺少有效方向，禁止风险定仓")
+    return (
+        _positive_decimal(decision.get("entry_price")),
+        _positive_decimal(decision.get("stop_loss_price")),
+        direction,
+    )
+
+
+def resolve_record_campaign_sizing(
+    record: AnalysisRecord,
+    client: OkxRestClient | None = None,
+) -> CampaignSizing:
+    """把一份 PA 记录转换成唯一的 Demo 风险数量。"""
+    entry_price, stop_loss_price, side = _record_risk_inputs(record)
+    return resolve_campaign_sizing(
+        client,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss_price,
+        side=side,
     )
 
 
@@ -730,13 +788,11 @@ def _attempt_canary_cleanup(
 
 def run_demo_lifecycle_canary() -> dict[str, str]:
     """通过现有 Controller/Worker 完成一次明确标记的 Demo 闭环验收。"""
-    preflight = okx_demo_private_preflight()
+    okx_demo_private_preflight()
     runtime: CampaignRuntime | None = None
     execution_id = ""
     try:
-        runtime = build_runtime(
-            resolved_quantity=preflight["resolved_quantity"],
-        )
+        runtime = build_runtime()
         validate_campaign_settings(runtime.settings)
         service = runtime.execution_service
         service.start_monitoring()
@@ -754,6 +810,8 @@ def run_demo_lifecycle_canary() -> dict[str, str]:
             bar=bar,
         )
         runtime.writer.save_full_durable(record)
+        sizing = runtime.sizing_resolver(record)
+        _apply_campaign_sizing(runtime, sizing)
         execution = service.prepare_analysis(record)
         execution_id = execution.id
         command = service.submit(execution.id)
@@ -804,7 +862,11 @@ def run_demo_lifecycle_canary() -> dict[str, str]:
 
 
 def okx_demo_private_preflight() -> dict[str, Any]:
-    """用模拟标头完成私有只读验证, 不返回账户标识或凭据。"""
+    """用模拟标头完成账户、规格、容量和行情只读验证。
+
+    这里没有 PA 的入场和止损，所以不计算可下单数量；缺少止损时风险引擎
+    必须阻断，而不是偷偷退回旧固定数量。
+    """
     client = OkxRestClient(
         load_okx_credentials("demo"),
         base_url=CAMPAIGN_OKX_API_BASE_URL,
@@ -817,8 +879,29 @@ def okx_demo_private_preflight() -> dict[str, Any]:
         for field in ("uid", "mainUid", "type")
     ):
         raise CampaignError("OKX Demo account/config 缺少账户身份字段")
+    if str(account_config.get("posMode") or "") != "net_mode":
+        raise CampaignError("OKX Demo 首发风险定仓只允许 net_mode 净持仓")
 
-    sizing = resolve_campaign_sizing(client)
+    instrument = _campaign_instrument(client)
+    minimum = _positive_decimal(instrument.get("minSz"))
+    lot = _positive_decimal(instrument.get("lotSz"))
+    contract_value = _positive_decimal(instrument.get("ctVal"))
+    contract_multiplier = _positive_decimal(instrument.get("ctMult"))
+    if min(minimum, lot, contract_value, contract_multiplier) <= 0:
+        raise CampaignError("OKX 黄金永续缺少有效的合约规格")
+    equity_usdt = _demo_usdt_equity(client.balance())
+    ticker = client.ticker(CAMPAIGN_INSTRUMENT)
+    reference_price = _positive_decimal(ticker.get("last"))
+    if reference_price <= 0:
+        raise CampaignError("OKX 黄金永续当前市价无效")
+    maximum = client.max_order_size(
+        instrument=CAMPAIGN_INSTRUMENT,
+        trade_mode=CAMPAIGN_MARGIN_MODE,
+    )
+    max_buy = _positive_decimal(maximum.get("maxBuy"))
+    max_sell = _positive_decimal(maximum.get("maxSell"))
+    if max_buy <= 0 or max_sell <= 0:
+        raise CampaignError("OKX Demo 当前最大可开张数无效")
 
     balances = client.balance()
     positions = client.positions(instrument=CAMPAIGN_INSTRUMENT)
@@ -839,16 +922,19 @@ def okx_demo_private_preflight() -> dict[str, Any]:
         "instrument": CAMPAIGN_INSTRUMENT,
         "instrument_state": "live",
         "sizing_mode": CAMPAIGN_SIZING_MODE,
-        "equity_usdt": str(sizing.equity_usdt),
-        "equity_fraction": str(CAMPAIGN_EQUITY_FRACTION),
-        "target_notional_usdt": str(sizing.target_notional_usdt),
-        "reference_price_usdt": str(sizing.reference_price_usdt),
-        "contract_notional_usdt": str(sizing.contract_notional_usdt),
-        "resolved_quantity": str(sizing.quantity),
-        "minimum_quantity": str(sizing.minimum_quantity),
-        "quantity_step": str(sizing.quantity_step),
-        "max_buy_sufficient": sizing.max_buy >= sizing.quantity,
-        "max_sell_sufficient": sizing.max_sell >= sizing.quantity,
+        "equity_usdt": str(equity_usdt),
+        "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+        "fee_rate": str(CAMPAIGN_FEE_RATE),
+        "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
+        "reference_price_usdt": str(reference_price),
+        "contract_notional_usdt": str(
+            contract_value * contract_multiplier * reference_price
+        ),
+        "minimum_quantity": str(minimum),
+        "quantity_step": str(lot),
+        "max_buy": str(max_buy),
+        "max_sell": str(max_sell),
+        "risk_quantity": "requires_entry_and_stop",
         "balance_rows": len(balances),
         "existing_position_rows": len(positions),
         "leverage_rows": len(leverage),
@@ -963,7 +1049,23 @@ class CampaignRuntime:
     orchestrator: TwoStageOrchestrator
     execution_service: ExecutionController
     supervisor: SupervisorGate
-    sizing_resolver: Callable[[], CampaignSizing] = resolve_campaign_sizing
+    sizing_resolver: Callable[[AnalysisRecord], CampaignSizing] = (
+        resolve_record_campaign_sizing
+    )
+
+
+def _apply_campaign_sizing(
+    runtime: CampaignRuntime,
+    sizing: CampaignSizing,
+) -> None:
+    """把本次风险定仓写入计划配置，并让新增风险租约同步到新指纹。"""
+    service = runtime.execution_service
+    was_armed = service.is_armed
+    runtime.settings.execution.okx.quantity = str(sizing.quantity)
+    validate_campaign_settings(runtime.settings)
+    if was_armed:
+        service.disarm()
+        service.arm(service.arm_confirmation_text())
 
 
 def build_runtime(
@@ -971,11 +1073,9 @@ def build_runtime(
     resolved_quantity: Decimal | str | None = None,
 ) -> CampaignRuntime:
     base_settings = load_settings(SETTINGS_JSON_PATH)
-    sizing_quantity = (
-        resolved_quantity
-        if resolved_quantity is not None
-        else resolve_campaign_sizing().quantity
-    )
+    # 分析结果尚未产生时没有 entry/stop，不能预先猜数量；只用合法的内存
+    # 启动值，真正创建计划前必须由风险引擎覆盖。
+    sizing_quantity = resolved_quantity or CAMPAIGN_BOOTSTRAP_QUANTITY
     settings = build_campaign_settings(base_settings, quantity=sizing_quantity)
     pa_primary_id, pa_primary_profile = resolve_verified_profile(
         settings,
@@ -1254,18 +1354,19 @@ class OkxDemoCampaign:
                 reason,
             )
 
-    def _refresh_order_quantity(self) -> CampaignSizing:
-        """在计划耐久化前，用此刻资金和市价刷新本次实际合约数。"""
-        sizing = self.runtime.sizing_resolver()
-        self.runtime.settings.execution.okx.quantity = str(sizing.quantity)
-        validate_campaign_settings(self.runtime.settings)
+    def _refresh_order_quantity(self, record: AnalysisRecord) -> CampaignSizing:
+        """在监督和计划耐久化前，用此刻风险快照刷新本次实际合约数。"""
+        sizing = self.runtime.sizing_resolver(record)
+        _apply_campaign_sizing(self.runtime, sizing)
         logger.info(
-            "Demo 动态仓位已刷新: equity_usdt=%s target_notional_usdt=%s "
-            "price=%s quantity=%s",
+            "Demo 风险定仓已刷新: equity_usdt=%s risk_budget_usdt=%s "
+            "entry=%s stop_distance=%s quantity=%s risk_used=%s",
             sizing.equity_usdt,
-            sizing.target_notional_usdt,
+            sizing.risk_budget_usdt,
             sizing.reference_price_usdt,
+            sizing.stop_distance_usdt,
             sizing.quantity,
+            sizing.risk_used_usdt,
         )
         return sizing
 
@@ -1319,7 +1420,7 @@ class OkxDemoCampaign:
             active_execution_count = len(
                 self.runtime.execution_service.list_active()
             )
-            sizing = self._refresh_order_quantity()
+            sizing = self._refresh_order_quantity(record)
             supervision = self.runtime.supervisor.review(
                 campaign_id=self.state.campaign_id,
                 record=record,
@@ -1357,8 +1458,6 @@ class OkxDemoCampaign:
                 return
 
         try:
-            if sizing is None:
-                self._refresh_order_quantity()
             execution = self.runtime.execution_service.prepare_analysis(record)
         except PlanBlocked as exc:
             result = f"blocked:{exc.code}"
@@ -1694,9 +1793,7 @@ def main(argv: list[str] | None = None) -> int:
                 else state_store.create_or_resume()
             )
             state_store.save(state)
-            runtime = build_runtime(
-                resolved_quantity=preflight["resolved_quantity"],
-            )
+            runtime = build_runtime()
             campaign = OkxDemoCampaign(runtime, state_store, state)
             completed = campaign.run()
             return 0 if completed else 3

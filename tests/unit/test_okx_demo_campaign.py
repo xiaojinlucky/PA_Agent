@@ -60,14 +60,22 @@ def _settings(quantity="120"):
     return build_campaign_settings(Settings(), quantity=quantity)
 
 
-def _sizing(quantity="120"):
+def _sizing(_record=None, quantity="120"):
+    del _record
     resolved = Decimal(quantity)
     return CampaignSizing(
         quantity=resolved,
         equity_usdt=Decimal("5000"),
-        target_notional_usdt=Decimal("500"),
+        risk_budget_usdt=Decimal("500"),
+        risk_used_usdt=Decimal("12"),
         reference_price_usdt=Decimal("4000"),
         contract_notional_usdt=Decimal("4"),
+        stop_distance_usdt=Decimal("10"),
+        worst_case_loss_per_contract_usdt=Decimal("0.1"),
+        fee_per_contract_usdt=Decimal("0.01"),
+        slippage_per_contract_usdt=Decimal("0.01"),
+        fee_rate=Decimal("0.0005"),
+        slippage_rate=Decimal("0.001"),
         minimum_quantity=Decimal("1"),
         quantity_step=Decimal("1"),
         max_buy=Decimal("10000"),
@@ -610,8 +618,11 @@ def test_campaign_process_lock_rejects_second_runner(tmp_path):
         raise AssertionError("第二个实验进程不应取得文件锁")
 
 
-def test_dynamic_sizing_uses_ten_percent_of_demo_usdt_equity():
+def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
     class _Client:
+        def account_config(self):
+            return {"posMode": "net_mode"}
+
         def instruments(self, inst_type):
             assert inst_type == "SWAP"
             return [
@@ -635,14 +646,37 @@ def test_dynamic_sizing_uses_ten_percent_of_demo_usdt_equity():
         def max_order_size(self, *, instrument, trade_mode):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
-            return {"maxBuy": "500", "maxSell": "500"}
+            return {"maxBuy": "100000", "maxSell": "100000"}
 
-    sizing = resolve_campaign_sizing(_Client())
+    sizing = resolve_campaign_sizing(
+        _Client(),
+        entry_price="4000",
+        stop_loss_price="3990",
+        side="long",
+    )
 
     assert sizing.equity_usdt == Decimal("5000")
-    assert sizing.target_notional_usdt == Decimal("500")
+    assert sizing.risk_budget_usdt == Decimal("500")
     assert sizing.contract_notional_usdt == Decimal("4")
-    assert sizing.quantity == Decimal("125")
+    assert sizing.stop_distance_usdt == Decimal("10")
+    assert sizing.quantity == Decimal("22742")
+
+
+def test_dynamic_sizing_rejects_non_net_position_mode():
+    class _Client:
+        def account_config(self):
+            return {"posMode": "long_short_mode"}
+
+        def instruments(self, _inst_type):
+            raise AssertionError("非 net_mode 不应读取后续定仓数据")
+
+    with pytest.raises(CampaignError, match="net_mode"):
+        resolve_campaign_sizing(
+            _Client(),
+            entry_price="4000",
+            stop_loss_price="3990",
+            side="long",
+        )
 
 
 def test_private_preflight_always_uses_demo_header(monkeypatch):
@@ -659,7 +693,12 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
             return 3
 
         def account_config(self):
-            return {"uid": "u", "mainUid": "m", "type": "1"}
+            return {
+                "uid": "u",
+                "mainUid": "m",
+                "type": "1",
+                "posMode": "net_mode",
+            }
 
         def instruments(self, inst_type):
             assert inst_type == "SWAP"
@@ -727,10 +766,10 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
         "simulated_arg": True,
     }
     assert result["simulated"] is True
-    assert result["max_buy_sufficient"] is True
-    assert result["max_sell_sufficient"] is True
-    assert result["equity_fraction"] == str(CAMPAIGN_EQUITY_FRACTION)
-    assert result["resolved_quantity"] == "125"
+    assert result["max_buy"] == "500"
+    assert result["max_sell"] == "500"
+    assert result["risk_percent"] == str(CAMPAIGN_EQUITY_FRACTION)
+    assert result["risk_quantity"] == "requires_entry_and_stop"
 
 
 def test_okx_campaign_source_uses_execution_instrument_prices():

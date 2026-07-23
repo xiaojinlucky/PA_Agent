@@ -103,7 +103,16 @@
 - `pa_agent/records/supervisor_writer.py` 按 `campaign_id + closed_bar_ts_open_ms + analysis_digest` 原子保存，重启复用同一结论，冲突和损坏直接失败。
 - `pa_agent/okx_demo_campaign.py` 在 `prepare_analysis()` 前接入监督门；拒绝不创建 execution、不入队命令，放行继续沿用既有 Controller/Worker。新增提交后崩溃恢复，避免同一 K 线重建第二笔 execution。
 - 设置增加 PA 主/备、监督主/备四个档案绑定字段。当前 Campaign 使用 PA 主档案和已配置的监督主档案；监督备用需在本机设置明确绑定，PA 备用档案先独立验证，完整 PA 分析备用切换属于后续工单。
-- 明确不修改 `pa_agent/execution/`，不改当前 Demo `equity_10pct_notional` 技术仓位算法，不触碰 OKX Live。
+- `WO-S2A-01` 已完成：本轮未修改 `pa_agent/execution/`，未触碰 OKX Live。
+
+### 5.5 WO-RISK-02 正式风险定仓
+
+- 新增 `pa_agent/risk/sizing.py`：纯 `Decimal` 风险计算器，输入账户权益、风险比例、PA 入场价/止损价、方向、`ctVal`、`ctMult`、`lotSz`、`minSz`、最大可开张数、费用率和滑点率，输出向下取整后的目标张数或明确 `RiskCalculationFailure`。
+- 单张最坏损失明确包含：入场到止损的价格损失、入场/止损双边费用、入场/止损双边保守滑点；当前 Demo 冻结 10% 风险比例、`0.0005` 费用率、`0.0010` 滑点率，后两项是定仓假设，不冒充账户实时成交费。
+- `pa_agent/okx_demo_campaign.py` 在监督和 `ExecutionController.prepare_analysis()` 前读取当前 Demo 权益、`XAU-USDT-SWAP` 动态合约规格及多空最大可开张数；没有 PA 入场/止损时只做私有只读预检，不计算数量、不回退旧固定数量。
+- 风险结果写入本次内存执行路由的 `quantity`，由现有 `ExecutionController → ExecutionWorker` 链路持久化到 `ExecutionPlan.quantity`；AI 返回的 `quantity`、杠杆或路由字段仍被忽略。`ExecutionWorker` 和 `ExecutionState` 未修改。
+- 若本次会话已经持有新增风险租约，风险数量写入后会先撤销旧租约、再按新配置指纹重新授权；旧数量的计划不能借用新数量的租约提交。
+- 已完成离线长短方向、费用/滑点、最小数量、最大数量限制、缺失输入、真实 Controller/Worker + FakeAdapter 命令链测试；没有连接真实券商、没有发送订单。
 
 ## 6. 当前验证证据
 
@@ -119,7 +128,8 @@
 - 活动文档旧基线号检查：通过。
 - `docs/` 密钥扫描：0 命中。
 - 本轮 `WO-S2A-01` 定向套件为 156 通过 / 0 失败，包含监督模型、监督落盘、Campaign、AI 档案、Controller、Worker、ExecutionService、OKX 数据源和真实 Controller/Worker 离线链路。
-- 本轮全量 `tests/unit` 收集 1225 项，发现 20 项既有非本工单失败；失败集中在旧的连续性、数据源切换替身、决策面板、提示归一化和 openclaw 兼容契约，新增监督/Campaign 测试没有失败。全量不能描述为全绿。
+- 本轮 `WO-RISK-02` 定向套件为 52 通过 / 0 失败，包含纯风险公式、Campaign 动态规格适配、`net_mode` 硬门、计划数量接缝、数量变化后的租约重建和真实 Controller/Worker + FakeAdapter 离线链路。
+- 本轮全量 `tests/unit` 收集 1239 项，1219 通过、20 失败；20 项仍集中在旧的连续性、数据源切换替身、决策面板、价格/提示归一化和 openclaw 兼容契约，风险/监督/Campaign/执行定向套件没有失败。全量不能描述为全绿。
 - 新增代码的 `ruff --select E,F,I,UP,B,SIM`、`compileall` 和 `git diff --check` 通过；本轮没有连接真实券商和发送真实订单。
 
 历史全仓测试和运行态证据必须以 `CONTEXT.md`、`docs/VALIDATION_EVIDENCE.md` 的具体记录为准；本次没有重新把全仓结果或自动 Campaign 运行状态说成当前已确认。此前运行态探针曾超时，因此 Web GPT 不得据旧快照断言策略仍在运行。

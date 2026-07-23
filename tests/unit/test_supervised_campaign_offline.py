@@ -24,7 +24,6 @@ from pa_agent.okx_demo_campaign import (
     CAMPAIGN_SYMBOL,
     CAMPAIGN_TIMEFRAME,
     CampaignRuntime,
-    CampaignSizing,
     CampaignStateStore,
     OkxDemoCampaign,
     build_campaign_settings,
@@ -52,20 +51,6 @@ def _frame(bar_ms: int) -> KlineFrame:
         bars=(bar,),
         indicators=IndicatorBundle(ema20=(4000.0,), atr14=(10.0,)),
         snapshot_ts_local_ms=bar_ms,
-    )
-
-
-def _sizing() -> CampaignSizing:
-    return CampaignSizing(
-        quantity=120,
-        equity_usdt=5000,
-        target_notional_usdt=500,
-        reference_price_usdt=4000,
-        contract_notional_usdt=4,
-        minimum_quantity=1,
-        quantity_step=1,
-        max_buy=10000,
-        max_sell=10000,
     )
 
 
@@ -124,6 +109,32 @@ class _ScriptedSupervisorClient:
         )
 
 
+class _RiskSizingClient:
+    def account_config(self):
+        return {"posMode": "net_mode"}
+
+    def instruments(self, inst_type):
+        assert inst_type == "SWAP"
+        return [
+            {
+                "instId": CAMPAIGN_SYMBOL,
+                "state": "live",
+                "minSz": "1",
+                "lotSz": "1",
+                "ctVal": "0.001",
+                "ctMult": "1",
+            }
+        ]
+
+    def balance(self):
+        return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+
+    def max_order_size(self, *, instrument, trade_mode):
+        assert instrument == CAMPAIGN_SYMBOL
+        assert trade_mode == "cross"
+        return {"maxBuy": "100000", "maxSell": "100000"}
+
+
 def _build_runtime(tmp_path: Path):
     settings = build_campaign_settings(Settings(), quantity="120")
     pending = PendingWriter(tmp_path / "pending")
@@ -179,6 +190,12 @@ def _build_runtime(tmp_path: Path):
         ),
         SupervisorWriter(tmp_path / "supervisor"),
     )
+
+    risk_client = _RiskSizingClient()
+
+    def _resolve_risk_sizing(record):
+        return campaign_module.resolve_record_campaign_sizing(record, risk_client)
+
     runtime = CampaignRuntime(
         settings=settings,
         source=source,
@@ -186,7 +203,7 @@ def _build_runtime(tmp_path: Path):
         orchestrator=orchestrator,
         execution_service=controller,
         supervisor=supervisor,
-        sizing_resolver=_sizing,
+        sizing_resolver=_resolve_risk_sizing,
     )
     return runtime, worker, worker_store, adapter, client, orchestrator
 
@@ -247,12 +264,18 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
 
     try:
         runtime.execution_service.arm("启用模拟交易")
+        initial_lease = worker_store.current_new_risk_lease()
+        assert initial_lease is not None
 
         assert runner.process_latest_closed_bar() is True
         assert runner.state.last_plan_result == "blocked:supervisor:primary"
         assert runtime.execution_service.list_active() == []
         assert runtime.execution_service.execution_store.list_recent() == []
         assert worker_store.list_commands() == []
+        first_sized_lease = worker_store.current_new_risk_lease()
+        assert first_sized_lease is not None
+        assert first_sized_lease.lease_id != initial_lease.lease_id
+        assert first_sized_lease.config_fingerprint != initial_lease.config_fingerprint
 
         current_frame["value"] = second_frame
         assert runner.process_latest_closed_bar() is True
@@ -265,6 +288,13 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
         assert submit_commands[0].environment == "demo"
         assert submit_commands[0].status is WorkerCommandStatus.SUCCEEDED
         assert len([call for call in adapter.calls if call[0] == "submit_entry"]) == 1
+        executions = runtime.execution_service.list_recent()
+        assert len(executions) == 1
+        assert executions[0].plan.quantity == 94473
+        final_lease = worker_store.current_new_risk_lease()
+        assert final_lease is not None
+        assert final_lease.lease_id != first_sized_lease.lease_id
+        assert executions[0].plan.config_fingerprint == final_lease.config_fingerprint
         assert len(client.calls) == 2
         assert orchestrator.calls == 2
 

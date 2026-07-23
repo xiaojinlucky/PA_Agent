@@ -105,4 +105,16 @@
 - 四个 AI 角色绑定字段已加入设置。当前 Campaign 采用 PA 主档案与已配置的监督主档案；监督备用档案需要本机设置明确绑定，未绑定时主模型失败直接确定性阻断；PA 备用档案只做独立验证，完整 PA 分析备用切换不在本工单偷渡实现。
 - 使用真实生产 `ExecutionController`、`ExecutionWorker` 和内存 FakeAdapter 的离线测试已证明：拒绝为 0 命令，放行为恰好 1 条 Demo `SUBMIT`，重启无重复模型调用和命令。
 
-明确未完成：当前 Demo 的 `equity_10pct_notional` 仍只是技术名义仓位算法，不是正式 10% 止损风险定仓；真实 OKX Demo 端到端运行和 Live 均不在本轮验收范围。
+### 8. 2026-07-23 WO-RISK-02：正式风险定仓落地
+
+外部工单要求把 Demo 的 `equity_10pct_notional` 替换为“按入场价、结构止损、合约规格、费用、滑点和最大可开张数计算”的正式数量。经本机代码核对后，采用现有 Campaign 在 `prepare_analysis()` 前刷新内存路由数量的最小接入，不修改 `ExecutionWorker`、`ExecutionState` 或第二套订单账本。
+
+已完成：
+
+- 新增纯函数 `calculate_risk_size()`，统一用 `Decimal` 计算 10% 风险预算、单张止损损失、双边费用、双边滑点、`lotSz` 向下取整和最小数量检查。
+- `XAU-USDT-SWAP` Demo 每次候选信号都重新读取 USDT 权益、动态 `ctVal`/`ctMult`/`lotSz`/`minSz` 和当前方向最大可开张数；PA 没有 entry/stop 时不计算、不回退固定数量。
+- 当前 Demo 冻结费用率 `0.0005`、滑点率 `0.0010`，这两项是保守的定仓假设，不是账户实际成交费；实际成交费用仍以 Worker/券商回报为准。
+- 计算结果只进入本次 `ExecutionPlan.quantity`，AI 的 `quantity`、杠杆、账户、品种和路由扩展字段不能覆盖它。
+- 失败路径覆盖缺失止损/规格/权益、零止损距离、最小数量不足、最大可开数量低于最小数量、风险目标超过最大可开数量和非法费用/滑点；任何容量不足都阻断新增风险，不偷偷改成另一种仓位。
+
+离线验证：纯风险模块、Campaign、监督门、计划构建和真实 Controller/Worker + FakeAdapter 定向测试通过；没有连接真实券商、没有发送 Demo/Live 订单。真实 OKX Demo 端到端定仓仍需另行授权和现场核验。
