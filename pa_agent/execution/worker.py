@@ -416,6 +416,7 @@ class ExecutionWorker:
             ) from exc
         try:
             self._stop_event.clear()
+            self.store.migrate_to_current(worker_lock=self._file_lock)
             self._set_heartbeat(WorkerState.STARTING)
             self.store.recover_inflight(failure_code="worker_restarted")
             self._revoke_lease(
@@ -624,6 +625,9 @@ class ExecutionWorker:
                 reason=command.reason_code,
             )
             self._validate_write_result(command.action, result)
+            structured_result = None
+        elif command.action is WorkerCommandAction.CLEAR_DRAWDOWN_STOP:
+            self.service.clear_drawdown_stop()
             structured_result = None
         elif command.action is WorkerCommandAction.REFRESH_ACCOUNT:
             if command.execution_id:
@@ -907,6 +911,7 @@ def _build_default_worker() -> ExecutionWorker:
     )
     from pa_agent.execution.service import ExecutionService
     from pa_agent.execution.store import ExecutionStore
+    from pa_agent.risk.runtime import RiskRuntime
     from pa_agent.util.logging import configure_logging
 
     configure_logging()
@@ -949,6 +954,7 @@ def _build_default_worker() -> ExecutionWorker:
         settings=settings,
         pending_writer=None,
         store=execution_store,
+        risk_runtime=RiskRuntime(worker_store),
         new_risk_authorizer=authority.is_authorized,
         new_risk_revoker=lambda: worker_store.revoke_current_new_risk_lease(
             failure_code="service_disarmed",

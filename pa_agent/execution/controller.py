@@ -499,6 +499,18 @@ class ExecutionController:
         )
         return command
 
+    def clear_drawdown_stop(self) -> WorkerCommand:
+        """排队一个不触碰券商的人工风险停止清除命令。"""
+        broker, environment, account = self._selected_route_identity()
+        command, _created = self._worker_store.enqueue(
+            action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+            requester=self._requester_id,
+            broker=broker,
+            environment=environment,
+            account=account,
+        )
+        return command
+
     def wait_for_worker(self, *, timeout: float = 10.0):
         deadline = time.monotonic() + max(0.1, float(timeout))
         while time.monotonic() < deadline:

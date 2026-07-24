@@ -51,6 +51,14 @@ from pa_agent.execution.worker_protocol import (
     WorkerCommandAction,
 )
 
+from pa_agent.risk.runtime import (
+    RiskRuntime,
+    RiskRuntimeBlocked,
+    RiskRuntimeState,
+    route_key,
+)
+from pa_agent.risk.sizing import RiskCalculationFailure
+
 _ARM_CONFIRMATION = "启用实盘交易"
 _PAPER_ARM_CONFIRMATION = "启用模拟交易"
 _NEW_RISK = "new_risk"
@@ -84,6 +92,7 @@ class ExecutionService:
         ] | None = None,
         leverage_adapter_factory: Callable[[WorkerCommand], OkxAdapter]
         | None = None,
+        risk_runtime: RiskRuntime | None = None,
         gate_checker: Callable[[], bool] | None = None,
         paper_gate_checker: Callable[[], bool] | None = None,
         okx_live_gate_checker: Callable[[], bool] | None = None,
@@ -97,6 +106,7 @@ class ExecutionService:
         self._store = store or ExecutionStore()
         self._adapter_factories = adapter_factories or {}
         self._leverage_adapter_factory = leverage_adapter_factory
+        self._risk_runtime = risk_runtime
         self._gate_checker = gate_checker or hard_live_gate_enabled
         self._paper_gate_checker = (
             paper_gate_checker or paper_trading_gate_enabled
@@ -390,6 +400,142 @@ class ExecutionService:
         return adapter
 
     @staticmethod
+    @staticmethod
+    def _risk_route_key(plan: ExecutionPlan) -> str:
+        return route_key(
+            broker=plan.broker,
+            environment=plan.environment,
+            account=plan.requested_account,
+        )
+
+    @staticmethod
+    def _risk_failure_code(exc: BaseException) -> str:
+        raw = str(getattr(exc, "code", "") or type(exc).__name__)
+        normalized = "".join(
+            character if character.isalnum() or character in "_.:-" else "_"
+            for character in raw
+        ).strip("_")
+        return (normalized or "read_failed")[:96]
+
+    def _refresh_risk_runtime(
+        self,
+        plan: ExecutionPlan,
+        adapter: BrokerAdapter,
+        *,
+        snapshot: AccountSnapshot | None = None,
+        raise_on_failure: bool,
+    ) -> RiskRuntimeState | None:
+        if self._risk_runtime is None or plan.broker != "okx":
+            return None
+        try:
+            account_snapshot = snapshot or adapter.account_snapshot(plan)
+            total_equity = account_snapshot.raw_summary.get(
+                "account_total_equity",
+                "",
+            )
+            identity = adapter.account_identity(plan)
+            read_bills = getattr(adapter, "account_bills", None)
+            if not callable(read_bills):
+                raise RuntimeError("OKX adapter 缺少资金账单读取能力")
+            state = self._risk_runtime.refresh(
+                broker=plan.broker,
+                environment=plan.environment,
+                account=plan.requested_account,
+                account_identity=identity,
+                total_equity_usd=total_equity,
+                bill_rows=read_bills(),
+            )
+        except Exception as exc:
+            code = f"risk_runtime_{self._risk_failure_code(exc)}"
+            state = self._risk_runtime.mark_failure(
+                broker=plan.broker,
+                environment=plan.environment,
+                account=plan.requested_account,
+                reason=code,
+            )
+            if raise_on_failure:
+                raise RiskRuntimeBlocked(
+                    state.kill_reason,
+                    "账户总权益或资金流水读取失败, 已关闭新增风险",
+                ) from exc
+            self._emit_error(
+                f"{plan.broker}/{plan.environment}/{plan.requested_account} "
+                f"风险运行态刷新失败: {code}"
+            )
+            return state
+        return state
+
+    def _prepare_new_risk_record(
+        self,
+        record: ExecutionRecord,
+        adapter: BrokerAdapter,
+    ) -> tuple[ExecutionRecord, BrokerAdapter]:
+        """在券商预检前刷新回撤闸门并按真实总权益定仓。"""
+
+        if self._risk_runtime is None or record.plan.broker != "okx":
+            return record, adapter
+        state = self._refresh_risk_runtime(
+            record.plan,
+            adapter,
+            raise_on_failure=True,
+        )
+        assert state is not None
+        state = self._risk_runtime.require_new_risk(
+            self._risk_route_key(record.plan)
+        )
+        calculate_size = getattr(adapter, "calculate_risk_size", None)
+        if not callable(calculate_size):
+            raise RiskRuntimeBlocked(
+                "risk_sizing_unavailable",
+                "OKX 执行适配器缺少通用风险定仓能力",
+            )
+        sizing = calculate_size(
+            record.plan,
+            account_equity_usd=state.last_total_equity_usd,
+        )
+        if sizing is None:
+            return record, adapter
+        updated_plan = record.plan.model_copy(
+            update={"quantity": sizing.target_contract_size}
+        )
+        updated_record = record.model_copy(
+            update={
+                "plan": updated_plan,
+                "broker_state": {
+                    **record.broker_state,
+                    "risk_sizing": {
+                        "account_total_equity_usd": str(
+                            state.last_total_equity_usd
+                        ),
+                        "risk_percent": "0.10",
+                        "target_contract_size": str(
+                            sizing.target_contract_size
+                        ),
+                        "risk_budget_usdt": str(sizing.risk_budget_usdt),
+                        "risk_used_usdt": str(sizing.risk_used_usdt),
+                        "stop_distance_usdt": str(sizing.stop_distance_usdt),
+                        "worst_case_loss_per_contract_usdt": str(
+                            sizing.worst_case_loss_per_contract_usdt
+                        ),
+                        "maximum_size": str(sizing.maximum_size),
+                    },
+                },
+            }
+        )
+        saved = self._store.save(
+            updated_record,
+            event_kind="risk_sizing_calculated",
+            event_payload={
+                "account_total_equity_usd": str(
+                    state.last_total_equity_usd
+                ),
+                "target_contract_size": str(sizing.target_contract_size),
+                "maximum_size": str(sizing.maximum_size),
+            },
+        )
+        self._emit_record(saved)
+        return saved, adapter
+
     def _validate_leverage_command(command: WorkerCommand):
         parameters = command.parameters
         if (
@@ -735,6 +881,55 @@ class ExecutionService:
                     return blocked
             try:
                 adapter = self._adapter(record.plan)
+                record, adapter = self._prepare_new_risk_record(
+                    record,
+                    adapter,
+                )
+            except RiskRuntimeBlocked as exc:
+                blocked = record.model_copy(
+                    update={
+                        "state": ExecutionState.BLOCKED,
+                        "state_reason": "资金流/回撤风险闸门阻断新增风险",
+                        "last_error": exc.code,
+                        "needs_attention": True,
+                    }
+                )
+                blocked = self._store.save(
+                    blocked,
+                    event_kind="risk_runtime_blocked",
+                    event_payload={"code": exc.code},
+                )
+                self._emit_record(blocked)
+                return blocked
+            except RiskCalculationFailure as exc:
+                blocked = record.model_copy(
+                    update={
+                        "state": ExecutionState.BLOCKED,
+                        "state_reason": "通用风险定仓未通过",
+                        "last_error": exc.code,
+                        "needs_attention": True,
+                    }
+                )
+                blocked = self._store.save(
+                    blocked,
+                    event_kind="risk_sizing_blocked",
+                    event_payload={
+                        "code": exc.code,
+                        "required_size": (
+                            str(exc.required_size)
+                            if exc.required_size is not None
+                            else ""
+                        ),
+                        "maximum_size": (
+                            str(exc.maximum_size)
+                            if exc.maximum_size is not None
+                            else ""
+                        ),
+                    },
+                )
+                self._emit_record(blocked)
+                return blocked
+            try:
                 preflight = adapter.preflight(record.plan)
             except (
                 PreflightError,
@@ -1459,6 +1654,20 @@ class ExecutionService:
             )
             return self._refresh_account_plan(plan)
 
+    def clear_drawdown_stop(self) -> RiskRuntimeState:
+        """经 Worker 控制命令显式清除停止，并重锚当前总权益。"""
+        with self._lock:
+            if self._risk_runtime is None:
+                raise PreflightError("当前执行服务未接入风险运行态")
+            plan = self._target_plan_from_settings()
+            if plan.broker != "okx":
+                raise PreflightError("资金流回撤停止当前只支持 OKX 路由")
+            self._refresh_account_plan(
+                plan,
+                raise_on_risk_failure=True,
+            )
+            return self._risk_runtime.clear(self._risk_route_key(plan))
+
     def _refresh_account_plan(
         self,
         plan: ExecutionPlan,
@@ -1466,6 +1675,7 @@ class ExecutionService:
         account_profile: str | None = None,
         broker_metadata: dict | None = None,
         execution: ExecutionRecord | None = None,
+        raise_on_risk_failure: bool = False,
     ) -> AccountSnapshot:
         adapter = self._adapter(plan)
         if execution is not None and (
@@ -1480,6 +1690,12 @@ class ExecutionService:
         )
         self._store.save_account_snapshot(snapshot)
         self._emit_account(snapshot)
+        self._refresh_risk_runtime(
+            plan,
+            adapter,
+            snapshot=snapshot,
+            raise_on_failure=raise_on_risk_failure,
+        )
         return snapshot
 
     def _target_plan_for_route(

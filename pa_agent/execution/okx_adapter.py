@@ -35,6 +35,14 @@ from pa_agent.execution.worker_protocol import (
     SetLeverageParameters,
     SetLeverageResult,
 )
+from pa_agent.risk.sizing import (
+    DEFAULT_FEE_RATE,
+    DEFAULT_RISK_PERCENT,
+    DEFAULT_SLIPPAGE_RATE,
+    RiskCalculationFailure,
+    RiskSizingResult,
+    calculate_risk_size,
+)
 
 
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal | None:
@@ -220,6 +228,11 @@ class OkxAdapter:
         self._client.sync_server_time()
         return self._identity_from_config(plan, self._client.account_config())
 
+    def account_bills(self) -> list[dict[str, Any]]:
+        """读取 OKX 资金账单；分页和分类由风险运行态处理。"""
+
+        return self._client.account_bills()
+
     @staticmethod
     def _leverage_account_identity(
         account_config: dict[str, Any],
@@ -380,6 +393,107 @@ class OkxAdapter:
     @staticmethod
     def _trade_mode(plan: ExecutionPlan) -> str:
         return "cash" if plan.product == "spot" else ""
+
+    def calculate_risk_size(
+        self,
+        plan: ExecutionPlan,
+        *,
+        account_equity_usd: object,
+    ) -> RiskSizingResult | None:
+        """按实时账户总权益计算 OKX 永续首仓，不接受计划数量作为真值。"""
+
+        if plan.product != "swap":
+            return None
+        self._client.sync_server_time()
+        instruments = self._client.instruments("SWAP")
+        instrument = next(
+            (
+                item
+                for item in instruments
+                if str(item.get("instId") or "") == plan.instrument
+            ),
+            None,
+        )
+        if instrument is None:
+            raise RiskCalculationFailure(
+                "invalid_input",
+                f"OKX 当前账户没有可用永续品种 {plan.instrument}",
+            )
+        try:
+            tick = Decimal(str(instrument.get("tickSz") or ""))
+            if not tick.is_finite() or tick <= 0:
+                raise ValueError
+        except (InvalidOperation, TypeError, ValueError):
+            raise RiskCalculationFailure(
+                "invalid_input",
+                "OKX tickSz 无效",
+            ) from None
+        entry = plan.entry_price
+        if plan.entry_order_mode == "limit_with_slippage":
+            try:
+                shifted_entry = apply_entry_atr_slippage(
+                    entry,
+                    plan.direction,
+                    plan.entry_atr,
+                    plan.entry_slippage_atr_multiple,
+                )
+            except ValueError as exc:
+                raise RiskCalculationFailure(
+                    "invalid_input",
+                    f"OKX 入场滑点配置无效: {exc}",
+                ) from exc
+            aligned = _align_float_artifact(shifted_entry, tick)
+            if aligned is None:
+                units = shifted_entry / tick
+                rounding = (
+                    ROUND_CEILING
+                    if plan.direction == "long"
+                    else ROUND_FLOOR
+                )
+                entry = units.to_integral_value(rounding=rounding) * tick
+            else:
+                entry = aligned
+        maximum = self._client.max_order_size(
+            instrument=plan.instrument,
+            trade_mode=self._margin_mode,
+            price=(
+                str(entry)
+                if plan.entry_type in {"limit", "breakout"}
+                else None
+            ),
+        )
+        max_field = "maxBuy" if plan.direction == "long" else "maxSell"
+        maximum_size = _decimal(maximum.get(max_field))
+        if plan.entry_order_mode == "market":
+            market_limit = _decimal(instrument.get("maxMktSz"))
+            if market_limit is not None:
+                maximum_size = (
+                    market_limit
+                    if maximum_size is None
+                    else min(maximum_size, market_limit)
+                )
+        try:
+            return calculate_risk_size(
+                account_equity=account_equity_usd,
+                risk_percent=DEFAULT_RISK_PERCENT,
+                entry_price=entry,
+                stop_loss_price=plan.stop_loss,
+                side=plan.direction,
+                ct_val=instrument.get("ctVal"),
+                ct_mult=instrument.get("ctMult"),
+                lot_sz=instrument.get("lotSz"),
+                min_sz=instrument.get("minSz"),
+                max_sz=maximum_size,
+                fee_rate=DEFAULT_FEE_RATE,
+                slippage_rate=DEFAULT_SLIPPAGE_RATE,
+            )
+        except RiskCalculationFailure:
+            raise
+        except Exception as exc:
+            raise RiskCalculationFailure(
+                "invalid_input",
+                "OKX 风险定仓输入无法解析",
+            ) from exc
 
     def preflight(self, plan: ExecutionPlan) -> PreflightResult:
         self._client.sync_server_time()

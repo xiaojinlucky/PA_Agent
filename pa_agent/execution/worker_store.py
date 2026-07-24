@@ -9,6 +9,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 from pa_agent.execution.worker_protocol import (
@@ -24,8 +25,9 @@ from pa_agent.execution.worker_protocol import (
     WorkerHeartbeat,
     WorkerState,
 )
+from pa_agent.risk.runtime import RiskRuntimeState
 
-_WORKER_SCHEMA_VERSION = 2
+_WORKER_SCHEMA_VERSION = 4
 _WRITE_ACTION_VALUES = (
     WorkerCommandAction.SUBMIT.value,
     WorkerCommandAction.SET_LEVERAGE.value,
@@ -63,7 +65,7 @@ _CREATE_WORKER_COMMANDS_SQL = """
         result_json TEXT NOT NULL,
         CHECK(action IN (
             'submit', 'set_leverage', 'cancel_entry', 'request_exit',
-            'refresh_account', 'reconcile'
+            'refresh_account', 'reconcile', 'clear_drawdown_stop'
         )),
         CHECK(status IN (
             'pending', 'running', 'succeeded',
@@ -94,7 +96,8 @@ class WorkerStore:
         self._path = Path(path)
         self._clock = clock or _system_utc_now
         self._lock = threading.RLock()
-        self._initialise()
+        self._schema_version = 0
+        self._initialise(allow_migration=False)
 
     @property
     def path(self) -> Path:
@@ -138,7 +141,17 @@ class WorkerStore:
             )
         return normalized
 
-    def _initialise(self) -> None:
+    @property
+    def schema_version(self) -> int:
+        return self._schema_version
+
+    def migrate_to_current(self, *, worker_lock: object) -> None:
+        """Upgrade durable state only while the caller owns the Worker lock."""
+        if not bool(getattr(worker_lock, "is_locked", False)):
+            raise RuntimeError("Worker 单例锁未持有, 禁止迁移 worker schema")
+        self._initialise(allow_migration=True)
+
+    def _initialise(self, *, allow_migration: bool) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
@@ -158,7 +171,21 @@ class WorkerStore:
                     WHERE key='worker_schema_version'
                     """
                 ).fetchone()
+                legacy_v1 = False
                 if version is None:
+                    existing_worker_state = connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name LIKE 'worker_%'
+                          AND name<>'worker_meta'
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if existing_worker_state is not None:
+                        raise RuntimeError(
+                            "worker schema 缺少版本号, 禁止猜测或自动改写"
+                        )
                     connection.execute(
                         """
                         INSERT INTO worker_meta(key, value)
@@ -171,34 +198,85 @@ class WorkerStore:
                         parsed_version = int(version["value"])
                     except (TypeError, ValueError) as exc:
                         raise RuntimeError("worker schema 版本无效") from exc
-                    if parsed_version not in {1, _WORKER_SCHEMA_VERSION}:
+                    if parsed_version not in {1, 2, 3, _WORKER_SCHEMA_VERSION}:
                         raise RuntimeError("不支持的 worker schema 版本")
+                    legacy_v1 = parsed_version == 1 and not allow_migration
+                    if (
+                        parsed_version != _WORKER_SCHEMA_VERSION
+                        and not allow_migration
+                        and parsed_version != 1
+                    ):
+                        self._schema_version = parsed_version
+                        connection.execute("COMMIT")
+                        return
+                has_previous_resolutions = False
+                if version is not None and parsed_version in {1, 2}:
+                    has_previous_resolutions = (
+                        connection.execute(
+                            """
+                            SELECT 1 FROM sqlite_master
+                            WHERE type='table'
+                              AND name='worker_command_resolutions'
+                            """
+                        ).fetchone()
+                        is not None
+                    )
+                    if has_previous_resolutions:
+                        connection.execute(
+                            "ALTER TABLE worker_command_resolutions "
+                            "RENAME TO worker_command_resolutions_previous"
+                        )
                 connection.execute(_CREATE_WORKER_COMMANDS_SQL)
-                if version is not None and parsed_version == 1:
+                if version is not None and parsed_version in {1, 2}:
+                    connection.execute(
+                        "DROP INDEX IF EXISTS idx_worker_commands_one_active"
+                    )
+                    connection.execute(
+                        "DROP INDEX IF EXISTS idx_worker_commands_claim"
+                    )
                     connection.execute(
                         "ALTER TABLE worker_commands "
-                        "RENAME TO worker_commands_v1"
+                        "RENAME TO worker_commands_previous"
                     )
                     connection.execute(_CREATE_WORKER_COMMANDS_SQL)
-                    connection.execute(
-                        """
-                        INSERT INTO worker_commands(
-                            id, scope_key, action, execution_id, requester,
-                            broker, environment, account, new_risk_lease_id,
-                            reason_code, parameters_json, status, worker_id,
-                            created_at, started_at, finished_at, result_code,
-                            failure_code, result_json
+                    if parsed_version == 1:
+                        connection.execute(
+                            """
+                            INSERT INTO worker_commands(
+                                id, scope_key, action, execution_id, requester,
+                                broker, environment, account, new_risk_lease_id,
+                                reason_code, parameters_json, status, worker_id,
+                                created_at, started_at, finished_at, result_code,
+                                failure_code, result_json
+                            )
+                            SELECT
+                                id, scope_key, action, execution_id, requester,
+                                broker, environment, account, new_risk_lease_id,
+                                reason_code, 'null', status, worker_id,
+                                created_at, started_at, finished_at, result_code,
+                                failure_code, 'null'
+                            FROM worker_commands_previous
+                            """
                         )
-                        SELECT
-                            id, scope_key, action, execution_id, requester,
-                            broker, environment, account, new_risk_lease_id,
-                            reason_code, 'null', status, worker_id,
-                            created_at, started_at, finished_at, result_code,
-                            failure_code, 'null'
-                        FROM worker_commands_v1
-                        """
-                    )
-                    connection.execute("DROP TABLE worker_commands_v1")
+                    else:
+                        connection.execute(
+                            """
+                            INSERT INTO worker_commands(
+                                id, scope_key, action, execution_id, requester,
+                                broker, environment, account, new_risk_lease_id,
+                                reason_code, parameters_json, status, worker_id,
+                                created_at, started_at, finished_at, result_code,
+                                failure_code, result_json
+                            )
+                            SELECT
+                                id, scope_key, action, execution_id, requester,
+                                broker, environment, account, new_risk_lease_id,
+                                reason_code, parameters_json, status, worker_id,
+                                created_at, started_at, finished_at, result_code,
+                                failure_code, result_json
+                            FROM worker_commands_previous
+                            """
+                        )
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS
@@ -228,6 +306,24 @@ class WorkerStore:
                     )
                     """
                 )
+                if has_previous_resolutions:
+                    connection.execute(
+                        """
+                        INSERT INTO worker_command_resolutions(
+                            command_id, resolution_code, evidence_json,
+                            evidence_digest, resolved_by, resolved_at
+                        )
+                        SELECT
+                            command_id, resolution_code, evidence_json,
+                            evidence_digest, resolved_by, resolved_at
+                        FROM worker_command_resolutions_previous
+                        """
+                    )
+                    connection.execute(
+                        "DROP TABLE worker_command_resolutions_previous"
+                    )
+                if version is not None and parsed_version in {1, 2}:
+                    connection.execute("DROP TABLE worker_commands_previous")
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS worker_new_risk_lease (
@@ -261,15 +357,58 @@ class WorkerStore:
                     )
                     """
                 )
-                if version is not None and parsed_version == 1:
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS risk_runtime_state (
+                        route_key TEXT PRIMARY KEY,
+                        broker TEXT NOT NULL,
+                        environment TEXT NOT NULL,
+                        account TEXT NOT NULL,
+                        account_identity TEXT NOT NULL,
+                        last_external_cashflow_bill_id TEXT NOT NULL,
+                        last_account_bill_id TEXT NOT NULL DEFAULT '',
+                        last_account_bill_timestamp_ms INTEGER,
+                        last_bill_scan_at TEXT,
+                        adjusted_high_water_usd TEXT,
+                        last_total_equity_usd TEXT,
+                        drawdown_usd TEXT,
+                        drawdown_fraction TEXT,
+                        kill_active INTEGER NOT NULL CHECK(kill_active IN (0, 1)),
+                        kill_reason TEXT NOT NULL,
+                        kill_activated_at TEXT,
+                        updated_at TEXT NOT NULL
+                    )
+                    """
+                )
+                risk_runtime_columns = {
+                    row["name"]
+                    for row in connection.execute(
+                        "PRAGMA table_info(risk_runtime_state)"
+                    ).fetchall()
+                }
+                for column_sql in (
+                    "ADD COLUMN last_account_bill_id "
+                    "TEXT NOT NULL DEFAULT ''",
+                    "ADD COLUMN last_account_bill_timestamp_ms INTEGER",
+                    "ADD COLUMN last_bill_scan_at TEXT",
+                ):
+                    column_name = column_sql.split()[2]
+                    if column_name not in risk_runtime_columns:
+                        connection.execute(
+                            f"ALTER TABLE risk_runtime_state {column_sql}"
+                        )
+                if version is not None and parsed_version in {1, 2, 3}:
                     connection.execute(
                         """
                         UPDATE worker_meta
                         SET value=?
                         WHERE key='worker_schema_version'
                         """,
-                        (str(_WORKER_SCHEMA_VERSION),),
+                        (
+                            "2" if legacy_v1 else str(_WORKER_SCHEMA_VERSION),
+                        ),
                     )
+                self._schema_version = 2 if legacy_v1 else _WORKER_SCHEMA_VERSION
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
@@ -359,6 +498,175 @@ class WorkerStore:
             last_error_code=row["last_error_code"],
         )
 
+    @staticmethod
+    def _row_to_risk_runtime_state(
+        row: sqlite3.Row | None,
+    ) -> RiskRuntimeState | None:
+        if row is None:
+            return None
+
+        def parse_decimal(value: object, field_name: str) -> Decimal | None:
+            if value is None or value == "":
+                return None
+            try:
+                parsed = Decimal(str(value))
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"risk runtime {field_name} 不是有效数字"
+                ) from exc
+            if not parsed.is_finite():
+                raise RuntimeError(f"risk runtime {field_name} 不是有限数字")
+            return parsed
+
+        updated_at = WorkerStore._parse_time(row["updated_at"])
+        if updated_at is None:
+            raise RuntimeError("risk runtime updated_at 缺失")
+        return RiskRuntimeState(
+            route_key=row["route_key"],
+            broker=row["broker"],
+            environment=row["environment"],
+            account=row["account"],
+            account_identity=row["account_identity"],
+            last_external_cashflow_bill_id=row[
+                "last_external_cashflow_bill_id"
+            ],
+            last_account_bill_id=row["last_account_bill_id"],
+            last_account_bill_timestamp_ms=(
+                int(row["last_account_bill_timestamp_ms"])
+                if row["last_account_bill_timestamp_ms"] is not None
+                else None
+            ),
+            last_bill_scan_at=WorkerStore._parse_time(
+                row["last_bill_scan_at"]
+            ),
+            adjusted_high_water_usd=parse_decimal(
+                row["adjusted_high_water_usd"],
+                "adjusted_high_water_usd",
+            ),
+            last_total_equity_usd=parse_decimal(
+                row["last_total_equity_usd"],
+                "last_total_equity_usd",
+            ),
+            drawdown_usd=parse_decimal(row["drawdown_usd"], "drawdown_usd"),
+            drawdown_fraction=parse_decimal(
+                row["drawdown_fraction"],
+                "drawdown_fraction",
+            ),
+            kill_active=bool(row["kill_active"]),
+            kill_reason=row["kill_reason"],
+            kill_activated_at=WorkerStore._parse_time(
+                row["kill_activated_at"]
+            ),
+            updated_at=updated_at,
+        )
+
+    def get_risk_runtime_state(
+        self,
+        route_key: str,
+    ) -> RiskRuntimeState | None:
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM risk_runtime_state WHERE route_key=?",
+                (route_key.strip(),),
+            ).fetchone()
+        return self._row_to_risk_runtime_state(row)
+
+    def save_risk_runtime_state(
+        self,
+        state: RiskRuntimeState,
+    ) -> RiskRuntimeState:
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            raise RuntimeError("worker schema 尚未迁移，不能保存 risk runtime")
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO risk_runtime_state(
+                        route_key, broker, environment, account,
+                        account_identity, last_external_cashflow_bill_id,
+                        last_account_bill_id,
+                        last_account_bill_timestamp_ms, last_bill_scan_at,
+                        adjusted_high_water_usd, last_total_equity_usd,
+                        drawdown_usd, drawdown_fraction, kill_active,
+                        kill_reason, kill_activated_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(route_key) DO UPDATE SET
+                        broker=excluded.broker,
+                        environment=excluded.environment,
+                        account=excluded.account,
+                        account_identity=excluded.account_identity,
+                        last_external_cashflow_bill_id=(
+                            excluded.last_external_cashflow_bill_id
+                        ),
+                        last_account_bill_id=excluded.last_account_bill_id,
+                        last_account_bill_timestamp_ms=(
+                            excluded.last_account_bill_timestamp_ms
+                        ),
+                        last_bill_scan_at=excluded.last_bill_scan_at,
+                        adjusted_high_water_usd=(
+                            excluded.adjusted_high_water_usd
+                        ),
+                        last_total_equity_usd=excluded.last_total_equity_usd,
+                        drawdown_usd=excluded.drawdown_usd,
+                        drawdown_fraction=excluded.drawdown_fraction,
+                        kill_active=excluded.kill_active,
+                        kill_reason=excluded.kill_reason,
+                        kill_activated_at=excluded.kill_activated_at,
+                        updated_at=excluded.updated_at
+                    """,
+                    (
+                        state.route_key,
+                        state.broker,
+                        state.environment,
+                        state.account,
+                        state.account_identity,
+                        state.last_external_cashflow_bill_id,
+                        state.last_account_bill_id,
+                        state.last_account_bill_timestamp_ms,
+                        (
+                            self._iso(state.last_bill_scan_at)
+                            if state.last_bill_scan_at
+                            else None
+                        ),
+                        (
+                            str(state.adjusted_high_water_usd)
+                            if state.adjusted_high_water_usd is not None
+                            else None
+                        ),
+                        (
+                            str(state.last_total_equity_usd)
+                            if state.last_total_equity_usd is not None
+                            else None
+                        ),
+                        (
+                            str(state.drawdown_usd)
+                            if state.drawdown_usd is not None
+                            else None
+                        ),
+                        (
+                            str(state.drawdown_fraction)
+                            if state.drawdown_fraction is not None
+                            else None
+                        ),
+                        int(state.kill_active),
+                        state.kill_reason,
+                        (
+                            self._iso(state.kill_activated_at)
+                            if state.kill_activated_at is not None
+                            else None
+                        ),
+                        self._iso(state.updated_at),
+                    ),
+                )
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return state
+
     def enqueue(
         self,
         *,
@@ -374,6 +682,10 @@ class WorkerStore:
         command_id: str | None = None,
     ) -> tuple[WorkerCommand, bool]:
         """Enqueue one command or return its existing pending/running twin."""
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            raise RuntimeError(
+                "worker schema 尚未由持锁 Worker 迁移, 禁止创建命令"
+            )
         now = self._now()
         candidate = WorkerCommand(
             id=command_id or str(uuid.uuid4()),

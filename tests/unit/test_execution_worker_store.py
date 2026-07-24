@@ -116,7 +116,7 @@ def test_worker_schema_is_independent_and_protocol_rejects_extra_fields(tmp_path
         synchronous = connection.execute("PRAGMA synchronous").fetchone()
 
     assert execution_version == ("2",)
-    assert worker_version == ("2",)
+    assert worker_version == ("4",)
     assert journal_mode == ("wal",)
     assert synchronous == (2,)
     with pytest.raises(ValidationError, match="Extra inputs"):

@@ -6,6 +6,10 @@ from dataclasses import dataclass
 from decimal import ROUND_DOWN, Decimal, InvalidOperation
 from typing import Literal
 
+DEFAULT_RISK_PERCENT = Decimal("0.10")
+DEFAULT_FEE_RATE = Decimal("0.0005")
+DEFAULT_SLIPPAGE_RATE = Decimal("0.0010")
+
 
 class RiskCalculationFailure(ValueError):
     """输入或约束不满足时，风险计算明确失败。"""

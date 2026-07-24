@@ -19,6 +19,7 @@ class WorkerCommandAction(StrEnum):
     REQUEST_EXIT = "request_exit"
     REFRESH_ACCOUNT = "refresh_account"
     RECONCILE = "reconcile"
+    CLEAR_DRAWDOWN_STOP = "clear_drawdown_stop"
 
 
 class WorkerCommandStatus(StrEnum):
