@@ -58,7 +58,10 @@ from pa_agent.data.multi_timeframe import (
 from pa_agent.data.okx_source import aggregate_okx_five_minute_rows
 from pa_agent.data.snapshot import build_analysis_frame
 from pa_agent.execution.controller import ExecutionController
-from pa_agent.execution.credentials import load_okx_credentials
+from pa_agent.execution.credentials import (
+    account_identity_fingerprint,
+    load_okx_credentials,
+)
 from pa_agent.execution.errors import (
     BrokerApiError,
     BrokerTransportError,
@@ -68,8 +71,12 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ACTIVE_EXECUTION_STATES, ExecutionState
 from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.plan_builder import execution_route_fingerprint
 from pa_agent.execution.store import ExecutionStore
-from pa_agent.execution.worker_protocol import WorkerCommandStatus
+from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    WorkerCommandStatus,
+)
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.records.analysis_history import (
     find_latest_successful_record,
@@ -81,6 +88,10 @@ from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
 from pa_agent.records.supervisor_writer import SupervisorWriter
 from pa_agent.risk.sizing import RiskCalculationFailure, calculate_risk_size
+from pa_agent.risk.leverage import (
+    LeveragePlanningFailure,
+    build_minimum_leverage_parameters,
+)
 from pa_agent.util.logging import configure_logging
 from pa_agent.util.threading import CancelToken
 
@@ -163,8 +174,17 @@ class CampaignError(RuntimeError):
 class CampaignRiskBlocked(CampaignError):
     """当前 PA 信号无法通过确定性风险定仓。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        required_size: Decimal | None = None,
+        maximum_size: Decimal | None = None,
+    ) -> None:
         self.code = str(code)
+        self.required_size = required_size
+        self.maximum_size = maximum_size
         super().__init__(message)
 
 
@@ -542,6 +562,14 @@ class CampaignSizing:
     equity_basis: str = CAMPAIGN_RISK_EQUITY_BASIS
 
 
+@dataclass(frozen=True)
+class CampaignLeverageCandidate:
+    """A read-only capacity plan plus sizing at its target leverage."""
+
+    parameters: SetLeverageParameters
+    sizing: CampaignSizing
+
+
 def _campaign_sizing_snapshot(sizing: CampaignSizing) -> dict[str, str]:
     """把真实定仓输入和结果写成可长期复核的非秘密快照。"""
     return {
@@ -623,6 +651,7 @@ def resolve_campaign_sizing(
     entry_price: object | None = None,
     stop_loss_price: object | None = None,
     side: object | None = None,
+    leverage: object | None = None,
 ) -> CampaignSizing:
     """用 PA 的入场/止损和 OKX 实时规格计算 Demo 首仓张数。"""
     active_client = client or OkxRestClient(
@@ -645,6 +674,16 @@ def resolve_campaign_sizing(
     maximum = active_client.max_order_size(
         instrument=CAMPAIGN_INSTRUMENT,
         trade_mode=CAMPAIGN_MARGIN_MODE,
+        price=(
+            str(_positive_decimal(entry_price))
+            if _positive_decimal(entry_price) > 0
+            else None
+        ),
+        leverage=(
+            str(_positive_decimal(leverage))
+            if _positive_decimal(leverage) > 0
+            else None
+        ),
     )
     max_buy = _positive_decimal(maximum.get("maxBuy"))
     max_sell = _positive_decimal(maximum.get("maxSell"))
@@ -672,6 +711,8 @@ def resolve_campaign_sizing(
         raise CampaignRiskBlocked(
             exc.code,
             f"风险定仓失败[{exc.code}]: {exc}",
+            required_size=exc.required_size,
+            maximum_size=exc.maximum_size,
         ) from exc
     return CampaignSizing(
         quantity=result.target_contract_size,
@@ -723,6 +764,97 @@ def resolve_record_campaign_sizing(
         entry_price=entry_price,
         stop_loss_price=stop_loss_price,
         side=side,
+    )
+
+
+def resolve_record_campaign_leverage(
+    record: AnalysisRecord,
+    analysis_digest: str,
+) -> CampaignLeverageCandidate:
+    """Build a Demo leverage candidate only after current capacity blocks."""
+    entry_price, stop_loss_price, side = _record_risk_inputs(record)
+    client = OkxRestClient(
+        load_okx_credentials("demo"),
+        base_url=CAMPAIGN_OKX_API_BASE_URL,
+        simulated=True,
+    )
+    try:
+        resolve_campaign_sizing(
+            client,
+            entry_price=entry_price,
+            stop_loss_price=stop_loss_price,
+            side=side,
+        )
+    except CampaignRiskBlocked as exc:
+        if exc.code != "max_size_exceeded" or exc.required_size is None:
+            raise
+        required_quantity = exc.required_size
+    else:
+        raise LeveragePlanningFailure(
+            "current_capacity_sufficient",
+            "当前杠杆容量已经足够，无需创建杠杆命令",
+        )
+
+    account_config = client.account_config()
+    raw_account_type = account_config.get("type")
+    account_identity = account_identity_fingerprint(
+        "okx",
+        "demo",
+        str(account_config.get("uid") or ""),
+        str(account_config.get("mainUid") or ""),
+        "" if raw_account_type is None else str(raw_account_type),
+    )
+    leverage_rows = client.leverage_info(
+        instrument=CAMPAIGN_INSTRUMENT,
+        margin_mode=CAMPAIGN_MARGIN_MODE,
+    )
+    current_leverage = next(
+        (
+            _positive_decimal(row.get("lever"))
+            for row in leverage_rows
+            if str(row.get("instId") or "") == CAMPAIGN_INSTRUMENT
+            and str(row.get("mgnMode") or "") == CAMPAIGN_MARGIN_MODE
+            and str(row.get("posSide") or "net") == "net"
+        ),
+        Decimal("0"),
+    )
+    if current_leverage <= 0:
+        raise LeveragePlanningFailure(
+            "missing_current_leverage",
+            "OKX 未返回当前全仓净持仓杠杆",
+        )
+    parameters = build_minimum_leverage_parameters(
+        client=client,
+        analysis_digest=analysis_digest,
+        config_fingerprint="pending_campaign_sizing",
+        instrument=CAMPAIGN_INSTRUMENT,
+        direction=side,
+        current_leverage=current_leverage,
+        required_quantity=required_quantity,
+        entry_price=entry_price,
+        expected_account_identity=account_identity,
+        okx_api_base_url=CAMPAIGN_OKX_API_BASE_URL,
+    )
+    if parameters is None:
+        raise LeveragePlanningFailure(
+            "current_capacity_sufficient",
+            "容量刷新后已足够，无需创建杠杆命令",
+        )
+    sizing = resolve_campaign_sizing(
+        client,
+        entry_price=entry_price,
+        stop_loss_price=stop_loss_price,
+        side=side,
+        leverage=parameters.target_leverage,
+    )
+    if sizing.quantity != required_quantity:
+        raise LeveragePlanningFailure(
+            "risk_quantity_changed",
+            "候选杠杆改变了风险公式目标数量",
+        )
+    return CampaignLeverageCandidate(
+        parameters=parameters,
+        sizing=sizing,
     )
 
 
@@ -1674,6 +1806,10 @@ class CampaignRuntime:
     sizing_resolver: Callable[[AnalysisRecord], CampaignSizing] = (
         resolve_record_campaign_sizing
     )
+    leverage_resolver: Callable[
+        [AnalysisRecord, str],
+        CampaignLeverageCandidate,
+    ] = resolve_record_campaign_leverage
 
 
 def _apply_campaign_sizing(
@@ -2091,6 +2227,7 @@ class OkxDemoCampaign:
             return
 
         sizing: CampaignSizing | None = None
+        leverage_parameters: SetLeverageParameters | None = None
         if self._is_supervision_candidate(record):
             active_execution_count = len(
                 self.runtime.execution_service.list_active()
@@ -2098,17 +2235,75 @@ class OkxDemoCampaign:
             try:
                 sizing = self._refresh_order_quantity(record)
             except CampaignRiskBlocked as exc:
-                self._save_state(
-                    inflight_bar_ms=None,
-                    last_completed_bar_ms=bar_ms,
-                    analyses_completed=completed_count,
-                    last_plan_result=f"blocked:risk:{exc.code}",
-                    last_error=str(exc),
-                )
-                logger.info("本轮风险定仓阻断，继续等待下一根已收盘 K 线: %s", exc)
-                return
+                if (
+                    exc.code == "max_size_exceeded"
+                    and exc.required_size is not None
+                ):
+                    try:
+                        leverage_candidate = (
+                            self.runtime.leverage_resolver(
+                                record,
+                                self._analysis_digest(record),
+                            )
+                        )
+                    except (
+                        CampaignRiskBlocked,
+                        LeveragePlanningFailure,
+                    ) as leverage_exc:
+                        code = getattr(
+                            leverage_exc,
+                            "code",
+                            "leverage_unavailable",
+                        )
+                        self._save_state(
+                            inflight_bar_ms=None,
+                            last_completed_bar_ms=bar_ms,
+                            analyses_completed=completed_count,
+                            last_plan_result=(
+                                f"blocked:risk:leverage:{code}"
+                            ),
+                            last_error=str(leverage_exc),
+                        )
+                        logger.info(
+                            "本轮动态杠杆容量仍不足，继续等待下一根 K 线: %s",
+                            leverage_exc,
+                        )
+                        return
+                    sizing = leverage_candidate.sizing
+                    _apply_campaign_sizing(self.runtime, sizing)
+                    leverage_parameters = (
+                        leverage_candidate.parameters.model_copy(
+                            update={
+                                "config_fingerprint": (
+                                    execution_route_fingerprint(
+                                        self.runtime.settings,
+                                        "okx",
+                                    )
+                                )
+                            }
+                        )
+                    )
+                else:
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=bar_ms,
+                        analyses_completed=completed_count,
+                        last_plan_result=f"blocked:risk:{exc.code}",
+                        last_error=str(exc),
+                    )
+                    logger.info(
+                        "本轮风险定仓阻断，继续等待下一根已收盘 K 线: %s",
+                        exc,
+                    )
+                    return
             _attach_campaign_sizing(record, sizing)
             self.runtime.writer.save_full_durable(record)
+            if leverage_parameters is not None:
+                leverage_parameters = leverage_parameters.model_copy(
+                    update={
+                        "analysis_digest": self._analysis_digest(record)
+                    }
+                )
             supervision = self.runtime.supervisor.review(
                 campaign_id=self.state.campaign_id,
                 record=record,
@@ -2144,6 +2339,60 @@ class OkxDemoCampaign:
                     supervision.reason,
                 )
                 return
+            if leverage_parameters is not None:
+                self._ensure_demo_write_session()
+                leverage_command = (
+                    self.runtime.execution_service.set_leverage(
+                        leverage_parameters
+                    )
+                )
+                leverage_result = (
+                    self.runtime.execution_service.wait_for_command(
+                        leverage_command.id,
+                        timeout=30.0,
+                    )
+                )
+                if leverage_result.status is WorkerCommandStatus.UNCERTAIN:
+                    raise CampaignError(
+                        "动态杠杆结果不明，禁止自动重试；"
+                        "请先完成券商只读对账"
+                    )
+                if leverage_result.status is not WorkerCommandStatus.SUCCEEDED:
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=bar_ms,
+                        analyses_completed=completed_count,
+                        last_plan_result=(
+                            "blocked:risk:leverage:"
+                            f"{leverage_result.failure_code or 'failed'}"
+                        ),
+                        last_error=(
+                            leverage_result.failure_code
+                            or leverage_result.status.value
+                        ),
+                    )
+                    return
+                refreshed_sizing = self.runtime.sizing_resolver(record)
+                if (
+                    _campaign_sizing_fingerprint(refreshed_sizing)
+                    != _campaign_sizing_fingerprint(sizing)
+                ):
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=bar_ms,
+                        analyses_completed=completed_count,
+                        last_plan_result=(
+                            "blocked:risk:stale_after_leverage"
+                        ),
+                        last_error=(
+                            "杠杆确认后权益或风险输入变化，"
+                            "本根 K 线不创建执行计划"
+                        ),
+                    )
+                    return
+                sizing = refreshed_sizing
+                _attach_campaign_sizing(record, sizing)
+                self.runtime.writer.save_full_durable(record)
 
         try:
             execution = self.runtime.execution_service.prepare_analysis(record)

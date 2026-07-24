@@ -303,11 +303,17 @@ class OkxRestClient:
         instrument: str,
         trade_mode: str,
         price: str | None = None,
+        leverage: str | None = None,
     ) -> dict[str, Any]:
         payload = self._request(
             "GET",
             "/api/v5/account/max-size",
-            params={"instId": instrument, "tdMode": trade_mode, "px": price},
+            params={
+                "instId": instrument,
+                "tdMode": trade_mode,
+                "px": price,
+                "leverage": leverage,
+            },
             private=True,
         )
         data = payload.get("data") or []
@@ -326,6 +332,50 @@ class OkxRestClient:
             private=True,
         )
         return [dict(item) for item in payload.get("data") or []]
+
+    def leverage_adjustment_info(
+        self,
+        *,
+        instrument_type: str,
+        margin_mode: str,
+        leverage: str,
+        instrument: str,
+        position_side: str = "net",
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "GET",
+            "/api/v5/account/adjust-leverage-info",
+            params={
+                "instType": instrument_type,
+                "mgnMode": margin_mode,
+                "lever": leverage,
+                "instId": instrument,
+                "posSide": position_side,
+            },
+            private=True,
+        )
+        data = payload.get("data") or []
+        return dict(data[0]) if data else {}
+
+    def set_leverage(
+        self,
+        *,
+        instrument: str,
+        margin_mode: str,
+        leverage: str,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            "POST",
+            "/api/v5/account/set-leverage",
+            body={
+                "instId": instrument,
+                "lever": leverage,
+                "mgnMode": margin_mode,
+            },
+            private=True,
+        )
+        data = self.require_item_success(payload)
+        return dict(data[0]) if data else {}
 
     def balance(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v5/account/balance", private=True)
@@ -400,6 +450,33 @@ class OkxRestClient:
             "GET",
             "/api/v5/account/positions",
             params={"instId": instrument},
+            private=True,
+        )
+        return [dict(item) for item in payload.get("data") or []]
+
+    def pending_orders(
+        self,
+        *,
+        instrument: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/api/v5/trade/orders-pending",
+            params={"instId": instrument},
+            private=True,
+        )
+        return [dict(item) for item in payload.get("data") or []]
+
+    def pending_algo_orders(
+        self,
+        *,
+        instrument: str,
+        order_type: str = "oco",
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            "/api/v5/trade/orders-algo-pending",
+            params={"instId": instrument, "ordType": order_type},
             private=True,
         )
         return [dict(item) for item in payload.get("data") or []]

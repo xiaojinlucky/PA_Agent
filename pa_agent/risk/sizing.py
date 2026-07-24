@@ -10,8 +10,17 @@ from typing import Literal
 class RiskCalculationFailure(ValueError):
     """输入或约束不满足时，风险计算明确失败。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        required_size: Decimal | None = None,
+        maximum_size: Decimal | None = None,
+    ) -> None:
         self.code = str(code)
+        self.required_size = required_size
+        self.maximum_size = maximum_size
         super().__init__(message)
 
 
@@ -152,6 +161,8 @@ def calculate_risk_size(
         raise RiskCalculationFailure(
             "max_size_exceeded",
             "按止损风险计算出的数量超过 OKX 当前最大可开数量",
+            required_size=risk_limited_size,
+            maximum_size=broker_limited_size,
         )
     target_size = risk_limited_size
 

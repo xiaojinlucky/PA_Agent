@@ -25,7 +25,10 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.plan_builder import build_execution_plan
-from pa_agent.execution.worker_protocol import WorkerCommandStatus
+from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    WorkerCommandStatus,
+)
 from pa_agent.okx_demo_campaign import (
     CAMPAIGN_BOOTSTRAP_QUANTITY,
     CAMPAIGN_DURATION,
@@ -43,6 +46,7 @@ from pa_agent.okx_demo_campaign import (
     CANARY_ORIGIN,
     CANARY_TIMEFRAME,
     CampaignError,
+    CampaignLeverageCandidate,
     CampaignProcessLock,
     CampaignRiskBlocked,
     CampaignRuntime,
@@ -62,6 +66,7 @@ from pa_agent.okx_demo_campaign import (
     resolve_record_campaign_sizing,
     validate_campaign_settings,
 )
+from pa_agent.risk.leverage import LeveragePlanningFailure
 from pa_agent.records.analysis_history import find_latest_successful_record
 from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.supervisor_writer import SupervisorWriter
@@ -252,6 +257,7 @@ class _FakeExecutionService:
         self.expired = []
         self.canceled = []
         self.exited = []
+        self.leverage_parameters = []
         self.refreshed = 0
         self.reconciled_execution_ids = []
         self.reconcile_commands = 0
@@ -295,6 +301,10 @@ class _FakeExecutionService:
         )
         self.store.records[execution_id] = execution
         return self._command("submit")
+
+    def set_leverage(self, parameters):
+        self.leverage_parameters.append(parameters)
+        return self._command("set_leverage")
 
     def expire_unsubmitted(self, execution_id, *, reason):
         self.expired.append((execution_id, reason))
@@ -867,7 +877,14 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
             assert instrument == CAMPAIGN_INSTRUMENT
             return {"last": "4000"}
 
-        def max_order_size(self, *, instrument, trade_mode):
+        def max_order_size(
+            self,
+            *,
+            instrument,
+            trade_mode,
+            price=None,
+            leverage=None,
+        ):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
             return {"maxBuy": "100000", "maxSell": "100000"}
@@ -907,7 +924,14 @@ def test_higher_timeframe_text_cannot_change_gate_or_risk_quantity():
         def balance(self):
             return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
 
-        def max_order_size(self, *, instrument, trade_mode):
+        def max_order_size(
+            self,
+            *,
+            instrument,
+            trade_mode,
+            price=None,
+            leverage=None,
+        ):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
             return {"maxBuy": "100000", "maxSell": "100000"}
@@ -983,7 +1007,14 @@ def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
             assert instrument == CAMPAIGN_INSTRUMENT
             return {"last": "4000"}
 
-        def max_order_size(self, *, instrument, trade_mode):
+        def max_order_size(
+            self,
+            *,
+            instrument,
+            trade_mode,
+            price=None,
+            leverage=None,
+        ):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
             return {"maxBuy": "21000", "maxSell": "21000"}
@@ -1133,7 +1164,14 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
                 }
             ]
 
-        def max_order_size(self, *, instrument, trade_mode):
+        def max_order_size(
+            self,
+            *,
+            instrument,
+            trade_mode,
+            price=None,
+            leverage=None,
+        ):
             assert instrument == CAMPAIGN_INSTRUMENT
             assert trade_mode == "cross"
             return {"maxBuy": "500", "maxSell": "500"}
@@ -1496,7 +1534,7 @@ def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
     tmp_path,
 ):
     first_bar_ms = 1_784_300_400_000
-    second_bar_ms = first_bar_ms + 15 * 60 * 1000
+    second_bar_ms = first_bar_ms + 10 * 60 * 1000
     current_bar_ms = {"value": first_bar_ms}
     monkeypatch.setattr(
         campaign_module,
@@ -1516,10 +1554,20 @@ def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
             raise CampaignRiskBlocked(
                 "max_size_exceeded",
                 "风险定仓失败[max_size_exceeded]: 按止损风险计算出的数量超过 OKX 当前最大可开数量",
+                required_size=Decimal("580000"),
+                maximum_size=Decimal("120000"),
             )
         return _sizing(record)
 
     runtime.sizing_resolver = _resolve_sizing
+
+    def _reject_non_monotonic_leverage(_record, _analysis_digest):
+        raise LeveragePlanningFailure(
+            "non_monotonic_capacity",
+            "OKX 容量曲线不是单调递增，禁止自动调整杠杆",
+        )
+
+    runtime.leverage_resolver = _reject_non_monotonic_leverage
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
     runner = OkxDemoCampaign(runtime, store, state)
@@ -1528,8 +1576,11 @@ def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
     assert runner.state.status == "active"
     assert runner.state.inflight_bar_ms is None
     assert runner.state.last_completed_bar_ms == first_bar_ms
-    assert runner.state.last_plan_result == "blocked:risk:max_size_exceeded"
-    assert "max_size_exceeded" in runner.state.last_error
+    assert (
+        runner.state.last_plan_result
+        == "blocked:risk:leverage:non_monotonic_capacity"
+    )
+    assert "容量曲线不是单调递增" in runner.state.last_error
     assert supervisor_client.calls == []
     assert service.prepared == []
     assert service.submitted == []
@@ -1543,6 +1594,77 @@ def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
     assert len(supervisor_client.calls) == 1
     assert service.prepared
     assert service.submitted == ["execution-1"]
+
+
+def test_campaign_changes_leverage_only_after_supervisor_allow_and_rechecks_sizing(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, supervisor_client, _ = _supervised_runtime(
+        tmp_path,
+        "allow_entry",
+    )
+    target_sizing = _sizing(quantity="580000")
+    sizing_calls = 0
+
+    def _resolve_sizing(record):
+        nonlocal sizing_calls
+        sizing_calls += 1
+        if sizing_calls == 1:
+            raise CampaignRiskBlocked(
+                "max_size_exceeded",
+                "风险目标数量超过当前容量",
+                required_size=target_sizing.quantity,
+                maximum_size=Decimal("120000"),
+            )
+        return target_sizing
+
+    runtime.sizing_resolver = _resolve_sizing
+    runtime.leverage_resolver = lambda _record, _digest: (
+        CampaignLeverageCandidate(
+            parameters=SetLeverageParameters(
+                analysis_digest="a" * 64,
+                config_fingerprint="pending_campaign_sizing",
+                instrument=CAMPAIGN_INSTRUMENT,
+                direction="short",
+                margin_mode="cross",
+                position_mode="net_mode",
+                current_leverage=Decimal("20"),
+                target_leverage=Decimal("30"),
+                required_quantity=target_sizing.quantity,
+                entry_price=Decimal("4000"),
+                expected_account_identity="b" * 64,
+                okx_api_base_url=CAMPAIGN_OKX_API_BASE_URL,
+            ),
+            sizing=target_sizing,
+        )
+    )
+    original_set_leverage = service.set_leverage
+
+    def _set_leverage_after_supervision(parameters):
+        assert len(supervisor_client.calls) == 1
+        return original_set_leverage(parameters)
+
+    service.set_leverage = _set_leverage_after_supervision
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert sizing_calls == 3
+    assert len(service.leverage_parameters) == 1
+    assert service.leverage_parameters[0].analysis_digest != "a" * 64
+    assert len(service.leverage_parameters[0].analysis_digest) == 64
+    assert service.leverage_parameters[0].required_quantity == Decimal("580000")
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert runner.state.last_plan_result == "execution:entry_pending"
 
 
 def test_campaign_rearms_only_after_demo_read_check(monkeypatch, tmp_path):

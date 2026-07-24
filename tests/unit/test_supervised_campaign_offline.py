@@ -129,7 +129,14 @@ class _RiskSizingClient:
     def balance(self):
         return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
 
-    def max_order_size(self, *, instrument, trade_mode):
+    def max_order_size(
+        self,
+        *,
+        instrument,
+        trade_mode,
+        price=None,
+        leverage=None,
+    ):
         assert instrument == CAMPAIGN_SYMBOL
         assert trade_mode == "cross"
         return {"maxBuy": "100000", "maxSell": "100000"}

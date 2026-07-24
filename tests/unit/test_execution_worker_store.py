@@ -3,6 +3,7 @@ from __future__ import annotations
 import multiprocessing
 import sqlite3
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 
 import pytest
 from pydantic import ValidationError
@@ -11,6 +12,7 @@ from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import (
     WorkerCommand,
     WorkerCommandAction,
+    WorkerCommandResolutionEvidence,
     WorkerCommandStatus,
     WorkerState,
 )
@@ -68,6 +70,32 @@ def _grant_submit_lease(store: WorkerStore):
     return lease
 
 
+def _resolution_evidence(
+    command: WorkerCommand,
+) -> WorkerCommandResolutionEvidence:
+    return WorkerCommandResolutionEvidence(
+        execution_id=command.execution_id,
+        command_action=command.action.value,
+        command_failure_code=command.failure_code,
+        broker=command.broker,
+        environment=command.environment,
+        account=command.account,
+        instrument="XAU-USDT-SWAP",
+        execution_state="canceled",
+        broker_order_id_present=False,
+        client_order_id_present=False,
+        filled_quantity=Decimal("0"),
+        event_kinds=("plan_created", "ready_expired"),
+        active_execution_count=0,
+        new_risk_lease_present=False,
+        broker_position_count=0,
+        broker_pending_order_count=0,
+        broker_pending_algo_order_count=0,
+        broker_account_identity_digest="e" * 64,
+        observed_at=datetime(2026, 7, 24, 4, 0, tzinfo=UTC),
+    )
+
+
 def test_worker_schema_is_independent_and_protocol_rejects_extra_fields(tmp_path):
     path = tmp_path / "execution.sqlite3"
     ExecutionStore(path)
@@ -88,7 +116,7 @@ def test_worker_schema_is_independent_and_protocol_rejects_extra_fields(tmp_path
         synchronous = connection.execute("PRAGMA synchronous").fetchone()
 
     assert execution_version == ("2",)
-    assert worker_version == ("1",)
+    assert worker_version == ("2",)
     assert journal_mode == ("wal",)
     assert synchronous == (2,)
     with pytest.raises(ValidationError, match="Extra inputs"):
@@ -287,6 +315,200 @@ def test_uncertain_command_blocks_same_action_until_explicit_resolution(tmp_path
             environment="demo",
             account="paper-account",
         )
+
+
+def test_uncertain_write_blocks_new_risk_until_durable_resolution(tmp_path):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    lease = _grant_submit_lease(store)
+    command, _ = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-schema-failed",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+    )
+    assert store.claim_next(worker_id="worker-one").id == command.id
+    store.recover_inflight(failure_code="ValidationError")
+    assert store.revoke_new_risk_lease(lease.lease_id) is True
+
+    assert store.list_unresolved_write_commands(
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+    ) == [store.get_command(command.id)]
+    assert (
+        store.grant_new_risk_lease(
+            worker_id="worker-one",
+            config_fingerprint="route-fingerprint",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            ttl_seconds=60,
+        )
+        is None
+    )
+
+    resolution = store.resolve_uncertain_command(
+        command.id,
+        resolution_code="confirmed_not_written_schema_validation",
+        evidence=_resolution_evidence(store.get_command(command.id)),
+        resolved_by="operator-audit",
+    )
+
+    assert resolution.command_id == command.id
+    assert store.get_command(command.id).status is WorkerCommandStatus.UNCERTAIN
+    assert store.get_command_resolution(command.id) == resolution
+    assert store.list_unresolved_write_commands(
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+    ) == []
+    assert (
+        store.grant_new_risk_lease(
+            worker_id="worker-one",
+            config_fingerprint="route-fingerprint",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            ttl_seconds=60,
+        )
+        is not None
+    )
+
+
+def test_uncertain_resolution_is_idempotent_but_cannot_be_rewritten(tmp_path):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    lease = _grant_submit_lease(store)
+    command, _ = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-idempotent",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+    )
+    assert store.claim_next(worker_id="worker-one").id == command.id
+    store.recover_inflight(failure_code="ValidationError")
+    recovered = store.get_command(command.id)
+    kwargs = {
+        "resolution_code": "confirmed_read_only",
+        "evidence": _resolution_evidence(recovered),
+        "resolved_by": "operator-audit",
+    }
+
+    first = store.resolve_uncertain_command(command.id, **kwargs)
+    second = store.resolve_uncertain_command(command.id, **kwargs)
+
+    assert second == first
+    with pytest.raises(RuntimeError, match="不同"):
+        store.resolve_uncertain_command(
+            command.id,
+            resolution_code="different_resolution",
+            evidence=_resolution_evidence(recovered),
+            resolved_by="operator-audit",
+        )
+
+
+def test_worker_schema_v1_upgrades_resolution_table_without_rewriting_commands(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE worker_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+            ("worker_schema_version", "1"),
+        )
+
+    store = WorkerStore(path)
+
+    with sqlite3.connect(path) as connection:
+        version = connection.execute(
+            "SELECT value FROM worker_meta WHERE key='worker_schema_version'"
+        ).fetchone()
+        resolution_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='worker_command_resolutions'
+            """
+        ).fetchone()
+
+    assert version == ("2",)
+    assert resolution_table == ("worker_command_resolutions",)
+    assert store.list_commands() == []
+
+
+def test_worker_schema_v1_migration_preserves_existing_uncertain_write(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE worker_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO worker_meta(key, value)
+            VALUES ('worker_schema_version', '1');
+            CREATE TABLE worker_commands (
+                id TEXT PRIMARY KEY,
+                scope_key TEXT NOT NULL,
+                action TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                requester TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                account TEXT NOT NULL,
+                new_risk_lease_id TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                status TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_code TEXT NOT NULL,
+                failure_code TEXT NOT NULL
+            );
+            INSERT INTO worker_commands(
+                id, scope_key, action, execution_id, requester,
+                broker, environment, account, new_risk_lease_id,
+                reason_code, status, worker_id, created_at, started_at,
+                finished_at, result_code, failure_code
+            ) VALUES (
+                'old-command', 'execution:old-execution', 'submit',
+                'old-execution', 'campaign', 'okx', 'demo', 'okx',
+                'old-lease', '', 'uncertain', 'old-worker',
+                '2026-07-24T00:00:00+00:00',
+                '2026-07-24T00:00:01+00:00',
+                '2026-07-24T00:00:02+00:00',
+                '', 'ValidationError'
+            );
+            """
+        )
+
+    store = WorkerStore(path)
+    command = store.get_command("old-command")
+
+    assert command is not None
+    assert command.status is WorkerCommandStatus.UNCERTAIN
+    assert command.parameters is None
+    assert command.result is None
+    with sqlite3.connect(path) as connection:
+        columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(worker_commands)"
+            ).fetchall()
+        }
+    assert {"parameters_json", "result_json"} <= columns
 
 
 def test_new_risk_lease_route_expiry_renew_and_revoke(tmp_path):

@@ -6,6 +6,7 @@ import threading
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
@@ -44,6 +45,11 @@ from pa_agent.execution.plan_builder import (
     execution_route_fingerprint,
 )
 from pa_agent.execution.store import ExecutionStore
+from pa_agent.execution.worker_protocol import (
+    SetLeverageResult,
+    WorkerCommand,
+    WorkerCommandAction,
+)
 
 _ARM_CONFIRMATION = "启用实盘交易"
 _PAPER_ARM_CONFIRMATION = "启用模拟交易"
@@ -52,6 +58,15 @@ _RISK_REDUCING = "risk_reducing"
 _OKX_DEMO_CAMPAIGN_API_BASE_URL = "https://www.okx.com"
 _OKX_DEMO_CAMPAIGN_INSTRUMENT = "XAU-USDT-SWAP"
 _RiskKind = Literal["new_risk", "risk_reducing"]
+
+
+@dataclass(frozen=True)
+class _LeverageWritePlan:
+    id: str
+    broker: Literal["okx"]
+    environment: Literal["demo"]
+    requested_account: Literal["okx"]
+    config_fingerprint: str
 
 
 class ExecutionService:
@@ -67,6 +82,8 @@ class ExecutionService:
         adapter_factories: dict[
             str, Callable[[ExecutionPlan], BrokerAdapter]
         ] | None = None,
+        leverage_adapter_factory: Callable[[WorkerCommand], OkxAdapter]
+        | None = None,
         gate_checker: Callable[[], bool] | None = None,
         paper_gate_checker: Callable[[], bool] | None = None,
         okx_live_gate_checker: Callable[[], bool] | None = None,
@@ -79,6 +96,7 @@ class ExecutionService:
         self._event_bus = event_bus
         self._store = store or ExecutionStore()
         self._adapter_factories = adapter_factories or {}
+        self._leverage_adapter_factory = leverage_adapter_factory
         self._gate_checker = gate_checker or hard_live_gate_enabled
         self._paper_gate_checker = (
             paper_gate_checker or paper_trading_gate_enabled
@@ -370,6 +388,76 @@ class ExecutionService:
             )
         self._adapters[cache_key] = adapter
         return adapter
+
+    @staticmethod
+    def _validate_leverage_command(command: WorkerCommand):
+        parameters = command.parameters
+        if (
+            command.action is not WorkerCommandAction.SET_LEVERAGE
+            or parameters is None
+            or command.broker != "okx"
+            or command.environment != "demo"
+            or command.account != "okx"
+        ):
+            raise PreflightError("只支持严格建模的 OKX Demo 杠杆命令")
+        return parameters
+
+    def _leverage_adapter(self, command: WorkerCommand) -> OkxAdapter:
+        parameters = self._validate_leverage_command(command)
+        if self._leverage_adapter_factory is not None:
+            return self._leverage_adapter_factory(command)
+        client = OkxRestClient(
+            load_okx_credentials(command.environment),
+            base_url=parameters.okx_api_base_url,
+            simulated=True,
+        )
+        return OkxAdapter(
+            client,
+            margin_mode=parameters.margin_mode,
+            runtime_id=self._runtime_id,
+        )
+
+    def reconcile_leverage(
+        self,
+        command: WorkerCommand,
+    ) -> SetLeverageResult:
+        """Read current Demo leverage/capacity without broker writes."""
+        parameters = self._validate_leverage_command(command)
+        if self._store.list_active():
+            raise PreflightError("存在活动 execution，禁止调整杠杆")
+        return self._leverage_adapter(command).read_leverage_state(
+            parameters,
+            environment=command.environment,
+        )
+
+    def set_leverage(
+        self,
+        command: WorkerCommand,
+    ) -> SetLeverageResult:
+        """Execute one Demo leverage command through the OKX adapter."""
+        parameters = self._validate_leverage_command(command)
+        if self._store.list_active():
+            raise PreflightError("存在活动 execution，禁止调整杠杆")
+        plan = _LeverageWritePlan(
+            id=parameters.analysis_digest,
+            broker="okx",
+            environment="demo",
+            requested_account="okx",
+            config_fingerprint=parameters.config_fingerprint,
+        )
+        self._require_plan_writes(plan)
+        adapter = self._leverage_adapter(command)
+        adapter.bind_write_executor(
+            lambda operation: self._execute_broker_write(
+                plan,
+                operation,
+                effective_account=command.account,
+            )
+        )
+        return adapter.set_leverage(
+            parameters,
+            environment=command.environment,
+        )
 
     @staticmethod
     def _expected_account_identity(record: ExecutionRecord) -> str:

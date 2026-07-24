@@ -38,6 +38,7 @@ from pa_agent.execution.plan_builder import (
 )
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
     WorkerCommand,
     WorkerCommandAction,
     WorkerCommandStatus,
@@ -125,6 +126,27 @@ class ExecutionController:
         broker, _environment, _account = self._selected_route_identity()
         return execution_route_fingerprint(self._settings, broker)
 
+    def _unresolved_route_writes(
+        self,
+        broker: str,
+        environment: str,
+        account: str,
+    ) -> list[WorkerCommand]:
+        getter = getattr(
+            self._worker_store,
+            "list_unresolved_write_commands",
+            None,
+        )
+        if getter is None:
+            return []
+        return list(
+            getter(
+                broker=broker,
+                environment=environment,
+                account=account,
+            )
+        )
+
     def arm_confirmation_text(self) -> str:
         _broker, environment, _account = self._selected_route_identity()
         return (
@@ -206,6 +228,8 @@ class ExecutionController:
                 or fingerprint != self._lease_fingerprint
             ):
                 return False
+            if self._unresolved_route_writes(broker, environment, account):
+                return False
             return self._worker_store.is_new_risk_authorized(
                 self._lease_id,
                 worker_id=worker_id,
@@ -227,6 +251,16 @@ class ExecutionController:
             self._require_environment_gate(broker, environment)
             worker_id = self._current_worker_id()
             fingerprint = self._selected_fingerprint()
+            unresolved = self._unresolved_route_writes(
+                broker,
+                environment,
+                account,
+            )
+            if unresolved:
+                raise LiveTradingDisabled(
+                    "当前账户存在未解决的券商写命令，"
+                    "必须完成只读对账和耐久处置后才能新增风险"
+                )
             lease = self._worker_store.grant_new_risk_lease(
                 worker_id=worker_id,
                 config_fingerprint=fingerprint,
@@ -356,6 +390,40 @@ class ExecutionController:
             WorkerCommandAction.SUBMIT,
             execution_id,
         )
+
+    def set_leverage(
+        self,
+        parameters: SetLeverageParameters,
+    ) -> WorkerCommand:
+        """Persist one deterministic OKX Demo leverage command."""
+        if not self.is_armed:
+            raise LiveTradingDisabled(
+                "新增风险授权租约不存在、已过期或与执行账户不一致"
+            )
+        broker, environment, account = self._selected_route_identity()
+        if (broker, environment, account) != ("okx", "demo", "okx"):
+            raise LiveTradingDisabled("首阶段杠杆调整只允许 OKX Demo")
+        if self._store.list_active():
+            raise LiveTradingDisabled("存在活动 execution，禁止调整杠杆")
+        if parameters.config_fingerprint != self._lease_fingerprint:
+            raise LiveTradingDisabled("杠杆计划来自旧交易配置")
+        okx = self._settings.execution.okx
+        if (
+            parameters.instrument != str(okx.instrument)
+            or parameters.margin_mode != str(okx.margin_mode)
+            or parameters.okx_api_base_url != str(okx.api_base_url)
+        ):
+            raise LiveTradingDisabled("杠杆计划与当前 OKX 路由配置不一致")
+        command, _created = self._worker_store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester=self._requester_id,
+            broker=broker,
+            environment=environment,
+            account=account,
+            new_risk_lease_id=self._lease_id,
+            parameters=parameters,
+        )
+        return command
 
     def cancel_entry(self, execution_id: str) -> WorkerCommand:
         return self._execution_command(

@@ -4,6 +4,7 @@ from decimal import Decimal
 
 import pytest
 
+from pa_agent.execution.credentials import account_identity_fingerprint
 from pa_agent.execution.errors import BrokerTransportError, PreflightError
 from pa_agent.execution.models import (
     ExecutionPlan,
@@ -12,6 +13,7 @@ from pa_agent.execution.models import (
     utc_now_iso,
 )
 from pa_agent.execution.okx_adapter import OkxAdapter
+from pa_agent.execution.worker_protocol import SetLeverageParameters
 
 
 class FakeOkxClient:
@@ -37,6 +39,12 @@ class FakeOkxClient:
             "mainUid": "1001",
             "type": "0",
         }
+        self.current_leverage = Decimal("5")
+        self.capacity_before = Decimal("10")
+        self.capacity_after = Decimal("30")
+        self.pending_order_rows = []
+        self.pending_algo_rows = {}
+        self.set_leverage_updates = True
 
     def sync_server_time(self):
         self.calls.append(("sync_server_time",))
@@ -90,7 +98,12 @@ class FakeOkxClient:
 
     def max_order_size(self, **kwargs):
         self.calls.append(("max_order_size", kwargs))
-        return {"maxBuy": "10", "maxSell": "10"}
+        capacity = (
+            self.capacity_after
+            if self.current_leverage > Decimal("5")
+            else self.capacity_before
+        )
+        return {"maxBuy": str(capacity), "maxSell": str(capacity)}
 
     def leverage_info(self, **kwargs):
         self.calls.append(("leverage_info", kwargs))
@@ -98,9 +111,27 @@ class FakeOkxClient:
             {
                 "instId": kwargs["instrument"],
                 "mgnMode": kwargs["margin_mode"],
-                "lever": "5",
+                "lever": str(self.current_leverage),
             }
         ]
+
+    def set_leverage(self, **kwargs):
+        self.calls.append(("set_leverage", kwargs))
+        if self.set_leverage_updates:
+            self.current_leverage = Decimal(str(kwargs["leverage"]))
+        return {
+            "instId": kwargs["instrument"],
+            "mgnMode": kwargs["margin_mode"],
+            "lever": kwargs["leverage"],
+        }
+
+    def pending_orders(self, *, instrument):
+        self.calls.append(("pending_orders", instrument))
+        return list(self.pending_order_rows)
+
+    def pending_algo_orders(self, *, instrument, order_type="oco"):
+        self.calls.append(("pending_algo_orders", instrument, order_type))
+        return list(self.pending_algo_rows.get(order_type, []))
 
     def positions(self, *, instrument=None):
         self.calls.append(("positions", instrument))
@@ -252,6 +283,93 @@ def _plan(*, product="swap", direction="long", instrument=None) -> ExecutionPlan
         config_fingerprint="config",
         entry_atr=Decimal("2"),
     )
+
+
+def _leverage_parameters() -> SetLeverageParameters:
+    return SetLeverageParameters(
+        analysis_digest="a" * 64,
+        config_fingerprint="config",
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage=Decimal("5"),
+        target_leverage=Decimal("10"),
+        required_quantity=Decimal("20"),
+        entry_price=Decimal("4000"),
+        expected_account_identity=account_identity_fingerprint(
+            "okx",
+            "demo",
+            "1001",
+            "1001",
+            "0",
+        ),
+        okx_api_base_url="https://www.okx.com",
+    )
+
+
+def test_set_leverage_writes_once_then_reads_back_leverage_and_capacity():
+    client = FakeOkxClient()
+    writes = []
+    adapter = OkxAdapter(
+        client,
+        margin_mode="cross",
+        write_executor=lambda operation: (
+            writes.append("set_leverage"),
+            operation(),
+        )[1],
+    )
+
+    result = adapter.set_leverage(
+        _leverage_parameters(),
+        environment="demo",
+    )
+
+    assert writes == ["set_leverage"]
+    assert result.confirmed_leverage == Decimal("10")
+    assert result.confirmed_max_size == Decimal("30")
+    assert len(
+        [call for call in client.calls if call[0] == "set_leverage"]
+    ) == 1
+    assert len(
+        [call for call in client.calls if call[0] == "leverage_info"]
+    ) == 2
+    assert len(
+        [call for call in client.calls if call[0] == "max_order_size"]
+    ) == 2
+
+
+def test_set_leverage_refuses_position_before_any_write():
+    client = FakeOkxClient()
+    client.positions_rows = [
+        {"instId": "XAU-USDT-SWAP", "pos": "1"}
+    ]
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(PreflightError, match="仍有仓位"):
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    assert not [call for call in client.calls if call[0] == "set_leverage"]
+
+
+def test_set_leverage_unknown_readback_never_reposts():
+    client = FakeOkxClient()
+    client.set_leverage_updates = False
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(BrokerTransportError, match="回读不一致") as caught:
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    assert caught.value.write_may_have_reached is True
+    assert len(
+        [call for call in client.calls if call[0] == "set_leverage"]
+    ) == 1
 
 
 def test_preflight_uses_live_instrument_specs_and_account_maximum():

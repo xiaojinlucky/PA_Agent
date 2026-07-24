@@ -1,6 +1,8 @@
 """Independent SQLite control plane for the headless execution worker."""
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sqlite3
 import threading
@@ -11,14 +13,25 @@ from pathlib import Path
 
 from pa_agent.execution.worker_protocol import (
     NewRiskLease,
+    SetLeverageParameters,
+    SetLeverageResolutionEvidence,
+    SetLeverageResult,
     WorkerCommand,
     WorkerCommandAction,
+    WorkerCommandResolution,
+    WorkerCommandResolutionEvidence,
     WorkerCommandStatus,
     WorkerHeartbeat,
     WorkerState,
 )
 
-_WORKER_SCHEMA_VERSION = 1
+_WORKER_SCHEMA_VERSION = 2
+_WRITE_ACTION_VALUES = (
+    WorkerCommandAction.SUBMIT.value,
+    WorkerCommandAction.SET_LEVERAGE.value,
+    WorkerCommandAction.CANCEL_ENTRY.value,
+    WorkerCommandAction.REQUEST_EXIT.value,
+)
 _SAFE_CODE_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]*$")
 _TERMINAL_COMMAND_STATES = frozenset(
     {
@@ -27,6 +40,37 @@ _TERMINAL_COMMAND_STATES = frozenset(
         WorkerCommandStatus.UNCERTAIN,
     }
 )
+_CREATE_WORKER_COMMANDS_SQL = """
+    CREATE TABLE IF NOT EXISTS worker_commands (
+        id TEXT PRIMARY KEY,
+        scope_key TEXT NOT NULL,
+        action TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        requester TEXT NOT NULL,
+        broker TEXT NOT NULL,
+        environment TEXT NOT NULL,
+        account TEXT NOT NULL,
+        new_risk_lease_id TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        parameters_json TEXT NOT NULL,
+        status TEXT NOT NULL,
+        worker_id TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        started_at TEXT,
+        finished_at TEXT,
+        result_code TEXT NOT NULL,
+        failure_code TEXT NOT NULL,
+        result_json TEXT NOT NULL,
+        CHECK(action IN (
+            'submit', 'set_leverage', 'cancel_entry', 'request_exit',
+            'refresh_account', 'reconcile'
+        )),
+        CHECK(status IN (
+            'pending', 'running', 'succeeded',
+            'failed', 'uncertain'
+        ))
+    )
+"""
 
 
 def _system_utc_now() -> datetime:
@@ -127,39 +171,34 @@ class WorkerStore:
                         parsed_version = int(version["value"])
                     except (TypeError, ValueError) as exc:
                         raise RuntimeError("worker schema 版本无效") from exc
-                    if parsed_version != _WORKER_SCHEMA_VERSION:
+                    if parsed_version not in {1, _WORKER_SCHEMA_VERSION}:
                         raise RuntimeError("不支持的 worker schema 版本")
-                connection.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS worker_commands (
-                        id TEXT PRIMARY KEY,
-                        scope_key TEXT NOT NULL,
-                        action TEXT NOT NULL,
-                        execution_id TEXT NOT NULL,
-                        requester TEXT NOT NULL,
-                        broker TEXT NOT NULL,
-                        environment TEXT NOT NULL,
-                        account TEXT NOT NULL,
-                        new_risk_lease_id TEXT NOT NULL,
-                        reason_code TEXT NOT NULL,
-                        status TEXT NOT NULL,
-                        worker_id TEXT NOT NULL,
-                        created_at TEXT NOT NULL,
-                        started_at TEXT,
-                        finished_at TEXT,
-                        result_code TEXT NOT NULL,
-                        failure_code TEXT NOT NULL,
-                        CHECK(action IN (
-                            'submit', 'cancel_entry', 'request_exit',
-                            'refresh_account', 'reconcile'
-                        )),
-                        CHECK(status IN (
-                            'pending', 'running', 'succeeded',
-                            'failed', 'uncertain'
-                        ))
+                connection.execute(_CREATE_WORKER_COMMANDS_SQL)
+                if version is not None and parsed_version == 1:
+                    connection.execute(
+                        "ALTER TABLE worker_commands "
+                        "RENAME TO worker_commands_v1"
                     )
-                    """
-                )
+                    connection.execute(_CREATE_WORKER_COMMANDS_SQL)
+                    connection.execute(
+                        """
+                        INSERT INTO worker_commands(
+                            id, scope_key, action, execution_id, requester,
+                            broker, environment, account, new_risk_lease_id,
+                            reason_code, parameters_json, status, worker_id,
+                            created_at, started_at, finished_at, result_code,
+                            failure_code, result_json
+                        )
+                        SELECT
+                            id, scope_key, action, execution_id, requester,
+                            broker, environment, account, new_risk_lease_id,
+                            reason_code, 'null', status, worker_id,
+                            created_at, started_at, finished_at, result_code,
+                            failure_code, 'null'
+                        FROM worker_commands_v1
+                        """
+                    )
+                    connection.execute("DROP TABLE worker_commands_v1")
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS
@@ -172,6 +211,21 @@ class WorkerStore:
                     """
                     CREATE INDEX IF NOT EXISTS idx_worker_commands_claim
                     ON worker_commands(status, created_at, id)
+                    """
+                )
+                connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS worker_command_resolutions (
+                        command_id TEXT PRIMARY KEY,
+                        resolution_code TEXT NOT NULL,
+                        evidence_json TEXT NOT NULL,
+                        evidence_digest TEXT NOT NULL,
+                        resolved_by TEXT NOT NULL,
+                        resolved_at TEXT NOT NULL,
+                        FOREIGN KEY(command_id)
+                            REFERENCES worker_commands(id)
+                            ON DELETE RESTRICT
+                    )
                     """
                 )
                 connection.execute(
@@ -207,6 +261,15 @@ class WorkerStore:
                     )
                     """
                 )
+                if version is not None and parsed_version == 1:
+                    connection.execute(
+                        """
+                        UPDATE worker_meta
+                        SET value=?
+                        WHERE key='worker_schema_version'
+                        """,
+                        (str(_WORKER_SCHEMA_VERSION),),
+                    )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
@@ -245,6 +308,11 @@ class WorkerStore:
             account=row["account"],
             new_risk_lease_id=row["new_risk_lease_id"],
             reason_code=row["reason_code"],
+            parameters=SetLeverageParameters.model_validate_json(
+                row["parameters_json"]
+            )
+            if row["parameters_json"] != "null"
+            else None,
             status=row["status"],
             worker_id=row["worker_id"],
             created_at=datetime.fromisoformat(row["created_at"]),
@@ -252,6 +320,11 @@ class WorkerStore:
             finished_at=WorkerStore._parse_time(row["finished_at"]),
             result_code=row["result_code"],
             failure_code=row["failure_code"],
+            result=SetLeverageResult.model_validate_json(
+                row["result_json"]
+            )
+            if row["result_json"] != "null"
+            else None,
         )
 
     @staticmethod
@@ -297,6 +370,7 @@ class WorkerStore:
         account: str,
         new_risk_lease_id: str = "",
         reason_code: str = "",
+        parameters: SetLeverageParameters | None = None,
         command_id: str | None = None,
     ) -> tuple[WorkerCommand, bool]:
         """Enqueue one command or return its existing pending/running twin."""
@@ -311,6 +385,7 @@ class WorkerStore:
             account=account,
             new_risk_lease_id=new_risk_lease_id,
             reason_code=reason_code,
+            parameters=parameters,
             created_at=now,
         )
         scope_key = self._scope_key(
@@ -342,7 +417,10 @@ class WorkerStore:
                     existing_command = self._row_to_command(existing)
                     assert existing_command is not None
                     return existing_command, False
-                if candidate.action is WorkerCommandAction.SUBMIT:
+                if candidate.action in {
+                    WorkerCommandAction.SUBMIT,
+                    WorkerCommandAction.SET_LEVERAGE,
+                }:
                     lease = connection.execute(
                         """
                         SELECT * FROM worker_new_risk_lease
@@ -362,7 +440,7 @@ class WorkerStore:
                     ).fetchone()
                     if lease is None:
                         raise PermissionError(
-                            "submit 命令缺少当前路由的有效 NEW_RISK 租约"
+                            "新增风险命令缺少当前路由的有效 NEW_RISK 租约"
                         )
                 connection.execute(
                     """
@@ -370,9 +448,10 @@ class WorkerStore:
                         id, scope_key, action, execution_id, requester,
                         broker, environment, account, new_risk_lease_id,
                         reason_code,
+                        parameters_json,
                         status, worker_id, created_at, started_at, finished_at,
-                        result_code, failure_code
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, NULL, NULL, '', '')
+                        result_code, failure_code, result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, NULL, NULL, '', '', 'null')
                     """,
                     (
                         candidate.id,
@@ -385,6 +464,9 @@ class WorkerStore:
                         candidate.account,
                         candidate.new_risk_lease_id,
                         candidate.reason_code,
+                        candidate.parameters.model_dump_json()
+                        if candidate.parameters is not None
+                        else "null",
                         candidate.status.value,
                         self._iso(candidate.created_at),
                     ),
@@ -406,7 +488,7 @@ class WorkerStore:
             """
             UPDATE worker_commands
             SET status='failed', finished_at=?, failure_code='new_risk_expired'
-            WHERE status='pending' AND action='submit'
+            WHERE status='pending' AND action IN ('submit', 'set_leverage')
               AND NOT EXISTS (
                   SELECT 1 FROM worker_new_risk_lease lease
                   WHERE lease.slot='NEW_RISK'
@@ -475,6 +557,7 @@ class WorkerStore:
         status: WorkerCommandStatus,
         result_code: str = "",
         failure_code: str = "",
+        result: SetLeverageResult | None = None,
     ) -> WorkerCommand:
         """Finish an owned running command with a durable terminal state."""
         if status not in _TERMINAL_COMMAND_STATES:
@@ -487,6 +570,11 @@ class WorkerStore:
             failure_code,
             field_name="failure_code",
         )
+        if result is not None and status is not WorkerCommandStatus.SUCCEEDED:
+            raise ValueError("只有成功命令可以保存结构化结果")
+        result_json = (
+            result.model_dump_json() if result is not None else "null"
+        )
         now = self._now()
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -494,7 +582,8 @@ class WorkerStore:
                 cursor = connection.execute(
                     """
                     UPDATE worker_commands
-                    SET status=?, finished_at=?, result_code=?, failure_code=?
+                    SET status=?, finished_at=?, result_code=?, failure_code=?,
+                        result_json=?
                     WHERE id=? AND status='running' AND worker_id=?
                     """,
                     (
@@ -502,6 +591,7 @@ class WorkerStore:
                         self._iso(now),
                         result_code,
                         failure_code,
+                        result_json,
                         command_id,
                         worker_id.strip(),
                     ),
@@ -580,6 +670,223 @@ class WorkerStore:
         ]
 
     @staticmethod
+    def _resolution_evidence_json(
+        evidence: (
+            WorkerCommandResolutionEvidence
+            | SetLeverageResolutionEvidence
+        ),
+    ) -> str:
+        return json.dumps(
+            evidence.model_dump(mode="json"),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+
+    @classmethod
+    def _row_to_resolution(
+        cls,
+        row: sqlite3.Row | None,
+    ) -> WorkerCommandResolution | None:
+        if row is None:
+            return None
+        evidence_json = str(row["evidence_json"])
+        evidence_digest = hashlib.sha256(
+            evidence_json.encode("utf-8")
+        ).hexdigest()
+        if evidence_digest != row["evidence_digest"]:
+            raise RuntimeError("uncertain 命令处置证据摘要不匹配")
+        return WorkerCommandResolution.model_validate(
+            {
+                "command_id": row["command_id"],
+                "resolution_code": row["resolution_code"],
+                "evidence": json.loads(evidence_json),
+                "evidence_digest": evidence_digest,
+                "resolved_by": row["resolved_by"],
+                "resolved_at": datetime.fromisoformat(
+                    row["resolved_at"]
+                ),
+            }
+        )
+
+    def resolve_uncertain_command(
+        self,
+        command_id: str,
+        *,
+        resolution_code: str,
+        evidence: (
+            WorkerCommandResolutionEvidence
+            | SetLeverageResolutionEvidence
+        ),
+        resolved_by: str,
+    ) -> WorkerCommandResolution:
+        """Attach immutable evidence to one uncertain command without rewriting it."""
+        now = self._now()
+        evidence_json = self._resolution_evidence_json(evidence)
+        evidence_digest = hashlib.sha256(
+            evidence_json.encode("utf-8")
+        ).hexdigest()
+        candidate = WorkerCommandResolution(
+            command_id=command_id,
+            resolution_code=resolution_code,
+            evidence=evidence,
+            evidence_digest=evidence_digest,
+            resolved_by=resolved_by,
+            resolved_at=now,
+        )
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                command = connection.execute(
+                    "SELECT * FROM worker_commands WHERE id=?",
+                    (candidate.command_id,),
+                ).fetchone()
+                if command is None:
+                    raise KeyError(f"未知 worker command: {candidate.command_id}")
+                if command["status"] != WorkerCommandStatus.UNCERTAIN.value:
+                    raise RuntimeError("只有 uncertain 命令可以追加处置证据")
+                if command["action"] not in _WRITE_ACTION_VALUES:
+                    raise RuntimeError("只有券商写命令可以追加处置证据")
+                expected_evidence = [
+                    ("command_action", command["action"]),
+                    ("command_failure_code", command["failure_code"]),
+                    ("broker", command["broker"]),
+                    ("environment", command["environment"]),
+                    ("account", command["account"]),
+                ]
+                if command["action"] == WorkerCommandAction.SET_LEVERAGE.value:
+                    parameters = SetLeverageParameters.model_validate_json(
+                        command["parameters_json"]
+                    )
+                    expected_evidence.append(
+                        ("analysis_digest", parameters.analysis_digest)
+                    )
+                else:
+                    expected_evidence.append(
+                        ("execution_id", command["execution_id"])
+                    )
+                for field_name, expected in expected_evidence:
+                    actual = getattr(candidate.evidence, field_name)
+                    actual_value = (
+                        actual.value
+                        if isinstance(actual, WorkerCommandAction)
+                        else actual
+                    )
+                    if actual_value != expected:
+                        raise RuntimeError(
+                            f"处置证据字段与命令不一致: {field_name}"
+                        )
+                existing = connection.execute(
+                    """
+                    SELECT * FROM worker_command_resolutions
+                    WHERE command_id=?
+                    """,
+                    (candidate.command_id,),
+                ).fetchone()
+                if existing is not None:
+                    resolution = self._row_to_resolution(existing)
+                    assert resolution is not None
+                    if (
+                        resolution.resolution_code
+                        != candidate.resolution_code
+                        or resolution.evidence != candidate.evidence
+                        or resolution.evidence_digest
+                        != candidate.evidence_digest
+                        or resolution.resolved_by
+                        != candidate.resolved_by
+                    ):
+                        raise RuntimeError("uncertain 命令已有不同的耐久处置证据")
+                    connection.execute("COMMIT")
+                    return resolution
+                connection.execute(
+                    """
+                    INSERT INTO worker_command_resolutions(
+                        command_id, resolution_code, evidence_json,
+                        evidence_digest,
+                        resolved_by, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        candidate.command_id,
+                        candidate.resolution_code,
+                        evidence_json,
+                        candidate.evidence_digest,
+                        candidate.resolved_by,
+                        self._iso(candidate.resolved_at),
+                    ),
+                )
+                row = connection.execute(
+                    """
+                    SELECT * FROM worker_command_resolutions
+                    WHERE command_id=?
+                    """,
+                    (candidate.command_id,),
+                ).fetchone()
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        resolution = self._row_to_resolution(row)
+        assert resolution is not None
+        return resolution
+
+    def get_command_resolution(
+        self,
+        command_id: str,
+    ) -> WorkerCommandResolution | None:
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                """
+                SELECT * FROM worker_command_resolutions
+                WHERE command_id=?
+                """,
+                (command_id.strip(),),
+            ).fetchone()
+        return self._row_to_resolution(row)
+
+    def list_unresolved_write_commands(
+        self,
+        *,
+        broker: str,
+        environment: str,
+        account: str,
+    ) -> list[WorkerCommand]:
+        """Return writes that still make the route unsafe for new exposure."""
+        placeholders = ",".join("?" for _ in _WRITE_ACTION_VALUES)
+        with self._lock, self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT command.*
+                FROM worker_commands command
+                LEFT JOIN worker_command_resolutions resolution
+                  ON resolution.command_id=command.id
+                WHERE command.broker=?
+                  AND command.environment=?
+                  AND command.account=?
+                  AND command.action IN ({placeholders})
+                  AND (
+                    command.status IN ('pending', 'running')
+                    OR (
+                      command.status='uncertain'
+                      AND resolution.command_id IS NULL
+                    )
+                  )
+                ORDER BY command.created_at ASC, command.id ASC
+                """,
+                (
+                    broker.strip().lower(),
+                    environment.strip().lower(),
+                    account.strip(),
+                    *_WRITE_ACTION_VALUES,
+                ),
+            ).fetchall()
+        return [
+            command
+            for row in rows
+            if (command := self._row_to_command(row)) is not None
+        ]
+
+    @staticmethod
     def _validate_ttl(ttl_seconds: int) -> int:
         ttl = int(ttl_seconds)
         if not 5 <= ttl <= 300:
@@ -613,6 +920,37 @@ class WorkerStore:
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
+                unresolved = connection.execute(
+                    f"""
+                    SELECT command.id
+                    FROM worker_commands command
+                    LEFT JOIN worker_command_resolutions resolution
+                      ON resolution.command_id=command.id
+                    WHERE command.broker=?
+                      AND command.environment=?
+                      AND command.account=?
+                      AND command.action IN ({
+                          ",".join("?" for _ in _WRITE_ACTION_VALUES)
+                      })
+                      AND (
+                        command.status IN ('pending', 'running')
+                        OR (
+                          command.status='uncertain'
+                          AND resolution.command_id IS NULL
+                        )
+                      )
+                    LIMIT 1
+                    """,
+                    (
+                        lease.broker,
+                        lease.environment,
+                        lease.account,
+                        *_WRITE_ACTION_VALUES,
+                    ),
+                ).fetchone()
+                if unresolved is not None:
+                    connection.execute("COMMIT")
+                    return None
                 current = connection.execute(
                     """
                     SELECT * FROM worker_new_risk_lease
@@ -757,7 +1095,8 @@ class WorkerStore:
                     """
                     UPDATE worker_commands
                     SET status='failed', finished_at=?, failure_code=?
-                    WHERE status='pending' AND action='submit'
+                    WHERE status='pending'
+                      AND action IN ('submit', 'set_leverage')
                       AND new_risk_lease_id=?
                       AND broker=? AND environment=? AND account=?
                     """,

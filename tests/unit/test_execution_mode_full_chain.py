@@ -8,12 +8,17 @@ import pytest
 
 from pa_agent.config.settings import Settings
 from pa_agent.execution.controller import ExecutionController
+from pa_agent.execution.credentials import account_identity_fingerprint
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.okx_adapter import OkxAdapter
+from pa_agent.execution.plan_builder import execution_route_fingerprint
 from pa_agent.execution.service import ExecutionService
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker import ExecutionWorker, WorkerNewRiskAuthority
-from pa_agent.execution.worker_protocol import WorkerCommandStatus
+from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    WorkerCommandStatus,
+)
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.records.schema import AnalysisRecord
 from pa_agent.risk.sizing import calculate_risk_size
@@ -77,6 +82,101 @@ def _run_worker_command(worker: ExecutionWorker, command) -> None:
     assert finished is not None
     assert finished.id == command.id
     assert finished.status is WorkerCommandStatus.SUCCEEDED
+
+
+def test_set_leverage_uses_controller_worker_service_adapter_chain(
+    tmp_path,
+):
+    controller_settings = _settings(
+        entry_mode="limit_with_slippage",
+        exit_mode="limit_with_slippage",
+        atr=Decimal("2"),
+        quantity=Decimal("20"),
+    )
+    worker_settings = Settings()
+    worker_settings.execution.enabled = False
+    worker_settings.execution.selected_broker = "longbridge"
+    worker_settings.execution.longbridge.instrument = "700.HK"
+    execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
+    worker_store = WorkerStore(tmp_path / "control.sqlite3")
+    worker_id = "worker-leverage-chain"
+    authority = WorkerNewRiskAuthority(worker_store, worker_id)
+    client = FakeOkxClient()
+    client.simulated = True
+    adapter = OkxAdapter(client, margin_mode="cross")
+    service = ExecutionService(
+        settings=worker_settings,
+        pending_writer=None,
+        store=execution_store,
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
+        leverage_adapter_factory=lambda _command: adapter,
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+        new_risk_authorizer=authority.is_authorized,
+        new_risk_revoker=lambda: worker_store.revoke_current_new_risk_lease(
+            failure_code="service_disarmed",
+        ),
+    )
+    worker = ExecutionWorker(
+        store=worker_store,
+        service=service,
+        settings=worker_settings,
+        lock_path=tmp_path / "worker.lock",
+        worker_id=worker_id,
+        new_risk_authority=authority,
+    )
+    controller = ExecutionController(
+        settings=controller_settings,
+        pending_writer=_PendingWriter(tmp_path / "unused.json"),
+        store=execution_store,
+        worker_store=worker_store,
+        worker_launcher=lambda: None,
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+    )
+    parameters = SetLeverageParameters(
+        analysis_digest="a" * 64,
+        config_fingerprint=execution_route_fingerprint(
+            controller_settings,
+            "okx",
+        ),
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage=Decimal("5"),
+        target_leverage=Decimal("10"),
+        required_quantity=Decimal("20"),
+        entry_price=Decimal("4000"),
+        expected_account_identity=account_identity_fingerprint(
+            "okx",
+            "demo",
+            "1001",
+            "1001",
+            "0",
+        ),
+        okx_api_base_url="https://www.okx.com",
+    )
+
+    worker.start()
+    try:
+        controller.arm("启用模拟交易")
+        command = controller.set_leverage(parameters)
+        _run_worker_command(worker, command)
+    finally:
+        worker.close()
+
+    finished = worker_store.get_command(command.id)
+    assert finished.result.confirmed_leverage == Decimal("10")
+    assert finished.result.confirmed_max_size == Decimal("30")
+    assert len(
+        [call for call in client.calls if call[0] == "set_leverage"]
+    ) == 1
 
 
 def _reconcile(

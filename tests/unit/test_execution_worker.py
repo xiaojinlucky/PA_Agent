@@ -20,6 +20,8 @@ from pa_agent.execution.models import (
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker import ExecutionWorker, WorkerAlreadyRunning
 from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    SetLeverageResult,
     WorkerCommandAction,
     WorkerCommandStatus,
     WorkerState,
@@ -46,6 +48,7 @@ class _FakeService:
         self.reloads: list[tuple[object, bool]] = []
         self.reconcile_entered = threading.Event()
         self.reconcile_release: threading.Event | None = None
+        self.leverage_reconcile_result = None
 
     def _fail(self, name: str) -> None:
         failure = self.failures.get(name)
@@ -66,6 +69,35 @@ class _FakeService:
     def submit(self, execution_id: str):
         self.calls.append(("submit", execution_id))
         self._fail("submit")
+
+    def set_leverage(self, command):
+        self.calls.append(("set_leverage", command.parameters))
+        self._fail("set_leverage")
+        return SetLeverageResult(
+            instrument=command.parameters.instrument,
+            confirmed_leverage=command.parameters.target_leverage,
+            confirmed_max_size=command.parameters.required_quantity,
+            broker_position_count=0,
+            broker_pending_order_count=0,
+            broker_pending_algo_order_count=0,
+            account_identity=command.parameters.expected_account_identity,
+            confirmed_at=datetime.now(UTC),
+        )
+
+    def reconcile_leverage(self, command):
+        self.calls.append(("reconcile_leverage", command.parameters))
+        if self.leverage_reconcile_result is not None:
+            return self.leverage_reconcile_result
+        return SetLeverageResult(
+            instrument=command.parameters.instrument,
+            confirmed_leverage=command.parameters.target_leverage,
+            confirmed_max_size=command.parameters.required_quantity,
+            broker_position_count=0,
+            broker_pending_order_count=0,
+            broker_pending_algo_order_count=0,
+            account_identity=command.parameters.expected_account_identity,
+            confirmed_at=datetime.now(UTC),
+        )
 
     def cancel_entry(self, execution_id: str):
         self.calls.append(("cancel_entry", execution_id))
@@ -118,6 +150,23 @@ def _plan(execution_id: str = "execution-one") -> ExecutionPlan:
         config_fingerprint=f"fingerprint-{execution_id}",
         okx_api_base_url="https://www.okx.com",
         okx_margin_mode="cross",
+    )
+
+
+def _leverage_parameters() -> SetLeverageParameters:
+    return SetLeverageParameters(
+        analysis_digest="a" * 64,
+        config_fingerprint="fingerprint-execution-one",
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage=Decimal("5"),
+        target_leverage=Decimal("10"),
+        required_quantity=Decimal("20"),
+        entry_price=Decimal("4000"),
+        expected_account_identity="b" * 64,
+        okx_api_base_url="https://www.okx.com",
     )
 
 
@@ -450,6 +499,120 @@ def test_worker_dispatches_all_commands_with_bound_reason(tmp_path):
     ) in service.calls
     assert ("refresh_account", "execution-one") in service.calls
     assert service.calls.count(("reconcile",)) == 2
+
+
+def test_worker_persists_set_leverage_readback_without_execution_record(
+    tmp_path,
+):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        command, created = store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            new_risk_lease_id=lease.lease_id,
+            parameters=_leverage_parameters(),
+        )
+        assert created is True
+
+        finished = worker.run_once()
+    finally:
+        worker.close()
+
+    assert finished.id == command.id
+    assert finished.status is WorkerCommandStatus.SUCCEEDED
+    assert finished.result.confirmed_leverage == Decimal("10")
+    assert finished.result.confirmed_max_size == Decimal("20")
+    assert service.calls.count(
+        ("set_leverage", _leverage_parameters())
+    ) == 1
+
+
+def test_worker_marks_set_leverage_unknown_and_never_replays(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        service.failures["set_leverage"] = RuntimeError(
+            "readback unavailable"
+        )
+        command, _ = store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            new_risk_lease_id=lease.lease_id,
+            parameters=_leverage_parameters(),
+        )
+
+        first = worker.run_once()
+        second = worker.run_once()
+    finally:
+        worker.close()
+
+    assert first.id == command.id
+    assert first.status is WorkerCommandStatus.UNCERTAIN
+    assert second is None
+    assert len(
+        [call for call in service.calls if call[0] == "set_leverage"]
+    ) == 1
+
+
+def test_worker_restart_resolves_unknown_leverage_by_readback_only(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        service.failures["set_leverage"] = RuntimeError(
+            "readback unavailable"
+        )
+        command, _ = store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            new_risk_lease_id=lease.lease_id,
+            parameters=_leverage_parameters(),
+        )
+        assert worker.run_once().status is WorkerCommandStatus.UNCERTAIN
+    finally:
+        worker.close()
+
+    restarted = ExecutionWorker(
+        store=store,
+        service=service,
+        lock_path=tmp_path / "execution.worker.lock",
+        worker_id="worker-restarted",
+        heartbeat_interval_seconds=0.02,
+    )
+    restarted.start()
+    try:
+        resolution = store.get_command_resolution(command.id)
+        heartbeat = store.get_heartbeat(restarted.worker_id)
+    finally:
+        restarted.close()
+
+    assert resolution.resolution_code == (
+        "confirmed_applied_by_leverage_readback"
+    )
+    assert resolution.evidence.confirmed_leverage == Decimal("10")
+    assert heartbeat.state is WorkerState.RUNNING
+    assert len(
+        [call for call in service.calls if call[0] == "set_leverage"]
+    ) == 1
+    assert len(
+        [
+            call
+            for call in service.calls
+            if call[0] == "reconcile_leverage"
+        ]
+    ) == 1
 
 
 def test_exception_classification_and_masked_logging(tmp_path, caplog):

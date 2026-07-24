@@ -25,6 +25,8 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.worker_protocol import (
+    SetLeverageResult,
+    SetLeverageResolutionEvidence,
     WorkerCommand,
     WorkerCommandAction,
     WorkerCommandStatus,
@@ -35,11 +37,18 @@ from pa_agent.execution.worker_store import WorkerStore
 _WRITE_ACTIONS = frozenset(
     {
         WorkerCommandAction.SUBMIT,
+        WorkerCommandAction.SET_LEVERAGE,
         WorkerCommandAction.CANCEL_ENTRY,
         WorkerCommandAction.REQUEST_EXIT,
     }
 )
-_EXECUTION_ACTIONS = _WRITE_ACTIONS
+_EXECUTION_ACTIONS = frozenset(
+    {
+        WorkerCommandAction.SUBMIT,
+        WorkerCommandAction.CANCEL_ENTRY,
+        WorkerCommandAction.REQUEST_EXIT,
+    }
+)
 _DEFINITELY_NOT_WRITTEN = (
     BrokerRejected,
     LiveTradingDisabled,
@@ -103,11 +112,18 @@ class WorkerNewRiskAuthority:
 
     def is_authorized(self, plan, effective_account: str) -> bool:
         command = getattr(self._local, "command", None)
-        if (
-            command is None
-            or command.action is not WorkerCommandAction.SUBMIT
-            or command.execution_id != plan.id
-        ):
+        if command is None:
+            return False
+        if command.action is WorkerCommandAction.SUBMIT:
+            if command.execution_id != plan.id:
+                return False
+        elif command.action is WorkerCommandAction.SET_LEVERAGE:
+            if (
+                command.parameters is None
+                or command.parameters.analysis_digest != plan.id
+            ):
+                return False
+        else:
             return False
         heartbeat = self._store.get_heartbeat(self._worker_id)
         if (
@@ -409,6 +425,7 @@ class ExecutionWorker:
             disarm = getattr(self.service, "disarm", None)
             if disarm is not None:
                 disarm(revoke_external=False)
+            self._resolve_uncertain_leverage_commands()
             self._started = True
             self._start_heartbeat_thread()
             try:
@@ -420,12 +437,108 @@ class ExecutionWorker:
                     last_error_code=type(exc).__name__[:128],
                 )
             else:
-                self._set_heartbeat(WorkerState.RUNNING)
+                unresolved = self._unresolved_write_commands()
+                self._set_heartbeat(
+                    (
+                        WorkerState.NEEDS_ATTENTION
+                        if unresolved
+                        else WorkerState.RUNNING
+                    ),
+                    last_error_code=(
+                        "unresolved_broker_write"
+                        if unresolved
+                        else ""
+                    ),
+                )
         except Exception:
             self._started = False
             self._stop_heartbeat_thread()
             self._file_lock.release()
             raise
+
+    def _unresolved_write_commands(self) -> list[WorkerCommand]:
+        return [
+            command
+            for command in self.store.list_commands()
+            if command.action in _WRITE_ACTIONS
+            and command.status
+            in {
+                WorkerCommandStatus.PENDING,
+                WorkerCommandStatus.RUNNING,
+                WorkerCommandStatus.UNCERTAIN,
+            }
+            and (
+                command.status is not WorkerCommandStatus.UNCERTAIN
+                or self.store.get_command_resolution(command.id) is None
+            )
+        ]
+
+    def _resolve_uncertain_leverage_commands(self) -> None:
+        for command in self.store.list_commands():
+            if (
+                command.action is not WorkerCommandAction.SET_LEVERAGE
+                or command.status is not WorkerCommandStatus.UNCERTAIN
+                or self.store.get_command_resolution(command.id) is not None
+                or command.parameters is None
+            ):
+                continue
+            try:
+                readback = self.service.reconcile_leverage(command)
+                parameters = command.parameters
+                if (
+                    readback.confirmed_leverage
+                    == parameters.target_leverage
+                    and readback.confirmed_max_size
+                    >= parameters.required_quantity
+                ):
+                    resolution_code = (
+                        "confirmed_applied_by_leverage_readback"
+                    )
+                elif (
+                    readback.confirmed_leverage
+                    == parameters.current_leverage
+                ):
+                    resolution_code = (
+                        "confirmed_not_applied_by_leverage_readback"
+                    )
+                else:
+                    continue
+                evidence = SetLeverageResolutionEvidence(
+                    analysis_digest=parameters.analysis_digest,
+                    command_action=command.action.value,
+                    command_failure_code=command.failure_code,
+                    broker=command.broker,
+                    environment=command.environment,
+                    account=command.account,
+                    instrument=parameters.instrument,
+                    target_leverage=parameters.target_leverage,
+                    confirmed_leverage=readback.confirmed_leverage,
+                    required_quantity=parameters.required_quantity,
+                    confirmed_max_size=readback.confirmed_max_size,
+                    active_execution_count=0,
+                    new_risk_lease_present=False,
+                    broker_position_count=(
+                        readback.broker_position_count
+                    ),
+                    broker_pending_order_count=(
+                        readback.broker_pending_order_count
+                    ),
+                    broker_pending_algo_order_count=(
+                        readback.broker_pending_algo_order_count
+                    ),
+                    broker_account_identity_digest=(
+                        readback.account_identity
+                    ),
+                    observed_at=readback.confirmed_at,
+                )
+                self.store.resolve_uncertain_command(
+                    command.id,
+                    resolution_code=resolution_code,
+                    evidence=evidence,
+                    resolved_by=f"worker:{self.worker_id}",
+                )
+            except Exception as exc:  # noqa: BLE001
+                self._log_failure(command.id, exc)
 
     def _require_started(self) -> None:
         if not self._started:
@@ -456,10 +569,11 @@ class ExecutionWorker:
             raise _CommandRejected("execution_route_mismatch")
         return record
 
-    def _require_submit_lease(
+    def _require_new_risk_lease(
         self,
         command: WorkerCommand,
-        record: Any,
+        *,
+        config_fingerprint: str,
     ) -> None:
         kwargs = self._supported_kwargs(
             self.store.is_new_risk_authorized,
@@ -467,7 +581,7 @@ class ExecutionWorker:
             environment=command.environment,
             account=command.account,
             worker_id=self.worker_id,
-            config_fingerprint=record.plan.config_fingerprint,
+            config_fingerprint=config_fingerprint,
             requester=command.requester,
         )
         authorized = self.store.is_new_risk_authorized(
@@ -477,23 +591,40 @@ class ExecutionWorker:
         if not authorized:
             raise _CommandRejected("new_risk_not_authorized")
 
-    def _dispatch(self, command: WorkerCommand) -> str:
+    def _dispatch(
+        self,
+        command: WorkerCommand,
+    ) -> tuple[str, SetLeverageResult | None]:
         record = None
         if command.action in _EXECUTION_ACTIONS:
             record = self._load_execution(command)
         if command.action is WorkerCommandAction.SUBMIT:
-            self._require_submit_lease(command, record)
+            self._require_new_risk_lease(
+                command,
+                config_fingerprint=record.plan.config_fingerprint,
+            )
             result = self.service.submit(command.execution_id)
             self._validate_write_result(command.action, result)
+            structured_result = None
+        elif command.action is WorkerCommandAction.SET_LEVERAGE:
+            if command.parameters is None:
+                raise _CommandRejected("set_leverage_parameters_missing")
+            self._require_new_risk_lease(
+                command,
+                config_fingerprint=command.parameters.config_fingerprint,
+            )
+            structured_result = self.service.set_leverage(command)
         elif command.action is WorkerCommandAction.CANCEL_ENTRY:
             result = self.service.cancel_entry(command.execution_id)
             self._validate_write_result(command.action, result)
+            structured_result = None
         elif command.action is WorkerCommandAction.REQUEST_EXIT:
             result = self.service.request_exit(
                 command.execution_id,
                 reason=command.reason_code,
             )
             self._validate_write_result(command.action, result)
+            structured_result = None
         elif command.action is WorkerCommandAction.REFRESH_ACCOUNT:
             if command.execution_id:
                 self._load_execution(command)
@@ -537,11 +668,13 @@ class ExecutionWorker:
                     raise _CommandRejected(
                         "account_refresh_route_mismatch"
                     )
+            structured_result = None
         elif command.action is WorkerCommandAction.RECONCILE:
             self._run_reconcile()
+            structured_result = None
         else:  # pragma: no cover - enum validation normally makes this unreachable.
             raise _CommandRejected("unsupported_action")
-        return f"{command.action.value}_completed"
+        return f"{command.action.value}_completed", structured_result
 
     @staticmethod
     def _validate_write_result(
@@ -647,10 +780,14 @@ class ExecutionWorker:
         try:
             if (
                 reload_error is not None
-                and command.action is WorkerCommandAction.SUBMIT
+                and command.action
+                in {
+                    WorkerCommandAction.SUBMIT,
+                    WorkerCommandAction.SET_LEVERAGE,
+                }
             ):
                 raise _CommandRejected("settings_reload_failed")
-            result_code = self._dispatch(command)
+            result_code, structured_result = self._dispatch(command)
         except Exception as exc:  # noqa: BLE001
             self._log_failure(command.id, exc)
             status = self._failure_status(command.action, exc)
@@ -696,6 +833,7 @@ class ExecutionWorker:
             worker_id=self.worker_id,
             status=WorkerCommandStatus.SUCCEEDED,
             result_code=result_code,
+            result=structured_result,
         )
         self._set_heartbeat(
             (

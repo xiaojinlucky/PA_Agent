@@ -58,6 +58,8 @@ def test_broker_maximum_insufficient_for_risk_target_blocks_new_risk():
         _calculate(max_sz="10")
 
     assert exc.value.code == "max_size_exceeded"
+    assert exc.value.required_size > exc.value.maximum_size
+    assert exc.value.maximum_size == Decimal("10")
 
 
 @pytest.mark.parametrize(

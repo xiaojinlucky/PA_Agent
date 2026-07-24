@@ -16,11 +16,14 @@ from pa_agent.execution.models import (
     ExecutionState,
     utc_now_iso,
 )
+from pa_agent.execution.plan_builder import execution_route_fingerprint
 from pa_agent.execution.service import ExecutionService
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker import ExecutionWorker, WorkerNewRiskAuthority
 from pa_agent.execution.worker_protocol import (
     WorkerCommandAction,
+    SetLeverageParameters,
+    WorkerCommandResolutionEvidence,
     WorkerCommandStatus,
     WorkerState,
 )
@@ -452,6 +455,88 @@ def test_worker_restart_invalidates_existing_lease(
     )
 
     assert controller.is_armed is False
+
+
+def test_unresolved_broker_write_blocks_rearm_until_durable_resolution(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, _settings_obj, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    execution = controller.prepare_analysis(record)
+    command = controller.submit(execution.id)
+    assert worker_store.claim_next(worker_id="worker-a").id == command.id
+    worker_store.recover_inflight(failure_code="worker_restarted")
+
+    assert controller.is_armed is False
+    controller.disarm()
+    with pytest.raises(LiveTradingDisabled, match="未解决"):
+        controller.arm("启用模拟交易")
+
+    worker_store.resolve_uncertain_command(
+        command.id,
+        resolution_code="confirmed_not_written",
+        evidence=WorkerCommandResolutionEvidence(
+            execution_id=command.execution_id,
+            command_action=command.action.value,
+            command_failure_code="worker_restarted",
+            broker=command.broker,
+            environment=command.environment,
+            account=command.account,
+            instrument=execution.plan.instrument,
+            execution_state="canceled",
+            broker_order_id_present=False,
+            client_order_id_present=False,
+            filled_quantity=Decimal("0"),
+            event_kinds=("plan_created",),
+            active_execution_count=0,
+            new_risk_lease_present=False,
+            broker_position_count=0,
+            broker_pending_order_count=0,
+            broker_pending_algo_order_count=0,
+            broker_account_identity_digest="d" * 64,
+            observed_at=datetime(2026, 7, 24, tzinfo=UTC),
+        ),
+        resolved_by="operator-audit",
+    )
+    controller.arm("启用模拟交易")
+
+    assert controller.is_armed is True
+
+
+def test_controller_enqueues_strict_demo_leverage_command_under_same_lease(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, _record_obj = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    parameters = SetLeverageParameters(
+        analysis_digest="a" * 64,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage=Decimal("5"),
+        target_leverage=Decimal("10"),
+        required_quantity=Decimal("20"),
+        entry_price=Decimal("4000"),
+        expected_account_identity="b" * 64,
+        okx_api_base_url="https://www.okx.com",
+    )
+
+    command = controller.set_leverage(parameters)
+
+    assert command.action is WorkerCommandAction.SET_LEVERAGE
+    assert command.parameters == parameters
+    assert command.new_risk_lease_id
+    assert worker_store.get_command(command.id) == command
 
 
 def test_reload_settings_revokes_lease_and_ready_plan_can_expire_locally(

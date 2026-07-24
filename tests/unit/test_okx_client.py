@@ -255,6 +255,100 @@ def test_leverage_info_uses_read_only_private_endpoint():
     )
 
 
+def test_max_order_size_can_evaluate_one_candidate_leverage():
+    transport = FakeTransport(
+        [_response({"code": "0", "data": [{"maxBuy": "120000"}], "msg": ""})]
+    )
+
+    row = _client(transport).max_order_size(
+        instrument="XAU-USDT-SWAP",
+        trade_mode="cross",
+        price="4000",
+        leverage="25",
+    )
+
+    assert row["maxBuy"] == "120000"
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/account/max-size"
+        "?instId=XAU-USDT-SWAP&leverage=25&px=4000&tdMode=cross"
+    )
+
+
+def test_leverage_adjustment_info_uses_official_read_only_estimate_endpoint():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [
+                        {
+                            "estMaxAmt": "120000",
+                            "existOrd": False,
+                            "maxLever": "50",
+                            "minLever": "0.01",
+                        }
+                    ],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+
+    row = _client(transport).leverage_adjustment_info(
+        instrument_type="SWAP",
+        margin_mode="cross",
+        leverage="25",
+        instrument="XAU-USDT-SWAP",
+    )
+
+    assert row["maxLever"] == "50"
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/account/adjust-leverage-info"
+        "?instId=XAU-USDT-SWAP&instType=SWAP&lever=25"
+        "&mgnMode=cross&posSide=net"
+    )
+
+
+def test_set_leverage_uses_private_post_with_exact_cross_net_body():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "XAU-USDT-SWAP",
+                            "lever": "25",
+                            "mgnMode": "cross",
+                            "posSide": "",
+                            "sCode": "0",
+                        }
+                    ],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+
+    row = _client(transport, simulated=True).set_leverage(
+        instrument="XAU-USDT-SWAP",
+        margin_mode="cross",
+        leverage="25",
+    )
+
+    call = transport.calls[0]
+    assert row["lever"] == "25"
+    assert call["method"] == "POST"
+    assert call["url"].endswith("/api/v5/account/set-leverage")
+    assert json.loads(call["body"]) == {
+        "instId": "XAU-USDT-SWAP",
+        "lever": "25",
+        "mgnMode": "cross",
+    }
+    assert call["headers"]["x-simulated-trading"] == "1"
+
+
 def test_account_bills_read_all_pages_with_bill_id_cursor():
     first_page = [
         {

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from decimal import Decimal
 from enum import StrEnum
 from typing import Literal
 
@@ -13,6 +14,7 @@ ExecutionEnvironment = Literal["demo", "live"]
 
 class WorkerCommandAction(StrEnum):
     SUBMIT = "submit"
+    SET_LEVERAGE = "set_leverage"
     CANCEL_ENTRY = "cancel_entry"
     REQUEST_EXIT = "request_exit"
     REFRESH_ACCOUNT = "refresh_account"
@@ -25,6 +27,248 @@ class WorkerCommandStatus(StrEnum):
     SUCCEEDED = "succeeded"
     FAILED = "failed"
     UNCERTAIN = "uncertain"
+
+
+class SetLeverageParameters(BaseModel):
+    """Immutable deterministic inputs for one OKX leverage adjustment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_digest: str = Field(min_length=64, max_length=64)
+    config_fingerprint: str = Field(min_length=1, max_length=256)
+    instrument: str = Field(min_length=1, max_length=128)
+    direction: Literal["long", "short"]
+    margin_mode: Literal["cross"]
+    position_mode: Literal["net_mode"]
+    current_leverage: Decimal = Field(gt=0)
+    target_leverage: Decimal = Field(gt=0, le=125)
+    required_quantity: Decimal = Field(gt=0)
+    entry_price: Decimal = Field(gt=0)
+    expected_account_identity: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    okx_api_base_url: str = Field(min_length=1, max_length=512)
+
+    @field_validator(
+        "analysis_digest",
+        "config_fingerprint",
+        "instrument",
+        "expected_account_identity",
+        "okx_api_base_url",
+        mode="before",
+    )
+    @classmethod
+    def _strip_leverage_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @model_validator(mode="after")
+    def _validate_leverage_increase(self) -> SetLeverageParameters:
+        if self.target_leverage <= self.current_leverage:
+            raise ValueError("目标杠杆必须高于已确认的当前杠杆")
+        if not self.okx_api_base_url.startswith("https://"):
+            raise ValueError("OKX API 地址必须使用 HTTPS")
+        return self
+
+
+class SetLeverageResult(BaseModel):
+    """Broker read-back proving the leverage change and resulting capacity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    instrument: str = Field(min_length=1, max_length=128)
+    confirmed_leverage: Decimal = Field(gt=0)
+    confirmed_max_size: Decimal = Field(gt=0)
+    broker_position_count: int = Field(ge=0)
+    broker_pending_order_count: int = Field(ge=0)
+    broker_pending_algo_order_count: int = Field(ge=0)
+    account_identity: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    confirmed_at: datetime
+
+    @field_validator("instrument", "account_identity", mode="before")
+    @classmethod
+    def _strip_result_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("confirmed_at")
+    @classmethod
+    def _normalise_confirmed_at(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+
+class WorkerCommandResolutionEvidence(BaseModel):
+    """Sanitized facts used to resolve one uncertain broker write."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    execution_id: str = Field(min_length=1, max_length=256)
+    command_action: Literal[
+        "submit",
+        "set_leverage",
+        "cancel_entry",
+        "request_exit",
+    ]
+    command_failure_code: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    broker: BrokerName
+    environment: ExecutionEnvironment
+    account: str = Field(min_length=1, max_length=256)
+    instrument: str = Field(min_length=1, max_length=128)
+    execution_state: Literal["blocked", "canceled", "rejected", "closed"]
+    broker_order_id_present: bool
+    client_order_id_present: bool
+    filled_quantity: Decimal = Field(ge=0)
+    event_kinds: tuple[str, ...] = Field(min_length=1, max_length=64)
+    active_execution_count: int = Field(ge=0)
+    new_risk_lease_present: bool
+    broker_position_count: int = Field(ge=0)
+    broker_pending_order_count: int = Field(ge=0)
+    broker_pending_algo_order_count: int = Field(ge=0)
+    broker_account_identity_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    observed_at: datetime
+
+    @field_validator(
+        "execution_id",
+        "command_failure_code",
+        "account",
+        "instrument",
+        "broker_account_identity_digest",
+        mode="before",
+    )
+    @classmethod
+    def _strip_evidence_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("event_kinds", mode="before")
+    @classmethod
+    def _normalise_event_kinds(cls, value: object) -> object:
+        if not isinstance(value, (list, tuple)):
+            return value
+        return tuple(
+            item.strip() if isinstance(item, str) else item
+            for item in value
+        )
+
+    @field_validator("event_kinds")
+    @classmethod
+    def _validate_event_kinds(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if any(
+            not item
+            or len(item) > 128
+            or not all(character.isalnum() or character in "_.:-" for character in item)
+            for item in value
+        ):
+            raise ValueError("事件类型必须是简短安全代码")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def _normalise_observed_at(cls, value: datetime) -> datetime:
+        return _utc(value)
+
+
+class SetLeverageResolutionEvidence(BaseModel):
+    """Read-back facts that settle one uncertain leverage write."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    analysis_digest: str = Field(min_length=64, max_length=64)
+    command_action: Literal["set_leverage"]
+    command_failure_code: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    broker: Literal["okx"]
+    environment: Literal["demo"]
+    account: str = Field(min_length=1, max_length=256)
+    instrument: str = Field(min_length=1, max_length=128)
+    target_leverage: Decimal = Field(gt=0)
+    confirmed_leverage: Decimal = Field(gt=0)
+    required_quantity: Decimal = Field(gt=0)
+    confirmed_max_size: Decimal = Field(gt=0)
+    active_execution_count: int = Field(ge=0)
+    new_risk_lease_present: bool
+    broker_position_count: int = Field(ge=0)
+    broker_pending_order_count: int = Field(ge=0)
+    broker_pending_algo_order_count: int = Field(ge=0)
+    broker_account_identity_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    observed_at: datetime
+
+    @field_validator(
+        "analysis_digest",
+        "command_failure_code",
+        "account",
+        "instrument",
+        "broker_account_identity_digest",
+        mode="before",
+    )
+    @classmethod
+    def _strip_leverage_evidence_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("observed_at")
+    @classmethod
+    def _normalise_leverage_observed_at(
+        cls,
+        value: datetime,
+    ) -> datetime:
+        return _utc(value)
+
+
+class WorkerCommandResolution(BaseModel):
+    """Durable proof that an uncertain broker write was explicitly resolved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    command_id: str = Field(min_length=1, max_length=128)
+    resolution_code: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[A-Za-z0-9_.:-]+$",
+    )
+    evidence: (
+        WorkerCommandResolutionEvidence
+        | SetLeverageResolutionEvidence
+    )
+    evidence_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    resolved_by: str = Field(min_length=1, max_length=128)
+    resolved_at: datetime
+
+    @field_validator(
+        "command_id",
+        "resolution_code",
+        "resolved_by",
+        mode="before",
+    )
+    @classmethod
+    def _strip_resolution_text(cls, value: object) -> object:
+        return value.strip() if isinstance(value, str) else value
+
+    @field_validator("resolved_at")
+    @classmethod
+    def _normalise_resolution_time(cls, value: datetime) -> datetime:
+        return _utc(value)
 
 
 class WorkerState(StrEnum):
@@ -59,6 +303,7 @@ class WorkerCommand(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9_.:-]*$",
     )
+    parameters: SetLeverageParameters | None = None
     status: WorkerCommandStatus = WorkerCommandStatus.PENDING
     worker_id: str = Field(default="", max_length=128)
     created_at: datetime
@@ -74,6 +319,7 @@ class WorkerCommand(BaseModel):
         max_length=128,
         pattern=r"^[A-Za-z0-9_.:-]*$",
     )
+    result: SetLeverageResult | None = None
 
     @field_validator(
         "id",
@@ -106,13 +352,28 @@ class WorkerCommand(BaseModel):
         if self.action is WorkerCommandAction.SUBMIT:
             if not self.new_risk_lease_id:
                 raise ValueError("submit 命令必须绑定 NEW_RISK 租约")
+        elif self.action is WorkerCommandAction.SET_LEVERAGE:
+            if not self.new_risk_lease_id:
+                raise ValueError("set_leverage 命令必须绑定 NEW_RISK 租约")
+            if self.execution_id:
+                raise ValueError("set_leverage 命令不得引用尚未创建的 execution")
         elif self.new_risk_lease_id:
-            raise ValueError("只有 submit 命令可以绑定 NEW_RISK 租约")
+            raise ValueError("只有新增风险命令可以绑定 NEW_RISK 租约")
         if self.action is WorkerCommandAction.REQUEST_EXIT:
             if not self.reason_code:
                 raise ValueError("request_exit 命令必须提供 reason_code")
         elif self.reason_code:
             raise ValueError("只有 request_exit 命令可以提供 reason_code")
+        if self.action is WorkerCommandAction.SET_LEVERAGE:
+            if self.parameters is None:
+                raise ValueError("set_leverage 命令必须提供严格参数")
+            if (
+                self.status is WorkerCommandStatus.SUCCEEDED
+                and self.result is None
+            ):
+                raise ValueError("成功的 set_leverage 命令必须保存回读结果")
+        elif self.parameters is not None or self.result is not None:
+            raise ValueError("只有 set_leverage 命令可以保存杠杆参数或结果")
         return self
 
 

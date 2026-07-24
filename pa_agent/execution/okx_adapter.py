@@ -31,6 +31,10 @@ from pa_agent.execution.order_modes import (
     apply_entry_atr_slippage,
     apply_exit_atr_slippage,
 )
+from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    SetLeverageResult,
+)
 
 
 def _decimal(value: object, *, default: Decimal | None = None) -> Decimal | None:
@@ -215,6 +219,163 @@ class OkxAdapter:
         del account_profile
         self._client.sync_server_time()
         return self._identity_from_config(plan, self._client.account_config())
+
+    @staticmethod
+    def _leverage_account_identity(
+        account_config: dict[str, Any],
+        *,
+        environment: str,
+    ) -> str:
+        uid = str(account_config.get("uid") or "").strip()
+        main_uid = str(account_config.get("mainUid") or "").strip()
+        raw_account_type = account_config.get("type")
+        account_type = (
+            "" if raw_account_type is None else str(raw_account_type).strip()
+        )
+        if not uid or not main_uid or not account_type:
+            raise PreflightError(
+                "OKX account/config 缺少 uid、mainUid 或账户类型"
+            )
+        return account_identity_fingerprint(
+            "okx",
+            environment,
+            uid,
+            main_uid,
+            account_type,
+        )
+
+    @staticmethod
+    def _direction_capacity(
+        row: dict[str, Any],
+        *,
+        direction: str,
+    ) -> Decimal:
+        field = "maxBuy" if direction == "long" else "maxSell"
+        return _positive_decimal(row.get(field), field)
+
+    def read_leverage_state(
+        self,
+        parameters: SetLeverageParameters,
+        *,
+        environment: str,
+    ) -> SetLeverageResult:
+        """Read account identity, exposure, leverage and current capacity."""
+        account_config = self._client.account_config()
+        account_identity = self._leverage_account_identity(
+            account_config,
+            environment=environment,
+        )
+        if account_identity != parameters.expected_account_identity:
+            raise PreflightError("OKX 实际账户身份与杠杆计划不一致")
+        if str(account_config.get("posMode") or "") != parameters.position_mode:
+            raise PreflightError("OKX 持仓模式与杠杆计划不一致")
+        if self._margin_mode != parameters.margin_mode:
+            raise PreflightError("OKX 保证金模式与杠杆计划不一致")
+        positions = self._client.positions(
+            instrument=parameters.instrument
+        )
+        position_count = sum(
+            1
+            for row in positions
+            if (
+            (_decimal(row.get("pos"), default=Decimal("0")) or Decimal("0"))
+            != 0
+            )
+        )
+        if position_count:
+            raise PreflightError("OKX 品种仍有仓位，禁止调整杠杆")
+        pending_orders = self._client.pending_orders(
+            instrument=parameters.instrument
+        )
+        if pending_orders:
+            raise PreflightError("OKX 品种仍有普通挂单，禁止调整杠杆")
+        pending_algo_count = 0
+        for order_type in (
+            "oco",
+            "conditional",
+            "trigger",
+            "move_order_stop",
+        ):
+            pending_algo = self._client.pending_algo_orders(
+                instrument=parameters.instrument,
+                order_type=order_type,
+            )
+            pending_algo_count += len(pending_algo)
+            if pending_algo:
+                raise PreflightError("OKX 品种仍有算法挂单，禁止调整杠杆")
+        leverage_rows = self._client.leverage_info(
+            instrument=parameters.instrument,
+            margin_mode=parameters.margin_mode,
+        )
+        leverage = next(
+            (
+                _positive_decimal(row.get("lever"), "当前杠杆")
+                for row in leverage_rows
+                if str(row.get("instId") or "") == parameters.instrument
+                and str(row.get("mgnMode") or "") == parameters.margin_mode
+            ),
+            None,
+        )
+        if leverage is None:
+            raise PreflightError("OKX 未返回当前品种杠杆")
+        capacity = self._direction_capacity(
+            self._client.max_order_size(
+                instrument=parameters.instrument,
+                trade_mode=parameters.margin_mode,
+                price=str(parameters.entry_price),
+            ),
+            direction=parameters.direction,
+        )
+        return SetLeverageResult(
+            instrument=parameters.instrument,
+            confirmed_leverage=leverage,
+            confirmed_max_size=capacity,
+            broker_position_count=position_count,
+            broker_pending_order_count=len(pending_orders),
+            broker_pending_algo_order_count=pending_algo_count,
+            account_identity=account_identity,
+            confirmed_at=datetime.now(UTC),
+        )
+
+    def set_leverage(
+        self,
+        parameters: SetLeverageParameters,
+        *,
+        environment: str,
+    ) -> SetLeverageResult:
+        """Set leverage once, then require authoritative leverage/capacity reads."""
+        before = self.read_leverage_state(
+            parameters,
+            environment=environment,
+        )
+        if before.confirmed_leverage != parameters.current_leverage:
+            raise PreflightError("OKX 当前杠杆已变化，旧杠杆计划失效")
+        if before.confirmed_max_size >= parameters.required_quantity:
+            raise PreflightError("OKX 当前容量已足够，无需调整杠杆")
+
+        self._write(
+            lambda: self._client.set_leverage(
+                instrument=parameters.instrument,
+                margin_mode=parameters.margin_mode,
+                leverage=str(parameters.target_leverage),
+            )
+        )
+
+        after = self.read_leverage_state(
+            parameters,
+            environment=environment,
+        )
+        if after.confirmed_leverage != parameters.target_leverage:
+            raise BrokerTransportError(
+                "OKX 杠杆写入后回读不一致",
+                write_may_have_reached=True,
+            )
+        if after.confirmed_max_size < parameters.required_quantity:
+            raise BrokerTransportError(
+                "OKX 杠杆写入后最大可开量仍不足",
+                write_may_have_reached=True,
+            )
+        return after
 
     @staticmethod
     def _trade_mode(plan: ExecutionPlan) -> str:
