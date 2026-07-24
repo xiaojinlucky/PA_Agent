@@ -2,6 +2,28 @@
 
 > **历史快照（截至 2026-07-22；不代表当前状态）**：本文件记录当时的发布、测试和运行验证。当前代码与 Git 基线以根目录 `CONTEXT.md`、`docs/CODEX_HANDOFF.md` 和最新 GitHub `main` 为准；本文件中的历史 SHA、测试数字和运行态只在各自时间点成立。
 
+## 2026-07-24 Demo-S 真实回归与运行反馈修复
+
+- 受控记录使用真实 OKX 5m→10m 已收盘快照、真实 ATR14、实时 USDT 权益/合约规格/最大可开数和真实 SupervisorGate；仍由 `ExecutionController → ExecutionWorker → ExecutionService → OkxAdapter` 执行，未直接写券商、未启用 Live。
+- execution `622b53fa-6d53-547f-ab4f-bf8ed3e2c9c6` 的入场限价单 `3770752241751908352` 为 `114344` 张，270 秒内成交 `0` 后由系统撤销并落为 `canceled`；这证明未成交时不静默切市价。
+- execution `cf351b86-9f24-59b5-9814-ab203e0fbb19` 的入场单 `3770781223721459712` 全成 `111596` 张，均价 `4052.1281972472131626`；两张 OCO `3770781689937571840`、`3770782168524435456` 各保护 `55798` 张；主动离场前两张保护均确认撤销，减仓单 `3770785337595486208` 全成 `111596` 张，均价 `4049.0276640739811485`。执行账本最终 `closed`、`remaining_quantity=0`、已实现盈亏 `-292.8682232087172257`。
+- 最终只读核验：XAU-USDT-SWAP 非零仓位 `0`、普通挂单 `0`、`conditional/oco/trigger/move_order_stop/iceberg/twap/chase/smart_iceberg` 八类算法挂单全部 `0`。这是当时的现场只读探针快照；本地执行账本可独立复核成交与关闭，但不把瞬时券商空单结果伪装成长期耐久事实。
+- 真实反馈修复：正常 `PENDING` 命令不再被 Worker 周期对账误判为未解决写入；受控 Demo-S 反推信号价，使适配器应用一次 `0.50×ATR14` 后的最终限价落到实时可成交参考价；监督与风险数量使用最终有效限价；离场等待扩展到 330 秒。后续对抗审查进一步要求监督数量与 Worker 提交数量精确相等，提交前任何改量都作废旧监督；风险定仓使用 USDT 权益，账户总权益只用于资金流/回撤；异常撤单后若竞态部分成交会切换为主动离场，execution 创建即关联 Campaign，重启保留最后完成 K 线。
+- 动态杠杆只读实证：两份自然记录在 20× 的 `maxBuy/maxSell=120000/120000`，25× 均降为 `55000/55000`，证明容量不单调；系统按硬门阻断并在最新状态中保存 `20x=120000 → 25x=55000`，没有猜测目标杠杆、没有截断风险数量。
+- AI 连续性修复：Codex CLI 候选不存在、版本探测临时超时、确定不可用三类语义分离；10 秒探测超时属于临时错误，只让当前 10m K 线记录失败并继续下一根。成功探测的绝对路径在客户端内缓存，登录和真实调用仍继续验证。
+- 定向验证：Campaign、Worker 并发、风险运行态、Codex 客户端和两阶段网络错误共 `121` 个测试通过、`0` 失败；项目 `.pytest_cache` 仍有既有 Windows 权限警告，但独立 `scratch` basetemp 下 pytest 退出码为 `0`。全量结果需以后续收口记录为准。
+
+## 2026-07-24 Worker v4、风险基线与历史不确定命令上线验收
+
+- 停机硬门：旧 Campaign 停止前，本地活动 execution、活动 Worker 命令、有效 `NEW_RISK` 租约、OKX Demo 非零仓位、普通挂单和八类算法挂单均为 0；没有撤销其他 GUI 会话租约，没有执行 Live 写入。
+- 生产库迁移：停止 Campaign 与 `PAAgentExecutionWorker` 后创建 `records/backups/execution-control-v1-before-v4-20260724-135141.sqlite3`；大小 61,440 字节，SHA-256 `1516981E36A8D16411C36326987669C6AAA40AD0BC299636A46B9829E9C392BF`，不可变只读 `integrity_check=ok`，与源库计数一致。新 Worker 在唯一锁下把控制库从 schema v1 迁移到 v4，保留 27 条历史命令、18 条心跳和全部历史 resolution。
+- 风险运行态：首次启动发现七天账单内有基线之前的 USDT、BTC、ETH、OKB 历史转入。修复后的首次基线只验证并保存最新账单 ID/时间边界，不把已经包含在当前总权益里的历史转账再次调整高水位；边界之后的新账单才分类。定向风险测试 15 个、Worker/Campaign/执行链回归 162 个均通过、0 失败。
+- 回撤事件证据：`submit()` 被持久风险停止阻断时，execution 进入 `BLOCKED`，`risk_runtime_blocked` 事件 payload 记录 `code`、`drawdown_fraction` 和 `adjusted_high_water`；回撤 60% / 高水位 1000 的定向断言与 Worker/Controller 回归共 69 项通过、0 失败。该阻断发生在券商预检和写入前。
+- 最终验证：非 Live 全量 1479 通过、31 失败；31 项与本轮开工前既有失败清单一致，均在旧预测 UI、严格/宽松校验、连续性、数据源切换、OpenClaw 和提示音范围。29 个本轮 Python 文件的 Ruff `E9/F`、`compileall pa_agent` 和 `git diff --check` 通过。
+- 生产重启：首次迁移后 Worker PID `49048` 成功建立风险基线。补齐回撤阻断事件审计字段后再次安全重启，Worker PID `48324` 自 `2026-07-24T06:16:53Z` 起连续更新心跳与 `last_successful_reconcile_at`。第二次启动首轮一次 `BrokerTransportError` 按工单 fail-safe 规则把 `kill_active` 置为 1；随后 `totalEq`、账单边界和回撤重新成功读取，但停止状态没有自动恢复。用户显式授权后，Controller 命令 `729d5331-37a5-434e-81e4-52d314ef1d92` 由 Worker 执行为 `succeeded / clear_drawdown_stop_completed`，重锚权益与高水位为 `78970.87234383462`、回撤为 0、`kill_active=false`；该控制命令未创建订单。
+- 历史不确定命令：命令 `686b6d0e-5c85-4430-a2d9-b9e069b76934` 关联 execution `8c0f83ab-fc6b-589e-8967-c4bd8f538015`，执行账本状态为 `canceled`，事件严格为 `plan_created → ready_expired`，无 client/broker order ID、无成交。使用当前 Demo 账户身份和券商只读证据确认非零仓位、普通挂单、八类算法挂单、活动 execution、有效租约均为 0，耐久裁决为 `confirmed_not_written_schema_validation`；未解决 uncertain 写入为 0，没有重提旧 READY。
+- Campaign 恢复：Campaign `0d239206-c7bc-436c-9944-23e9433e34d5` 已按 `OKX Demo / XAU-USDT-SWAP / 10m / min_trade_confidence=20 / extreme_aggressive` 启动；10m 来源为严格 OKX 5m 成对聚合，1h/4h 仍只作薄背景，进出场均为 `limit_with_slippage / 0.50 × ATR14`。本条只记录恢复后首根已收盘 10m K 线为真实 `blocked:no_order` 的历史验收快照；之后的受控 execution、Worker 并发竞态和 Campaign 运行态以更晚证据及现场探针为准，不能继续把这里的 `execution 0` 解释为当前状态。
+
 ## 2026-07-24 USDT 账户内换币验收与余额真值修复
 
 - 用户现场确认本次是其他资产换成 USDT/账户内转换。OKX Demo 只读证据：USDT `eq/cashBal/availBal=79041.2190279924`、`frozenBal=0`、账户 `totalEq=78976.40522916657`；最近换币账单为 `type=2/subType=1`、`instId=USDC-USDT`，时间 `2026-07-24T03:06:31.671Z`。分页读取 326 条 USDT 账单，识别 35 条内部换币；外部 `type=1/subType=11` 只有历史 `2026-07-17T08:04:08.320Z` 的 `5000 USDT`，没有把本次换币误记成外部资金流。
@@ -331,7 +353,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 ### 最终运行态边界
 
 - OKX Demo 只读回查：非零 `XAU-USDT-SWAP` 仓位 `0`、普通挂单 `0`、待生效 OCO `0`；本地活动 execution `0`、有效 `NEW_RISK` 租约 `0`。
-- 旧 Campaign 历史 execution 全部经耐久账本确认终态后归档；新 Campaign `52a4f507-a8f8-4975-b0bf-ddddf9ff901c` 已恢复为 `active`，固定配置为严格聚合 `10m / min_trade_confidence=20 / extreme_aggressive / Demo`。WinSW ExecutionWorker 已加载最终代码，心跳和最后成功对账正常。
+- 旧 Campaign 历史 execution 全部经耐久账本确认终态后归档；新 Campaign `52a4f507-a8f8-4975-b0bf-ddddf9ff901c` 已恢复为 `active`，固定配置为严格聚合 `10m / min_trade_confidence=20 / extreme_aggressive / Demo`。WinSW ExecutionWorker 心跳和最后成功对账正常，但 PID 536 启动早于后续动态杠杆/风险运行态工作区代码；这些后续能力尚未加载。
 - 共享环境已明确设置 `PA_AGENT_LIVE_TRADING_ENABLED=false`、`OKX_LIVE_ENABLED=false`，模拟门保持 `true`。本轮没有调用 Live 路由。
 - 本轮适配器、执行服务、Campaign 与生命周期定向回归：151 通过、0 失败。第一轮以无界面 Qt 平台运行完整 `not live` 套件，收集 1407 项：1376 通过、31 失败；本轮新增的 Worker 空账本账户刷新夹具、Campaign 单测误连私有预检和“历史 execution 仅终态才允许归档重启”均已通过。剩余 31 项位于本轮未修改的既有预测、严格/宽松校验、决策面板、连续性、数据源切换、OpenClaw 和音效范围，不能描述为全仓全绿。
 - 补充硬验收后再次运行当前工作区非 Live 全量：1335 项中 1315 通过、20 失败、0 跳过；20 项仍全部位于上述既有范围，新增工单测试无失败。工单指定的 23 文件套件为 398 通过、0 失败。
@@ -353,3 +375,19 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 多周期、GUI、MT5/OKX 数据源、Demo Campaign、提示词组定向测试：`107` 通过、`0` 失败；包含高周期结构/位置输出、GUI 同源读取、10m 路由、提示词残留硬闸检索和 Demo 真实路径接缝。
 - 新增提示词审计会失败于“高周期确认=高可靠性”“窗口共识才可评估三价”“只在多个窗口同时识别才可路由”等旧句式；第一次复跑暴露测试变量名错误，已修正后完整复跑通过，未把失败运行计入通过数量。
 - 未完成：完整原始资料逐篇人工语义审计、Session/成交量实验、日线背景、自然 PA 信号的策略绩效证明。本轮只证明代码与提示词契约，不证明盈利能力。
+
+## 2026-07-24 动态杠杆与风险运行态离线收口
+
+- 同一生产对象链已覆盖 `max_size_exceeded → 有界策略网格逐点容量读取 → SupervisorGate 放行 → Controller → Worker → Service → OkxAdapter 调杠杆与回读 → 原风险数量复算 → SUBMIT`；监督拒绝和 50% 回撤停止两条路径均证明券商杠杆写入与订单写入为 0。容量不单调、最大杠杆仍不足、监督证据被改写、POST 后回读不明、余额变化导致风险快照失效都保持硬阻断。
+- `WorkerStore` 目标 schema 为 v4：v1/v2 迁移保留历史命令和 resolution；v3→v4 增加任意 OKX 账单 ID、时间和最近扫描时间。旧外部转账自然滑出七天查询窗口时不会误触发停止；扫描真正中断满七天才失败关闭。动态杠杆与普通新增风险在券商 POST 前都刷新并执行同一资金流/回撤门。
+- 核心执行、动态杠杆、监督、Campaign、资金流和风险运行态 297 项通过、0 失败；八类 OKX 算法单的 uncertain 处置参数化测试 14 项通过、0 失败；Ruff `E9/F`、`compileall` 和 `git diff --check` 通过。非 Live 全量仍为既有 31 项失败，失败范围与本节改动无关，没有为全绿放宽交易逻辑。
+- 生产运行态已完成核心部署：迁移前硬门确认 Demo 非零仓位、普通挂单、八类算法单、活动 execution 和 `NEW_RISK` 租约均为 0；控制库一致性备份后由新 Worker 持锁从 schema v1 迁移到 v4。历史 submit 命令 `686b6d0e-...` 已用账户身份绑定的只读证据裁决为未写入，未解决 uncertain 写入为 0。Worker PID `48324` 已加载本节风险代码并连续成功对账；一次只读传输故障触发的 fail-safe 停止已按用户显式授权由 Worker 重锚解除。Campaign `0d239206-...` 持续运行真实 10m 分析。
+
+## 2026-07-24 监督数量完整性与最终运行态复验
+
+- 对抗审查发现真实 Demo-S `cf351b86-9f24-59b5-9814-ab203e0fbb19` 的监督数量为 `116289`，旧 Worker 提交前刷新后实际提交 `111596`。该笔实际风险未超限并已完整关闭，但它证明旧链允许 Worker 静默改写监督批准的数量。现已把提交前账户刷新拆成两种明确用途：账户总权益仅用于资金流和回撤闸门，`XAU-USDT-SWAP` 风险定仓使用结算币 USDT 权益；重新计算出的数量与监督冻结数量只要不精确相等，无论增加或减少，均以 `risk_sizing_changed_after_supervision` 阻断并要求重新监督。
+- 自然与受控监督快照现同时耐久保存阶段二信号价、`0.50×ATR14` 后的最终有效限价、止损、USDT 风险权益、10% 预算和技术数量。动态杠杆授权校验使用该有效限价；Demo-S 反推信号价，避免适配器再次应用 ATR 偏移。execution 在 `prepare_analysis()` 后立即关联 Campaign；Demo-S 结果同时返回监督数量与执行账本实际数量。撤单竞态若转成部分成交/持仓，清理循环会切换到一次主动离场并等待真实终态。
+- Campaign 重启继承 `last_completed_bar_ms`，不得重复分析或交易同一根已收盘 K 线。新 Campaign `7c462fdc-0574-4185-ad8c-1383bbeb77aa` 已证明从 `1784881800000` 继续到下一根 `1784882400000`，没有重复上一根；配置保持 `OKX Demo / XAU-USDT-SWAP / 10m / 20 / extreme_aggressive / entry+exit limit_with_slippage 0.50×ATR14`。
+- 当前受影响套件最终复跑：338 通过、0 失败。最终全量单元测试收集 1445 项：1425 通过、20 失败；20 项仍全部属于既有严格/宽松校验、预测、决策面板、连续性、数据源切换、OpenClaw 与音效契约，没有为全绿放宽交易逻辑。全量集成测试：19 通过、8 失败、3 跳过；8 项为 AkShare 真实联网、旧预测、旧决策面板和旧 `no_order` 严格校验范围。全部本轮 Python 文件 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。
+- 20×/25×/45× 的真实方向容量分别观测为 `120000/55000/28000`，证明 OKX Demo 容量对杠杆并不单调。最新自然计划所需 `441374/436449` 张均超过真实容量，因此仍硬阻断，不截断。错误证据会保存首个下降点，例如 `20x=120000 → 25x=55000`。
+- 2026-07-24 16:57（北京时间）OKX 账单端点再次返回 `50004`，风险运行态已按设计置为 `kill_active=true / risk_runtime_50004`。17:09 后 `last_bill_scan_at` 已连续前进，证明端点恢复；持久停写仍正确保持，Campaign/Worker 继续运行，活动 execution/命令/租约、仓位和挂单均为 0。只有用户明确授权 CLEAR 后才允许由唯一 Worker 重锚恢复新增风险，不能因接口恢复自动清除。

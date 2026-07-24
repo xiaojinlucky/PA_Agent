@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime, timedelta
@@ -9,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from filelock import FileLock
 from pydantic import ValidationError as PydanticValidationError
 
 from pa_agent.execution.errors import BrokerRejected, PreflightError
@@ -156,6 +158,7 @@ def _plan(execution_id: str = "execution-one") -> ExecutionPlan:
 def _leverage_parameters() -> SetLeverageParameters:
     return SetLeverageParameters(
         analysis_digest="a" * 64,
+        analysis_record_path="records/pending/analysis.json",
         config_fingerprint="fingerprint-execution-one",
         instrument="XAU-USDT-SWAP",
         direction="long",
@@ -163,10 +166,23 @@ def _leverage_parameters() -> SetLeverageParameters:
         position_mode="net_mode",
         current_leverage=Decimal("5"),
         target_leverage=Decimal("10"),
+        current_capacity=Decimal("10"),
+        target_capacity=Decimal("20"),
+        maximum_leverage=Decimal("10"),
+        maximum_capacity=Decimal("20"),
+        planning_method="bounded_sequential_policy_grid_v1",
+        policy_grid_step=Decimal("5"),
+        verified_grid=(
+            {"leverage": "5", "capacity": "10"},
+            {"leverage": "10", "capacity": "20"},
+        ),
         required_quantity=Decimal("20"),
         entry_price=Decimal("4000"),
         expected_account_identity="b" * 64,
         okx_api_base_url="https://www.okx.com",
+        supervisor_record_id="supervisor-record",
+        supervisor_record_path="records/supervisor/decision.json",
+        supervisor_record_digest="d" * 64,
     )
 
 
@@ -304,6 +320,81 @@ def test_stop_request_keeps_lock_until_inflight_command_finishes(tmp_path):
     worker.close()
     contender.start()
     contender.close()
+
+
+def test_v1_worker_schema_migrates_only_after_singleton_lock(tmp_path):
+    database = tmp_path / "execution.sqlite3"
+    execution_store = ExecutionStore(database)
+    execution_store.create(_plan())
+    with sqlite3.connect(database) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE worker_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO worker_meta(key, value)
+            VALUES ('worker_schema_version', '1');
+            CREATE TABLE worker_commands (
+                id TEXT PRIMARY KEY,
+                scope_key TEXT NOT NULL,
+                action TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                requester TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                account TEXT NOT NULL,
+                new_risk_lease_id TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                status TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_code TEXT NOT NULL,
+                failure_code TEXT NOT NULL
+            );
+            """
+        )
+    store = WorkerStore(database)
+    lock_path = tmp_path / "execution.worker.lock"
+    worker = ExecutionWorker(
+        store=store,
+        service=_FakeService(execution_store),
+        lock_path=lock_path,
+        worker_id="replacement-worker",
+        heartbeat_interval_seconds=0.02,
+    )
+    old_worker_lock = FileLock(str(lock_path))
+    old_worker_lock.acquire(timeout=0)
+    try:
+        with pytest.raises(WorkerAlreadyRunning):
+            worker.start()
+        with sqlite3.connect(database) as connection:
+            version_while_locked = connection.execute(
+                """
+                SELECT value FROM worker_meta
+                WHERE key='worker_schema_version'
+                """
+            ).fetchone()
+        assert version_while_locked == ("1",)
+        assert store.schema_version == 1
+    finally:
+        old_worker_lock.release()
+
+    worker.start()
+    try:
+        with sqlite3.connect(database) as connection:
+            migrated_version = connection.execute(
+                """
+                SELECT value FROM worker_meta
+                WHERE key='worker_schema_version'
+                """
+            ).fetchone()
+            assert migrated_version == ("4",)
+        assert store.schema_version == 4
+    finally:
+        worker.close()
 
 
 def test_startup_recovers_running_without_replay(tmp_path):
@@ -561,6 +652,94 @@ def test_worker_marks_set_leverage_unknown_and_never_replays(tmp_path):
     assert len(
         [call for call in service.calls if call[0] == "set_leverage"]
     ) == 1
+
+
+def test_successful_work_and_reconcile_keep_unresolved_write_attention(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        service.failures["cancel_entry"] = RuntimeError("write uncertain")
+        uncertain = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.CANCEL_ENTRY,
+        )
+        assert worker.run_once().status is WorkerCommandStatus.UNCERTAIN
+        service.failures.pop("cancel_entry")
+
+        reconcile, _ = store.enqueue(
+            action=WorkerCommandAction.RECONCILE,
+            requester="system",
+            broker="okx",
+            environment="demo",
+            account="okx",
+        )
+        assert worker.run_once().id == reconcile.id
+        heartbeat_after_command = store.get_heartbeat(worker.worker_id)
+
+        worker._run_reconcile()
+        worker._set_available_heartbeat()
+        heartbeat_after_periodic = store.get_heartbeat(worker.worker_id)
+    finally:
+        worker.close()
+
+    assert store.get_command(uncertain.id).status is WorkerCommandStatus.UNCERTAIN
+    assert heartbeat_after_command.state is WorkerState.NEEDS_ATTENTION
+    assert heartbeat_after_command.last_error_code == "unresolved_broker_write"
+    assert heartbeat_after_periodic.state is WorkerState.NEEDS_ATTENTION
+    assert heartbeat_after_periodic.last_error_code == "unresolved_broker_write"
+
+
+def test_periodic_reconcile_does_not_revoke_pending_submit(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    reconcile_errors: list[BaseException] = []
+    try:
+        service.reconcile_entered.clear()
+        service.reconcile_release = threading.Event()
+
+        def finish_periodic_reconcile() -> None:
+            try:
+                worker._run_reconcile()
+                worker._set_available_heartbeat()
+            except BaseException as exc:  # pragma: no cover - assertion below
+                reconcile_errors.append(exc)
+
+        reconcile_thread = threading.Thread(
+            target=finish_periodic_reconcile,
+            name="test-periodic-reconcile",
+        )
+        reconcile_thread.start()
+        assert service.reconcile_entered.wait(5)
+
+        lease = _grant_submit(worker, store)
+        submit = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.SUBMIT,
+            lease_id=lease.lease_id,
+        )
+
+        service.reconcile_release.set()
+        reconcile_thread.join(timeout=5)
+        assert not reconcile_thread.is_alive()
+        heartbeat = store.get_heartbeat(worker.worker_id)
+        pending = store.get_command(submit.id)
+        current_lease = store.current_new_risk_lease()
+
+        finished = worker.run_once()
+    finally:
+        if service.reconcile_release is not None:
+            service.reconcile_release.set()
+        worker.close()
+
+    assert reconcile_errors == []
+    assert heartbeat.state is WorkerState.RUNNING
+    assert heartbeat.last_error_code == ""
+    assert pending.status is WorkerCommandStatus.PENDING
+    assert current_lease is not None
+    assert current_lease.lease_id == lease.lease_id
+    assert finished.id == submit.id
+    assert finished.status is WorkerCommandStatus.SUCCEEDED
+    assert ("submit", "execution-one") in service.calls
 
 
 def test_worker_restart_resolves_unknown_leverage_by_readback_only(tmp_path):

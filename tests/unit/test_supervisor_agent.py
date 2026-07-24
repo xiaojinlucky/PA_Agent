@@ -7,6 +7,7 @@ import pytest
 
 from pa_agent.agents.supervisor import (
     SupervisorAgent,
+    SupervisorConfigurationError,
     SupervisorGate,
     build_supervisor_input,
 )
@@ -173,6 +174,48 @@ def test_supervisor_snapshot_defaults_to_natural_pa_mode():
     assert _snapshot().input_mode == "natural_pa"
 
 
+def test_natural_pa_snapshot_freezes_effective_limit_execution_context():
+    record = _record(symbol="XAU-USDT-SWAP").model_copy(deep=True)
+    record.kline_data = [
+        {
+            "seq": 1,
+            "ts_open": 1_784_300_400_000,
+            "open": 4000,
+            "high": 4010,
+            "low": 3990,
+            "close": 4005,
+            "volume": 100,
+            "closed": True,
+        }
+    ]
+    sizing = SimpleNamespace(
+        equity_usdt="5000",
+        equity_basis="usdt_equity",
+        reference_price_usdt="4056.0",
+        risk_budget_usdt="500",
+        max_buy="23000",
+        max_sell="23000",
+        quantity="21000",
+    )
+
+    snapshot = build_supervisor_input(
+        campaign_id="campaign-natural",
+        record=record,
+        bar_ms=1_784_300_400_000,
+        analysis_digest="natural-one",
+        active_execution_count=0,
+        sizing=sizing,
+    )
+
+    assert snapshot.input_mode == "natural_pa"
+    assert snapshot.stage2_decision["execution_context"][
+        "signal_entry_price"
+    ] == str(record.stage2_decision["decision"]["entry_price"])
+    assert snapshot.stage2_decision["execution_context"][
+        "effective_entry_price"
+    ] == "4056.0"
+
+
 def test_controlled_demo_s_is_explicit_in_frozen_supervisor_snapshot():
     record = _record(symbol="XAU-USDT-SWAP").model_copy(deep=True)
     record.meta = record.meta.model_copy(
@@ -208,6 +251,9 @@ def test_controlled_demo_s_is_explicit_in_frozen_supervisor_snapshot():
         active_execution_count=0,
         sizing=SimpleNamespace(
             equity_usdt="5000",
+            equity_basis="usdt_equity",
+            reference_price_usdt="4056.0",
+            risk_budget_usdt="500",
             max_buy="23000",
             max_sell="23000",
             quantity="21000",
@@ -215,8 +261,60 @@ def test_controlled_demo_s_is_explicit_in_frozen_supervisor_snapshot():
     )
 
     assert snapshot.input_mode == "controlled_reproducible"
+    assert snapshot.stage2_decision["execution_context"] == {
+        "signal_entry_price": str(
+            record.stage2_decision["decision"]["entry_price"]
+        ),
+        "effective_entry_price": "4056.0",
+        "stop_loss_price": str(
+            record.stage2_decision["decision"]["stop_loss_price"]
+        ),
+        "risk_equity_basis": "usdt_equity",
+        "risk_equity_usdt": "5000",
+        "risk_budget_usdt": "500",
+        "technical_plan_quantity": "21000",
+    }
     with pytest.raises(ValueError):
         snapshot.input_mode = "natural_pa"
+
+
+@pytest.mark.parametrize(
+    ("bar_ms", "closed"),
+    [
+        (1_784_300_400_001, True),
+        (1_784_300_400_000, False),
+    ],
+)
+def test_supervisor_rejects_bar_time_or_close_state_mismatch(
+    bar_ms,
+    closed,
+):
+    record = _record(symbol="XAU-USDT-SWAP").model_copy(deep=True)
+    record.kline_data = [
+        {
+            "ts_open": 1_784_300_400_000,
+            "open": 4000,
+            "high": 4010,
+            "low": 3990,
+            "close": 4005,
+            "closed": closed,
+        }
+    ]
+
+    with pytest.raises(SupervisorConfigurationError):
+        build_supervisor_input(
+            campaign_id="campaign-one",
+            record=record,
+            bar_ms=bar_ms,
+            analysis_digest="analysis-one",
+            active_execution_count=0,
+            sizing=SimpleNamespace(
+                equity_usdt="5000",
+                max_buy="23000",
+                max_sell="23000",
+                quantity="21000",
+            ),
+        )
 
 
 def test_ai_role_bindings_round_trip_without_copying_provider_secrets():

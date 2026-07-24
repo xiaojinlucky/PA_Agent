@@ -5,11 +5,13 @@ from decimal import Decimal
 
 import pytest
 
+from pa_agent.execution.credentials import account_identity_fingerprint
 from pa_agent.execution.models import (
     ExecutionPlan,
     ExecutionState,
     utc_now_iso,
 )
+from pa_agent.execution.okx_client import OKX_PENDING_ALGO_ORDER_TYPES
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.uncertain_resolution import (
     resolve_okx_demo_prebroker_schema_failure,
@@ -19,6 +21,14 @@ from pa_agent.execution.worker_protocol import (
     WorkerCommandStatus,
 )
 from pa_agent.execution.worker_store import WorkerStore
+
+_EXPECTED_ACCOUNT_IDENTITY = account_identity_fingerprint(
+    "okx",
+    "demo",
+    "1001",
+    "1001",
+    "0",
+)
 
 
 class _ReadOnlyOkxClient:
@@ -134,6 +144,7 @@ def test_read_only_resolution_keeps_uncertain_history_and_unblocks_route(
         worker_store=worker_store,
         execution_store=execution_store,
         client=client,
+        expected_account_identity=_EXPECTED_ACCOUNT_IDENTITY,
         resolved_by="operator-audit",
         observed_at=datetime(2026, 7, 24, 4, 30, tzinfo=UTC),
     )
@@ -182,6 +193,31 @@ def test_resolution_refuses_any_broker_exposure_or_pending_order(
             worker_store=worker_store,
             execution_store=execution_store,
             client=client,
+            expected_account_identity=_EXPECTED_ACCOUNT_IDENTITY,
+            resolved_by="operator-audit",
+        )
+
+    assert worker_store.get_command_resolution(command.id) is None
+
+
+@pytest.mark.parametrize("order_type", OKX_PENDING_ALGO_ORDER_TYPES)
+def test_resolution_checks_every_supported_okx_algo_order_type(
+    tmp_path,
+    order_type,
+):
+    execution_store, worker_store, command = (
+        _stores_with_uncertain_submit(tmp_path)
+    )
+    client = _ReadOnlyOkxClient()
+    client.algo_rows[order_type] = [{"algoId": f"{order_type}-order"}]
+
+    with pytest.raises(RuntimeError, match="仓位或挂单"):
+        resolve_okx_demo_prebroker_schema_failure(
+            command_id=command.id,
+            worker_store=worker_store,
+            execution_store=execution_store,
+            client=client,
+            expected_account_identity=_EXPECTED_ACCOUNT_IDENTITY,
             resolved_by="operator-audit",
         )
 
@@ -202,6 +238,41 @@ def test_resolution_refuses_event_history_that_reached_submit_intent(
             worker_store=worker_store,
             execution_store=execution_store,
             client=_ReadOnlyOkxClient(),
+            expected_account_identity=_EXPECTED_ACCOUNT_IDENTITY,
+            resolved_by="operator-audit",
+        )
+
+    assert worker_store.get_command_resolution(command.id) is None
+
+
+def test_resolution_refuses_wrong_or_missing_account_identity(tmp_path):
+    execution_store, worker_store, command = (
+        _stores_with_uncertain_submit(tmp_path)
+    )
+    client = _ReadOnlyOkxClient()
+
+    with pytest.raises(RuntimeError, match="账户身份"):
+        resolve_okx_demo_prebroker_schema_failure(
+            command_id=command.id,
+            worker_store=worker_store,
+            execution_store=execution_store,
+            client=client,
+            expected_account_identity="f" * 64,
+            resolved_by="operator-audit",
+        )
+
+    client.account_config = lambda: {
+        "uid": "",
+        "mainUid": "1001",
+        "type": "0",
+    }
+    with pytest.raises(RuntimeError, match="缺少"):
+        resolve_okx_demo_prebroker_schema_failure(
+            command_id=command.id,
+            worker_store=worker_store,
+            execution_store=execution_store,
+            client=client,
+            expected_account_identity=_EXPECTED_ACCOUNT_IDENTITY,
             resolved_by="operator-audit",
         )
 

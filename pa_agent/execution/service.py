@@ -30,6 +30,10 @@ from pa_agent.execution.errors import (
     SubmissionUnknown,
 )
 from pa_agent.execution.longbridge_adapter import LongbridgeAdapter
+from pa_agent.execution.leverage_authorization import (
+    LeverageAuthorizationError,
+    validate_leverage_authorization,
+)
 from pa_agent.execution.longbridge_session import LongbridgeSession
 from pa_agent.execution.models import (
     AccountSnapshot,
@@ -50,7 +54,6 @@ from pa_agent.execution.worker_protocol import (
     WorkerCommand,
     WorkerCommandAction,
 )
-
 from pa_agent.risk.runtime import (
     RiskRuntime,
     RiskRuntimeBlocked,
@@ -75,6 +78,8 @@ class _LeverageWritePlan:
     environment: Literal["demo"]
     requested_account: Literal["okx"]
     config_fingerprint: str
+    product: Literal["swap"]
+    instrument: str
 
 
 class ExecutionService:
@@ -400,7 +405,6 @@ class ExecutionService:
         return adapter
 
     @staticmethod
-    @staticmethod
     def _risk_route_key(plan: ExecutionPlan) -> str:
         return route_key(
             broker=plan.broker,
@@ -419,16 +423,17 @@ class ExecutionService:
 
     def _refresh_risk_runtime(
         self,
-        plan: ExecutionPlan,
+        plan: ExecutionPlan | _LeverageWritePlan,
         adapter: BrokerAdapter,
         *,
         snapshot: AccountSnapshot | None = None,
         raise_on_failure: bool,
-    ) -> RiskRuntimeState | None:
+    ) -> tuple[RiskRuntimeState | None, AccountSnapshot | None]:
         if self._risk_runtime is None or plan.broker != "okx":
-            return None
+            return None, snapshot
+        account_snapshot = snapshot
         try:
-            account_snapshot = snapshot or adapter.account_snapshot(plan)
+            account_snapshot = account_snapshot or adapter.account_snapshot(plan)
             total_equity = account_snapshot.raw_summary.get(
                 "account_total_equity",
                 "",
@@ -462,8 +467,8 @@ class ExecutionService:
                 f"{plan.broker}/{plan.environment}/{plan.requested_account} "
                 f"风险运行态刷新失败: {code}"
             )
-            return state
-        return state
+            return state, account_snapshot
+        return state, account_snapshot
 
     def _prepare_new_risk_record(
         self,
@@ -474,12 +479,13 @@ class ExecutionService:
 
         if self._risk_runtime is None or record.plan.broker != "okx":
             return record, adapter
-        state = self._refresh_risk_runtime(
+        state, account_snapshot = self._refresh_risk_runtime(
             record.plan,
             adapter,
             raise_on_failure=True,
         )
         assert state is not None
+        assert account_snapshot is not None
         state = self._risk_runtime.require_new_risk(
             self._risk_route_key(record.plan)
         )
@@ -489,21 +495,38 @@ class ExecutionService:
                 "risk_sizing_unavailable",
                 "OKX 执行适配器缺少通用风险定仓能力",
             )
+        risk_equity = account_snapshot.equity
+        if (
+            risk_equity is None
+            or not risk_equity.is_finite()
+            or risk_equity <= 0
+        ):
+            raise RiskRuntimeBlocked(
+                "risk_sizing_equity_unavailable",
+                "OKX 结算币权益无效，禁止新增风险",
+            )
         sizing = calculate_size(
             record.plan,
-            account_equity_usd=state.last_total_equity_usd,
+            account_equity_usd=risk_equity,
         )
         if sizing is None:
             return record, adapter
+        if sizing.target_contract_size != record.plan.quantity:
+            raise RiskRuntimeBlocked(
+                "risk_sizing_changed_after_supervision",
+                "提交前风险数量已变化，旧监督计划作废",
+            )
         updated_plan = record.plan.model_copy(
             update={"quantity": sizing.target_contract_size}
         )
         updated_record = record.model_copy(
             update={
                 "plan": updated_plan,
+                "remaining_quantity": sizing.target_contract_size,
                 "broker_state": {
                     **record.broker_state,
                     "risk_sizing": {
+                        "account_equity_usdt": str(risk_equity),
                         "account_total_equity_usd": str(
                             state.last_total_equity_usd
                         ),
@@ -536,6 +559,7 @@ class ExecutionService:
         self._emit_record(saved)
         return saved, adapter
 
+    @staticmethod
     def _validate_leverage_command(command: WorkerCommand):
         parameters = command.parameters
         if (
@@ -584,15 +608,33 @@ class ExecutionService:
         parameters = self._validate_leverage_command(command)
         if self._store.list_active():
             raise PreflightError("存在活动 execution，禁止调整杠杆")
+        try:
+            validate_leverage_authorization(parameters)
+        except LeverageAuthorizationError as exc:
+            raise PreflightError(
+                f"杠杆命令没有匹配的耐久监督授权：{exc}"
+            ) from exc
         plan = _LeverageWritePlan(
             id=parameters.analysis_digest,
             broker="okx",
             environment="demo",
             requested_account="okx",
             config_fingerprint=parameters.config_fingerprint,
+            product="swap",
+            instrument=parameters.instrument,
         )
         self._require_plan_writes(plan)
         adapter = self._leverage_adapter(command)
+        if self._risk_runtime is not None:
+            state, _snapshot = self._refresh_risk_runtime(
+                plan,
+                adapter,
+                raise_on_failure=True,
+            )
+            assert state is not None
+            self._risk_runtime.require_new_risk(
+                self._risk_route_key(plan)
+            )
         adapter.bind_write_executor(
             lambda operation: self._execute_broker_write(
                 plan,
@@ -886,6 +928,13 @@ class ExecutionService:
                     adapter,
                 )
             except RiskRuntimeBlocked as exc:
+                risk_state = (
+                    self._risk_runtime.get(
+                        self._risk_route_key(record.plan)
+                    )
+                    if self._risk_runtime is not None
+                    else None
+                )
                 blocked = record.model_copy(
                     update={
                         "state": ExecutionState.BLOCKED,
@@ -897,7 +946,21 @@ class ExecutionService:
                 blocked = self._store.save(
                     blocked,
                     event_kind="risk_runtime_blocked",
-                    event_payload={"code": exc.code},
+                    event_payload={
+                        "code": exc.code,
+                        "drawdown_fraction": (
+                            str(risk_state.drawdown_fraction)
+                            if risk_state is not None
+                            and risk_state.drawdown_fraction is not None
+                            else ""
+                        ),
+                        "adjusted_high_water": (
+                            str(risk_state.adjusted_high_water_usd)
+                            if risk_state is not None
+                            and risk_state.adjusted_high_water_usd is not None
+                            else ""
+                        ),
+                    },
                 )
                 self._emit_record(blocked)
                 return blocked
@@ -1656,6 +1719,7 @@ class ExecutionService:
 
     def clear_drawdown_stop(self) -> RiskRuntimeState:
         """经 Worker 控制命令显式清除停止，并重锚当前总权益。"""
+
         with self._lock:
             if self._risk_runtime is None:
                 raise PreflightError("当前执行服务未接入风险运行态")

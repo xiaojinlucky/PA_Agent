@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -21,14 +22,17 @@ from pa_agent.execution.service import ExecutionService
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker import ExecutionWorker, WorkerNewRiskAuthority
 from pa_agent.execution.worker_protocol import (
-    WorkerCommandAction,
     SetLeverageParameters,
+    WorkerCommandAction,
     WorkerCommandResolutionEvidence,
     WorkerCommandStatus,
     WorkerState,
 )
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
+from tests.unit.leverage_authorization_helpers import (
+    authorized_leverage_parameters,
+)
 from tests.unit.test_execution_service import FakeAdapter
 
 
@@ -511,24 +515,16 @@ def test_controller_enqueues_strict_demo_leverage_command_under_same_lease(
     tmp_path,
     monkeypatch,
 ):
-    controller, worker_store, settings, _record_obj = _controller(
+    controller, worker_store, settings, record_obj = _controller(
         tmp_path,
         monkeypatch,
     )
     controller.arm("启用模拟交易")
-    parameters = SetLeverageParameters(
-        analysis_digest="a" * 64,
+    parameters, _authorized_record = authorized_leverage_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record_obj,
         config_fingerprint=execution_route_fingerprint(settings, "okx"),
-        instrument="XAU-USDT-SWAP",
-        direction="long",
-        margin_mode="cross",
-        position_mode="net_mode",
-        current_leverage=Decimal("5"),
-        target_leverage=Decimal("10"),
-        required_quantity=Decimal("20"),
-        entry_price=Decimal("4000"),
         expected_account_identity="b" * 64,
-        okx_api_base_url="https://www.okx.com",
     )
 
     command = controller.set_leverage(parameters)
@@ -537,6 +533,128 @@ def test_controller_enqueues_strict_demo_leverage_command_under_same_lease(
     assert command.parameters == parameters
     assert command.new_risk_lease_id
     assert worker_store.get_command(command.id) == command
+
+
+def test_controller_authorizes_effective_limit_distinct_from_pa_signal(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, record_obj = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    signal_entry = Decimal(
+        str(record_obj.stage2_decision["decision"]["entry_price"])
+    )
+    parameters, _authorized_record = authorized_leverage_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record_obj,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+        effective_entry_price=signal_entry + Decimal("2.5"),
+    )
+
+    command = controller.set_leverage(parameters)
+
+    assert parameters.entry_price != signal_entry
+    assert command.parameters.entry_price == signal_entry + Decimal("2.5")
+    assert worker_store.get_command(command.id) == command
+
+
+def test_controller_rejects_tampered_effective_limit_reference(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, record_obj = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    signal_entry = Decimal(
+        str(record_obj.stage2_decision["decision"]["entry_price"])
+    )
+    parameters, authorized_record = authorized_leverage_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record_obj,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+        effective_entry_price=signal_entry + Decimal("2.5"),
+    )
+    response = dict(authorized_record.stage2_response)
+    response["risk_sizing"] = {"reference_price_usdt": str(signal_entry)}
+    tampered_record = authorized_record.model_copy(
+        update={"stage2_response": response}
+    )
+    analysis_path = Path(parameters.analysis_record_path)
+    analysis_path.write_text(
+        tampered_record.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    parameters = parameters.model_copy(
+        update={
+            "analysis_digest": hashlib.sha256(
+                analysis_path.read_bytes()
+            ).hexdigest()
+        }
+    )
+
+    with pytest.raises(
+        LiveTradingDisabled,
+        match="没有匹配的耐久监督授权",
+    ):
+        controller.set_leverage(parameters)
+
+    assert worker_store.list_commands() == []
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {
+            "target_leverage": Decimal("9"),
+            "target_capacity": Decimal("30"),
+            "verified_grid": (
+                {"leverage": "5", "capacity": "10"},
+                {"leverage": "9", "capacity": "30"},
+                {"leverage": "10", "capacity": "30"},
+            ),
+        },
+        {"direction": "short"},
+        {"required_quantity": Decimal("25")},
+    ],
+)
+def test_controller_rejects_tampered_supervised_leverage_intent(
+    tmp_path,
+    monkeypatch,
+    updates,
+):
+    controller, worker_store, settings, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    parameters, _authorized_record = authorized_leverage_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+    )
+    tampered = SetLeverageParameters.model_validate(
+        {
+            **parameters.model_dump(mode="python"),
+            **updates,
+            "leverage_intent_digest": "",
+        }
+    )
+
+    with pytest.raises(
+        LiveTradingDisabled,
+        match="没有匹配的耐久监督授权",
+    ):
+        controller.set_leverage(tampered)
+
+    assert worker_store.list_commands() == []
 
 
 def test_reload_settings_revokes_lease_and_ready_plan_can_expire_locally(

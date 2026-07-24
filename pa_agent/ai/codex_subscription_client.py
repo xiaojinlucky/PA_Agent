@@ -83,11 +83,23 @@ _DISABLED_FEATURES = (
     "hooks",
 )
 _ALLOWED_ITEM_TYPES = frozenset({"agent_message", "reasoning"})
-_CODEX_VERSION_PROBE_TIMEOUT_S = 3.0
+_CODEX_VERSION_PROBE_TIMEOUT_S = 10.0
 
 
 class CodexTransientError(TimeoutError):
     """Codex CLI 已登录，但本次请求因临时服务问题失败。"""
+
+
+class CodexExecutableProbeError(RuntimeError):
+    """已找到 Codex CLI 候选，但无法及时确认其可执行。"""
+
+
+class CodexExecutableProbeTimeout(CodexTransientError):
+    """Codex CLI 版本探测因本机暂时拥堵而超时。"""
+
+
+class CodexExecutableUnavailable(CodexExecutableProbeError):
+    """Codex CLI 候选存在，但启动或版本检查明确失败。"""
 
 
 @dataclass(frozen=True)
@@ -194,9 +206,21 @@ def _is_runnable_codex_executable(
             )
     except (CancelledError, _RequestDeadlineExceeded):
         raise
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return completed.returncode == 0
+    except subprocess.TimeoutExpired as exc:
+        if deadline is not None:
+            _check_request_budget(deadline, cancel_token)
+        raise CodexExecutableProbeTimeout(
+            "已找到官方 Codex CLI，但版本探测超时。"
+        ) from exc
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise CodexExecutableUnavailable(
+            "已找到官方 Codex CLI，但无法完成版本探测。"
+        ) from exc
+    if completed.returncode != 0:
+        raise CodexExecutableUnavailable(
+            "已找到官方 Codex CLI，但版本探测未通过。"
+        )
+    return True
 
 
 def _codex_executable(
@@ -224,24 +248,45 @@ def _codex_executable(
             candidates.append(Path(found))
 
     seen: set[str] = set()
+    probe_error: Exception | None = None
+    eligible_candidate_found = False
     for candidate in candidates:
         candidate_key = str(candidate).casefold()
         if candidate_key in seen:
             continue
         seen.add(candidate_key)
+        if (
+            candidate.suffix.casefold() == ".exe"
+            and candidate.is_file()
+        ):
+            eligible_candidate_found = True
         timeout_s = _CODEX_VERSION_PROBE_TIMEOUT_S
         if deadline is not None:
             timeout_s = min(
                 timeout_s,
                 _check_request_budget(deadline, cancel_token),
             )
-        if _is_runnable_codex_executable(
-            candidate,
-            timeout_s=timeout_s,
-            deadline=deadline,
-            cancel_token=cancel_token,
-        ):
+        try:
+            runnable = _is_runnable_codex_executable(
+                candidate,
+                timeout_s=timeout_s,
+                deadline=deadline,
+                cancel_token=cancel_token,
+            )
+        except (
+            CodexExecutableProbeTimeout,
+            CodexExecutableUnavailable,
+        ) as exc:
+            probe_error = exc
+            continue
+        if runnable:
             return str(candidate)
+    if eligible_candidate_found:
+        if probe_error is not None:
+            raise probe_error
+        raise CodexExecutableUnavailable(
+            "已找到官方 Codex CLI，但版本探测未通过。"
+        )
     return None
 
 
@@ -547,6 +592,7 @@ class CodexSubscriptionClient:
     ) -> None:
         self._settings = settings
         self._log = logger_ or logger
+        self._verified_executable = ""
 
     def update_provider(self, settings: AIProviderSettings) -> None:
         self._settings = settings
@@ -622,10 +668,17 @@ class CodexSubscriptionClient:
         if persist_session and thread_id:
             thread_id = _canonical_codex_thread_id(thread_id)
 
-        executable = _codex_executable(
-            deadline=deadline,
-            cancel_token=cancel_token,
-        )
+        executable = self._verified_executable
+        if executable and not Path(executable).is_file():
+            executable = ""
+            self._verified_executable = ""
+        if not executable:
+            executable = _codex_executable(
+                deadline=deadline,
+                cancel_token=cancel_token,
+            )
+            if executable:
+                self._verified_executable = executable
         _check_request_budget(deadline, cancel_token)
         status = codex_login_status(
             timeout_s=_check_request_budget(deadline, cancel_token),

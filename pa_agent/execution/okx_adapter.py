@@ -26,7 +26,10 @@ from pa_agent.execution.models import (
     PreflightResult,
     utc_now_iso,
 )
-from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.okx_client import (
+    OKX_PENDING_ALGO_ORDER_TYPES,
+    OkxRestClient,
+)
 from pa_agent.execution.order_modes import (
     apply_entry_atr_slippage,
     apply_exit_atr_slippage,
@@ -303,12 +306,7 @@ class OkxAdapter:
         if pending_orders:
             raise PreflightError("OKX 品种仍有普通挂单，禁止调整杠杆")
         pending_algo_count = 0
-        for order_type in (
-            "oco",
-            "conditional",
-            "trigger",
-            "move_order_stop",
-        ):
+        for order_type in OKX_PENDING_ALGO_ORDER_TYPES:
             pending_algo = self._client.pending_algo_orders(
                 instrument=parameters.instrument,
                 order_type=order_type,
@@ -316,6 +314,21 @@ class OkxAdapter:
             pending_algo_count += len(pending_algo)
             if pending_algo:
                 raise PreflightError("OKX 品种仍有算法挂单，禁止调整杠杆")
+        adjustment = self._client.leverage_adjustment_info(
+            instrument_type="SWAP",
+            margin_mode=parameters.margin_mode,
+            leverage=str(parameters.target_leverage),
+            instrument=parameters.instrument,
+            position_side="net",
+        )
+        if adjustment.get("existOrd") is True:
+            raise PreflightError(
+                "OKX 杠杆估算仍报告存在未识别挂单，禁止调整杠杆"
+            )
+        if adjustment.get("existOrd") is not False:
+            raise PreflightError(
+                "OKX 杠杆估算未返回可靠挂单状态，禁止调整杠杆"
+            )
         leverage_rows = self._client.leverage_info(
             instrument=parameters.instrument,
             margin_mode=parameters.margin_mode,
@@ -374,20 +387,33 @@ class OkxAdapter:
             )
         )
 
-        after = self.read_leverage_state(
-            parameters,
-            environment=environment,
-        )
-        if after.confirmed_leverage != parameters.target_leverage:
-            raise BrokerTransportError(
-                "OKX 杠杆写入后回读不一致",
-                write_may_have_reached=True,
+        try:
+            after = self.read_leverage_state(
+                parameters,
+                environment=environment,
             )
-        if after.confirmed_max_size < parameters.required_quantity:
+            if after.confirmed_leverage != parameters.target_leverage:
+                raise BrokerTransportError(
+                    "OKX 杠杆写入后回读不一致",
+                    write_may_have_reached=True,
+                )
+            if after.confirmed_max_size < parameters.required_quantity:
+                raise BrokerTransportError(
+                    "OKX 杠杆写入后最大可开量仍不足",
+                    write_may_have_reached=True,
+                )
+        except BrokerTransportError as exc:
+            if exc.write_may_have_reached:
+                raise
             raise BrokerTransportError(
-                "OKX 杠杆写入后最大可开量仍不足",
+                "OKX 杠杆写入后只读确认失败",
                 write_may_have_reached=True,
-            )
+            ) from exc
+        except Exception as exc:
+            raise BrokerTransportError(
+                "OKX 杠杆写入后只读确认失败",
+                write_may_have_reached=True,
+            ) from exc
         return after
 
     @staticmethod

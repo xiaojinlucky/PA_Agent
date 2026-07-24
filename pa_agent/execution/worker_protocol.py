@@ -1,6 +1,8 @@
 """Typed protocol shared by the execution worker and its control plane."""
 from __future__ import annotations
 
+import hashlib
+import json
 from datetime import UTC, datetime
 from decimal import Decimal
 from enum import StrEnum
@@ -30,12 +32,26 @@ class WorkerCommandStatus(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class LeverageCapacityPoint(BaseModel):
+    """One broker-read capacity point on the bounded policy grid."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    leverage: Decimal = Field(gt=0, le=125)
+    capacity: Decimal = Field(gt=0)
+
+
 class SetLeverageParameters(BaseModel):
     """Immutable deterministic inputs for one OKX leverage adjustment."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", frozen=True)
 
-    analysis_digest: str = Field(min_length=64, max_length=64)
+    analysis_digest: str = Field(
+        min_length=64,
+        max_length=64,
+        pattern=r"^[0-9a-f]{64}$",
+    )
+    analysis_record_path: str = Field(default="", max_length=1024)
     config_fingerprint: str = Field(min_length=1, max_length=256)
     instrument: str = Field(min_length=1, max_length=128)
     direction: Literal["long", "short"]
@@ -43,6 +59,16 @@ class SetLeverageParameters(BaseModel):
     position_mode: Literal["net_mode"]
     current_leverage: Decimal = Field(gt=0)
     target_leverage: Decimal = Field(gt=0, le=125)
+    current_capacity: Decimal = Field(gt=0)
+    target_capacity: Decimal = Field(gt=0)
+    maximum_leverage: Decimal = Field(gt=0, le=125)
+    maximum_capacity: Decimal = Field(gt=0)
+    planning_method: Literal["bounded_sequential_policy_grid_v1"]
+    policy_grid_step: Decimal = Field(gt=0)
+    verified_grid: tuple[LeverageCapacityPoint, ...] = Field(
+        min_length=2,
+        max_length=64,
+    )
     required_quantity: Decimal = Field(gt=0)
     entry_price: Decimal = Field(gt=0)
     expected_account_identity: str = Field(
@@ -51,13 +77,30 @@ class SetLeverageParameters(BaseModel):
         pattern=r"^[0-9a-f]{64}$",
     )
     okx_api_base_url: str = Field(min_length=1, max_length=512)
+    leverage_intent_digest: str = Field(
+        default="",
+        max_length=64,
+        pattern=r"^(|[0-9a-f]{64})$",
+    )
+    supervisor_record_id: str = Field(default="", max_length=256)
+    supervisor_record_path: str = Field(default="", max_length=1024)
+    supervisor_record_digest: str = Field(
+        default="",
+        max_length=64,
+        pattern=r"^(|[0-9a-f]{64})$",
+    )
 
     @field_validator(
         "analysis_digest",
+        "analysis_record_path",
         "config_fingerprint",
         "instrument",
         "expected_account_identity",
         "okx_api_base_url",
+        "leverage_intent_digest",
+        "supervisor_record_id",
+        "supervisor_record_path",
+        "supervisor_record_digest",
         mode="before",
     )
     @classmethod
@@ -68,9 +111,105 @@ class SetLeverageParameters(BaseModel):
     def _validate_leverage_increase(self) -> SetLeverageParameters:
         if self.target_leverage <= self.current_leverage:
             raise ValueError("目标杠杆必须高于已确认的当前杠杆")
+        if self.target_leverage > self.maximum_leverage:
+            raise ValueError("目标杠杆超过 OKX 已确认最大杠杆")
+        if self.current_capacity >= self.required_quantity:
+            raise ValueError("当前容量已经足够，不应创建杠杆命令")
+        if self.target_capacity < self.required_quantity:
+            raise ValueError("目标杠杆容量不足以容纳风险目标数量")
+        points = self.verified_grid
+        if (
+            points[0].leverage != self.current_leverage
+            or points[0].capacity != self.current_capacity
+            or points[-1].leverage != self.maximum_leverage
+            or points[-1].capacity != self.maximum_capacity
+        ):
+            raise ValueError("容量验证网格首尾与杠杆计划不一致")
+        for previous, current in zip(points, points[1:], strict=False):
+            if current.leverage <= previous.leverage:
+                raise ValueError("容量验证网格杠杆必须严格递增")
+            if current.leverage - previous.leverage > self.policy_grid_step:
+                raise ValueError("容量验证网格存在未验证的杠杆空档")
+            if current.capacity < previous.capacity:
+                raise ValueError("容量验证网格不是单调递增")
+        sufficient = [
+            point
+            for point in points
+            if point.capacity >= self.required_quantity
+        ]
+        if (
+            not sufficient
+            or sufficient[0].leverage != self.target_leverage
+            or sufficient[0].capacity != self.target_capacity
+        ):
+            raise ValueError("目标杠杆不是策略网格内首个容量充足点")
         if not self.okx_api_base_url.startswith("https://"):
             raise ValueError("OKX API 地址必须使用 HTTPS")
+        expected_intent_digest = leverage_intent_digest(self)
+        if (
+            self.leverage_intent_digest
+            and self.leverage_intent_digest != expected_intent_digest
+        ):
+            raise ValueError("杠杆意图摘要与不可变参数不一致")
+        object.__setattr__(
+            self,
+            "leverage_intent_digest",
+            expected_intent_digest,
+        )
         return self
+
+
+def leverage_intent_payload(
+    parameters: SetLeverageParameters,
+) -> dict[str, object]:
+    """Return the exact leverage facts that supervision must authorize."""
+    return {
+        "schema_version": 1,
+        "analysis_record_path": parameters.analysis_record_path,
+        "config_fingerprint": parameters.config_fingerprint,
+        "instrument": parameters.instrument,
+        "direction": parameters.direction,
+        "margin_mode": parameters.margin_mode,
+        "position_mode": parameters.position_mode,
+        "current_leverage": str(parameters.current_leverage),
+        "target_leverage": str(parameters.target_leverage),
+        "current_capacity": str(parameters.current_capacity),
+        "target_capacity": str(parameters.target_capacity),
+        "maximum_leverage": str(parameters.maximum_leverage),
+        "maximum_capacity": str(parameters.maximum_capacity),
+        "planning_method": parameters.planning_method,
+        "policy_grid_step": str(parameters.policy_grid_step),
+        "verified_grid": [
+            {
+                "leverage": str(point.leverage),
+                "capacity": str(point.capacity),
+            }
+            for point in parameters.verified_grid
+        ],
+        "required_quantity": str(parameters.required_quantity),
+        "entry_price": str(parameters.entry_price),
+        "expected_account_identity": parameters.expected_account_identity,
+        "okx_api_base_url": parameters.okx_api_base_url,
+    }
+
+
+def leverage_intent_digest(parameters: SetLeverageParameters) -> str:
+    encoded = json.dumps(
+        leverage_intent_payload(parameters),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def leverage_intent_snapshot(
+    parameters: SetLeverageParameters,
+) -> dict[str, object]:
+    return {
+        **leverage_intent_payload(parameters),
+        "leverage_intent_digest": parameters.leverage_intent_digest,
+    }
 
 
 class SetLeverageResult(BaseModel):
@@ -368,6 +507,13 @@ class WorkerCommand(BaseModel):
         if self.action is WorkerCommandAction.SET_LEVERAGE:
             if self.parameters is None:
                 raise ValueError("set_leverage 命令必须提供严格参数")
+            if not (
+                self.parameters.analysis_record_path
+                and self.parameters.supervisor_record_id
+                and self.parameters.supervisor_record_path
+                and self.parameters.supervisor_record_digest
+            ):
+                raise ValueError("set_leverage 命令缺少耐久分析或监督授权证据")
             if (
                 self.status is WorkerCommandStatus.SUCCEEDED
                 and self.result is None

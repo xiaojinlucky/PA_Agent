@@ -47,13 +47,14 @@ def _bill(
     *,
     amount: str,
     subtype: str = "11",
+    currency: str = "USDT",
     timestamp: str = "1720000000000",
 ) -> dict[str, str]:
     return {
         "billId": bill_id,
         "type": "1",
         "subType": subtype,
-        "ccy": "USDT",
+        "ccy": currency,
         "balChg": amount,
         "ts": timestamp,
     }
@@ -109,6 +110,84 @@ def test_external_deposit_lifts_high_water_and_preserves_ten_percent_budget(
     assert second.drawdown_fraction == Decimal("0")
     assert second.last_external_cashflow_bill_id == "deposit-1"
     assert second.last_total_equity_usd * Decimal("0.10") == Decimal("889.930")
+
+
+def test_initial_baseline_includes_historical_non_usdt_transfer_once(tmp_path):
+    _store, runtime, _clock = _runtime(tmp_path)
+
+    state = _refresh(
+        runtime,
+        equity="78975.61",
+        bills=[
+            _bill(
+                "historical-eth-transfer",
+                amount="1",
+                currency="ETH",
+            )
+        ],
+    )
+
+    assert state.kill_active is False
+    assert state.adjusted_high_water_usd == Decimal("78975.61")
+    assert state.last_total_equity_usd == Decimal("78975.61")
+    assert state.last_external_cashflow_bill_id == ""
+    assert state.last_account_bill_id == "historical-eth-transfer"
+    assert state.last_account_bill_timestamp_ms == 1720000000000
+    assert state.last_bill_scan_at is not None
+
+
+def test_failed_bootstrap_without_trusted_equity_can_recover(tmp_path):
+    _store, runtime, clock = _runtime(tmp_path)
+    failed = runtime.mark_failure(
+        broker="okx",
+        environment="demo",
+        account="okx",
+        account_identity="a" * 64,
+        reason="risk_runtime_unsupported_transfer_currency",
+    )
+    assert failed.kill_active is True
+    assert failed.last_total_equity_usd is None
+    assert failed.adjusted_high_water_usd is None
+    assert failed.last_bill_scan_at is None
+
+    clock.advance(minutes=1)
+    recovered = _refresh(
+        runtime,
+        equity="78975.61",
+        bills=[
+            _bill(
+                "historical-btc-transfer",
+                amount="1",
+                currency="BTC",
+            )
+        ],
+    )
+
+    assert recovered.kill_active is False
+    assert recovered.kill_reason == ""
+    assert recovered.adjusted_high_water_usd == Decimal("78975.61")
+    assert recovered.last_account_bill_id == "historical-btc-transfer"
+
+
+def test_established_state_with_missing_scan_boundary_does_not_rebaseline(
+    tmp_path,
+):
+    store, runtime, clock = _runtime(tmp_path)
+    established = _refresh(runtime, equity="1000")
+    store.save_risk_runtime_state(
+        replace(
+            established,
+            last_bill_scan_at=None,
+        )
+    )
+
+    clock.advance(minutes=1)
+    blocked = _refresh(runtime, equity="1100")
+
+    assert blocked.kill_active is True
+    assert blocked.kill_reason == "risk_runtime_bill_scan_boundary_missing"
+    assert blocked.adjusted_high_water_usd == Decimal("1000")
+    assert blocked.last_total_equity_usd == Decimal("1000")
 
 
 def test_drawdown_stop_persists_across_refresh_and_manual_clear_is_explicit(
@@ -376,8 +455,9 @@ def test_worker_schema_v3_adds_bill_scan_boundary_under_worker_lock(tmp_path):
 
 
 class _RuntimeAdapter:
-    def __init__(self, equity: str) -> None:
+    def __init__(self, equity: str, *, target_size: str = "7") -> None:
         self.equity = Decimal(equity)
+        self.target_size = Decimal(target_size)
         self.bills: list[dict[str, str]] = []
         self.calls: list[tuple[str, object]] = []
         self.identity = "b" * 64
@@ -405,7 +485,7 @@ class _RuntimeAdapter:
     def calculate_risk_size(self, _plan, *, account_equity_usd):
         self.calls.append(("calculate_risk_size", account_equity_usd))
         return RiskSizingResult(
-            target_contract_size=Decimal("7"),
+            target_contract_size=self.target_size,
             risk_budget_usdt=Decimal("100"),
             risk_used_usdt=Decimal("70"),
             stop_distance_usdt=Decimal("5"),
@@ -458,7 +538,7 @@ def _service(tmp_path, monkeypatch, adapter, runtime):
     settings.execution.okx.source_symbol = "XAU-USDT-SWAP"
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.product = "swap"
-    settings.execution.okx.quantity = "999"
+    settings.execution.okx.quantity = "7"
     record = _record()
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
     path = _persist(record, tmp_path)
@@ -475,7 +555,7 @@ def _service(tmp_path, monkeypatch, adapter, runtime):
     return service, record
 
 
-def test_general_submit_uses_current_total_equity_and_ignores_route_quantity(
+def test_general_submit_freezes_supervised_quantity_and_uses_usdt_equity(
     tmp_path,
     monkeypatch,
 ):
@@ -489,8 +569,27 @@ def test_general_submit_uses_current_total_equity_and_ignores_route_quantity(
 
     assert submitted.state is ExecutionState.ENTRY_PENDING
     assert submitted.plan.quantity == Decimal("7")
+    assert submitted.remaining_quantity == Decimal("7")
     assert submitted.broker_state["risk_sizing"]["target_contract_size"] == "7"
+    assert submitted.broker_state["risk_sizing"]["account_equity_usdt"] == "1000"
     assert ("preflight", Decimal("7")) in adapter.calls
+
+
+def test_general_submit_blocks_when_fresh_risk_quantity_changed(
+    tmp_path,
+    monkeypatch,
+):
+    _store, runtime, _clock = _runtime(tmp_path)
+    _refresh(runtime, equity="1000", identity="b" * 64)
+    adapter = _RuntimeAdapter("1000", target_size="8")
+    service, record = _service(tmp_path, monkeypatch, adapter, runtime)
+    execution = service.prepare_analysis(record)
+
+    blocked = service.submit(execution.id)
+
+    assert blocked.state is ExecutionState.BLOCKED
+    assert blocked.last_error == "risk_sizing_changed_after_supervision"
+    assert not any(name == "preflight" for name, _value in adapter.calls)
 
 
 def test_general_submit_persists_drawdown_block_before_preflight(
@@ -509,7 +608,14 @@ def test_general_submit_persists_drawdown_block_before_preflight(
     assert blocked.last_error == "drawdown_threshold_exceeded"
     assert not any(name == "preflight" for name, _value in adapter.calls)
     events = service.store.events(execution.id)
-    assert any(event.kind == "risk_runtime_blocked" for event in events)
+    event = next(
+        event for event in events if event.kind == "risk_runtime_blocked"
+    )
+    assert event.payload == {
+        "code": "drawdown_threshold_exceeded",
+        "drawdown_fraction": "0.6",
+        "adjusted_high_water": "1000",
+    }
 
 
 def test_okx_adapter_risk_sizing_uses_contract_specs_and_current_equity():

@@ -16,6 +16,17 @@ from typing import Any, Protocol
 from pa_agent.execution.credentials import OkxCredentials
 from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
 
+OKX_PENDING_ALGO_ORDER_TYPES = (
+    "conditional",
+    "oco",
+    "trigger",
+    "move_order_stop",
+    "iceberg",
+    "twap",
+    "chase",
+    "smart_iceberg",
+)
+
 
 @dataclass(frozen=True)
 class HttpResponse:
@@ -473,10 +484,16 @@ class OkxRestClient:
         instrument: str,
         order_type: str = "oco",
     ) -> list[dict[str, Any]]:
+        clean_order_type = str(order_type).strip()
+        if clean_order_type not in OKX_PENDING_ALGO_ORDER_TYPES:
+            raise BrokerTransportError(
+                "OKX 算法单类型不在当前已核验清单，禁止据此确认空挂单",
+                write_may_have_reached=False,
+            )
         payload = self._request(
             "GET",
             "/api/v5/trade/orders-algo-pending",
-            params={"instId": instrument, "ordType": order_type},
+            params={"instId": instrument, "ordType": clean_order_type},
             private=True,
         )
         return [dict(item) for item in payload.get("data") or []]

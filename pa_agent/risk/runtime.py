@@ -232,7 +232,6 @@ class RiskRuntime:
                     "账户身份指纹缺失",
                 )
             raw_rows = tuple(bill_rows)
-            events = classify_okx_external_cashflows(raw_rows)
             ordered_rows = self._ordered_bill_rows(raw_rows)
             newest_bill_id = (
                 ordered_rows[-1][1] if ordered_rows else ""
@@ -240,15 +239,30 @@ class RiskRuntime:
             newest_bill_timestamp_ms = (
                 ordered_rows[-1][0] if ordered_rows else None
             )
-            if previous is None:
-                cursor = events[-1].bill_id if events else ""
+            needs_baseline = previous is None or (
+                previous.last_total_equity_usd is None
+                and previous.adjusted_high_water_usd is None
+                and previous.last_bill_scan_at is None
+            )
+            if needs_baseline:
+                if (
+                    previous is not None
+                    and previous.account_identity
+                    and previous.account_identity != account_identity
+                ):
+                    raise CashflowReconciliationFailure(
+                        "account_identity_changed",
+                        "账户身份指纹发生变化",
+                    )
                 state = RiskRuntimeState(
                     route_key=route_key_value,
                     broker=broker,
                     environment=environment,
                     account=account,
                     account_identity=account_identity,
-                    last_external_cashflow_bill_id=cursor,
+                    # 首次建立的是“当前总权益”基线；更早账单已经包含在
+                    # 这份权益里，不能再次当作基线后的资金流重复调整。
+                    last_external_cashflow_bill_id="",
                     last_account_bill_id=newest_bill_id,
                     last_account_bill_timestamp_ms=newest_bill_timestamp_ms,
                     last_bill_scan_at=now,

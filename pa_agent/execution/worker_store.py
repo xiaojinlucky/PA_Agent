@@ -171,7 +171,6 @@ class WorkerStore:
                     WHERE key='worker_schema_version'
                     """
                 ).fetchone()
-                legacy_v1 = False
                 if version is None:
                     existing_worker_state = connection.execute(
                         """
@@ -200,17 +199,15 @@ class WorkerStore:
                         raise RuntimeError("worker schema 版本无效") from exc
                     if parsed_version not in {1, 2, 3, _WORKER_SCHEMA_VERSION}:
                         raise RuntimeError("不支持的 worker schema 版本")
-                    legacy_v1 = parsed_version == 1 and not allow_migration
                     if (
                         parsed_version != _WORKER_SCHEMA_VERSION
                         and not allow_migration
-                        and parsed_version != 1
                     ):
                         self._schema_version = parsed_version
                         connection.execute("COMMIT")
                         return
                 has_previous_resolutions = False
-                if version is not None and parsed_version in {1, 2}:
+                if version is not None and parsed_version == 2:
                     has_previous_resolutions = (
                         connection.execute(
                             """
@@ -277,6 +274,8 @@ class WorkerStore:
                             FROM worker_commands_previous
                             """
                         )
+                    if parsed_version == 1:
+                        connection.execute("DROP TABLE worker_commands_previous")
                 connection.execute(
                     """
                     CREATE UNIQUE INDEX IF NOT EXISTS
@@ -322,7 +321,6 @@ class WorkerStore:
                     connection.execute(
                         "DROP TABLE worker_command_resolutions_previous"
                     )
-                if version is not None and parsed_version in {1, 2}:
                     connection.execute("DROP TABLE worker_commands_previous")
                 connection.execute(
                     """
@@ -366,7 +364,7 @@ class WorkerStore:
                         account TEXT NOT NULL,
                         account_identity TEXT NOT NULL,
                         last_external_cashflow_bill_id TEXT NOT NULL,
-                        last_account_bill_id TEXT NOT NULL DEFAULT '',
+                        last_account_bill_id TEXT NOT NULL,
                         last_account_bill_timestamp_ms INTEGER,
                         last_bill_scan_at TEXT,
                         adjusted_high_water_usd TEXT,
@@ -380,23 +378,20 @@ class WorkerStore:
                     )
                     """
                 )
-                risk_runtime_columns = {
-                    row["name"]
-                    for row in connection.execute(
-                        "PRAGMA table_info(risk_runtime_state)"
-                    ).fetchall()
-                }
-                for column_sql in (
-                    "ADD COLUMN last_account_bill_id "
-                    "TEXT NOT NULL DEFAULT ''",
-                    "ADD COLUMN last_account_bill_timestamp_ms INTEGER",
-                    "ADD COLUMN last_bill_scan_at TEXT",
-                ):
-                    column_name = column_sql.split()[2]
-                    if column_name not in risk_runtime_columns:
-                        connection.execute(
-                            f"ALTER TABLE risk_runtime_state {column_sql}"
-                        )
+                if version is not None and parsed_version == 3:
+                    connection.execute(
+                        "ALTER TABLE risk_runtime_state "
+                        "ADD COLUMN last_account_bill_id "
+                        "TEXT NOT NULL DEFAULT ''"
+                    )
+                    connection.execute(
+                        "ALTER TABLE risk_runtime_state "
+                        "ADD COLUMN last_account_bill_timestamp_ms INTEGER"
+                    )
+                    connection.execute(
+                        "ALTER TABLE risk_runtime_state "
+                        "ADD COLUMN last_bill_scan_at TEXT"
+                    )
                 if version is not None and parsed_version in {1, 2, 3}:
                     connection.execute(
                         """
@@ -404,11 +399,9 @@ class WorkerStore:
                         SET value=?
                         WHERE key='worker_schema_version'
                         """,
-                        (
-                            "2" if legacy_v1 else str(_WORKER_SCHEMA_VERSION),
-                        ),
+                        (str(_WORKER_SCHEMA_VERSION),),
                     )
-                self._schema_version = 2 if legacy_v1 else _WORKER_SCHEMA_VERSION
+                self._schema_version = _WORKER_SCHEMA_VERSION
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
@@ -437,6 +430,7 @@ class WorkerStore:
     def _row_to_command(row: sqlite3.Row | None) -> WorkerCommand | None:
         if row is None:
             return None
+        columns = set(row.keys())
         return WorkerCommand(
             id=row["id"],
             action=row["action"],
@@ -450,7 +444,10 @@ class WorkerStore:
             parameters=SetLeverageParameters.model_validate_json(
                 row["parameters_json"]
             )
-            if row["parameters_json"] != "null"
+            if (
+                "parameters_json" in columns
+                and row["parameters_json"] != "null"
+            )
             else None,
             status=row["status"],
             worker_id=row["worker_id"],
@@ -462,7 +459,7 @@ class WorkerStore:
             result=SetLeverageResult.model_validate_json(
                 row["result_json"]
             )
-            if row["result_json"] != "null"
+            if "result_json" in columns and row["result_json"] != "null"
             else None,
         )
 
@@ -711,10 +708,19 @@ class WorkerStore:
             try:
                 existing = connection.execute(
                     """
-                    SELECT * FROM worker_commands
-                    WHERE scope_key=? AND action=?
-                      AND status IN ('pending', 'running', 'uncertain')
-                    ORDER BY created_at ASC, id ASC
+                    SELECT command.*
+                    FROM worker_commands command
+                    LEFT JOIN worker_command_resolutions resolution
+                      ON resolution.command_id=command.id
+                    WHERE command.scope_key=? AND command.action=?
+                      AND (
+                        command.status IN ('pending', 'running')
+                        OR (
+                          command.status='uncertain'
+                          AND resolution.command_id IS NULL
+                        )
+                      )
+                    ORDER BY command.created_at ASC, command.id ASC
                     LIMIT 1
                     """,
                     (scope_key, candidate.action.value),
@@ -722,12 +728,20 @@ class WorkerStore:
                 if existing is not None:
                     if existing["status"] == WorkerCommandStatus.UNCERTAIN.value:
                         raise RuntimeError(
-                            "同一 execution 和动作存在 uncertain 命令，"
+                            "同一 execution 和动作存在 uncertain 命令, "
                             "完成只读对账和人工处置前禁止新建"
                         )
-                    connection.execute("COMMIT")
                     existing_command = self._row_to_command(existing)
                     assert existing_command is not None
+                    if (
+                        candidate.action is WorkerCommandAction.SET_LEVERAGE
+                        and existing_command.parameters != candidate.parameters
+                    ):
+                        raise RuntimeError(
+                            "同一路由已有不同参数的 set_leverage 命令, "
+                            "禁止静默复用"
+                        )
+                    connection.execute("COMMIT")
                     return existing_command, False
                 if candidate.action in {
                     WorkerCommandAction.SUBMIT,
@@ -1033,6 +1047,8 @@ class WorkerStore:
         resolved_by: str,
     ) -> WorkerCommandResolution:
         """Attach immutable evidence to one uncertain command without rewriting it."""
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            raise RuntimeError("worker schema 尚未迁移, 不能保存处置证据")
         now = self._now()
         evidence_json = self._resolution_evidence_json(evidence)
         evidence_digest = hashlib.sha256(
@@ -1146,6 +1162,8 @@ class WorkerStore:
         self,
         command_id: str,
     ) -> WorkerCommandResolution | None:
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            return None
         with self._lock, self._connect() as connection:
             row = connection.execute(
                 """
@@ -1166,32 +1184,48 @@ class WorkerStore:
         """Return writes that still make the route unsafe for new exposure."""
         placeholders = ",".join("?" for _ in _WRITE_ACTION_VALUES)
         with self._lock, self._connect() as connection:
-            rows = connection.execute(
-                f"""
-                SELECT command.*
-                FROM worker_commands command
-                LEFT JOIN worker_command_resolutions resolution
-                  ON resolution.command_id=command.id
-                WHERE command.broker=?
-                  AND command.environment=?
-                  AND command.account=?
-                  AND command.action IN ({placeholders})
-                  AND (
-                    command.status IN ('pending', 'running')
-                    OR (
-                      command.status='uncertain'
-                      AND resolution.command_id IS NULL
-                    )
-                  )
-                ORDER BY command.created_at ASC, command.id ASC
-                """,
-                (
-                    broker.strip().lower(),
-                    environment.strip().lower(),
-                    account.strip(),
-                    *_WRITE_ACTION_VALUES,
-                ),
-            ).fetchall()
+            parameters = (
+                broker.strip().lower(),
+                environment.strip().lower(),
+                account.strip(),
+                *_WRITE_ACTION_VALUES,
+            )
+            if self._schema_version == _WORKER_SCHEMA_VERSION:
+                rows = connection.execute(
+                    f"""
+                    SELECT command.*
+                    FROM worker_commands command
+                    LEFT JOIN worker_command_resolutions resolution
+                      ON resolution.command_id=command.id
+                    WHERE command.broker=?
+                      AND command.environment=?
+                      AND command.account=?
+                      AND command.action IN ({placeholders})
+                      AND (
+                        command.status IN ('pending', 'running')
+                        OR (
+                          command.status='uncertain'
+                          AND resolution.command_id IS NULL
+                        )
+                      )
+                    ORDER BY command.created_at ASC, command.id ASC
+                    """,
+                    parameters,
+                ).fetchall()
+            else:
+                rows = connection.execute(
+                    f"""
+                    SELECT command.*
+                    FROM worker_commands command
+                    WHERE command.broker=?
+                      AND command.environment=?
+                      AND command.account=?
+                      AND command.action IN ({placeholders})
+                      AND command.status IN ('pending', 'running', 'uncertain')
+                    ORDER BY command.created_at ASC, command.id ASC
+                    """,
+                    parameters,
+                ).fetchall()
         return [
             command
             for row in rows
@@ -1217,6 +1251,8 @@ class WorkerStore:
         ttl_seconds: int,
     ) -> NewRiskLease | None:
         """Grant the single NEW_RISK slot unless a live lease already owns it."""
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            return None
         now = self._now()
         lease = NewRiskLease(
             lease_id=str(uuid.uuid4()),

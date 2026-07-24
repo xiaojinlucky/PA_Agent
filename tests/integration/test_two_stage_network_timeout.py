@@ -8,10 +8,11 @@ from unittest.mock import MagicMock
 
 import openai
 
-from tests.fixtures.validators import schema_test_validator
+from pa_agent.ai.codex_subscription_client import CodexExecutableProbeTimeout
 from pa_agent.ai.router import route_strategy_files
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.util.threading import CancelToken, OrchestratorEvent
+from tests.fixtures.validators import schema_test_validator
 
 
 def test_httpx_read_error_stage1(frame, pending_writer, assembler, exp_reader):
@@ -102,3 +103,9 @@ def test_transient_api_status_is_a_network_error():
             self.status_code = 503
 
     assert TwoStageOrchestrator._is_network_error(TransientStatus()) is True
+
+
+def test_codex_executable_probe_timeout_is_a_network_error():
+    error = CodexExecutableProbeTimeout("Codex CLI 版本探测超时")
+
+    assert TwoStageOrchestrator._is_network_error(error) is True

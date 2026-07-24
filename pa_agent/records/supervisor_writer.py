@@ -51,6 +51,16 @@ class SupervisorWriter:
         filename = hashlib.sha256(key).hexdigest() + ".json"
         return self.directory / filename
 
+    def path_for_key(
+        self,
+        *,
+        campaign_id: str,
+        bar_ms: int,
+        analysis_digest: str,
+    ) -> Path:
+        """Return the canonical durable path for an existing decision."""
+        return self._path_for_key(campaign_id, bar_ms, analysis_digest)
+
     def load_for(
         self,
         snapshot: SupervisorInputSnapshot,

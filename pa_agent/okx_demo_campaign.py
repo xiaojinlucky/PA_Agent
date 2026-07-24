@@ -71,11 +71,13 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ACTIVE_EXECUTION_STATES, ExecutionState
 from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.order_modes import apply_entry_atr_slippage
 from pa_agent.execution.plan_builder import execution_route_fingerprint
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import (
     SetLeverageParameters,
     WorkerCommandStatus,
+    leverage_intent_snapshot,
 )
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.records.analysis_history import (
@@ -161,6 +163,7 @@ CANARY_ORIGIN = "okx_demo_lifecycle_canary"
 CONTROLLED_DEMO_S_ORIGIN = "controlled_reproducible_demo_s"
 CANARY_DIRECTION = "long"
 CANARY_TIMEOUT_SECONDS = 120.0
+CANARY_CLEANUP_TIMEOUT_SECONDS = CAMPAIGN_ENTRY_TIMEOUT_SECONDS + 60.0
 CANARY_PRICE_BUFFER_RATIO = Decimal("0.005")
 CANARY_MIN_BUFFER_TICKS = Decimal("50")
 
@@ -254,7 +257,9 @@ def _campaign_config_payload() -> dict[str, Any]:
             "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
             "fee_rate": str(CAMPAIGN_FEE_RATE),
             "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
-            "price_source": "pa_stage2_entry_price",
+            "price_source": (
+                "pa_stage2_entry_price_plus_0.50_atr_effective_limit"
+            ),
             "stop_source": "pa_stage2_stop_loss_price",
             "contract_value_source": "okx_swap_ctVal_x_ctMult",
         },
@@ -460,6 +465,11 @@ class CampaignStateStore:
             config_fingerprint=campaign_config_fingerprint(),
             started_at=current.isoformat(),
             expires_at=(current + CAMPAIGN_DURATION).isoformat(),
+            last_completed_bar_ms=(
+                existing.last_completed_bar_ms
+                if existing is not None
+                else None
+            ),
             updated_at=current.isoformat(),
         )
 
@@ -610,6 +620,54 @@ def _attach_campaign_sizing(
     record.stage2_response = response
 
 
+def _attach_campaign_leverage_intent(
+    record: AnalysisRecord,
+    parameters: SetLeverageParameters,
+) -> None:
+    """Put the exact proposed leverage action inside the supervised record."""
+    response = (
+        dict(record.stage2_response)
+        if isinstance(record.stage2_response, dict)
+        else {}
+    )
+    response["leverage_intent"] = leverage_intent_snapshot(parameters)
+    record.stage2_response = response
+
+
+def _rebuild_leverage_parameters(
+    parameters: SetLeverageParameters,
+    **updates: object,
+) -> SetLeverageParameters:
+    payload = parameters.model_dump(mode="python")
+    payload.update(updates)
+    if any(
+        field in updates
+        for field in (
+            "analysis_record_path",
+            "config_fingerprint",
+            "instrument",
+            "direction",
+            "margin_mode",
+            "position_mode",
+            "current_leverage",
+            "target_leverage",
+            "current_capacity",
+            "target_capacity",
+            "maximum_leverage",
+            "maximum_capacity",
+            "planning_method",
+            "policy_grid_step",
+            "verified_grid",
+            "required_quantity",
+            "entry_price",
+            "expected_account_identity",
+            "okx_api_base_url",
+        )
+    ):
+        payload["leverage_intent_digest"] = ""
+    return SetLeverageParameters.model_validate(payload)
+
+
 def _campaign_instrument(client: OkxRestClient) -> dict[str, Any]:
     instrument = next(
         (
@@ -753,15 +811,52 @@ def _record_risk_inputs(record: AnalysisRecord) -> tuple[Decimal, Decimal, str]:
     )
 
 
+def _record_effective_entry_price(
+    record: AnalysisRecord,
+    client: OkxRestClient,
+    entry_price: Decimal,
+    side: str,
+) -> Decimal:
+    """按 Campaign 实际委托模式计算风险定仓使用的最终入场限价。"""
+    if CAMPAIGN_ENTRY_ORDER_MODE != "limit_with_slippage":
+        return entry_price
+    try:
+        shifted = apply_entry_atr_slippage(
+            entry_price,
+            side,
+            record.analysis_atr14,
+            CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE,
+        )
+    except ValueError as exc:
+        raise CampaignError(f"PA 记录 ATR 滑点无效：{exc}") from exc
+    tick = _positive_decimal(_campaign_instrument(client).get("tickSz"))
+    return _align_to_tick(
+        shifted,
+        tick,
+        rounding=ROUND_CEILING if side == "long" else ROUND_FLOOR,
+    )
+
+
 def resolve_record_campaign_sizing(
     record: AnalysisRecord,
     client: OkxRestClient | None = None,
 ) -> CampaignSizing:
     """把一份 PA 记录转换成唯一的 Demo 风险数量。"""
     entry_price, stop_loss_price, side = _record_risk_inputs(record)
+    active_client = client or OkxRestClient(
+        load_okx_credentials("demo"),
+        base_url=CAMPAIGN_OKX_API_BASE_URL,
+        simulated=True,
+    )
+    effective_entry_price = _record_effective_entry_price(
+        record,
+        active_client,
+        entry_price,
+        side,
+    )
     return resolve_campaign_sizing(
-        client,
-        entry_price=entry_price,
+        active_client,
+        entry_price=effective_entry_price,
         stop_loss_price=stop_loss_price,
         side=side,
     )
@@ -778,10 +873,16 @@ def resolve_record_campaign_leverage(
         base_url=CAMPAIGN_OKX_API_BASE_URL,
         simulated=True,
     )
+    effective_entry_price = _record_effective_entry_price(
+        record,
+        client,
+        entry_price,
+        side,
+    )
     try:
         resolve_campaign_sizing(
             client,
-            entry_price=entry_price,
+            entry_price=effective_entry_price,
             stop_loss_price=stop_loss_price,
             side=side,
         )
@@ -831,7 +932,7 @@ def resolve_record_campaign_leverage(
         direction=side,
         current_leverage=current_leverage,
         required_quantity=required_quantity,
-        entry_price=entry_price,
+        entry_price=effective_entry_price,
         expected_account_identity=account_identity,
         okx_api_base_url=CAMPAIGN_OKX_API_BASE_URL,
     )
@@ -842,7 +943,7 @@ def resolve_record_campaign_leverage(
         )
     sizing = resolve_campaign_sizing(
         client,
-        entry_price=entry_price,
+        entry_price=effective_entry_price,
         stop_loss_price=stop_loss_price,
         side=side,
         leverage=parameters.target_leverage,
@@ -1090,6 +1191,14 @@ def build_controlled_demo_s_record(
     }.get(stage1_direction)
     if direction is None:
         direction = "long" if float(latest["close"]) >= float(latest["open"]) else "short"
+    executable_reference = _positive_decimal(
+        (
+            ticker.get("askPx")
+            if direction == "long"
+            else ticker.get("bidPx")
+        )
+        or ticker.get("last")
+    )
     direction_text = "做多" if direction == "long" else "做空"
     level_field = "support_levels" if direction == "long" else "resistance_levels"
     levels = base_record.stage1_diagnosis.get(level_field)
@@ -1098,7 +1207,50 @@ def build_controlled_demo_s_record(
         if isinstance(levels, list) and levels
         else reference_price
     )
+    selected_level_source = level_field
     entry = _align_to_tick(selected_level, tick, rounding=ROUND_HALF_UP)
+    shifted_entry = _align_to_tick(
+        entry + atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE
+        if direction == "long"
+        else entry - atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE,
+        tick,
+        rounding=ROUND_CEILING if direction == "long" else ROUND_FLOOR,
+    )
+    is_executable = (
+        shifted_entry >= executable_reference
+        if direction == "long"
+        else shifted_entry <= executable_reference
+    )
+    if not is_executable:
+        selected_level_source = (
+            "okx_live_ask_effective_limit"
+            if direction == "long"
+            else "okx_live_bid_effective_limit"
+        )
+        entry = _align_to_tick(
+            executable_reference
+            - atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE
+            if direction == "long"
+            else executable_reference
+            + atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE,
+            tick,
+            rounding=ROUND_FLOOR if direction == "long" else ROUND_CEILING,
+        )
+        shifted_entry = _align_to_tick(
+            entry + atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE
+            if direction == "long"
+            else entry - atr * CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE,
+            tick,
+            rounding=ROUND_CEILING if direction == "long" else ROUND_FLOOR,
+        )
+        if (
+            direction == "long"
+            and shifted_entry < executable_reference
+        ) or (
+            direction == "short"
+            and shifted_entry > executable_reference
+        ):
+            raise CampaignError("Demo-S 无法生成可成交的 0.50 ATR 限价")
 
     distance = _align_to_tick(
         max(atr * Decimal("2"), tick),
@@ -1118,7 +1270,7 @@ def build_controlled_demo_s_record(
         try:
             sizing = resolve_campaign_sizing(
                 client,
-                entry_price=entry,
+                entry_price=shifted_entry,
                 stop_loss_price=stop,
                 side=direction,
             )
@@ -1156,7 +1308,7 @@ def build_controlled_demo_s_record(
         "reason": (
             "WO-EXEC-03 Demo-S controlled reproducible input；"
             f"方向继承真实阶段一 {stage1_direction or direction}，"
-            f"入场参考阶段一 {level_field}；"
+            f"入场参考 {selected_level_source}；"
             "基于真实 OKX 5m→10m 已收盘快照与 ATR14"
         ),
     }
@@ -1167,7 +1319,8 @@ def build_controlled_demo_s_record(
         "diagnosis_confidence": 20,
         "entry_setup": (
             f"WO-EXEC-03 受控 Demo-S：{direction_text}，"
-            f"entry={entry}，stop={stop}，TP1={tp1}，TP2={tp2}"
+            f"signal_entry={entry}，effective_limit={shifted_entry}，"
+            f"stop={stop}，TP1={tp1}，TP2={tp2}"
         ),
         "risk_warning": (
             "仅限 OKX Demo；真实 10m ATR14="
@@ -1181,7 +1334,9 @@ def build_controlled_demo_s_record(
             ),
             "analysis_atr14": str(atr),
             "reference_price": str(reference_price),
-            "entry_level_source": level_field,
+            "executable_reference_price": str(executable_reference),
+            "effective_limit_price": str(shifted_entry),
+            "entry_level_source": selected_level_source,
         },
         "trend_context": {
             "primary_direction": "bullish" if direction == "long" else "bearish",
@@ -1307,20 +1462,79 @@ def _assert_canary_protection(execution) -> None:
 def _attempt_canary_cleanup(
     service: ExecutionController,
     execution_id: str,
-) -> None:
-    """只对已确认有仓位的状态发减险命令，未知状态不盲目重试。"""
+    *,
+    timeout: float = CANARY_CLEANUP_TIMEOUT_SECONDS,
+) -> object:
+    """持续跟随撤单竞态；一旦出现成交仓位，只发一次主动减险。"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    cancel_requested = False
+    exit_requested = False
+    safe_terminal_states = {
+        ExecutionState.CLOSED,
+        ExecutionState.CANCELED,
+        ExecutionState.BLOCKED,
+        ExecutionState.REJECTED,
+    }
+    while time.monotonic() < deadline:
+        execution = service.get_execution(execution_id)
+        if execution is None:
+            raise CampaignError("Demo 生命周期验收异常收口时执行记录丢失")
+        if execution.state in safe_terminal_states:
+            return execution
+        if execution.state in {ExecutionState.UNKNOWN, ExecutionState.ERROR}:
+            raise CampaignError(
+                "Demo 生命周期验收异常收口进入不安全状态: "
+                f"{execution.state.value}"
+            )
+        if execution.state is ExecutionState.READY:
+            return service.expire_unsubmitted(
+                execution_id,
+                reason="Demo 生命周期验收异常发生在提交前",
+            )
+        command = None
+        if (
+            execution.state is ExecutionState.ENTRY_PENDING
+            and not cancel_requested
+        ):
+            cancel_requested = True
+            command = service.cancel_entry(execution_id)
+        elif (
+            execution.state
+            in {
+                ExecutionState.PARTIALLY_FILLED,
+                ExecutionState.PROTECTING,
+                ExecutionState.OPEN,
+            }
+            and not exit_requested
+        ):
+            exit_requested = True
+            command = service.request_exit(
+                execution_id,
+                reason="Demo 生命周期验收异常收口",
+            )
+        if command is not None:
+            try:
+                service.wait_for_command(command.id, timeout=30.0)
+            except (LiveTradingDisabled, TimeoutError):
+                pass
+            continue
+        previous = service.latest_successful_reconcile_at()
+        try:
+            service.wait_for_reconcile(
+                after=previous,
+                timeout=min(5.0, max(0.1, deadline - time.monotonic())),
+            )
+        except (LiveTradingDisabled, TimeoutError):
+            time.sleep(0.2)
     execution = service.get_execution(execution_id)
     if execution is None:
-        return
-    if execution.state is ExecutionState.ENTRY_PENDING:
-        service.cancel_entry(execution_id)
-        return
-    if execution.state in {
-        ExecutionState.PARTIALLY_FILLED,
-        ExecutionState.PROTECTING,
-        ExecutionState.OPEN,
-    }:
-        service.request_exit(execution_id, reason="Demo 生命周期验收异常收口")
+        raise CampaignError("Demo 生命周期验收异常收口超时且执行记录丢失")
+    if execution.state not in safe_terminal_states:
+        raise CampaignError(
+            "Demo 生命周期验收异常收口未达到安全终态: "
+            f"{execution.state.value}"
+        )
+    return execution
 
 
 def run_demo_lifecycle_canary(
@@ -1407,12 +1621,19 @@ def run_demo_lifecycle_canary(
             "state": closed.state.value,
             "origin": CANARY_ORIGIN,
         }
-    except Exception:
+    except Exception as exc:
+        cleanup_error: Exception | None = None
         if runtime is not None and execution_id:
             try:
                 _attempt_canary_cleanup(runtime.execution_service, execution_id)
-            except Exception:
-                logger.exception("Demo 生命周期验收异常后的减险命令未能入队")
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
+                logger.exception("Demo 生命周期验收异常收口未达到安全终态")
+        if cleanup_error is not None:
+            raise CampaignError(
+                f"Demo 生命周期验收失败: {exc}; "
+                f"异常收口失败: {cleanup_error}"
+            ) from cleanup_error
         raise
     finally:
         if runtime is not None:
@@ -1499,14 +1720,6 @@ def run_controlled_demo_s() -> dict[str, str]:
 
         execution = service.prepare_analysis(record)
         execution_id = execution.id
-        try:
-            _require_fresh_campaign_sizing(runtime, record, sizing)
-        except CampaignRiskBlocked as exc:
-            service.expire_unsubmitted(
-                execution.id,
-                reason="USDT 风险快照变化，旧计划禁止提交",
-            )
-            raise CampaignError(str(exc)) from exc
         state = state.model_copy(
             update={
                 "execution_ids": list(
@@ -1529,6 +1742,14 @@ def run_controlled_demo_s() -> dict[str, str]:
             }
         )
         CampaignStateStore().save(state)
+        try:
+            _require_fresh_campaign_sizing(runtime, record, sizing)
+        except CampaignRiskBlocked as exc:
+            service.expire_unsubmitted(
+                execution.id,
+                reason="USDT 风险快照变化，旧计划禁止提交",
+            )
+            raise CampaignError(str(exc)) from exc
         command = service.submit(execution.id)
         result = service.wait_for_command(command.id, timeout=30.0)
         if result.status is not WorkerCommandStatus.SUCCEEDED:
@@ -1555,7 +1776,7 @@ def run_controlled_demo_s() -> dict[str, str]:
             service,
             execution.id,
             accepted={ExecutionState.CLOSED},
-            timeout=CANARY_TIMEOUT_SECONDS,
+            timeout=float(runtime.settings.execution.entry_timeout_seconds) + 60,
         )
         state = state.model_copy(
             update={
@@ -1572,7 +1793,8 @@ def run_controlled_demo_s() -> dict[str, str]:
             "provenance": record.meta.market_data_provenance,
             "supervision_record_id": supervision.record_id,
             "supervision_action": supervision.action,
-            "quantity": str(sizing.quantity),
+            "supervised_quantity": str(sizing.quantity),
+            "quantity": str(closed.plan.quantity),
             "equity_usdt": str(sizing.equity_usdt),
             "max_buy": str(sizing.max_buy),
             "max_sell": str(sizing.max_sell),
@@ -1581,12 +1803,37 @@ def run_controlled_demo_s() -> dict[str, str]:
             "atr14": str(record.analysis_atr14),
             "preflight_simulated": str(preflight["simulated"]).lower(),
         }
-    except Exception:
+    except Exception as exc:
+        cleanup_error: Exception | None = None
         if runtime is not None and execution_id:
             try:
-                _attempt_canary_cleanup(runtime.execution_service, execution_id)
-            except Exception:
-                logger.exception("Demo-S 异常后的减险命令未能入队")
+                latest_execution = _attempt_canary_cleanup(
+                    runtime.execution_service,
+                    execution_id,
+                )
+            except Exception as cleanup_exc:
+                cleanup_error = cleanup_exc
+                logger.exception("Demo-S 异常收口未达到安全终态")
+                latest_execution = runtime.execution_service.get_execution(
+                    execution_id
+                )
+            latest_state = CampaignStateStore().load() or state
+            if latest_execution is not None and latest_state is not None:
+                CampaignStateStore().save(
+                    latest_state.model_copy(
+                        update={
+                            "last_plan_result": (
+                                f"execution:{latest_execution.state.value}"
+                            ),
+                            "last_error": f"Demo-S: {exc}",
+                            "updated_at": _utc_now().isoformat(),
+                        }
+                    )
+                )
+        if cleanup_error is not None:
+            raise CampaignError(
+                f"Demo-S 失败: {exc}; 异常收口失败: {cleanup_error}"
+            ) from cleanup_error
         raise
     finally:
         if runtime is not None:
@@ -2213,7 +2460,40 @@ class OkxDemoCampaign:
             return hashlib.sha256(payload).hexdigest()
         raise CampaignError("无法为监督结论建立 PA 分析摘要")
 
+    @staticmethod
+    def _validate_record_context(
+        record: AnalysisRecord,
+        bar_ms: int,
+    ) -> None:
+        if (
+            record.meta.symbol != CAMPAIGN_SYMBOL
+            or record.meta.timeframe != CAMPAIGN_TIMEFRAME
+            or record.meta.data_source != "okx"
+            or record.meta.market_data_provenance
+            not in {
+                "okx_5m_utc_pair_aggregation",
+                (
+                    "okx_public_5m_utc_pair_aggregation_"
+                    "controlled_reproducible"
+                ),
+            }
+        ):
+            raise CampaignError("PA 耐久记录不属于当前 OKX 10m Campaign")
+        if not record.kline_data or not isinstance(
+            record.kline_data[0],
+            dict,
+        ):
+            raise CampaignError("PA 耐久记录缺少主周期已收盘 K 线")
+        closed_bar = record.kline_data[0]
+        try:
+            record_bar_ms = int(ts_open_to_ms(closed_bar["ts_open"]))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise CampaignError("PA 耐久记录主周期 K 线时间无效") from exc
+        if record_bar_ms != int(bar_ms) or closed_bar.get("closed") is not True:
+            raise CampaignError("PA 耐久记录与当前已收盘 10m K 线不一致")
+
     def _consume_record(self, record, bar_ms: int, *, reused: bool) -> None:
+        self._validate_record_context(record, bar_ms)
         completed_count = self.state.analyses_completed + (0 if reused else 1)
         if _utc_now() >= self.state.expires_at_utc:
             self._save_state(
@@ -2271,17 +2551,17 @@ class OkxDemoCampaign:
                         return
                     sizing = leverage_candidate.sizing
                     _apply_campaign_sizing(self.runtime, sizing)
-                    leverage_parameters = (
-                        leverage_candidate.parameters.model_copy(
-                            update={
-                                "config_fingerprint": (
-                                    execution_route_fingerprint(
-                                        self.runtime.settings,
-                                        "okx",
-                                    )
-                                )
-                            }
-                        )
+                    leverage_parameters = _rebuild_leverage_parameters(
+                        leverage_candidate.parameters,
+                        analysis_record_path=str(
+                            Path(
+                                self.runtime.writer.full_path(record)
+                            ).resolve()
+                        ),
+                        config_fingerprint=execution_route_fingerprint(
+                            self.runtime.settings,
+                            "okx",
+                        ),
                     )
                 else:
                     self._save_state(
@@ -2297,12 +2577,16 @@ class OkxDemoCampaign:
                     )
                     return
             _attach_campaign_sizing(record, sizing)
+            if leverage_parameters is not None:
+                _attach_campaign_leverage_intent(
+                    record,
+                    leverage_parameters,
+                )
             self.runtime.writer.save_full_durable(record)
             if leverage_parameters is not None:
-                leverage_parameters = leverage_parameters.model_copy(
-                    update={
-                        "analysis_digest": self._analysis_digest(record)
-                    }
+                leverage_parameters = _rebuild_leverage_parameters(
+                    leverage_parameters,
+                    analysis_digest=self._analysis_digest(record),
                 )
             supervision = self.runtime.supervisor.review(
                 campaign_id=self.state.campaign_id,
@@ -2340,6 +2624,23 @@ class OkxDemoCampaign:
                 )
                 return
             if leverage_parameters is not None:
+                supervisor_path = (
+                    self.runtime.supervisor.writer.path_for_key(
+                        campaign_id=self.state.campaign_id,
+                        bar_ms=bar_ms,
+                        analysis_digest=leverage_parameters.analysis_digest,
+                    ).resolve()
+                )
+                if not supervisor_path.is_file():
+                    raise CampaignError("监督放行记录没有耐久落盘")
+                leverage_parameters = _rebuild_leverage_parameters(
+                    leverage_parameters,
+                    supervisor_record_id=supervision.record_id,
+                    supervisor_record_path=str(supervisor_path),
+                    supervisor_record_digest=hashlib.sha256(
+                        supervisor_path.read_bytes()
+                    ).hexdigest(),
+                )
                 self._ensure_demo_write_session()
                 leverage_command = (
                     self.runtime.execution_service.set_leverage(
@@ -2372,7 +2673,23 @@ class OkxDemoCampaign:
                         ),
                     )
                     return
-                refreshed_sizing = self.runtime.sizing_resolver(record)
+                try:
+                    refreshed_sizing = self.runtime.sizing_resolver(record)
+                except CampaignRiskBlocked as exc:
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=bar_ms,
+                        analyses_completed=completed_count,
+                        last_plan_result=(
+                            f"blocked:risk:after_leverage:{exc.code}"
+                        ),
+                        last_error=str(exc),
+                    )
+                    logger.info(
+                        "杠杆确认后风险定仓仍被阻断，继续下一根 K 线: %s",
+                        exc,
+                    )
+                    return
                 if (
                     _campaign_sizing_fingerprint(refreshed_sizing)
                     != _campaign_sizing_fingerprint(sizing)
@@ -2393,6 +2710,13 @@ class OkxDemoCampaign:
                 sizing = refreshed_sizing
                 _attach_campaign_sizing(record, sizing)
                 self.runtime.writer.save_full_durable(record)
+                if (
+                    self._analysis_digest(record)
+                    != leverage_parameters.analysis_digest
+                ):
+                    raise CampaignError(
+                        "监督放行后的耐久分析摘要发生变化"
+                    )
 
         try:
             execution = self.runtime.execution_service.prepare_analysis(record)
@@ -2660,6 +2984,25 @@ class OkxDemoCampaign:
             after=after,
             timeout=max(30.0, poll_interval * 3 + 5),
         )
+        last_execution_id = self.state.last_execution_id
+        if not last_execution_id:
+            return
+        execution = self.runtime.execution_service.get_execution(
+            last_execution_id
+        )
+        if execution is None:
+            raise CampaignError(
+                f"实验 execution {last_execution_id} 不存在于执行账本"
+            )
+        actual_result = f"execution:{execution.state.value}"
+        if (
+            self.state.last_plan_result.startswith("execution:")
+            and self.state.last_plan_result != actual_result
+        ):
+            self._save_state(
+                last_plan_result=actual_result,
+                last_error="",
+            )
 
     def _owned_active_executions(self):
         owned_ids = set(self.state.execution_ids)

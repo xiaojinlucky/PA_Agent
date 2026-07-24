@@ -9,9 +9,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from pa_agent.ai.codex_subscription_client import (
+    CodexExecutableProbeTimeout,
+    CodexExecutableUnavailable,
     CodexLoginStatus,
     CodexSubscriptionClient,
     CodexTransientError,
+    _is_runnable_codex_executable,
     _codex_executable,
     _parse_codex_jsonl,
     _sanitized_codex_environment,
@@ -141,7 +144,6 @@ def test_codex_executable_skips_unrunnable_candidate(
     "failure",
     [
         OSError("cannot start"),
-        subprocess.TimeoutExpired(cmd="codex --version", timeout=3.0),
         subprocess.CompletedProcess(
             args=["codex", "--version"],
             returncode=1,
@@ -174,6 +176,113 @@ def test_codex_executable_rejects_failed_version_probe(
             if isinstance(failure, BaseException)
             else failure,
         ),
+        pytest.raises(CodexExecutableUnavailable),
+    ):
+        _codex_executable()
+
+
+def test_codex_executable_reports_probe_timeout_as_transient(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    candidate = tmp_path / "OpenAI" / "Codex" / "bin" / "codex.exe"
+    candidate.parent.mkdir(parents=True)
+    candidate.write_bytes(b"test")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    with (
+        patch(
+            "pa_agent.ai.codex_subscription_client.shutil.which",
+            return_value=None,
+        ),
+        patch(
+            "pa_agent.ai.codex_subscription_client.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(
+                cmd="codex --version",
+                timeout=10.0,
+            ),
+        ),
+        pytest.raises(CodexExecutableProbeTimeout),
+    ):
+        _codex_executable()
+
+
+def test_codex_executable_tries_second_candidate_after_probe_timeout(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    first = tmp_path / "OpenAI" / "Codex" / "bin" / "codex.exe"
+    second = (
+        tmp_path / "Programs" / "OpenAI" / "Codex" / "bin" / "codex.exe"
+    )
+    first.parent.mkdir(parents=True)
+    second.parent.mkdir(parents=True)
+    first.write_bytes(b"slow")
+    second.write_bytes(b"runnable")
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    def fake_run(command: list[str], **_kwargs):
+        if command[0] == str(first):
+            raise subprocess.TimeoutExpired(command, timeout=10.0)
+        return subprocess.CompletedProcess(
+            args=command,
+            returncode=0,
+            stdout="codex-cli 1.0",
+            stderr="",
+        )
+
+    with (
+        patch(
+            "pa_agent.ai.codex_subscription_client.shutil.which",
+            return_value=None,
+        ),
+        patch(
+            "pa_agent.ai.codex_subscription_client.subprocess.run",
+            side_effect=fake_run,
+        ),
+    ):
+        executable = _codex_executable()
+
+    assert executable == str(second)
+
+
+def test_codex_version_probe_preserves_total_request_deadline(
+    tmp_path,
+) -> None:
+    candidate = tmp_path / "codex.exe"
+    candidate.write_bytes(b"test")
+
+    with (
+        patch(
+            "pa_agent.ai.codex_subscription_client._run_bounded_preflight",
+            side_effect=subprocess.TimeoutExpired(
+                cmd="codex --version",
+                timeout=10.0,
+            ),
+        ),
+        patch(
+            "pa_agent.ai.codex_subscription_client.time.monotonic",
+            return_value=2.0,
+        ),
+        pytest.raises(TimeoutError, match="request timed out") as exc_info,
+    ):
+        _is_runnable_codex_executable(
+            candidate,
+            deadline=1.0,
+        )
+
+    assert not isinstance(exc_info.value, CodexExecutableProbeTimeout)
+
+
+def test_codex_executable_returns_none_when_no_candidate(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+
+    with patch(
+        "pa_agent.ai.codex_subscription_client.shutil.which",
+        return_value=None,
     ):
         executable = _codex_executable()
 
@@ -330,6 +439,44 @@ def test_codex_client_disables_tools_and_returns_reply() -> None:
     assert "image_generation" in command
     assert "plugins" in command
     assert captured["env"].get("OKX_API_KEY") is None
+
+
+def test_codex_client_reuses_verified_absolute_executable(tmp_path) -> None:
+    executable = tmp_path / "codex.exe"
+    executable.write_bytes(b"test")
+    first_process = MagicMock()
+    first_process.returncode = 0
+    first_process.communicate.return_value = (_jsonl_reply("FIRST"), "")
+    second_process = MagicMock()
+    second_process.returncode = 0
+    second_process.communicate.return_value = (_jsonl_reply("SECOND"), "")
+    client = CodexSubscriptionClient(
+        AIProviderSettings(
+            adapter_id="codex_subscription",
+            model="auto",
+        )
+    )
+
+    with (
+        patch(
+            "pa_agent.ai.codex_subscription_client.codex_login_status",
+            return_value=CodexLoginStatus(True, True, "ok"),
+        ),
+        patch(
+            "pa_agent.ai.codex_subscription_client._codex_executable",
+            return_value=str(executable),
+        ) as resolve,
+        patch(
+            "pa_agent.ai.codex_subscription_client.subprocess.Popen",
+            side_effect=(first_process, second_process),
+        ),
+    ):
+        first = client.chat([{"role": "user", "content": "第一轮"}])
+        second = client.chat([{"role": "user", "content": "第二轮"}])
+
+    assert first.content == "FIRST"
+    assert second.content == "SECOND"
+    resolve.assert_called_once()
 
 
 def test_codex_thread_call_persists_then_resumes_same_session() -> None:

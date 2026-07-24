@@ -6,10 +6,13 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from filelock import FileLock
 from pydantic import ValidationError
 
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    SetLeverageResolutionEvidence,
     WorkerCommand,
     WorkerCommandAction,
     WorkerCommandResolutionEvidence,
@@ -93,6 +96,43 @@ def _resolution_evidence(
         broker_pending_algo_order_count=0,
         broker_account_identity_digest="e" * 64,
         observed_at=datetime(2026, 7, 24, 4, 0, tzinfo=UTC),
+    )
+
+
+def _leverage_parameters(
+    *,
+    digest: str = "a" * 64,
+    current: str = "1",
+    target: str = "2",
+    required: str = "2",
+) -> SetLeverageParameters:
+    return SetLeverageParameters(
+        analysis_digest=digest,
+        analysis_record_path="records/pending/analysis.json",
+        config_fingerprint="route-fingerprint",
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage=current,
+        target_leverage=target,
+        current_capacity=current,
+        target_capacity=required,
+        maximum_leverage=target,
+        maximum_capacity=required,
+        planning_method="bounded_sequential_policy_grid_v1",
+        policy_grid_step=str(Decimal(target) - Decimal(current)),
+        verified_grid=(
+            {"leverage": current, "capacity": current},
+            {"leverage": target, "capacity": required},
+        ),
+        required_quantity=required,
+        entry_price="4000",
+        expected_account_identity="b" * 64,
+        okx_api_base_url="https://www.okx.com",
+        supervisor_record_id="supervisor-record",
+        supervisor_record_path="records/supervisor/decision.json",
+        supervisor_record_digest="d" * 64,
     )
 
 
@@ -414,7 +454,102 @@ def test_uncertain_resolution_is_idempotent_but_cannot_be_rewritten(tmp_path):
         )
 
 
-def test_worker_schema_v1_upgrades_resolution_table_without_rewriting_commands(
+def test_resolved_uncertain_leverage_allows_new_distinct_command(tmp_path):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    lease = _grant_submit_lease(store)
+    parameters = _leverage_parameters()
+    command, _ = store.enqueue(
+        action=WorkerCommandAction.SET_LEVERAGE,
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+        parameters=parameters,
+    )
+    assert store.claim_next(worker_id="worker-one").id == command.id
+    store.recover_inflight(failure_code="BrokerTransportError")
+    store.revoke_new_risk_lease(lease.lease_id)
+    store.resolve_uncertain_command(
+        command.id,
+        resolution_code="confirmed_applied_by_leverage_readback",
+        evidence=SetLeverageResolutionEvidence(
+            analysis_digest=parameters.analysis_digest,
+            command_action="set_leverage",
+            command_failure_code="BrokerTransportError",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            instrument=parameters.instrument,
+            target_leverage=parameters.target_leverage,
+            confirmed_leverage=parameters.target_leverage,
+            required_quantity=parameters.required_quantity,
+            confirmed_max_size="10",
+            active_execution_count=0,
+            new_risk_lease_present=False,
+            broker_position_count=0,
+            broker_pending_order_count=0,
+            broker_pending_algo_order_count=0,
+            broker_account_identity_digest="b" * 64,
+            observed_at=datetime.now(UTC),
+        ),
+        resolved_by="worker:replacement",
+    )
+    replacement_lease = _grant_submit_lease(store)
+    replacement_parameters = _leverage_parameters(
+        digest="c" * 64,
+        current="2",
+        target="3",
+        required="4",
+    )
+
+    replacement, created = store.enqueue(
+        action=WorkerCommandAction.SET_LEVERAGE,
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=replacement_lease.lease_id,
+        parameters=replacement_parameters,
+    )
+
+    assert created is True
+    assert replacement.id != command.id
+    assert replacement.parameters == replacement_parameters
+
+
+def test_active_leverage_command_rejects_different_parameters(tmp_path):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    lease = _grant_submit_lease(store)
+    first, _ = store.enqueue(
+        action=WorkerCommandAction.SET_LEVERAGE,
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+        parameters=_leverage_parameters(),
+    )
+
+    with pytest.raises(RuntimeError, match="不同参数"):
+        store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+            parameters=_leverage_parameters(
+                digest="c" * 64,
+                target="3",
+                required="4",
+            ),
+        )
+
+    assert store.get_command(first.id).parameters == _leverage_parameters()
+
+
+def test_worker_schema_v1_waits_for_explicit_locked_migration(
     tmp_path,
 ):
     path = tmp_path / "worker.sqlite3"
@@ -430,6 +565,27 @@ def test_worker_schema_v1_upgrades_resolution_table_without_rewriting_commands(
     store = WorkerStore(path)
 
     with sqlite3.connect(path) as connection:
+        deferred_version = connection.execute(
+            "SELECT value FROM worker_meta WHERE key='worker_schema_version'"
+        ).fetchone()
+        deferred_resolution_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='worker_command_resolutions'
+            """
+        ).fetchone()
+
+    assert store.schema_version == 1
+    assert deferred_version == ("1",)
+    assert deferred_resolution_table is None
+
+    with pytest.raises(RuntimeError, match="单例锁未持有"):
+        store.migrate_to_current(
+            worker_lock=FileLock(str(tmp_path / "unheld-worker.lock"))
+        )
+    with FileLock(str(tmp_path / "worker.lock")) as worker_lock:
+        store.migrate_to_current(worker_lock=worker_lock)
+    with sqlite3.connect(path) as connection:
         version = connection.execute(
             "SELECT value FROM worker_meta WHERE key='worker_schema_version'"
         ).fetchone()
@@ -440,9 +596,30 @@ def test_worker_schema_v1_upgrades_resolution_table_without_rewriting_commands(
             """
         ).fetchone()
 
-    assert version == ("2",)
+    assert store.schema_version == 4
+    assert version == ("4",)
     assert resolution_table == ("worker_command_resolutions",)
     assert store.list_commands() == []
+
+
+def test_existing_worker_tables_without_version_are_not_adopted(tmp_path):
+    path = tmp_path / "worker.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE worker_heartbeats(worker_id TEXT PRIMARY KEY)"
+        )
+
+    with pytest.raises(RuntimeError, match="缺少版本号"):
+        WorkerStore(path)
+
+    with sqlite3.connect(path) as connection:
+        meta_table = connection.execute(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name='worker_meta'
+            """
+        ).fetchone()
+    assert meta_table is None
 
 
 def test_worker_schema_v1_migration_preserves_existing_uncertain_write(
@@ -495,6 +672,9 @@ def test_worker_schema_v1_migration_preserves_existing_uncertain_write(
         )
 
     store = WorkerStore(path)
+    assert store.schema_version == 1
+    with FileLock(str(tmp_path / "worker.lock")) as worker_lock:
+        store.migrate_to_current(worker_lock=worker_lock)
     command = store.get_command("old-command")
 
     assert command is not None

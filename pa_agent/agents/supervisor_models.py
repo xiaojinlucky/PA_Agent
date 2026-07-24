@@ -66,6 +66,7 @@ class SupervisorInputSnapshot(BaseModel):
     closed_bar: dict[str, Any]
     stage1_diagnosis: dict[str, Any]
     stage2_decision: dict[str, Any]
+    leverage_intent: dict[str, Any] | None = None
     active_execution_count: int = Field(ge=0)
     account_equity_usdt: str = Field(min_length=1, max_length=64)
     max_buy: str = Field(min_length=1, max_length=64)
@@ -76,11 +77,15 @@ class SupervisorInputSnapshot(BaseModel):
         "closed_bar",
         "stage1_diagnosis",
         "stage2_decision",
+        "leverage_intent",
         mode="after",
     )
     @classmethod
-    def _deep_freeze_mapping(cls, value: dict[str, Any]) -> dict[str, Any]:
-        return _freeze(value)
+    def _deep_freeze_mapping(
+        cls,
+        value: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        return _freeze(value) if value is not None else None
 
 
 class SupervisorDecisionRecord(BaseModel):

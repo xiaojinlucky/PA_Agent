@@ -1,12 +1,14 @@
 """Read-only reconciliation for uncertain broker writes before risk can resume."""
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Protocol
 
 from pa_agent.execution.credentials import account_identity_fingerprint
 from pa_agent.execution.models import ExecutionState
+from pa_agent.execution.okx_client import OKX_PENDING_ALGO_ORDER_TYPES
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import (
     WorkerCommandAction,
@@ -23,14 +25,6 @@ _SCHEMA_FAILURE_CODES = frozenset(
     }
 )
 _EXPECTED_PRE_BROKER_EVENTS = ("plan_created", "ready_expired")
-_PENDING_ALGO_ORDER_TYPES = (
-    "oco",
-    "conditional",
-    "trigger",
-    "move_order_stop",
-)
-
-
 class _OkxReadOnlyClient(Protocol):
     def account_config(self) -> dict: ...
 
@@ -53,6 +47,10 @@ def _account_identity(account_config: dict, *, environment: str) -> str:
     account_type = (
         "" if raw_account_type is None else str(raw_account_type).strip()
     )
+    if not uid or not main_uid or not account_type:
+        raise RuntimeError(
+            "OKX account/config 缺少 uid、mainUid 或账户类型, 禁止处置"
+        )
     return account_identity_fingerprint(
         "okx",
         environment,
@@ -80,10 +78,14 @@ def resolve_okx_demo_prebroker_schema_failure(
     worker_store: WorkerStore,
     execution_store: ExecutionStore,
     client: _OkxReadOnlyClient,
+    expected_account_identity: str,
     resolved_by: str,
     observed_at: datetime | None = None,
 ) -> WorkerCommandResolution:
     """Resolve one known pre-broker schema failure using only broker reads."""
+    expected_identity = expected_account_identity.strip().lower()
+    if re.fullmatch(r"[0-9a-f]{64}", expected_identity) is None:
+        raise ValueError("expected_account_identity 必须是明确的账户身份摘要")
     existing = worker_store.get_command_resolution(command_id)
     if existing is not None:
         return existing
@@ -128,6 +130,8 @@ def resolve_okx_demo_prebroker_schema_failure(
         client.account_config(),
         environment=command.environment,
     )
+    if account_identity != expected_identity:
+        raise RuntimeError("当前 OKX Demo 账户身份与待处置命令不一致")
     position_count = _nonzero_position_count(
         client.positions(instrument=record.plan.instrument)
     )
@@ -136,7 +140,7 @@ def resolve_okx_demo_prebroker_schema_failure(
     )
     pending_algo_orders = [
         row
-        for order_type in _PENDING_ALGO_ORDER_TYPES
+        for order_type in OKX_PENDING_ALGO_ORDER_TYPES
         for row in client.pending_algo_orders(
             instrument=record.plan.instrument,
             order_type=order_type,

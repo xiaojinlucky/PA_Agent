@@ -16,12 +16,14 @@ from pa_agent.execution.service import ExecutionService
 from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker import ExecutionWorker, WorkerNewRiskAuthority
 from pa_agent.execution.worker_protocol import (
-    SetLeverageParameters,
     WorkerCommandStatus,
 )
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.records.schema import AnalysisRecord
 from pa_agent.risk.sizing import calculate_risk_size
+from tests.unit.leverage_authorization_helpers import (
+    authorized_leverage_parameters,
+)
 from tests.unit.test_execution_controller import _PendingWriter
 from tests.unit.test_execution_plan_builder import _record
 from tests.unit.test_okx_adapter import FakeOkxClient
@@ -129,30 +131,14 @@ def test_set_leverage_uses_controller_worker_service_adapter_chain(
         worker_id=worker_id,
         new_risk_authority=authority,
     )
-    controller = ExecutionController(
-        settings=controller_settings,
-        pending_writer=_PendingWriter(tmp_path / "unused.json"),
-        store=execution_store,
-        worker_store=worker_store,
-        worker_launcher=lambda: None,
-        gate_checker=lambda: False,
-        paper_gate_checker=lambda: True,
-        okx_live_gate_checker=lambda: False,
-    )
-    parameters = SetLeverageParameters(
-        analysis_digest="a" * 64,
+    analysis_path = tmp_path / "leverage-analysis.json"
+    parameters, _authorized_record = authorized_leverage_parameters(
+        analysis_path=analysis_path,
+        record=_analysis(atr=Decimal("2")),
         config_fingerprint=execution_route_fingerprint(
             controller_settings,
             "okx",
         ),
-        instrument="XAU-USDT-SWAP",
-        direction="long",
-        margin_mode="cross",
-        position_mode="net_mode",
-        current_leverage=Decimal("5"),
-        target_leverage=Decimal("10"),
-        required_quantity=Decimal("20"),
-        entry_price=Decimal("4000"),
         expected_account_identity=account_identity_fingerprint(
             "okx",
             "demo",
@@ -160,9 +146,17 @@ def test_set_leverage_uses_controller_worker_service_adapter_chain(
             "1001",
             "0",
         ),
-        okx_api_base_url="https://www.okx.com",
     )
-
+    controller = ExecutionController(
+        settings=controller_settings,
+        pending_writer=_PendingWriter(analysis_path),
+        store=execution_store,
+        worker_store=worker_store,
+        worker_launcher=lambda: None,
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+    )
     worker.start()
     try:
         controller.arm("启用模拟交易")

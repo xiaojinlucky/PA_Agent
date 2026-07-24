@@ -191,7 +191,7 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.selected_broker` | string | `"longbridge"` | 当前写操作只允许 `longbridge` 或 `okx` 之一 |
 | `execution.min_trade_confidence` | int | `70` | 独立于提示弹窗的执行置信度门槛 |
 | `execution.poll_interval_seconds` | float | `2.0` | 活动订单/保护/盈亏轮询间隔 |
-| `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量；15 分钟 OKX Demo 运行器为恢复/收口历史限价记录固定覆盖为 `270` |
+| `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量；当前 10 分钟 OKX Demo 运行器固定覆盖为 `270` |
 | `execution.entry_order_mode` | string | `"signal"` | 入场方式：`signal` 跟随 PA 原始类型；`limit` 原价挂限价；`limit_with_slippage` 向成交侧移动限价；`market` 市价 |
 | `execution.exit_order_mode` | string | `"market"` | 主动离场方式：`limit`、`limit_with_slippage` 或 `market`；原生止盈止损保护单不受此字段改写 |
 | `execution.entry_slippage_atr_multiple` | decimal | `0.50` | 入场限价+滑点使用分析时主周期 ATR14 的倍数；只在对应模式下生效 |
@@ -216,13 +216,12 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 
 Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
 
-### OKX Demo 黄金 15 分钟自动循环
+### OKX Demo 黄金 10 分钟自动循环
 
-当前产品运行器固定使用 15 分钟；此前的 5 分钟循环、7 笔限价单和生命周期 canary 只属于历史 Demo 实验，不是当前产品周期或实盘绩效。该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
-`OKX XAU-USDT-SWAP / 15m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
-10% 的动态张数`，PA 倾向为 `extreme_aggressive`，执行置信度门槛为 `40`。当前运行器固定使用
-市价入场/市价主动离场；普通 GUI 可以独立选择入场和主动离场的三种方式。该运行器另有仅自身使用的快速执行提示：
-当模型能以最新已收盘 K1 附近构造合法三价时，只输出市价单；否则如实不下单，
+当前产品运行器固定使用严格聚合的 10 分钟主周期；它由两根连续、同一 UTC 10 分钟边界且均已收盘的 OKX 官方 5 分钟 K 线生成，不会冒充 OKX 原生 10 分钟周期。此前的 5 分钟循环、7 笔限价单和生命周期 canary 只属于历史 Demo 实验，不是当前产品周期或策略绩效。该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
+`OKX XAU-USDT-SWAP / 5m→10m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
+10% 的动态风险张数`，PA 倾向为 `extreme_aggressive`，执行置信度门槛为 `20`。当前运行器的入场和主动离场均为
+`limit_with_slippage / 0.50 × 主周期 ATR14`；原生保护单继续独立管理。自然分析只能在最新已收盘 K 线附近构造合法三价时给出订单，否则如实记录 `no_order` 并继续下一根 10 分钟 K 线，
 不会新建限价单或突破单。日常 GUI / PA 分析不继承此规则。`270` 秒的限价超时仍用于
 恢复或收口历史限价记录。
 

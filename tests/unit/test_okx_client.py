@@ -9,7 +9,11 @@ import pytest
 
 from pa_agent.execution.credentials import OkxCredentials
 from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
-from pa_agent.execution.okx_client import HttpResponse, OkxRestClient
+from pa_agent.execution.okx_client import (
+    OKX_PENDING_ALGO_ORDER_TYPES,
+    HttpResponse,
+    OkxRestClient,
+)
 
 
 class FakeTransport:
@@ -347,6 +351,54 @@ def test_set_leverage_uses_private_post_with_exact_cross_net_body():
         "mgnMode": "cross",
     }
     assert call["headers"]["x-simulated-trading"] == "1"
+
+
+def test_pending_orders_use_official_current_orders_endpoint():
+    transport = FakeTransport(
+        [_response({"code": "0", "data": [], "msg": ""})]
+    )
+
+    rows = _client(transport, simulated=True).pending_orders(
+        instrument="XAU-USDT-SWAP",
+    )
+
+    assert rows == []
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/trade/orders-pending?instId=XAU-USDT-SWAP"
+    )
+
+
+@pytest.mark.parametrize("order_type", OKX_PENDING_ALGO_ORDER_TYPES)
+def test_pending_algo_orders_support_every_verified_official_type(order_type):
+    transport = FakeTransport(
+        [_response({"code": "0", "data": [], "msg": ""})]
+    )
+
+    rows = _client(transport, simulated=True).pending_algo_orders(
+        instrument="XAU-USDT-SWAP",
+        order_type=order_type,
+    )
+
+    assert rows == []
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/trade/orders-algo-pending"
+        f"?instId=XAU-USDT-SWAP&ordType={order_type}"
+    )
+
+
+def test_pending_algo_orders_reject_unknown_type_without_querying_broker():
+    transport = FakeTransport([])
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport, simulated=True).pending_algo_orders(
+            instrument="XAU-USDT-SWAP",
+            order_type="future_unknown_algo",
+        )
+
+    assert caught.value.write_may_have_reached is False
+    assert transport.calls == []
 
 
 def test_account_bills_read_all_pages_with_bill_id_cursor():

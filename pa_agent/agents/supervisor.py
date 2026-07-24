@@ -183,6 +183,19 @@ def build_supervisor_input(
 
     if not record.kline_data or not isinstance(record.kline_data[0], dict):
         raise SupervisorConfigurationError("PA 记录缺少监督所需的已收盘 K 线")
+    closed_bar = dict(record.kline_data[0])
+    try:
+        record_bar_ms = int(float(closed_bar["ts_open"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise SupervisorConfigurationError(
+            "PA 记录的已收盘 K 线时间无效"
+        ) from exc
+    if record_bar_ms != int(bar_ms):
+        raise SupervisorConfigurationError(
+            "监督 K 线时间与 PA 耐久记录不一致"
+        )
+    if closed_bar.get("closed") is not True:
+        raise SupervisorConfigurationError("监督只允许使用已收盘 K 线")
     stage1 = record.stage1_diagnosis
     stage2 = record.stage2_decision
     if not isinstance(stage1, dict) or not isinstance(stage2, dict):
@@ -196,6 +209,40 @@ def build_supervisor_input(
         )
         else "natural_pa"
     )
+    stage2_response = (
+        record.stage2_response
+        if isinstance(record.stage2_response, dict)
+        else {}
+    )
+    leverage_intent = stage2_response.get("leverage_intent")
+    if leverage_intent is not None and not isinstance(
+        leverage_intent,
+        dict,
+    ):
+        raise SupervisorConfigurationError("杠杆意图不是结构化对象")
+    decision = stage2.get("decision")
+    if not isinstance(decision, dict):
+        raise SupervisorConfigurationError("PA 阶段二缺少可执行决策")
+    signal_entry_price = str(decision.get("entry_price") or "")
+    stop_loss_price = str(decision.get("stop_loss_price") or "")
+    if not signal_entry_price or not stop_loss_price:
+        raise SupervisorConfigurationError("PA 阶段二缺少入场价或止损价")
+    stage2_snapshot = dict(stage2)
+    stage2_snapshot["execution_context"] = {
+        "signal_entry_price": signal_entry_price,
+        "effective_entry_price": str(
+            getattr(sizing, "reference_price_usdt", signal_entry_price)
+        ),
+        "stop_loss_price": stop_loss_price,
+        "risk_equity_basis": str(
+            getattr(sizing, "equity_basis", "usdt_equity")
+        ),
+        "risk_equity_usdt": str(sizing.equity_usdt),
+        "risk_budget_usdt": str(
+            getattr(sizing, "risk_budget_usdt", "")
+        ),
+        "technical_plan_quantity": str(sizing.quantity),
+    }
     return SupervisorInputSnapshot(
         input_mode=input_mode,
         campaign_id=campaign_id,
@@ -203,9 +250,14 @@ def build_supervisor_input(
         symbol=record.meta.symbol,
         timeframe=record.meta.timeframe,
         closed_bar_ts_open_ms=int(bar_ms),
-        closed_bar=dict(record.kline_data[0]),
+        closed_bar=closed_bar,
         stage1_diagnosis=dict(stage1),
-        stage2_decision=dict(stage2),
+        stage2_decision=stage2_snapshot,
+        leverage_intent=(
+            dict(leverage_intent)
+            if isinstance(leverage_intent, dict)
+            else None
+        ),
         active_execution_count=int(active_execution_count),
         account_equity_usdt=str(sizing.equity_usdt),
         max_buy=str(sizing.max_buy),

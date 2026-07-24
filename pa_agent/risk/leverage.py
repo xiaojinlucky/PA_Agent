@@ -1,12 +1,18 @@
 """Read-only OKX leverage planning from broker-reported capacity."""
 from __future__ import annotations
 
-from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal, InvalidOperation
+from decimal import ROUND_CEILING, Decimal, InvalidOperation
 from typing import Literal, Protocol
 
-from pa_agent.execution.worker_protocol import SetLeverageParameters
+from pa_agent.execution.worker_protocol import (
+    LeverageCapacityPoint,
+    SetLeverageParameters,
+)
 
-_LEVERAGE_STEP = Decimal("0.01")
+# 这是 PA_Agent 主动声明的粗粒度策略网格, 不是 OKX 最小杠杆档位。
+# 每个候选值都必须由 OKX max-size 端点逐点验证, 最后另含官方 maxLever。
+_POLICY_GRID_STEP = Decimal("5")
+_MAX_CAPACITY_READS = 16
 
 
 class LeveragePlanningFailure(ValueError):
@@ -55,6 +61,25 @@ def _capacity(
     return _positive(row.get(field), field)
 
 
+def _policy_candidate_grid(
+    current: Decimal,
+    maximum: Decimal,
+) -> tuple[Decimal, ...]:
+    """构造策略声明的候选网格, 不把它冒充成交易所最小档位。"""
+    candidates = [current]
+    next_grid_point = (
+        current / _POLICY_GRID_STEP
+    ).to_integral_value(rounding=ROUND_CEILING) * _POLICY_GRID_STEP
+    if next_grid_point <= current:
+        next_grid_point += _POLICY_GRID_STEP
+    while next_grid_point < maximum:
+        candidates.append(next_grid_point)
+        next_grid_point += _POLICY_GRID_STEP
+    if maximum != current:
+        candidates.append(maximum)
+    return tuple(candidates)
+
+
 def build_minimum_leverage_parameters(
     *,
     client: _CapacityClient,
@@ -68,7 +93,7 @@ def build_minimum_leverage_parameters(
     expected_account_identity: str,
     okx_api_base_url: str,
 ) -> SetLeverageParameters | None:
-    """Return the lowest 0.01x leverage whose official capacity is sufficient."""
+    """返回有界策略网格中第一个经过逐点验证且容量足够的杠杆。"""
     current = _positive(current_leverage, "current_leverage")
     required = _positive(required_quantity, "required_quantity")
     price = _positive(entry_price, "entry_price")
@@ -92,63 +117,72 @@ def build_minimum_leverage_parameters(
             "OKX 当前杠杆不在官方允许范围内",
         )
 
-    cache: dict[Decimal, Decimal] = {}
-
-    def quote(leverage: Decimal) -> Decimal:
-        if leverage not in cache:
-            cache[leverage] = _capacity(
-                client,
-                instrument=instrument,
-                direction=direction,
-                entry_price=price,
-                leverage=leverage,
-            )
-        return cache[leverage]
-
-    current_capacity = quote(current)
+    current_capacity = _capacity(
+        client,
+        instrument=instrument,
+        direction=direction,
+        entry_price=price,
+        leverage=current,
+    )
     if current_capacity >= required:
         return None
-    current_units = int(
-        (current / _LEVERAGE_STEP).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
-    )
-    maximum_units = int(
-        (maximum / _LEVERAGE_STEP).to_integral_value(
-            rounding=ROUND_FLOOR
-        )
-    )
-    maximum_capacity = quote(
-        Decimal(maximum_units) * _LEVERAGE_STEP
-    )
-    if maximum_capacity < current_capacity:
+
+    candidates = _policy_candidate_grid(current, maximum)
+    if len(candidates) > _MAX_CAPACITY_READS:
         raise LeveragePlanningFailure(
-            "non_monotonic_capacity",
-            "OKX 候选杠杆容量不是单调增加, 禁止猜测最低杠杆",
+            "capacity_grid_exceeds_read_budget",
+            "候选杠杆网格超过只读容量探测上限, 无法在有界请求内证明",
         )
+
+    first_sufficient: Decimal | None = None
+    target_capacity: Decimal | None = None
+    previous_leverage = current
+    previous_capacity = current_capacity
+    maximum_capacity = current_capacity
+    verified_grid = [
+        LeverageCapacityPoint(
+            leverage=current,
+            capacity=current_capacity,
+        )
+    ]
+    for candidate in candidates[1:]:
+        candidate_capacity = _capacity(
+            client,
+            instrument=instrument,
+            direction=direction,
+            entry_price=price,
+            leverage=candidate,
+        )
+        if candidate_capacity < previous_capacity:
+            raise LeveragePlanningFailure(
+                "non_monotonic_capacity",
+                "OKX 候选网格容量不是逐点单调增加："
+                f"{previous_leverage}x={previous_capacity} → "
+                f"{candidate}x={candidate_capacity}；禁止猜测目标杠杆",
+            )
+        verified_grid.append(
+            LeverageCapacityPoint(
+                leverage=candidate,
+                capacity=candidate_capacity,
+            )
+        )
+        if first_sufficient is None and candidate_capacity >= required:
+            first_sufficient = candidate
+            target_capacity = candidate_capacity
+        previous_leverage = candidate
+        previous_capacity = candidate_capacity
+        maximum_capacity = candidate_capacity
+
     if maximum_capacity < required:
         raise LeveragePlanningFailure(
             "max_leverage_capacity_insufficient",
             "OKX 最大允许杠杆仍不足以容纳风险目标张数",
         )
-
-    low = current_units
-    high = maximum_units
-    while high - low > 1:
-        middle = (low + high) // 2
-        candidate = Decimal(middle) * _LEVERAGE_STEP
-        if quote(candidate) >= required:
-            high = middle
-        else:
-            low = middle
-    target = Decimal(high) * _LEVERAGE_STEP
-    previous = target - _LEVERAGE_STEP
-    if previous > current and quote(previous) >= required:
+    if first_sufficient is None or target_capacity is None:
         raise LeveragePlanningFailure(
-            "non_monotonic_capacity",
-            "OKX 杠杆容量不是可验证的单调结果",
+            "capacity_proof_incomplete",
+            "候选网格没有形成可审计的足够容量点",
         )
-    target = target.quantize(_LEVERAGE_STEP, rounding=ROUND_CEILING)
     return SetLeverageParameters(
         analysis_digest=analysis_digest,
         config_fingerprint=config_fingerprint,
@@ -157,7 +191,14 @@ def build_minimum_leverage_parameters(
         margin_mode="cross",
         position_mode="net_mode",
         current_leverage=current,
-        target_leverage=target,
+        target_leverage=first_sufficient,
+        current_capacity=current_capacity,
+        target_capacity=target_capacity,
+        maximum_leverage=maximum,
+        maximum_capacity=maximum_capacity,
+        planning_method="bounded_sequential_policy_grid_v1",
+        policy_grid_step=_POLICY_GRID_STEP,
+        verified_grid=tuple(verified_grid),
         required_quantity=required,
         entry_price=price,
         expected_account_identity=expected_account_identity,

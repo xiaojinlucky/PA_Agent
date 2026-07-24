@@ -31,6 +31,10 @@ from pa_agent.execution.errors import (
     NewRiskLeaseUnavailable,
     PreflightError,
 )
+from pa_agent.execution.leverage_authorization import (
+    LeverageAuthorizationError,
+    validate_leverage_authorization,
+)
 from pa_agent.execution.models import ExecutionRecord, ExecutionState
 from pa_agent.execution.plan_builder import (
     build_execution_plan,
@@ -414,6 +418,12 @@ class ExecutionController:
             or parameters.okx_api_base_url != str(okx.api_base_url)
         ):
             raise LiveTradingDisabled("杠杆计划与当前 OKX 路由配置不一致")
+        try:
+            validate_leverage_authorization(parameters)
+        except LeverageAuthorizationError as exc:
+            raise LiveTradingDisabled(
+                f"杠杆命令没有匹配的耐久监督授权：{exc}"
+            ) from exc
         command, _created = self._worker_store.enqueue(
             action=WorkerCommandAction.SET_LEVERAGE,
             requester=self._requester_id,

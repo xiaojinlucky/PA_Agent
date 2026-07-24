@@ -5,7 +5,11 @@ from decimal import Decimal
 import pytest
 
 from pa_agent.execution.credentials import account_identity_fingerprint
-from pa_agent.execution.errors import BrokerTransportError, PreflightError
+from pa_agent.execution.errors import (
+    BrokerApiError,
+    BrokerTransportError,
+    PreflightError,
+)
 from pa_agent.execution.models import (
     ExecutionPlan,
     ExecutionRecord,
@@ -13,6 +17,7 @@ from pa_agent.execution.models import (
     utc_now_iso,
 )
 from pa_agent.execution.okx_adapter import OkxAdapter
+from pa_agent.execution.okx_client import OKX_PENDING_ALGO_ORDER_TYPES
 from pa_agent.execution.worker_protocol import SetLeverageParameters
 
 
@@ -44,7 +49,9 @@ class FakeOkxClient:
         self.capacity_after = Decimal("30")
         self.pending_order_rows = []
         self.pending_algo_rows = {}
+        self.adjustment_exist_ord = False
         self.set_leverage_updates = True
+        self.bill_rows = []
 
     def sync_server_time(self):
         self.calls.append(("sync_server_time",))
@@ -87,6 +94,7 @@ class FakeOkxClient:
                 "minSz": "1",
                 "settleCcy": "USDT",
                 "ctVal": "0.01",
+                "ctMult": "1",
                 "ctType": "linear",
                 "maxMktSz": "20000",
             }
@@ -133,6 +141,14 @@ class FakeOkxClient:
         self.calls.append(("pending_algo_orders", instrument, order_type))
         return list(self.pending_algo_rows.get(order_type, []))
 
+    def leverage_adjustment_info(self, **kwargs):
+        self.calls.append(("leverage_adjustment_info", kwargs))
+        return {
+            "existOrd": self.adjustment_exist_ord,
+            "maxLever": "50",
+            "minLever": "0.01",
+        }
+
     def positions(self, *, instrument=None):
         self.calls.append(("positions", instrument))
         if instrument:
@@ -143,6 +159,10 @@ class FakeOkxClient:
 
     def balance(self):
         return list(self.balance_rows)
+
+    def account_bills(self):
+        self.calls.append(("account_bills",))
+        return list(self.bill_rows)
 
     def ticker(self, instrument):
         return {"instId": instrument, "last": "105"}
@@ -295,6 +315,16 @@ def _leverage_parameters() -> SetLeverageParameters:
         position_mode="net_mode",
         current_leverage=Decimal("5"),
         target_leverage=Decimal("10"),
+        current_capacity=Decimal("10"),
+        target_capacity=Decimal("30"),
+        maximum_leverage=Decimal("10"),
+        maximum_capacity=Decimal("30"),
+        planning_method="bounded_sequential_policy_grid_v1",
+        policy_grid_step=Decimal("5"),
+        verified_grid=(
+            {"leverage": "5", "capacity": "10"},
+            {"leverage": "10", "capacity": "30"},
+        ),
         required_quantity=Decimal("20"),
         entry_price=Decimal("4000"),
         expected_account_identity=account_identity_fingerprint(
@@ -355,6 +385,51 @@ def test_set_leverage_refuses_position_before_any_write():
     assert not [call for call in client.calls if call[0] == "set_leverage"]
 
 
+@pytest.mark.parametrize(
+    "order_type",
+    [None, *OKX_PENDING_ALGO_ORDER_TYPES],
+)
+def test_set_leverage_refuses_every_official_pending_order_before_write(
+    order_type,
+):
+    client = FakeOkxClient()
+    if order_type is None:
+        client.pending_order_rows = [{"ordId": "ordinary-order"}]
+    else:
+        client.pending_algo_rows[order_type] = [
+            {"algoId": f"{order_type}-order"}
+        ]
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(PreflightError, match=r"仍有.*挂单"):
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    assert not [call for call in client.calls if call[0] == "set_leverage"]
+
+
+def test_set_leverage_refuses_unknown_pending_order_reported_by_adjustment():
+    client = FakeOkxClient()
+    client.adjustment_exist_ord = True
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(PreflightError, match="未识别挂单"):
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    queried_types = [
+        call[2]
+        for call in client.calls
+        if call[0] == "pending_algo_orders"
+    ]
+    assert queried_types == list(OKX_PENDING_ALGO_ORDER_TYPES)
+    assert not [call for call in client.calls if call[0] == "set_leverage"]
+
+
 def test_set_leverage_unknown_readback_never_reposts():
     client = FakeOkxClient()
     client.set_leverage_updates = False
@@ -367,6 +442,84 @@ def test_set_leverage_unknown_readback_never_reposts():
         )
 
     assert caught.value.write_may_have_reached is True
+    assert len(
+        [call for call in client.calls if call[0] == "set_leverage"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "readback_stage",
+    [
+        "account_config",
+        "positions",
+        "pending_orders",
+        "pending_algo_orders",
+        "leverage_adjustment_info",
+        "leverage_info",
+        "max_order_size",
+    ],
+)
+def test_set_leverage_post_write_readback_failure_is_always_uncertain(
+    monkeypatch,
+    readback_stage,
+):
+    client = FakeOkxClient()
+    original = getattr(client, readback_stage)
+
+    def _fail_only_after_post(*args, **kwargs):
+        if any(call[0] == "set_leverage" for call in client.calls):
+            raise PreflightError(f"{readback_stage} failed after write")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(client, readback_stage, _fail_only_after_post)
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(BrokerTransportError) as caught:
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    assert caught.value.write_may_have_reached is True
+    assert isinstance(caught.value.__cause__, PreflightError)
+    assert len(
+        [call for call in client.calls if call[0] == "set_leverage"]
+    ) == 1
+
+
+@pytest.mark.parametrize(
+    "read_error",
+    [
+        BrokerTransportError(
+            "GET transport failed",
+            write_may_have_reached=False,
+        ),
+        BrokerApiError("50011", "GET rejected"),
+    ],
+)
+def test_set_leverage_post_write_read_error_is_promoted_to_uncertain(
+    monkeypatch,
+    read_error,
+):
+    client = FakeOkxClient()
+    original = client.account_config
+
+    def _fail_only_after_post():
+        if any(call[0] == "set_leverage" for call in client.calls):
+            raise read_error
+        return original()
+
+    monkeypatch.setattr(client, "account_config", _fail_only_after_post)
+    adapter = OkxAdapter(client, margin_mode="cross")
+
+    with pytest.raises(BrokerTransportError) as caught:
+        adapter.set_leverage(
+            _leverage_parameters(),
+            environment="demo",
+        )
+
+    assert caught.value.write_may_have_reached is True
+    assert caught.value.__cause__ is read_error
     assert len(
         [call for call in client.calls if call[0] == "set_leverage"]
     ) == 1

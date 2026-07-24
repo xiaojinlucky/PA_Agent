@@ -66,15 +66,46 @@ def _build(client, **overrides):
     return build_minimum_leverage_parameters(**kwargs)
 
 
-def test_planner_selects_lowest_official_point_zero_one_leverage():
+def test_planner_selects_first_sufficient_point_on_verified_policy_grid():
     client = _CapacityClient()
 
     parameters = _build(client)
 
-    assert parameters.target_leverage == Decimal("20.10")
+    assert parameters.target_leverage == Decimal("25")
     assert parameters.required_quantity == Decimal("201")
-    assert Decimal("20.09") in client.quoted
-    assert Decimal("20.10") in client.quoted
+    assert parameters.current_capacity == Decimal("200")
+    assert parameters.target_capacity == Decimal("250")
+    assert parameters.maximum_leverage == Decimal("50")
+    assert parameters.maximum_capacity == Decimal("500")
+    assert parameters.planning_method == "bounded_sequential_policy_grid_v1"
+    assert parameters.policy_grid_step == Decimal("5")
+    assert [
+        (point.leverage, point.capacity)
+        for point in parameters.verified_grid
+    ] == [
+        (Decimal(value), Decimal(value * 10))
+        for value in range(20, 51, 5)
+    ]
+    assert len(parameters.leverage_intent_digest) == 64
+    assert client.quoted == [
+        Decimal(value) for value in range(20, 51, 5)
+    ]
+
+
+def test_planner_includes_exact_fractional_official_maximum_as_tail_point():
+    client = _CapacityClient(max_leverage=Decimal("21.5"))
+
+    parameters = _build(
+        client,
+        current_leverage="20.25",
+        required_quantity="214",
+    )
+
+    assert parameters.target_leverage == Decimal("21.5")
+    assert client.quoted == [
+        Decimal("20.25"),
+        Decimal("21.5"),
+    ]
 
 
 def test_planner_returns_none_when_current_capacity_is_already_sufficient():
@@ -99,6 +130,7 @@ def test_planner_fails_when_official_maximum_leverage_is_insufficient():
         _build(client, required_quantity="30")
 
     assert caught.value.code == "max_leverage_capacity_insufficient"
+    assert client.quoted == [Decimal("20"), Decimal("25")]
 
 
 def test_planner_refuses_exchange_reported_pending_orders():
@@ -113,19 +145,64 @@ def test_planner_refuses_exchange_reported_pending_orders():
     assert caught.value.code == "pending_orders"
 
 
-def test_planner_refuses_non_monotonic_broker_capacity_curve():
+def test_planner_refuses_internal_capacity_drop_after_a_sufficient_point():
     client = _CapacityClient(
-        max_leverage=Decimal("50"),
+        max_leverage=Decimal("30"),
         capacity_override={
-            Decimal("20"): Decimal("120000"),
-            Decimal("50.00"): Decimal("28000"),
+            Decimal("20"): Decimal("200"),
+            Decimal("25"): Decimal("260"),
+            Decimal("30"): Decimal("250"),
         },
     )
 
     with pytest.raises(
         LeveragePlanningFailure,
-        match="不是单调增加",
+        match="逐点单调增加",
     ) as caught:
-        _build(client, required_quantity="130000")
+        _build(client, required_quantity="201")
 
     assert caught.value.code == "non_monotonic_capacity"
+    assert "25x=260 → 30x=250" in str(caught.value)
+    assert client.quoted == [
+        Decimal("20"),
+        Decimal("25"),
+        Decimal("30"),
+    ]
+
+
+def test_planner_accepts_exact_capacity_read_budget_boundary():
+    client = _CapacityClient(
+        capacity_per_leverage=Decimal("1"),
+        max_leverage=Decimal("75"),
+    )
+
+    parameters = _build(
+        client,
+        current_leverage="1",
+        required_quantity="75",
+    )
+
+    assert parameters.target_leverage == Decimal("75")
+    assert len(client.quoted) == 16
+    assert client.quoted[0] == Decimal("1")
+    assert client.quoted[-1] == Decimal("75")
+
+
+def test_planner_blocks_before_exceeding_capacity_read_budget():
+    client = _CapacityClient(
+        capacity_per_leverage=Decimal("1"),
+        max_leverage=Decimal("80"),
+    )
+
+    with pytest.raises(
+        LeveragePlanningFailure,
+        match="只读容量探测上限",
+    ) as caught:
+        _build(
+            client,
+            current_leverage="1",
+            required_quantity="80",
+        )
+
+    assert caught.value.code == "capacity_grid_exceeds_read_budget"
+    assert client.quoted == [Decimal("1")]

@@ -25,14 +25,15 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.worker_protocol import (
-    SetLeverageResult,
     SetLeverageResolutionEvidence,
+    SetLeverageResult,
     WorkerCommand,
     WorkerCommandAction,
     WorkerCommandStatus,
     WorkerState,
 )
 from pa_agent.execution.worker_store import WorkerStore
+from pa_agent.risk.runtime import RiskRuntimeBlocked
 
 _WRITE_ACTIONS = frozenset(
     {
@@ -54,6 +55,7 @@ _DEFINITELY_NOT_WRITTEN = (
     LiveTradingDisabled,
     PreflightError,
     CredentialError,
+    RiskRuntimeBlocked,
 )
 _HEARTBEAT_STALE_SECONDS = 10
 _RECONCILE_STALE_SECONDS = 30
@@ -438,19 +440,7 @@ class ExecutionWorker:
                     last_error_code=type(exc).__name__[:128],
                 )
             else:
-                unresolved = self._unresolved_write_commands()
-                self._set_heartbeat(
-                    (
-                        WorkerState.NEEDS_ATTENTION
-                        if unresolved
-                        else WorkerState.RUNNING
-                    ),
-                    last_error_code=(
-                        "unresolved_broker_write"
-                        if unresolved
-                        else ""
-                    ),
-                )
+                self._set_available_heartbeat()
         except Exception:
             self._started = False
             self._stop_heartbeat_thread()
@@ -464,7 +454,6 @@ class ExecutionWorker:
             if command.action in _WRITE_ACTIONS
             and command.status
             in {
-                WorkerCommandStatus.PENDING,
                 WorkerCommandStatus.RUNNING,
                 WorkerCommandStatus.UNCERTAIN,
             }
@@ -473,6 +462,25 @@ class ExecutionWorker:
                 or self.store.get_command_resolution(command.id) is None
             )
         ]
+
+    def _set_available_heartbeat(
+        self,
+        *,
+        last_error_code: str = "",
+    ) -> None:
+        unresolved = self._unresolved_write_commands()
+        self._set_heartbeat(
+            (
+                WorkerState.NEEDS_ATTENTION
+                if unresolved
+                else WorkerState.RUNNING
+            ),
+            last_error_code=(
+                "unresolved_broker_write"
+                if unresolved
+                else last_error_code
+            ),
+        )
 
     def _resolve_uncertain_leverage_commands(self) -> None:
         for command in self.store.list_commands():
@@ -813,22 +821,19 @@ class ExecutionWorker:
                 status=status,
                 failure_code=failure_code,
             )
-            self._set_heartbeat(
-                (
-                    WorkerState.NEEDS_ATTENTION
-                    if (
-                        reload_error is not None
-                        or
-                        status is WorkerCommandStatus.UNCERTAIN
-                        or isinstance(
-                            exc,
-                            _ReconciliationNeedsAttention,
-                        )
-                    )
-                    else WorkerState.RUNNING
-                ),
-                last_error_code=failure_code,
-            )
+            if (
+                reload_error is not None
+                or status is WorkerCommandStatus.UNCERTAIN
+                or isinstance(exc, _ReconciliationNeedsAttention)
+            ):
+                self._set_heartbeat(
+                    WorkerState.NEEDS_ATTENTION,
+                    last_error_code=failure_code,
+                )
+            else:
+                self._set_available_heartbeat(
+                    last_error_code=failure_code,
+                )
             return finished
         finally:
             self._new_risk_authority.clear()
@@ -839,18 +844,13 @@ class ExecutionWorker:
             result_code=result_code,
             result=structured_result,
         )
-        self._set_heartbeat(
-            (
-                WorkerState.NEEDS_ATTENTION
-                if reload_error is not None
-                else WorkerState.RUNNING
-            ),
-            last_error_code=(
-                type(reload_error).__name__[:128]
-                if reload_error is not None
-                else ""
-            ),
-        )
+        if reload_error is not None:
+            self._set_heartbeat(
+                WorkerState.NEEDS_ATTENTION,
+                last_error_code=type(reload_error).__name__[:128],
+            )
+        else:
+            self._set_available_heartbeat()
         return finished
 
     def run_forever(self) -> None:
@@ -870,7 +870,7 @@ class ExecutionWorker:
                         last_error_code=type(exc).__name__[:128],
                     )
                 else:
-                    self._set_heartbeat(WorkerState.RUNNING)
+                    self._set_available_heartbeat()
                 self._stop_event.wait(self._poll_interval_seconds)
         finally:
             self.close()
