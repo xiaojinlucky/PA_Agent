@@ -83,6 +83,20 @@ def test_trading_loss_reaches_fifty_percent_drawdown_without_cashflow():
     assert result.drawdown_fraction == Decimal("0.5")
 
 
+def test_asset_conversion_is_not_external_cashflow_or_trading_profit():
+    rows = [
+        _bill(
+            "asset-conversion",
+            bill_type="2",
+            subtype="1",
+            change="60475.077592255",
+            currency="USDT",
+        )
+    ]
+
+    assert classify_okx_external_cashflows(rows) == ()
+
+
 def test_trade_and_fee_bills_are_not_external_cashflows():
     rows = [
         _bill("trade", bill_type="2", subtype="1", change="4000"),

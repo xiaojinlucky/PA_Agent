@@ -57,6 +57,7 @@ def _settings() -> Settings:
     settings.general.last_symbol = "XAU-USDT-SWAP"
     settings.general.last_timeframe = "15m"
     settings.execution.selected_broker = "okx"
+    settings.execution.okx.simulated = True
     return settings
 
 
@@ -92,7 +93,11 @@ def test_capture_separates_confirmed_subscription_from_plan_and_local_lifecycle(
     execution_store = _ExecutionStore(
         active=[latest],
         recent=[latest],
-        account=AccountSnapshot(broker="okx", account_profile="okx"),
+        account=AccountSnapshot(
+            broker="okx",
+            account_profile="okx-demo",
+            captured_at="2026-07-23T11:59:00+00:00",
+        ),
     )
     worker_store = _WorkerStore(heartbeat)
 
@@ -122,7 +127,27 @@ def test_capture_separates_confirmed_subscription_from_plan_and_local_lifecycle(
     assert snapshot.active_execution_count.value == "1"
     assert snapshot.latest_execution_state.value == "open"
     assert snapshot.latest_execution_state.certainty is FactCertainty.PLAN
-    assert execution_store.account_route == ("okx", "okx")
+    assert execution_store.account_route == ("okx", "okx-demo")
+
+
+def test_capture_marks_old_account_snapshot_unknown():
+    execution_store = _ExecutionStore(
+        account=AccountSnapshot(
+            broker="okx",
+            account_profile="okx-demo",
+            captured_at="2026-07-23T10:00:00+00:00",
+        )
+    )
+    worker_store = _WorkerStore(None)
+
+    snapshot = _model(
+        source=_source(connected=False, symbol="", timeframe=""),
+        execution_store=execution_store,
+        worker_store=worker_store,
+    ).capture()
+
+    assert snapshot.account.certainty is FactCertainty.UNKNOWN
+    assert "陈旧" in snapshot.account.value
 
 
 def test_capture_keeps_missing_worker_and_account_as_unknown():

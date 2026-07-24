@@ -17,6 +17,7 @@ from pa_agent.execution.worker_protocol import WorkerHeartbeat
 
 _HEARTBEAT_STALE_SECONDS = 10
 _RECONCILE_STALE_SECONDS = 30
+_ACCOUNT_SNAPSHOT_STALE_SECONDS = 90
 
 
 class FactCertainty(StrEnum):
@@ -290,7 +291,9 @@ class WorkbenchReadModel:
             ).strip()
             return broker, account
         if broker == "okx":
-            return broker, "okx"
+            route = getattr(execution, "okx", None)
+            profile = "okx-demo" if bool(getattr(route, "simulated", False)) else "okx-live"
+            return broker, profile
         return "", ""
 
     @staticmethod
@@ -306,6 +309,31 @@ class WorkbenchReadModel:
                 value=f"未读取到账户快照（{route}）",
                 certainty=FactCertainty.UNKNOWN,
                 source="records/execution.sqlite3 / account_snapshots",
+                observed_at=observed_at,
+            )
+        try:
+            captured_at = datetime.fromisoformat(snapshot.captured_at)
+            observed = datetime.fromisoformat(observed_at)
+        except (TypeError, ValueError):
+            return ReadFact(
+                value=f"账户快照时间无效（{route}）",
+                certainty=FactCertainty.UNKNOWN,
+                source="records/execution.sqlite3 / account_snapshots / captured_at",
+                observed_at=observed_at,
+            )
+        if captured_at.tzinfo is None or captured_at.utcoffset() is None:
+            return ReadFact(
+                value=f"账户快照时间无时区（{route}）",
+                certainty=FactCertainty.UNKNOWN,
+                source="records/execution.sqlite3 / account_snapshots / captured_at",
+                observed_at=observed_at,
+            )
+        age_seconds = (observed - captured_at.astimezone(UTC)).total_seconds()
+        if age_seconds > _ACCOUNT_SNAPSHOT_STALE_SECONDS:
+            return ReadFact(
+                value=f"账户快照陈旧（{route}，{int(age_seconds)}秒）",
+                certainty=FactCertainty.UNKNOWN,
+                source="records/execution.sqlite3 / account_snapshots / captured_at",
                 observed_at=observed_at,
             )
         return ReadFact(
