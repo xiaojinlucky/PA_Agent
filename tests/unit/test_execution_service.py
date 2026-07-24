@@ -929,6 +929,21 @@ def test_monitor_once_refreshes_actual_selected_account(
     assert ("account_snapshot", "comprehensive") in adapter.calls
 
 
+def test_monitor_once_refreshes_selected_account_without_active_execution(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+
+    updates, snapshots = service.monitor_once()
+
+    assert updates == []
+    assert len(snapshots) == 1
+    assert snapshots[0].account_profile == "okx-live"
+    assert ("account_snapshot", None) in adapter.calls
+
+
 def test_unknown_reconcile_write_disarms_entire_session(tmp_path, monkeypatch):
     adapter = FakeAdapter()
     service, record = _service(tmp_path, monkeypatch, adapter)
@@ -1020,6 +1035,32 @@ def test_active_execution_blocks_account_switch_before_read_or_write(
     with pytest.raises(CredentialError, match="实际账户"):
         service.refresh_account(active.id)
     assert not [call for call in adapter.calls if call[0] == "account_snapshot"]
+
+
+def test_restored_account_identity_clears_only_identity_write_block(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service.arm("启用实盘交易")
+    service.submit(execution.id)
+    adapter.identity = "okx-account-b"
+    blocked = service.reconcile_once()[0]
+    assert blocked.broker_state["risk_reducing_writes_blocked"] == (
+        "identity_or_route_blocked"
+    )
+
+    adapter.identity = "okx-account-a"
+    adapter.calls.clear()
+    recovered = service.reconcile_once()[0]
+
+    assert recovered.state is ExecutionState.OPEN
+    assert recovered.needs_attention is False
+    assert "identity_or_route_blocked" not in recovered.broker_state
+    assert "risk_reducing_writes_blocked" not in recovered.broker_state
+    assert ("reconcile", ExecutionState.ENTRY_PENDING, False) in adapter.calls
 
 
 def test_manual_exit_account_switch_disarms_before_exit_intent(

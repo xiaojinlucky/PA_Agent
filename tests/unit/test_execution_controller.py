@@ -514,6 +514,7 @@ def test_controller_queue_worker_is_the_only_broker_write_path(
     worker_settings.execution.enabled = False
     worker_settings.execution.selected_broker = "longbridge"
     worker_settings.execution.longbridge.preferred_account = "comprehensive"
+    worker_settings.execution.longbridge.instrument = "700.HK"
     execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
     worker_store = WorkerStore(tmp_path / "control.sqlite3")
     worker_id = "worker-e2e"
@@ -523,7 +524,10 @@ def test_controller_queue_worker_is_the_only_broker_write_path(
         settings=worker_settings,
         pending_writer=None,
         store=execution_store,
-        adapter_factories={"okx": lambda _plan: adapter},
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
         gate_checker=lambda: False,
         paper_gate_checker=lambda: True,
         okx_live_gate_checker=lambda: False,
@@ -600,6 +604,7 @@ def test_rejected_risk_reduction_stops_worker_and_immediate_rearm(
     worker_settings.execution.enabled = False
     worker_settings.execution.selected_broker = "longbridge"
     worker_settings.execution.longbridge.preferred_account = "comprehensive"
+    worker_settings.execution.longbridge.instrument = "700.HK"
     execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
     worker_store = WorkerStore(tmp_path / "control.sqlite3")
     worker_id = f"worker-rejected-{action}"
@@ -609,7 +614,10 @@ def test_rejected_risk_reduction_stops_worker_and_immediate_rearm(
         settings=worker_settings,
         pending_writer=None,
         store=execution_store,
-        adapter_factories={"okx": lambda _plan: adapter},
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
         gate_checker=lambda: False,
         paper_gate_checker=lambda: True,
         okx_live_gate_checker=lambda: False,

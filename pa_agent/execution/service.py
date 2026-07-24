@@ -960,14 +960,26 @@ class ExecutionService:
                     if current.broker_state.get("identity_or_route_blocked"):
                         broker_state = dict(current.broker_state)
                         broker_state.pop("identity_or_route_blocked", None)
+                        if (
+                            broker_state.get("risk_reducing_writes_blocked")
+                            == "identity_or_route_blocked"
+                        ):
+                            broker_state.pop(
+                                "risk_reducing_writes_blocked",
+                                None,
+                            )
                         adapter_record = current.model_copy(
                             update={
                                 "broker_state": broker_state,
+                                "needs_attention": False,
                                 "last_error": "",
+                                "state_reason": (
+                                    "实际账户身份与活动路由已重新验证"
+                                ),
                             }
                         )
                     persistent_write_block = (
-                        self._persistent_risk_reducing_blocked(current)
+                        self._persistent_risk_reducing_blocked(adapter_record)
                     )
                     allow_risk_reducing_writes = (
                         not writes_paused
@@ -1550,13 +1562,32 @@ class ExecutionService:
     def monitor_once(
         self,
     ) -> tuple[list[ExecutionRecord], list[AccountSnapshot]]:
-        """Reconcile orders, then refresh each account seen at loop start."""
-        active_ids = [record.id for record in self._store.list_active()]
+        """对账并刷新活动账户；无活动执行时仍刷新当前选定账户。"""
+        active_records = self._store.list_active()
+        active_ids = [record.id for record in active_records]
         updates = self.reconcile_once()
         snapshots = self.refresh_execution_accounts(
             active_ids,
             raise_on_error=True,
         )
+        target_plan = self._target_plan_from_settings()
+        target_key = (
+            target_plan.broker,
+            target_plan.environment,
+            target_plan.requested_account,
+            target_plan.okx_api_base_url,
+        )
+        active_keys = {
+            (
+                record.plan.broker,
+                record.plan.environment,
+                record.selected_account or record.plan.requested_account,
+                record.plan.okx_api_base_url,
+            )
+            for record in active_records
+        }
+        if target_key not in active_keys:
+            snapshots.append(self.refresh_account())
         return updates, snapshots
 
     def _monitor_once(self) -> None:

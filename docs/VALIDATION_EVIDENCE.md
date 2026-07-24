@@ -2,6 +2,14 @@
 
 > **历史快照（截至 2026-07-22；不代表当前状态）**：本文件记录当时的发布、测试和运行验证。当前代码与 Git 基线以根目录 `CONTEXT.md`、`docs/CODEX_HANDOFF.md` 和最新 GitHub `main` 为准；本文件中的历史 SHA、测试数字和运行态只在各自时间点成立。
 
+## 2026-07-24 USDT 账户内换币验收与余额真值修复
+
+- 用户现场确认本次是其他资产换成 USDT/账户内转换。OKX Demo 只读证据：USDT `eq/cashBal/availBal=79041.2190279924`、`frozenBal=0`、账户 `totalEq=78976.40522916657`；最近换币账单为 `type=2/subType=1`、`instId=USDC-USDT`，时间 `2026-07-24T03:06:31.671Z`。分页读取 326 条 USDT 账单，识别 35 条内部换币；外部 `type=1/subType=11` 只有历史 `2026-07-17T08:04:08.320Z` 的 `5000 USDT`，没有把本次换币误记成外部资金流。
+- 代码修复：`ExecutionService.monitor_once()` 无活动 execution 时仍刷新当前选定账户；工作台按 `okx-demo/okx-live` 读取正确快照并将超过 90 秒的快照标为 `UNKNOWN`；`OkxAdapter.account_snapshot()` 保存 `totalEq`、USDT `eq/cashBal/availBal/frozenBal` 与 OKX `uTime`；Campaign 明确 `usdt_equity` 为 10% 风险基数；提交前再次读取定仓，风险快照变化就作废旧计划。
+- 离线验收：目标 6 个新增硬用例 `6/6` 通过；目标套件共 168 个用例，`168/168` 通过。第一次直接运行的断言全部通过但 pytest 收尾受 Windows 临时目录占用影响返回 1；改用项目外独立 basetemp 后退出码 0。`git diff --check` 通过；Ruff `E/F/I` 仅命中仓库既有一条超长行，未新增语法、未定义名或导入错误。
+- 当前真实定仓在余额升高后按 USDT `eq` 重新读取，但给定当时紧止损输入产生的风险数量超过 OKX `maxBuy`，因此返回 `max_size_exceeded` 并硬阻断；没有静默按上限截断。生产资金流水游标、高水位和恢复接线仍未完成，不能把本轮验收描述成阶段 4 完整能力。
+- 运行态验证：`PAAgentExecutionWorker` 已成功重启；Worker 心跳 PID 从 `5084` 切换为 `536`，`started_at=2026-07-24T03:40:46Z`。在活动 execution=0、有效新增风险租约=0 时，Worker 连续写入 `okx/okx-demo` 快照，现场复核到 `snapshot_id=7367`，心跳/最后成功对账持续更新且错误码为空。
+
 ## 本轮后续验证（2026-07-23）
 
 - `WO-RISK-02` 定向套件：52 通过、0 失败。覆盖纯风险定仓、长短方向、费用/滑点、`lotSz`/`minSz`、最大可开张数、`net_mode` 硬门、缺失输入、Campaign 动态规格适配、监督门、计划构建和真实 `ExecutionController` / `ExecutionWorker` + FakeAdapter 离线链路。
@@ -290,3 +298,39 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - Codex 订阅、Kimi、DeepSeek、档案保存/激活、模型目录与能力范围：247 通过、0 失败；Qt E2E：4 通过、0 失败；风险指标语义：51 通过、0 失败。
 - 全仓现状：1251 通过、32 失败、3 跳过。4 项为 AkShare 真实联网超时；27 项由两个独立只读审查者确认属于 HEAD 既有测试契约或旧测试数据，不是本轮回归；1 项日志遮罩测试因为日志文件为空而失败，没有发现明文密钥。不得将该结果描述为全仓全绿。
 - 全部变更 Python 文件的 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。
+
+## 2026-07-24 WO-EXEC-03 Demo-A/C 真实 Demo 收口
+
+### 独立复核
+
+- 基线 `537eaf578fccddc62804dc672d70377f5be68dde` 上独立回查 Demo-S execution `328d0f7f-fef6-5e5e-bd39-dad92a66512b`：真实 SupervisorGate 为 `allow_entry`，origin 为 `controlled_reproducible_demo_s`，入场、两笔原生保护、主动离场和 `closed/remaining=0` 证据均在生产执行账本中。
+- 工单列出的 23 个执行、10m 聚合、多周期、GUI、监督、定仓和资金流测试文件最终复跑为 392 通过、0 失败。九组合走 Controller→Worker→Service→OkxAdapter→Fake client 的生产链；ATR 倍增、定仓滑点隔离、保护与主动离场隔离均保持硬断言。
+
+### Demo-A：limit → market
+
+- execution：`4d118cb0-ec65-5340-a8c9-9f9d8583bd1e`；数量 `27440`；限价入场订单 `3770119237559996416` 成交。
+- 原生保护：`3770119507314909184`、`3770119717130772480`，均在主动离场前确认建立并随后撤销。
+- OKX 实时单笔市价上限为 `20000`。第一笔原始 `27440` 市价离场被券商明确拒绝，没有当作未知写入重发；修复后保留拒绝证据，按真实单笔上限提交 `3770133355453042688`（`20000`）和 `3770134044895956992`（`7440`），均成交。
+- 终态：`closed`、剩余 `0`、已实现盈亏 `-73.5046000000000050`。
+
+### Demo-C：market → limit
+
+- execution：`89e45ac4-4bee-58eb-9686-7ac36f90db79`；数量 `15057`；市价入场订单 `3770140719510016000` 成交。
+- 原生保护：`3770140997116665856`、`3770141214280949760`。一次撤单意图在调用券商前被账户身份检查打断；Worker 重启后先保留未知标记，只读确认同一两笔保护仍为 `live`，再生成新撤单意图并跨轮复核后撤销，没有盲重发。
+- 限价主动离场订单 `3770160697147740160` 按原模式累计成交 `15057`；部分成交期间发现累计成交量被重复扣减，随即暂停 Worker，保持券商 reduce-only 离场单覆盖真实剩余仓位，修复为固定提交前基线后恢复。
+- 终态：`closed`、剩余 `0`、已实现盈亏 `-117.0923`。
+
+### 10% 风险数量复核与证据边界
+
+- 两笔均使用 `ctVal×ctMult=0.001`、`lotSz=minSz=1`、风险比例 `0.10`、费用率 `0.0005`、保守滑点率 `0.0010`。Demo-C 的入场前空仓账户快照为 `8714.71942600003 USDT`，entry/stop 为 `4047.9/4002.1`；同一 `calculate_risk_size()` 得到风险预算 `871.4719426000030`、单张最坏损失 `0.05787500`、风险占用 `871.42387500`、目标 `15057`，与 execution 完全一致。
+- Demo-A 在资金变化后到入场前没有紧邻的直接账户快照。耐久账本第一份成交后快照记录现金 `8843.74440770003`、入场费用 `55.557134`，可重建入场前权益 `8899.30154170003`；entry/stop 为 `4053.9/4033.6`，同一公式得到风险预算 `889.9301541700030`、单张最坏损失 `0.03243125`、风险占用 `889.91350000`、目标 `27440`，与 execution 完全一致。该权益明确标为可验证重建值，不称作直接快照。
+- 历史 Demo-A/C 记录没有保存当时 `maxBuy/maxSell` 的确切数值，无法事后诚实补写；只能确认生产定仓器在计划前执行容量硬门，且两笔真实订单均被 OKX Demo 接受。为消除后续证据缺口，现已在所有 Campaign 候选、Demo-S 和生命周期 canary 的耐久记录中写入完整 `risk_sizing`：权益口径与数值、10% 预算、入场/止损距离、费用/滑点、`minSz/lotSz`、`maxBuy/maxSell`、风险占用和最终数量。风险超限仍硬阻断，不截断。
+
+### 最终运行态边界
+
+- OKX Demo 只读回查：非零 `XAU-USDT-SWAP` 仓位 `0`、普通挂单 `0`、待生效 OCO `0`；本地活动 execution `0`、有效 `NEW_RISK` 租约 `0`。
+- 旧 Campaign 历史 execution 全部经耐久账本确认终态后归档；新 Campaign `52a4f507-a8f8-4975-b0bf-ddddf9ff901c` 已恢复为 `active`，固定配置为严格聚合 `10m / min_trade_confidence=20 / extreme_aggressive / Demo`。WinSW ExecutionWorker 已加载最终代码，心跳和最后成功对账正常。
+- 共享环境已明确设置 `PA_AGENT_LIVE_TRADING_ENABLED=false`、`OKX_LIVE_ENABLED=false`，模拟门保持 `true`。本轮没有调用 Live 路由。
+- 本轮适配器、执行服务、Campaign 与生命周期定向回归：151 通过、0 失败。最终以无界面 Qt 平台运行完整 `not live` 套件，收集 1407 项：1376 通过、31 失败；本轮新增的 Worker 空账本账户刷新夹具、Campaign 单测误连私有预检和“历史 execution 仅终态才允许归档重启”均已通过。剩余 31 项位于本轮未修改的既有预测、严格/宽松校验、决策面板、连续性、数据源切换、OpenClaw 和音效范围，不能描述为全仓全绿。
+- 本轮改动 Python 文件的 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。
+- 本节的运行态以后仍会变化；发布提交与远程 SHA 以本轮 Git 收口的实时核验为准。

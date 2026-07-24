@@ -68,6 +68,7 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.models import ACTIVE_EXECUTION_STATES, ExecutionState
 from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.execution.store import ExecutionStore
 from pa_agent.execution.worker_protocol import WorkerCommandStatus
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.records.analysis_history import (
@@ -88,6 +89,9 @@ CAMPAIGN_SYMBOL = CAMPAIGN_INSTRUMENT
 CAMPAIGN_TIMEFRAME = "10m"
 CAMPAIGN_PRODUCT = "swap"
 CAMPAIGN_MARGIN_MODE = "cross"
+# PA Demo 是 USDT 结算合约；10% 风险基数明确使用 USDT 币种权益 eq，
+# 不是账户 totalEq，也不是 availBal/availEq。
+CAMPAIGN_RISK_EQUITY_BASIS = "usdt_equity"
 # 每个单仓生命周期的首仓最多使用 Demo USDT 总权益的 10% 止损风险。
 # 数量在每次准备新计划前重新读取账户权益、合约规格和最大可开张数；
 # 费用和滑点是假设输入，不是券商返回的已确认成交费用。
@@ -226,6 +230,7 @@ def _campaign_config_payload() -> dict[str, Any]:
         "margin_mode": CAMPAIGN_MARGIN_MODE,
         "sizing": {
             "mode": CAMPAIGN_SIZING_MODE,
+            "equity_basis": CAMPAIGN_RISK_EQUITY_BASIS,
             "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
             "fee_rate": str(CAMPAIGN_FEE_RATE),
             "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
@@ -390,15 +395,34 @@ class CampaignStateStore:
         *,
         reason: str,
         now: datetime | None = None,
+        execution_lookup: Callable[[str], Any] | None = None,
     ) -> CampaignState:
         """保留旧状态快照后，以明确新配置开启新的 Demo Campaign。"""
         current = (now or _utc_now()).astimezone(UTC)
         existing = self.load()
         if existing is not None:
             if existing.execution_ids:
-                raise CampaignError(
-                    "旧 Campaign 仍有自己创建的 execution，禁止直接切换配置"
-                )
+                if execution_lookup is None:
+                    raise CampaignError(
+                        "旧 Campaign 仍有自己创建的 execution，禁止直接切换配置"
+                    )
+                allowed_terminal_states = {
+                    ExecutionState.CLOSED,
+                    ExecutionState.CANCELED,
+                    ExecutionState.REJECTED,
+                }
+                unresolved = []
+                for execution_id in existing.execution_ids:
+                    execution = execution_lookup(execution_id)
+                    if (
+                        execution is None
+                        or execution.state not in allowed_terminal_states
+                    ):
+                        unresolved.append(execution_id)
+                if unresolved:
+                    raise CampaignError(
+                        "旧 Campaign 仍有未确认终态的 execution，禁止直接切换配置"
+                    )
             CAMPAIGN_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
             archive = CAMPAIGN_HISTORY_DIR / (
                 f"{existing.campaign_id}-{current.strftime('%Y%m%dT%H%M%SZ')}.json"
@@ -515,6 +539,47 @@ class CampaignSizing:
     quantity_step: Decimal
     max_buy: Decimal
     max_sell: Decimal
+    equity_basis: str = CAMPAIGN_RISK_EQUITY_BASIS
+
+
+def _campaign_sizing_snapshot(sizing: CampaignSizing) -> dict[str, str]:
+    """把真实定仓输入和结果写成可长期复核的非秘密快照。"""
+    return {
+        "equity_basis": sizing.equity_basis,
+        "equity_usdt": str(sizing.equity_usdt),
+        "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+        "risk_budget_usdt": str(sizing.risk_budget_usdt),
+        "risk_used_usdt": str(sizing.risk_used_usdt),
+        "reference_price_usdt": str(sizing.reference_price_usdt),
+        "stop_distance_usdt": str(sizing.stop_distance_usdt),
+        "contract_notional_usdt": str(sizing.contract_notional_usdt),
+        "worst_case_loss_per_contract_usdt": str(
+            sizing.worst_case_loss_per_contract_usdt
+        ),
+        "fee_per_contract_usdt": str(sizing.fee_per_contract_usdt),
+        "slippage_per_contract_usdt": str(sizing.slippage_per_contract_usdt),
+        "fee_rate": str(sizing.fee_rate),
+        "slippage_rate": str(sizing.slippage_rate),
+        "minimum_quantity": str(sizing.minimum_quantity),
+        "quantity_step": str(sizing.quantity_step),
+        "max_buy": str(sizing.max_buy),
+        "max_sell": str(sizing.max_sell),
+        "target_quantity": str(sizing.quantity),
+    }
+
+
+def _attach_campaign_sizing(
+    record: AnalysisRecord,
+    sizing: CampaignSizing,
+) -> None:
+    """把本次定仓快照并入策略记录，不改模型判断或委托价格。"""
+    response = (
+        dict(record.stage2_response)
+        if isinstance(record.stage2_response, dict)
+        else {}
+    )
+    response["risk_sizing"] = _campaign_sizing_snapshot(sizing)
+    record.stage2_response = response
 
 
 def _campaign_instrument(client: OkxRestClient) -> dict[str, Any]:
@@ -625,6 +690,7 @@ def resolve_campaign_sizing(
         quantity_step=result.lot_size,
         max_buy=max_buy,
         max_sell=max_sell,
+        equity_basis=CAMPAIGN_RISK_EQUITY_BASIS,
     )
 
 
@@ -727,6 +793,38 @@ def _canary_price_triplet(
     execution_settings = getattr(
         getattr(runtime, "settings", None), "execution", None
     )
+    if str(getattr(execution_settings, "entry_order_mode", "")) == "market":
+        maximum_market_quantity = _positive_decimal(instrument.get("maxMktSz"))
+        if maximum_market_quantity <= 0:
+            raise CampaignError("Demo 市价入场缺少有效的 OKX maxMktSz")
+        for _ in range(20):
+            sizing = resolve_campaign_sizing(
+                client,
+                entry_price=entry,
+                stop_loss_price=stop,
+                side=CANARY_DIRECTION,
+            )
+            if sizing.quantity <= maximum_market_quantity:
+                break
+            buffer = _align_to_tick(
+                buffer + max(buffer / Decimal("2"), tick),
+                tick,
+                rounding=ROUND_CEILING,
+            )
+            if CANARY_DIRECTION == "long":
+                stop = entry - buffer
+                tp1 = entry + buffer
+                tp2 = entry + buffer * Decimal("2")
+            else:
+                stop = entry + buffer
+                tp1 = entry - buffer
+                tp2 = entry - buffer * Decimal("2")
+            if min(entry, stop, tp1, tp2) <= 0:
+                raise CampaignError("Demo 市价入场风险距离导致三价非正数")
+        else:
+            raise CampaignError(
+                "Demo 市价入场无法在保持10%风险公式时满足 OKX maxMktSz"
+            )
     selected_modes = {
         str(getattr(execution_settings, "entry_order_mode", "")),
         str(getattr(execution_settings, "exit_order_mode", "")),
@@ -993,6 +1091,7 @@ def build_controlled_demo_s_record(
         "origin": CONTROLLED_DEMO_S_ORIGIN,
         "decision": decision,
     }
+    _attach_campaign_sizing(record, sizing)
     record.strategy_files_used = list(
         dict.fromkeys(
             [*record.strategy_files_used, CONTROLLED_DEMO_S_ORIGIN]
@@ -1128,11 +1227,20 @@ def run_demo_lifecycle_canary(
             entry_order_mode=runtime.settings.execution.entry_order_mode,
             analysis_atr14=analysis_atr14,
         )
-        runtime.writer.save_full_durable(record)
         sizing = runtime.sizing_resolver(record)
+        _attach_campaign_sizing(record, sizing)
+        runtime.writer.save_full_durable(record)
         _apply_campaign_sizing(runtime, sizing)
         execution = service.prepare_analysis(record)
         execution_id = execution.id
+        try:
+            _require_fresh_campaign_sizing(runtime, record, sizing)
+        except CampaignRiskBlocked as exc:
+            service.expire_unsubmitted(
+                execution.id,
+                reason="USDT 风险快照变化，旧计划禁止提交",
+            )
+            raise CampaignError(str(exc)) from exc
         command = service.submit(execution.id)
         result = service.wait_for_command(command.id, timeout=30.0)
         if result.status is not WorkerCommandStatus.SUCCEEDED:
@@ -1259,6 +1367,14 @@ def run_controlled_demo_s() -> dict[str, str]:
 
         execution = service.prepare_analysis(record)
         execution_id = execution.id
+        try:
+            _require_fresh_campaign_sizing(runtime, record, sizing)
+        except CampaignRiskBlocked as exc:
+            service.expire_unsubmitted(
+                execution.id,
+                reason="USDT 风险快照变化，旧计划禁止提交",
+            )
+            raise CampaignError(str(exc)) from exc
         state = state.model_copy(
             update={
                 "execution_ids": list(
@@ -1406,6 +1522,7 @@ def okx_demo_private_preflight() -> dict[str, Any]:
         "instrument": CAMPAIGN_INSTRUMENT,
         "instrument_state": "live",
         "sizing_mode": CAMPAIGN_SIZING_MODE,
+        "equity_basis": CAMPAIGN_RISK_EQUITY_BASIS,
         "equity_usdt": str(equity_usdt),
         "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
         "fee_rate": str(CAMPAIGN_FEE_RATE),
@@ -1571,6 +1688,45 @@ def _apply_campaign_sizing(
     if was_armed:
         service.disarm()
         service.arm(service.arm_confirmation_text())
+
+
+_CAMPAIGN_SIZING_FINGERPRINT_FIELDS = (
+    "equity_basis",
+    "equity_usdt",
+    "risk_budget_usdt",
+    "risk_used_usdt",
+    "quantity",
+    "reference_price_usdt",
+    "stop_distance_usdt",
+    "worst_case_loss_per_contract_usdt",
+    "fee_per_contract_usdt",
+    "slippage_per_contract_usdt",
+    "max_buy",
+    "max_sell",
+)
+
+
+def _campaign_sizing_fingerprint(sizing: CampaignSizing) -> tuple[str, ...]:
+    """返回必须与已生成计划保持一致的风险定仓字段。"""
+    return tuple(
+        str(getattr(sizing, field, ""))
+        for field in _CAMPAIGN_SIZING_FINGERPRINT_FIELDS
+    )
+
+
+def _require_fresh_campaign_sizing(
+    runtime: CampaignRuntime,
+    record: AnalysisRecord,
+    initial: CampaignSizing,
+) -> CampaignSizing:
+    """提交前重新读 USDT 权益，余额变化就让旧计划失效。"""
+    current = runtime.sizing_resolver(record)
+    if _campaign_sizing_fingerprint(current) != _campaign_sizing_fingerprint(initial):
+        raise CampaignRiskBlocked(
+            "stale_risk_sizing",
+            "USDT 风险基数或定仓输入在计划生成后发生变化，旧计划禁止提交",
+        )
+    return current
 
 
 def build_runtime(
@@ -1876,8 +2032,10 @@ class OkxDemoCampaign:
         sizing = self.runtime.sizing_resolver(record)
         _apply_campaign_sizing(self.runtime, sizing)
         logger.info(
-            "Demo 风险定仓已刷新: equity_usdt=%s risk_budget_usdt=%s "
-            "entry=%s stop_distance=%s quantity=%s risk_used=%s",
+            "Demo 风险定仓已刷新: equity_basis=%s equity_usdt=%s "
+            "risk_budget_usdt=%s entry=%s stop_distance=%s quantity=%s "
+            "risk_used=%s",
+            sizing.equity_basis,
             sizing.equity_usdt,
             sizing.risk_budget_usdt,
             sizing.reference_price_usdt,
@@ -1949,6 +2107,8 @@ class OkxDemoCampaign:
                 )
                 logger.info("本轮风险定仓阻断，继续等待下一根已收盘 K 线: %s", exc)
                 return
+            _attach_campaign_sizing(record, sizing)
+            self.runtime.writer.save_full_durable(record)
             supervision = self.runtime.supervisor.review(
                 campaign_id=self.state.campaign_id,
                 record=record,
@@ -2016,6 +2176,27 @@ class OkxDemoCampaign:
             and _utc_now() < self.state.expires_at_utc
         ):
             self._ensure_demo_write_session()
+            if sizing is not None:
+                try:
+                    _require_fresh_campaign_sizing(
+                        self.runtime,
+                        record,
+                        sizing,
+                    )
+                except CampaignRiskBlocked as exc:
+                    self.runtime.execution_service.expire_unsubmitted(
+                        execution.id,
+                        reason="USDT 风险快照变化，旧计划禁止提交",
+                    )
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=bar_ms,
+                        analyses_completed=completed_count,
+                        last_plan_result=f"blocked:risk:{exc.code}",
+                        last_error=str(exc),
+                    )
+                    logger.info("提交前风险快照已失效：%s", exc)
+                    return
             command = self.runtime.execution_service.submit(execution.id)
             self._wait_for_worker_command(command.id, action="提交入场")
             refreshed = self.runtime.execution_service.get_execution(
@@ -2395,6 +2576,7 @@ def main(argv: list[str] | None = None) -> int:
                 runtime_lock.__exit__(None, None, None)
 
     state_store = CampaignStateStore()
+    execution_store = ExecutionStore(schema_mode="require_current")
     runtime: CampaignRuntime | None = None
     campaign: OkxDemoCampaign | None = None
     try:
@@ -2402,6 +2584,7 @@ def main(argv: list[str] | None = None) -> int:
             state = (
                 state_store.restart(
                     reason="用户授权更新 10m OKX Demo 运行器配置",
+                    execution_lookup=execution_store.get,
                 )
                 if args.command == "restart"
                 else state_store.create_or_resume()

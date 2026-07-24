@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -620,6 +621,74 @@ def test_demo_canary_prices_use_closed_bar_and_okx_tick(monkeypatch):
     assert analysis_atr14 is None
 
 
+def test_demo_market_entry_expands_stop_until_risk_size_fits_max_market_order(
+    monkeypatch,
+):
+    bar = KlineBar(
+        seq=1,
+        ts_open=1_784_304_000_000,
+        open=4000,
+        high=4010,
+        low=3990,
+        close=4005.13,
+        volume=100,
+        amount=400500,
+        closed=True,
+    )
+
+    class _Source:
+        def latest_snapshot(self, count):
+            assert count == 3
+            return [bar]
+
+    class _Client:
+        def __init__(self, credentials, *, base_url, simulated):
+            del credentials
+            assert base_url == CAMPAIGN_OKX_API_BASE_URL
+            assert simulated is True
+
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "tickSz": "0.1",
+                    "maxMktSz": "20000",
+                }
+            ]
+
+    quantities = iter((Decimal("25000"), Decimal("15000")))
+    stops = []
+
+    def _sizing(_client, *, entry_price, stop_loss_price, side):
+        del _client, entry_price
+        assert side == "long"
+        stops.append(stop_loss_price)
+        return SimpleNamespace(quantity=next(quantities))
+
+    monkeypatch.setattr(campaign_module, "load_okx_credentials", lambda _: object())
+    monkeypatch.setattr(campaign_module, "OkxRestClient", _Client)
+    monkeypatch.setattr(campaign_module, "resolve_campaign_sizing", _sizing)
+    runtime = SimpleNamespace(
+        source=_Source(),
+        settings=SimpleNamespace(
+            execution=SimpleNamespace(
+                entry_order_mode="market",
+                exit_order_mode="limit",
+            )
+        ),
+    )
+
+    entry, tp1, tp2, stop, returned_bar, analysis_atr14 = _canary_price_triplet(
+        runtime
+    )
+
+    assert returned_bar is bar
+    assert analysis_atr14 is None
+    assert len(stops) == 2
+    assert stop < stops[0] < entry < tp1 < tp2
+
+
 def test_campaign_state_resume_never_extends_deadline(tmp_path):
     store = CampaignStateStore(tmp_path / "campaign.json")
     started = datetime(2026, 7, 17, 8, 0, tzinfo=UTC)
@@ -662,6 +731,65 @@ def test_explicit_restart_archives_an_idle_campaign(monkeypatch, tmp_path):
     archived = campaign_module.json.loads(archives[0].read_text(encoding="utf-8"))
     assert archived["reason"] == "configuration changed"
     assert archived["state"]["campaign_id"] == original.campaign_id
+
+
+def test_explicit_restart_allows_only_durable_terminal_owned_executions(
+    monkeypatch,
+    tmp_path,
+):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(
+        original.model_copy(
+            update={"execution_ids": ["closed-id", "canceled-id"]}
+        )
+    )
+    history = tmp_path / "history"
+    monkeypatch.setattr(campaign_module, "CAMPAIGN_HISTORY_DIR", history)
+    executions = {
+        "closed-id": SimpleNamespace(state=ExecutionState.CLOSED),
+        "canceled-id": SimpleNamespace(state=ExecutionState.CANCELED),
+    }
+
+    restarted = store.restart(
+        reason="configuration changed",
+        now=datetime(2026, 7, 17, 1, tzinfo=UTC),
+        execution_lookup=executions.get,
+    )
+
+    assert restarted.campaign_id != original.campaign_id
+    assert len(list(history.glob("*.json"))) == 1
+
+
+@pytest.mark.parametrize(
+    "execution",
+    [
+        None,
+        SimpleNamespace(state=ExecutionState.READY),
+        SimpleNamespace(state=ExecutionState.UNKNOWN),
+        SimpleNamespace(state=ExecutionState.ERROR),
+    ],
+)
+def test_explicit_restart_rejects_missing_or_nonterminal_owned_execution(
+    monkeypatch,
+    tmp_path,
+    execution,
+):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(original.model_copy(update={"execution_ids": ["owned-id"]}))
+    monkeypatch.setattr(
+        campaign_module,
+        "CAMPAIGN_HISTORY_DIR",
+        tmp_path / "history",
+    )
+
+    with pytest.raises(CampaignError, match="未确认终态"):
+        store.restart(
+            reason="configuration changed",
+            now=datetime(2026, 7, 17, 1, tzinfo=UTC),
+            execution_lookup=lambda _execution_id: execution,
+        )
 
 
 def test_campaign_process_lock_rejects_second_runner(tmp_path):
@@ -802,6 +930,30 @@ def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
     ) > Decimal("10.8")
     assert sizing.quantity <= sizing.max_buy
     assert sizing.quantity != sizing.max_buy
+    assert record.stage2_response["risk_sizing"] == {
+        "equity_basis": "usdt_equity",
+        "equity_usdt": "5000",
+        "risk_percent": "0.10",
+        "risk_budget_usdt": "500.00",
+        "risk_used_usdt": str(sizing.risk_used_usdt),
+        "reference_price_usdt": decision["entry_price"],
+        "stop_distance_usdt": str(sizing.stop_distance_usdt),
+        "contract_notional_usdt": str(sizing.contract_notional_usdt),
+        "worst_case_loss_per_contract_usdt": str(
+            sizing.worst_case_loss_per_contract_usdt
+        ),
+        "fee_per_contract_usdt": str(sizing.fee_per_contract_usdt),
+        "slippage_per_contract_usdt": str(
+            sizing.slippage_per_contract_usdt
+        ),
+        "fee_rate": "0.0005",
+        "slippage_rate": "0.0010",
+        "minimum_quantity": "1",
+        "quantity_step": "1",
+        "max_buy": "21000",
+        "max_sell": "21000",
+        "target_quantity": str(sizing.quantity),
+    }
 
 
 def test_demo_s_skips_newer_controlled_record_and_selects_natural_10m(
@@ -1063,6 +1215,8 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     record = SimpleNamespace(exception=None)
     orchestrator = _FakeOrchestrator(record)
     service = _FakeExecutionService()
+    # 本用例只验证同一根 K 线幂等，不应在 not-live 套件中调用 OKX 私有预检。
+    service.is_armed = True
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
     runner = OkxDemoCampaign(
@@ -1202,6 +1356,51 @@ def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
     assert len(client.calls) == 1
+
+
+def test_balance_change_after_plan_creation_expires_old_plan_before_submit(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, _client, _record_value = _supervised_runtime(
+        tmp_path,
+        "allow_entry",
+    )
+    sizing_calls = 0
+
+    def _changing_sizing(record):
+        nonlocal sizing_calls
+        sizing_calls += 1
+        initial = _sizing(record)
+        if sizing_calls == 2:
+            return replace(
+                initial,
+                equity_usdt=Decimal("2500"),
+                risk_budget_usdt=Decimal("250"),
+                risk_used_usdt=Decimal("6"),
+                quantity=Decimal("60"),
+            )
+        return initial
+
+    runtime.sizing_resolver = _changing_sizing
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert len(service.prepared) == 1
+    assert service.submitted == []
+    assert service.expired == [
+        ("execution-1", "USDT 风险快照变化，旧计划禁止提交")
+    ]
+    assert runner.state.last_plan_result == "blocked:risk:stale_risk_sizing"
+    assert "旧计划禁止提交" in runner.state.last_error
 
 
 def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(

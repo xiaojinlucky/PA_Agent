@@ -317,6 +317,16 @@ class OkxAdapter:
             raise PreflightError(
                 f"OKX 可交易数量 {max_quantity or 0} 小于计划数量 {plan.quantity}"
             )
+        if plan.entry_order_mode == "market":
+            maximum_market_quantity = _positive_decimal(
+                instrument.get("maxMktSz"),
+                "maxMktSz",
+            )
+            if plan.quantity > maximum_market_quantity:
+                raise PreflightError(
+                    "OKX 市价入场数量 "
+                    f"{plan.quantity} 超过单笔市场单上限 {maximum_market_quantity}"
+                )
 
         if plan.product == "swap":
             existing = [
@@ -1730,15 +1740,41 @@ class OkxAdapter:
         )
         remaining = max(base_quantity - exited, Decimal("0"))
         realized = self._realized_with_baseline(record, targets, state)
+        recovered_live_cancel = False
         for item in targets:
             if (
                 item.get("cancel_status") == "unknown"
                 and item.get("state") in {"canceled", "effective", "order_failed"}
             ):
                 item["cancel_status"] = "confirmed"
+            elif (
+                item.get("cancel_status") == "unknown"
+                and item.get("state") == "live"
+                and not item.get("child_active")
+            ):
+                # 券商权威查询确认原保护单仍然有效，说明上一撤单没有生效。
+                # 先只落一笔新的撤单意图；下一轮再次查询仍为 live 后才会写券商。
+                item["cancel_status"] = "intent"
+                item["cancel_runtime_id"] = self._runtime_id
+                item["cancel_recovery"] = "broker_confirmed_live"
+                recovered_live_cancel = True
         if not any(item.get("cancel_status") == "unknown" for item in targets):
             state.pop("write_unknown", None)
         state["protection_targets"] = targets
+        if recovered_live_cancel:
+            return record.model_copy(
+                update={
+                    "remaining_quantity": remaining,
+                    "realized_pnl": realized,
+                    "broker_state": state,
+                    "needs_attention": False,
+                    "last_error": "",
+                    "state_reason": (
+                        "OKX 已确认原保护单仍有效；已生成新的撤销意图，"
+                        "下一轮复核后执行"
+                    ),
+                }
+            )
         if remaining <= 0:
             return record.model_copy(
                 update={
@@ -1984,6 +2020,41 @@ class OkxAdapter:
             }
         )
 
+    def _market_exit_maximum(self, record: ExecutionRecord) -> Decimal:
+        """读取当前品种的权威单笔市场单上限。"""
+        inst_type = "SPOT" if record.plan.product == "spot" else "SWAP"
+        instrument = next(
+            (
+                item
+                for item in self._client.instruments(inst_type)
+                if str(item.get("instId") or "") == record.plan.instrument
+            ),
+            None,
+        )
+        if instrument is None:
+            raise PreflightError(
+                f"OKX 主动离场无法读取品种 {record.plan.instrument}"
+            )
+        return _positive_decimal(instrument.get("maxMktSz"), "maxMktSz")
+
+    def _exit_submit_quantity(self, record: ExecutionRecord) -> Decimal:
+        """按 OKX 实时单笔上限拆分市场离场，不改写总持仓或风险数量。"""
+        if record.plan.exit_order_mode != "market":
+            return record.remaining_quantity
+        maximum = self._market_exit_maximum(record)
+        preflight = record.preflight
+        if preflight is None:
+            raise ReconciliationError("OKX 主动离场缺少预检")
+        step = preflight.quantity_step or Decimal("1")
+        minimum = preflight.minimum_quantity or step
+        quantity = min(record.remaining_quantity, maximum)
+        quantity = (quantity / step).to_integral_value(rounding=ROUND_FLOOR) * step
+        if quantity < minimum:
+            raise PreflightError(
+                f"OKX 市场离场分块数量 {quantity} 小于最小数量 {minimum}"
+            )
+        return quantity
+
     def _exit_reconcile(
         self,
         record: ExecutionRecord,
@@ -1992,6 +2063,46 @@ class OkxAdapter:
     ) -> ExecutionRecord:
         state = dict(record.broker_state)
         phase = str(state.get("exit_phase") or "cancel_protection")
+        if (
+            phase == "submit_exit_ready"
+            and state.get("risk_reducing_writes_blocked") == "broker_rejected"
+        ):
+            rejected_order = dict(state.get("exit_order") or {})
+            rejected_quantity = _decimal(rejected_order.get("quantity"))
+            if (
+                record.plan.exit_order_mode != "market"
+                or rejected_quantity is None
+                or rejected_quantity <= self._market_exit_maximum(record)
+            ):
+                return record
+            rejected_orders = list(state.get("rejected_exit_orders") or [])
+            rejected_orders.append(
+                {
+                    "client_order_id": str(
+                        rejected_order.get("client_order_id") or ""
+                    ),
+                    "quantity": str(rejected_order.get("quantity") or ""),
+                    "reason": str(record.last_error or "broker_rejected"),
+                }
+            )
+            state["rejected_exit_orders"] = rejected_orders
+            state["exit_order_sequence"] = (
+                int(state.get("exit_order_sequence") or 0) + 1
+            )
+            state["exit_phase"] = "submit_exit"
+            state["exit_order"] = {}
+            state.pop("risk_reducing_writes_blocked", None)
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "needs_attention": False,
+                    "last_error": "",
+                    "state_reason": (
+                        "OKX 已明确拒绝上一笔主动离场；"
+                        "保留证据并按实时单笔上限生成新意图"
+                    ),
+                }
+            )
         if phase == "cancel_protection":
             targets = state.get("protection_targets") or []
             interrupted_cancel = any(
@@ -2013,12 +2124,16 @@ class OkxAdapter:
                 )
             return self._cancel_one_protection(record)
         if phase == "submit_exit":
+            sequence = int(state.get("exit_order_sequence") or 0)
+            quantity = self._exit_submit_quantity(record)
             state["exit_phase"] = "submit_exit_ready"
+            state["exit_order_sequence"] = sequence
             state["exit_order"] = {
                 "order_id": "",
-                "client_order_id": _client_id(record.id, "exit"),
-                "quantity": str(record.remaining_quantity),
+                "client_order_id": _client_id(record.id, "exit", sequence),
+                "quantity": str(quantity),
                 "submit_runtime_id": self._runtime_id,
+                "remaining_before_exit": str(record.remaining_quantity),
                 "realized_before_exit": (
                     str(record.realized_pnl)
                     if record.realized_pnl is not None
@@ -2114,6 +2229,24 @@ class OkxAdapter:
             _decimal(exit_order.get("quantity"), default=record.remaining_quantity)
             or record.remaining_quantity
         )
+        previous_filled = (
+            _decimal(
+                exit_order.get("filled_quantity"),
+                default=Decimal("0"),
+            )
+            or Decimal("0")
+        )
+        remaining_before_exit = _decimal(
+            exit_order.get("remaining_before_exit")
+        )
+        if remaining_before_exit is None:
+            # 兼容升级前已在途的退出单：record.remaining_quantity 已经扣过
+            # 上一轮累计成交量，必须先加回，不能再次重复扣减。
+            remaining_before_exit = max(
+                record.remaining_quantity + previous_filled,
+                original_quantity,
+            )
+            exit_order["remaining_before_exit"] = str(remaining_before_exit)
         if status in {"filled", "canceled", "rejected"}:
             try:
                 qty, price = self._confirmed_terminal_fill(
@@ -2130,7 +2263,7 @@ class OkxAdapter:
                 or Decimal("0")
             )
             price = _decimal(raw.get("avgPx"))
-        remaining = max(original_quantity - qty, Decimal("0"))
+        remaining = max(remaining_before_exit - qty, Decimal("0"))
         before = _decimal(exit_order.get("realized_before_exit"))
         if record.plan.product == "swap" and qty > 0:
             exit_pnl = self._swap_order_realized_pnl(
@@ -2160,6 +2293,25 @@ class OkxAdapter:
         state["exit_order"] = exit_order
         if status == "filled":
             if remaining > 0:
+                if record.plan.exit_order_mode == "market":
+                    state["exit_order_sequence"] = (
+                        int(state.get("exit_order_sequence") or 0) + 1
+                    )
+                    state["exit_phase"] = "submit_exit"
+                    state["exit_order"] = {}
+                    return record.model_copy(
+                        update={
+                            "state": ExecutionState.EXIT_PENDING,
+                            "remaining_quantity": remaining,
+                            "realized_pnl": realized,
+                            "broker_state": state,
+                            "state_reason": (
+                                "OKX 市场离场分块已成交，继续处理剩余仓位"
+                            ),
+                            "needs_attention": False,
+                            "last_error": "",
+                        }
+                    )
                 state["protection_targets"] = []
                 state["exit_phase"] = ""
                 state["exit_order"] = {}
@@ -2487,7 +2639,13 @@ class OkxAdapter:
             positions=positions,
             raw_summary={
                 "adjusted_equity": str(balance.get("adjEq") or ""),
+                "account_total_equity": str(balance.get("totalEq") or ""),
                 "margin_ratio": str(balance.get("mgnRatio") or ""),
                 "notional_usd": str(balance.get("notionalUsd") or ""),
+                "usdt_equity": str(detail.get("eq") or ""),
+                "usdt_cash_balance": str(detail.get("cashBal") or ""),
+                "usdt_available_balance": str(detail.get("availBal") or ""),
+                "usdt_frozen_balance": str(detail.get("frozenBal") or ""),
+                "account_update_ms": str(balance.get("uTime") or ""),
             },
         )

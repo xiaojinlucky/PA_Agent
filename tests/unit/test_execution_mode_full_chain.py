@@ -117,6 +117,7 @@ def _run_full_chain(
     worker_settings = Settings()
     worker_settings.execution.enabled = False
     worker_settings.execution.selected_broker = "longbridge"
+    worker_settings.execution.longbridge.instrument = "700.HK"
     execution_store = ExecutionStore(root / "execution.sqlite3")
     worker_store = WorkerStore(root / "control.sqlite3")
     worker_id = f"worker-{root.name}"
@@ -128,7 +129,10 @@ def _run_full_chain(
         settings=worker_settings,
         pending_writer=None,
         store=execution_store,
-        adapter_factories={"okx": lambda _plan: adapter},
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
         gate_checker=lambda: False,
         paper_gate_checker=lambda: True,
         okx_live_gate_checker=lambda: False,
