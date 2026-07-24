@@ -1,10 +1,10 @@
-"""OKX Demo 黄金 15 分钟自动交易运行器。
+"""OKX Demo 黄金 10 分钟自动交易运行器。
 
 该入口故意固定交易范围，运行时不采纳日常交易路由中的品种和券商字段：
 
-- OKX XAU-USDT-SWAP / 15m
+- OKX XAU-USDT-SWAP / 10m（由真实已收盘 5m 两两聚合）
 - PA 极度激进
-- 执行置信度门槛 40
+- 执行置信度门槛 20
 - OKX Demo XAU-USDT-SWAP / cross / 当前 Demo 权益 10% 的动态张数
 - 运行窗口 24 小时
 """
@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import (
     ROUND_CEILING,
+    ROUND_FLOOR,
     ROUND_HALF_UP,
     Decimal,
     InvalidOperation,
@@ -54,12 +55,14 @@ from pa_agent.data.multi_timeframe import (
     higher_timeframes_for,
     render_higher_timeframe_context,
 )
+from pa_agent.data.okx_source import aggregate_okx_five_minute_rows
 from pa_agent.data.snapshot import build_analysis_frame
 from pa_agent.execution.controller import ExecutionController
 from pa_agent.execution.credentials import load_okx_credentials
 from pa_agent.execution.errors import (
     BrokerApiError,
     BrokerTransportError,
+    LiveTradingDisabled,
     NewRiskLeaseUnavailable,
     PlanBlocked,
 )
@@ -69,6 +72,7 @@ from pa_agent.execution.worker_protocol import WorkerCommandStatus
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.records.analysis_history import (
     find_latest_successful_record,
+    list_record_paths,
     load_record,
 )
 from pa_agent.records.experience_reader import ExperienceReader
@@ -81,7 +85,7 @@ from pa_agent.util.threading import CancelToken
 
 CAMPAIGN_INSTRUMENT = "XAU-USDT-SWAP"
 CAMPAIGN_SYMBOL = CAMPAIGN_INSTRUMENT
-CAMPAIGN_TIMEFRAME = "15m"
+CAMPAIGN_TIMEFRAME = "10m"
 CAMPAIGN_PRODUCT = "swap"
 CAMPAIGN_MARGIN_MODE = "cross"
 # 每个单仓生命周期的首仓最多使用 Demo USDT 总权益的 10% 止损风险。
@@ -94,37 +98,39 @@ CAMPAIGN_SIZING_MODE = "equity_10pct_stop_loss_risk"
 CAMPAIGN_BOOTSTRAP_QUANTITY = "1"
 CAMPAIGN_OKX_API_BASE_URL = "https://www.okx.com"
 CAMPAIGN_STANCE = "extreme_aggressive"
-CAMPAIGN_MIN_CONFIDENCE = 40
-# 当前 Demo 首轮直接用市价入场/离场验证持续交易；普通界面可独立切换三种方式。
-CAMPAIGN_ENTRY_ORDER_MODE = "market"
-CAMPAIGN_EXIT_ORDER_MODE = "market"
+CAMPAIGN_MIN_CONFIDENCE = 20
+CAMPAIGN_ENTRY_ORDER_MODE = "limit_with_slippage"
+CAMPAIGN_EXIT_ORDER_MODE = "limit_with_slippage"
 # 允许滑点不是固定基点，而是分析时主周期 ATR14 的倍数。0.50 ATR
 # 故意设得足够大，先让 Demo 真实检验“更容易成交但价格更差”的边界。
 CAMPAIGN_ENTRY_SLIPPAGE_ATR_MULTIPLE = Decimal("0.50")
 CAMPAIGN_EXIT_SLIPPAGE_ATR_MULTIPLE = Decimal("0.50")
 CAMPAIGN_HIGHER_TIMEFRAMES = higher_timeframes_for(CAMPAIGN_TIMEFRAME)
 _CAMPAIGN_TIMEFRAME_TO_OKX_BAR = {
-    "15m": "15m",
+    # OKX 没有原生 10m，主周期使用真实 5m 两两聚合。
+    "10m": "5m",
     "1h": "1H",
     "4h": "4H",
 }
-# 本轮只用于 Demo 15 分钟闭环验收。它只改变模型在本运行器中的下单方式，
+# 本轮只用于 Demo 10 分钟闭环验收。它只改变模型在本运行器中的下单方式，
 # 不写入日常设置，也不改变 GUI / 普通分析的提示词。
-CAMPAIGN_EXECUTION_STYLE = "market_when_valid"
+CAMPAIGN_EXECUTION_STYLE = "limit_with_slippage_when_valid"
 CAMPAIGN_FAST_EXECUTION_GUIDANCE = """
-## 本轮专用：15 分钟 Demo 快速执行模式
+## 本轮专用：10 分钟 Demo 快速执行模式
 
 这是一次仅限 OKX Demo 的闭环验收：目标是尽快验证「分析 → 入场 → 保护 → 离场」。
 它不是日常策略默认规则，也不会改变其他调用。
 
-- 本段是本运行器对通用策略资料的最高优先级覆盖：通用资料中的「§9.0P 计划型限价」和非市价 §11 路径在这里均不可用。仍须保留 §9.0P 审计节点，但若唯一候选是等待未来回撤/反弹的限价或突破，填写「不适用」并说明「本运行器禁止新建挂单」，不得把它写成待触发方案。
-- 若 §9、§10.3、§14 允许交易，直接输出 **市价单**；不要因为等待一个更好限价而放弃已经有效的即时方案。并以最新已收盘 K1 的收盘价附近重新构建 entry / stop / TP1 / TP2 三价。
-- 改为市价单后，三价必须仍满足方向顺序、最小价格跳动和 RR / 交易者方程；止损和止盈不能沿用一个远离 K1 收盘价的旧限价计划。
-- 本运行器内不要新建限价单或突破单：只有「有效的立即市价方案」或「不下单」两种选择。
-- 不要把“还可以等更好价格”“尚未完美确认”本身当作不下单理由；只有无法构造合法方向、止损、TP1、TP2 的即时三价时才输出不下单。不得伪造价格、取消止损或放宽 §14。
+- 若 §9、§10.3、§14 允许交易，输出基于最新已收盘 K1 的有效即时三价。
+  执行层会按 0.50 ATR 使用 limit_with_slippage，
+  不得把滑点后的委托价写回 PA 信号价。
+- 三价必须满足方向顺序、最小价格跳动和 RR / 交易者方程；止损和止盈不能沿用远离 K1 的旧计划。
+- 本运行器只有「有效的即时方案」或「不下单」两种选择，不得用等待未来回撤或突破冒充当前有效信号。
+- 不要把“还可以等更好价格”“尚未完美确认”本身当作不下单理由。
+  只有无法构造合法方向、止损、TP1、TP2 的即时三价时才输出不下单。
+  不得伪造价格、取消止损或放宽 §14。
 """.strip()
-# 15 分钟循环不再创建新的限价单；270 秒仅用于恢复或收口已有历史限价
-# 记录，避免沿用旧 120 秒全局默认值时过早撤单。
+# 10 分钟循环的限价加滑点模式保留 270 秒入场窗口。
 CAMPAIGN_ENTRY_TIMEOUT_SECONDS = 270
 CAMPAIGN_DURATION = timedelta(hours=24)
 CAMPAIGN_POLL_SECONDS = 30.0
@@ -137,6 +143,7 @@ CAMPAIGN_HISTORY_DIR = RECORDS_PENDING_DIR.parent / "okx_demo_campaign_history"
 # 「市价入场 -> 成交回读 -> 原生保护 -> 受控离场」完整走一遍。
 CANARY_TIMEFRAME = "demo_canary"
 CANARY_ORIGIN = "okx_demo_lifecycle_canary"
+CONTROLLED_DEMO_S_ORIGIN = "controlled_reproducible_demo_s"
 CANARY_DIRECTION = "long"
 CANARY_TIMEOUT_SECONDS = 120.0
 CANARY_PRICE_BUFFER_RATIO = Decimal("0.005")
@@ -147,6 +154,14 @@ logger = logging.getLogger("pa_agent.okx_demo_campaign")
 
 class CampaignError(RuntimeError):
     """实验配置或运行状态不满足硬约束。"""
+
+
+class CampaignRiskBlocked(CampaignError):
+    """当前 PA 信号无法通过确定性风险定仓。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = str(code)
+        super().__init__(message)
 
 
 class CampaignState(BaseModel):
@@ -205,7 +220,7 @@ def _campaign_config_payload() -> dict[str, Any]:
     return {
         "symbol": CAMPAIGN_SYMBOL,
         "timeframe": CAMPAIGN_TIMEFRAME,
-        "market_data_source": "okx_public_candles",
+        "market_data_source": "okx_public_5m_utc_pair_aggregation",
         "instrument": CAMPAIGN_INSTRUMENT,
         "product": CAMPAIGN_PRODUCT,
         "margin_mode": CAMPAIGN_MARGIN_MODE,
@@ -254,9 +269,10 @@ def build_campaign_settings(
 ):
     """复制设置并只在内存中应用实验路由。"""
     settings = copy.deepcopy(base_settings)
-    # 15 分钟循环优先保证一根 K 线内完成判断，不沿用日常高推理强度。
+    # 10 分钟循环优先保证一根 K 线内完成判断，不沿用日常高推理强度。
     settings.provider.reasoning_effort = "medium"
     settings.general.decision_stance = CAMPAIGN_STANCE
+    settings.general.last_data_source = "okx"
     settings.general.last_symbol = CAMPAIGN_SYMBOL
     settings.general.last_timeframe = CAMPAIGN_TIMEFRAME
     settings.execution.enabled = True
@@ -588,7 +604,10 @@ def resolve_campaign_sizing(
             slippage_rate=CAMPAIGN_SLIPPAGE_RATE,
         )
     except RiskCalculationFailure as exc:
-        raise CampaignError(f"风险定仓失败[{exc.code}]: {exc}") from exc
+        raise CampaignRiskBlocked(
+            exc.code,
+            f"风险定仓失败[{exc.code}]: {exc}",
+        ) from exc
     return CampaignSizing(
         quantity=result.target_contract_size,
         equity_usdt=equity_usdt,
@@ -659,7 +678,7 @@ def _canary_price_triplet(
     bars = runtime.source.latest_snapshot(3)
     latest_closed = next((bar for bar in bars if bar.closed), None)
     if latest_closed is None:
-        raise CampaignError("Demo 生命周期验收缺少已收盘 15m K 线")
+        raise CampaignError("Demo 生命周期验收缺少已收盘 10m 聚合 K 线")
 
     client = OkxRestClient(
         load_okx_credentials("demo"),
@@ -764,8 +783,10 @@ def build_demo_canary_record(
             timestamp_local_iso=current.isoformat(),
             timestamp_local_ms=timestamp_ms,
             symbol=CAMPAIGN_SYMBOL,
-            # 避免被 15m 策略运行器当成上一根真实策略分析记录。
+            # 避免被 10m 策略运行器当成上一根真实策略分析记录。
             timeframe=CANARY_TIMEFRAME,
+            data_source="okx",
+            market_data_provenance="okx_public_ticker_controlled_canary",
             bar_count=1,
             ai_provider={"adapter": CANARY_ORIGIN, "model": "none"},
             decision_stance=CANARY_ORIGIN,
@@ -802,6 +823,204 @@ def build_demo_canary_record(
     )
 
 
+def build_controlled_demo_s_record(
+    base_record: AnalysisRecord,
+    *,
+    client: OkxRestClient,
+    now: datetime | None = None,
+) -> tuple[AnalysisRecord, CampaignSizing]:
+    """基于真实 10m 快照构造可复现的 Demo-S 三价，不伪装成自然信号。"""
+    if (
+        base_record.meta.symbol != CAMPAIGN_SYMBOL
+        or base_record.meta.timeframe != CAMPAIGN_TIMEFRAME
+        or base_record.meta.data_source != "okx"
+        or base_record.meta.market_data_provenance
+        != "okx_5m_utc_pair_aggregation"
+    ):
+        raise CampaignError("Demo-S 基础记录不是受审计的 OKX 5m→10m 聚合记录")
+    if not base_record.kline_data:
+        raise CampaignError("Demo-S 基础记录缺少真实 10m K 线")
+    atr = _positive_decimal(base_record.analysis_atr14)
+    if atr <= 0:
+        raise CampaignError("Demo-S 基础记录缺少有效的真实 10m ATR14")
+
+    instrument = _campaign_instrument(client)
+    tick = _positive_decimal(instrument.get("tickSz"))
+    ticker = client.ticker(CAMPAIGN_INSTRUMENT)
+    reference_price = _positive_decimal(ticker.get("last"))
+    latest = base_record.kline_data[0]
+    stage1_direction = str(
+        base_record.stage1_diagnosis.get("direction") or ""
+    ).strip().lower()
+    direction = {
+        "bullish": "long",
+        "long": "long",
+        "bearish": "short",
+        "short": "short",
+    }.get(stage1_direction)
+    if direction is None:
+        direction = "long" if float(latest["close"]) >= float(latest["open"]) else "short"
+    direction_text = "做多" if direction == "long" else "做空"
+    level_field = "support_levels" if direction == "long" else "resistance_levels"
+    levels = base_record.stage1_diagnosis.get(level_field)
+    selected_level = (
+        _positive_decimal(levels[0])
+        if isinstance(levels, list) and levels
+        else reference_price
+    )
+    entry = _align_to_tick(selected_level, tick, rounding=ROUND_HALF_UP)
+
+    distance = _align_to_tick(
+        max(atr * Decimal("2"), tick),
+        tick,
+        rounding=ROUND_CEILING,
+    )
+    sizing: CampaignSizing | None = None
+    stop = Decimal("0")
+    for _ in range(20):
+        stop = (
+            _align_to_tick(entry - distance, tick, rounding=ROUND_FLOOR)
+            if direction == "long"
+            else _align_to_tick(entry + distance, tick, rounding=ROUND_CEILING)
+        )
+        if stop <= 0:
+            raise CampaignError("Demo-S 风险距离导致止损价非正数")
+        try:
+            sizing = resolve_campaign_sizing(
+                client,
+                entry_price=entry,
+                stop_loss_price=stop,
+                side=direction,
+            )
+            break
+        except CampaignRiskBlocked as exc:
+            if exc.code != "max_size_exceeded":
+                raise
+            distance = _align_to_tick(
+                distance + atr,
+                tick,
+                rounding=ROUND_CEILING,
+            )
+    if sizing is None:
+        raise CampaignError("Demo-S 无法在保持 10% 风险公式时满足真实最大可开张数")
+
+    if direction == "long":
+        tp1 = _align_to_tick(entry + distance * 2, tick, rounding=ROUND_CEILING)
+        tp2 = _align_to_tick(entry + distance * 3, tick, rounding=ROUND_CEILING)
+    else:
+        tp1 = _align_to_tick(entry - distance * 2, tick, rounding=ROUND_FLOOR)
+        tp2 = _align_to_tick(entry - distance * 3, tick, rounding=ROUND_FLOOR)
+    if min(entry, stop, tp1, tp2) <= 0:
+        raise CampaignError("Demo-S 三价必须全部为正数")
+
+    current = (now or datetime.now().astimezone()).astimezone()
+    timestamp_ms = int(current.timestamp() * 1000)
+    decision = {
+        "order_direction": direction_text,
+        "order_type": "限价单",
+        "entry_price": str(entry),
+        "take_profit_price": str(tp1),
+        "take_profit_price_2": str(tp2),
+        "stop_loss_price": str(stop),
+        "trade_confidence": 20,
+        "reason": (
+            "WO-EXEC-03 Demo-S controlled reproducible input；"
+            f"方向继承真实阶段一 {stage1_direction or direction}，"
+            f"入场参考阶段一 {level_field}；"
+            "基于真实 OKX 5m→10m 已收盘快照与 ATR14"
+        ),
+    }
+    controlled_stage1 = {
+        "input_mode": "controlled_reproducible",
+        "gate_result": "proceed",
+        "direction": "bullish" if direction == "long" else "bearish",
+        "diagnosis_confidence": 20,
+        "entry_setup": (
+            f"WO-EXEC-03 受控 Demo-S：{direction_text}，"
+            f"entry={entry}，stop={stop}，TP1={tp1}，TP2={tp2}"
+        ),
+        "risk_warning": (
+            "仅限 OKX Demo；真实 10m ATR14="
+            f"{atr}；风险数量={sizing.quantity}；"
+            f"maxBuy={sizing.max_buy}；maxSell={sizing.max_sell}"
+        ),
+        "controlled_basis": {
+            "closed_bar_ts_open": latest["ts_open"],
+            "market_data_provenance": (
+                "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+            ),
+            "analysis_atr14": str(atr),
+            "reference_price": str(reference_price),
+            "entry_level_source": level_field,
+        },
+        "trend_context": {
+            "primary_direction": "bullish" if direction == "long" else "bearish",
+            "trading_direction": "bullish" if direction == "long" else "bearish",
+            "conflict": False,
+        },
+        "bar_analysis": {
+            "last_closed_bar": "K1",
+            "entry_setup_type": "controlled_reproducible",
+            "follow_through": "controlled_test",
+        },
+    }
+    record = base_record.model_copy(deep=True)
+    record.meta = record.meta.model_copy(
+        update={
+            "timestamp_local_iso": current.isoformat(),
+            "timestamp_local_ms": timestamp_ms,
+            "market_data_provenance": (
+                "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+            ),
+            "ai_provider": {
+                **record.meta.ai_provider,
+                "controlled_input": CONTROLLED_DEMO_S_ORIGIN,
+            },
+        }
+    )
+    record.stage1_response = {
+        "origin": CONTROLLED_DEMO_S_ORIGIN,
+        "base_stage1_response": base_record.stage1_response,
+        "base_stage1_diagnosis": base_record.stage1_diagnosis,
+    }
+    record.stage1_diagnosis = controlled_stage1
+    record.stage2_response = {
+        "origin": CONTROLLED_DEMO_S_ORIGIN,
+        "base_stage2_response": base_record.stage2_response,
+        "base_stage2_decision": base_record.stage2_decision,
+    }
+    record.stage2_decision = {
+        "origin": CONTROLLED_DEMO_S_ORIGIN,
+        "decision": decision,
+    }
+    record.strategy_files_used = list(
+        dict.fromkeys(
+            [*record.strategy_files_used, CONTROLLED_DEMO_S_ORIGIN]
+        )
+    )
+    return record, sizing
+
+
+def find_latest_natural_campaign_record() -> AnalysisRecord | None:
+    """只返回真实 OKX 5m→10m 自然分析，跳过所有受控或其他来源记录。"""
+    for path in list_record_paths(RECORDS_PENDING_DIR):
+        record = load_record(path)
+        if record is None or record.exception is not None:
+            continue
+        if (
+            record.meta.symbol == CAMPAIGN_SYMBOL
+            and record.meta.timeframe == CAMPAIGN_TIMEFRAME
+            and record.meta.data_source == "okx"
+            and record.meta.market_data_provenance
+            == "okx_5m_utc_pair_aggregation"
+            and bool(record.stage1_diagnosis)
+            and bool(record.stage2_decision)
+            and bool(record.kline_data)
+        ):
+            return record
+    return None
+
+
 def _wait_for_execution_state(
     service: ExecutionController,
     execution_id: str,
@@ -818,7 +1037,7 @@ def _wait_for_execution_state(
             raise CampaignError("Demo 生命周期验收 execution 在账本中消失")
         if execution.state in accepted:
             return execution
-        if execution.state in {
+        if bool(getattr(execution, "needs_attention", False)) or execution.state in {
             ExecutionState.BLOCKED,
             ExecutionState.CANCELED,
             ExecutionState.REJECTED,
@@ -836,6 +1055,12 @@ def _wait_for_execution_state(
                 timeout=min(10.0, remaining),
             )
         except TimeoutError:
+            continue
+        except LiveTradingDisabled:
+            # Worker 会在单次对账异常时短暂进入 needs_attention，并在下一次
+            # 成功对账后自行恢复。执行记录仍是普通活动态时继续等到账本终态；
+            # UNKNOWN/ERROR/needs_attention 等真实风险状态已在上方硬阻断。
+            time.sleep(min(0.2, remaining))
             continue
     raise CampaignError("Demo 生命周期验收等待 Worker 对账超时")
 
@@ -955,6 +1180,172 @@ def run_demo_lifecycle_canary(
             runtime.source.disconnect()
 
 
+def run_controlled_demo_s() -> dict[str, str]:
+    """用真实 10m 记录、真实监督和生产执行链完成 Demo-S。"""
+    preflight = okx_demo_private_preflight()
+    state = CampaignStateStore().load()
+    if state is None or state.status != "active":
+        raise CampaignError("Demo-S 要求 10m Campaign 正在运行")
+    base_record = find_latest_natural_campaign_record()
+    if base_record is None:
+        raise CampaignError("Demo-S 尚无真实 10m PA 记录")
+    bar_ms = int(ts_open_to_ms(base_record.kline_data[0]["ts_open"]))
+    if state.last_completed_bar_ms != bar_ms:
+        raise CampaignError("Demo-S 只能使用 Campaign 最新完成的真实 10m 记录")
+
+    runtime: CampaignRuntime | None = None
+    execution_id = ""
+    try:
+        runtime = build_runtime(
+            entry_order_mode="limit_with_slippage",
+            exit_order_mode="limit_with_slippage",
+            entry_slippage_atr_multiple=Decimal("0.50"),
+            exit_slippage_atr_multiple=Decimal("0.50"),
+        )
+        service = runtime.execution_service
+        service.start_monitoring()
+        service.wait_for_worker(timeout=10.0)
+        if service.list_active():
+            raise CampaignError("存在活动执行，Demo-S 禁止新增风险")
+        service.arm(service.arm_confirmation_text())
+
+        client = OkxRestClient(
+            load_okx_credentials("demo"),
+            base_url=CAMPAIGN_OKX_API_BASE_URL,
+            simulated=True,
+        )
+        record, sizing = build_controlled_demo_s_record(
+            base_record,
+            client=client,
+        )
+        runtime.writer.save_full_durable(record)
+        _apply_campaign_sizing(runtime, sizing)
+        record_path = Path(runtime.writer.full_path(record))
+        digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
+        supervision = runtime.supervisor.review(
+            campaign_id=state.campaign_id,
+            record=record,
+            bar_ms=bar_ms,
+            analysis_digest=digest,
+            active_execution_count=0,
+            sizing=sizing,
+        )
+        state = state.model_copy(
+            update={
+                "supervisor_record_ids": list(
+                    dict.fromkeys(
+                        [
+                            *state.supervisor_record_ids,
+                            supervision.record_id,
+                        ]
+                    )
+                ),
+                "last_supervisor_action": supervision.action,
+                "last_plan_result": (
+                    f"blocked:supervisor:{supervision.fallback_level}"
+                    if supervision.action != "allow_entry"
+                    else state.last_plan_result
+                ),
+                "last_error": "",
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        CampaignStateStore().save(state)
+        if supervision.action != "allow_entry":
+            raise CampaignError(
+                "Demo-S 真实监督未放行: "
+                f"{supervision.fallback_level}: {supervision.reason}"
+            )
+
+        execution = service.prepare_analysis(record)
+        execution_id = execution.id
+        state = state.model_copy(
+            update={
+                "execution_ids": list(
+                    dict.fromkeys([*state.execution_ids, execution.id])
+                ),
+                "supervisor_record_ids": list(
+                    dict.fromkeys(
+                        [
+                            *state.supervisor_record_ids,
+                            supervision.record_id,
+                        ]
+                    )
+                ),
+                "last_execution_id": execution.id,
+                "last_supervisor_action": supervision.action,
+                "executions_prepared": state.executions_prepared + 1,
+                "last_plan_result": f"execution:{execution.state.value}",
+                "last_error": "",
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        CampaignStateStore().save(state)
+        command = service.submit(execution.id)
+        result = service.wait_for_command(command.id, timeout=30.0)
+        if result.status is not WorkerCommandStatus.SUCCEEDED:
+            raise CampaignError(
+                f"Demo-S 入场命令失败: {result.failure_code or result.status.value}"
+            )
+        opened = _wait_for_execution_state(
+            service,
+            execution.id,
+            accepted={ExecutionState.OPEN},
+            timeout=float(runtime.settings.execution.entry_timeout_seconds) + 60,
+        )
+        _assert_canary_protection(opened)
+        exit_command = service.request_exit(
+            execution.id,
+            reason="WO-EXEC-03 Demo-S 受控主动离场",
+        )
+        exit_result = service.wait_for_command(exit_command.id, timeout=30.0)
+        if exit_result.status is not WorkerCommandStatus.SUCCEEDED:
+            raise CampaignError(
+                f"Demo-S 离场命令失败: {exit_result.failure_code or exit_result.status.value}"
+            )
+        closed = _wait_for_execution_state(
+            service,
+            execution.id,
+            accepted={ExecutionState.CLOSED},
+            timeout=CANARY_TIMEOUT_SECONDS,
+        )
+        state = state.model_copy(
+            update={
+                "last_plan_result": f"execution:{closed.state.value}",
+                "last_error": "",
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        CampaignStateStore().save(state)
+        return {
+            "execution_id": closed.id,
+            "state": closed.state.value,
+            "origin": CONTROLLED_DEMO_S_ORIGIN,
+            "provenance": record.meta.market_data_provenance,
+            "supervision_record_id": supervision.record_id,
+            "supervision_action": supervision.action,
+            "quantity": str(sizing.quantity),
+            "equity_usdt": str(sizing.equity_usdt),
+            "max_buy": str(sizing.max_buy),
+            "max_sell": str(sizing.max_sell),
+            "entry_price": str(record.stage2_decision["decision"]["entry_price"]),
+            "stop_price": str(record.stage2_decision["decision"]["stop_loss_price"]),
+            "atr14": str(record.analysis_atr14),
+            "preflight_simulated": str(preflight["simulated"]).lower(),
+        }
+    except Exception:
+        if runtime is not None and execution_id:
+            try:
+                _attempt_canary_cleanup(runtime.execution_service, execution_id)
+            except Exception:
+                logger.exception("Demo-S 异常后的减险命令未能入队")
+        raise
+    finally:
+        if runtime is not None:
+            runtime.execution_service.stop_monitoring()
+            runtime.source.disconnect()
+
+
 def okx_demo_private_preflight() -> dict[str, Any]:
     """用模拟标头完成账户、规格、容量和行情只读验证。
 
@@ -1003,13 +1394,12 @@ def okx_demo_private_preflight() -> dict[str, Any]:
         instrument=CAMPAIGN_INSTRUMENT,
         margin_mode=CAMPAIGN_MARGIN_MODE,
     )
-    market_rows = client.candles(
+    market_rows_5m = client.candles(
         instrument=CAMPAIGN_INSTRUMENT,
-        bar=CAMPAIGN_TIMEFRAME,
-        limit=2,
+        bar="5m",
+        limit=4,
     )
-    if not any(len(row) >= 9 and row[8] == "1" for row in market_rows):
-        raise CampaignError("OKX 黄金永续没有可用的已收盘 15m K 线")
+    market_rows = aggregate_okx_five_minute_rows(market_rows_5m, limit=1)
     return {
         "simulated": client.simulated,
         "account_identity_present": True,
@@ -1056,7 +1446,7 @@ class OkxCampaignSource:
 
     def subscribe(self, symbol: str, timeframe: str) -> None:
         if symbol != CAMPAIGN_INSTRUMENT or timeframe != CAMPAIGN_TIMEFRAME:
-            raise CampaignError("OKX Demo 快速运行只允许自身执行产品的 15m K 线")
+            raise CampaignError("OKX Demo 快速运行只允许自身执行产品的 10m K 线")
         self._subscribed = True
 
     def latest_snapshot(self, n: int) -> list[KlineBar]:
@@ -1073,13 +1463,24 @@ class OkxCampaignSource:
         if timeframe not in {CAMPAIGN_TIMEFRAME, *CAMPAIGN_HIGHER_TIMEFRAMES}:
             raise CampaignError(f"OKX Demo 不允许读取实验外周期：{timeframe}")
         try:
+            if timeframe == CAMPAIGN_TIMEFRAME and n > 150:
+                raise DataSourceTransientError(
+                    "OKX 10m 由真实 5m 两两聚合，单次最多请求 150 根 10m"
+                )
+            raw_limit = (
+                min(300, n * 2 + 2)
+                if timeframe == CAMPAIGN_TIMEFRAME
+                else n
+            )
             rows = self._client.candles(
                 instrument=CAMPAIGN_INSTRUMENT,
                 bar=_CAMPAIGN_TIMEFRAME_TO_OKX_BAR[timeframe],
-                limit=n,
+                limit=raw_limit,
             )
         except (BrokerApiError, BrokerTransportError) as exc:
             raise DataSourceTransientError(f"OKX K 线暂时不可用: {exc}") from exc
+        if timeframe == CAMPAIGN_TIMEFRAME:
+            rows = aggregate_okx_five_minute_rows(rows, limit=n)
 
         bars: list[KlineBar] = []
         previous_ts: int | None = None
@@ -1400,6 +1801,7 @@ class OkxDemoCampaign:
 
         if not current:
             return False
+        self._ensure_demo_write_session()
         command = self.runtime.execution_service.submit(current[0].id)
         self._wait_for_worker_command(command.id, action="恢复提交")
         execution = self.runtime.execution_service.get_execution(current[0].id)
@@ -1535,7 +1937,18 @@ class OkxDemoCampaign:
             active_execution_count = len(
                 self.runtime.execution_service.list_active()
             )
-            sizing = self._refresh_order_quantity(record)
+            try:
+                sizing = self._refresh_order_quantity(record)
+            except CampaignRiskBlocked as exc:
+                self._save_state(
+                    inflight_bar_ms=None,
+                    last_completed_bar_ms=bar_ms,
+                    analyses_completed=completed_count,
+                    last_plan_result=f"blocked:risk:{exc.code}",
+                    last_error=str(exc),
+                )
+                logger.info("本轮风险定仓阻断，继续等待下一根已收盘 K 线: %s", exc)
+                return
             supervision = self.runtime.supervisor.review(
                 campaign_id=self.state.campaign_id,
                 record=record,
@@ -1602,6 +2015,7 @@ class OkxDemoCampaign:
             execution.state == ExecutionState.READY
             and _utc_now() < self.state.expires_at_utc
         ):
+            self._ensure_demo_write_session()
             command = self.runtime.execution_service.submit(execution.id)
             self._wait_for_worker_command(command.id, action="提交入场")
             refreshed = self.runtime.execution_service.get_execution(
@@ -1633,7 +2047,7 @@ class OkxDemoCampaign:
             CAMPAIGN_TIMEFRAME,
         )
         if frame is None:
-            raise DataSourceTransientError("XAU-USDT-SWAP 15m 已收盘 K 线不足")
+            raise DataSourceTransientError("XAU-USDT-SWAP 10m 已收盘聚合 K 线不足")
         bar_ms = int(ts_open_to_ms(frame.bars[0].ts_open))
         if self._recover_owned_ready_for_bar(bar_ms):
             return True
@@ -1787,10 +2201,8 @@ class OkxDemoCampaign:
 
         while _utc_now() < self.state.expires_at_utc:
             try:
-                self._ensure_demo_write_session()
                 self._monitor_owned_executions()
-                # 对账中的网络/身份异常会按安全规则停写；提交新计划前必须重新只读验证。
-                self._ensure_demo_write_session()
+                # PA 分析不依赖新增风险租约；只有真正提交前才争用 NEW_RISK。
                 self.process_latest_closed_bar()
                 self._monitor_owned_executions()
             except DataSourceTransientError as exc:
@@ -1889,14 +2301,15 @@ def _safe_status(state_store: CampaignStateStore) -> dict[str, Any]:
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="PA_Agent OKX Demo XAU-USDT-SWAP 15m 快速运行"
+        description="PA_Agent OKX Demo XAU-USDT-SWAP 10m 快速运行"
     )
     parser.add_argument(
         "command",
-        choices=("preflight", "run", "restart", "status", "canary"),
+        choices=("preflight", "run", "restart", "status", "canary", "demo-s"),
         help=(
-            "preflight=私有只读预检; run=15m 策略自动模拟运行; "
+            "preflight=私有只读预检; run=10m 策略自动模拟运行; "
             "restart=归档空闲旧 Campaign 后按新固定配置启动; "
+            "demo-s=真实 10m 记录的受控可复现监督闭环; "
             "canary=明确标记的 Demo 成交-保护-离场验收; status=读取状态"
         ),
     )
@@ -1944,6 +2357,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "preflight":
         return 0
 
+    if args.command == "demo-s":
+        try:
+            with CampaignProcessLock():
+                result = run_controlled_demo_s()
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
+        except KeyboardInterrupt:
+            logger.warning("Demo-S 被人工中断；Worker 将继续只读对账和减险")
+            return 130
+        except Exception as exc:
+            logger.exception("Demo-S 失败: %s", exc)
+            return 3
+
     if args.command == "canary":
         runtime_lock: CampaignProcessLock | None = None
         try:
@@ -1975,7 +2401,7 @@ def main(argv: list[str] | None = None) -> int:
         with CampaignProcessLock():
             state = (
                 state_store.restart(
-                    reason="用户授权更新 15m OKX Demo 运行器配置",
+                    reason="用户授权更新 10m OKX Demo 运行器配置",
                 )
                 if args.command == "restart"
                 else state_store.create_or_resume()

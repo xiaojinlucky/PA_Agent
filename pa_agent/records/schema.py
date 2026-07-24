@@ -35,6 +35,10 @@ class RecordMeta(BaseModel):
     timestamp_local_ms: int   # Local time in milliseconds
     symbol: str
     timeframe: str
+    # 价格来源必须与执行路由一起耐久化，不能只靠分析结束后的当前 GUI 设置猜测。
+    data_source: str = "unknown"
+    # 非秘密行情来源说明；10m 聚合不能被误称为 OKX 原生周期。
+    market_data_provenance: str = "unknown"
     bar_count: int
     ai_provider: dict         # Sanitized provider config snapshot (no plaintext API key)
     decision_stance: str = "conservative"  # conservative | balanced | aggressive | extreme_aggressive

@@ -62,3 +62,51 @@ def test_longbridge_health_label_distinguishes_disconnected_source(qtbot) -> Non
 
     assert window._data_source_health_label.objectName() == "sourceHealthError"
     assert "未连接" in window._data_source_health_label.text()
+
+
+def test_execution_status_explicitly_blocks_mt5_prices_for_okx_demo(qtbot) -> None:
+    settings = Settings()
+    settings.general.last_data_source = "mt5"
+    settings.general.last_symbol = "XAUUSD"
+    settings.execution.enabled = True
+    settings.execution.selected_broker = "okx"
+    settings.execution.okx.source_symbol = "XAU-USDT-SWAP"
+    settings.execution.okx.instrument = "XAU-USDT-SWAP"
+    settings.execution.okx.simulated = True
+    source = MagicMock()
+    source._connected = False
+    source.list_symbols.return_value = []
+    source.supported_timeframes.return_value = ["15m"]
+
+    window = MainWindow(AppContext(settings=settings, data_source=source))
+    qtbot.addWidget(window)
+
+    text = window._execution_status_label.text()
+    assert "MT5/XAUUSD" in text
+    assert "OKX 模拟 XAU-USDT-SWAP" in text
+    assert "行情/执行不一致，已阻断" in text
+    assert "入场 跟随信号 / 离场 市价" in text
+
+
+def test_execution_status_shows_okx_demo_order_modes_and_atr(qtbot) -> None:
+    settings = Settings()
+    settings.general.last_data_source = "okx"
+    settings.general.last_symbol = "XAU-USDT-SWAP"
+    settings.execution.enabled = True
+    settings.execution.selected_broker = "okx"
+    settings.execution.entry_order_mode = "limit_with_slippage"
+    settings.execution.exit_order_mode = "limit_with_slippage"
+    settings.execution.okx.source_symbol = "XAU-USDT-SWAP"
+    settings.execution.okx.instrument = "XAU-USDT-SWAP"
+    settings.execution.okx.simulated = True
+    source = MagicMock()
+    source._connected = False
+    source.list_symbols.return_value = []
+    source.supported_timeframes.return_value = ["15m", "1h", "4h"]
+
+    window = MainWindow(AppContext(settings=settings, data_source=source))
+    qtbot.addWidget(window)
+
+    assert "同源可执行" in window._execution_status_label.text()
+    assert "入场 限价+ATR / 离场 限价+ATR" in window._execution_status_label.text()
+    assert "ATR 倍数 0.50" in window._execution_status_label.toolTip()

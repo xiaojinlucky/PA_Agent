@@ -6,6 +6,7 @@ from pa_agent.data.base import DataSourceTransientError
 from pa_agent.data.okx_source import (
     OKX_MAX_ANALYSIS_BARS,
     OkxSource,
+    aggregate_okx_five_minute_rows,
     normalize_okx_instrument,
     okx_instrument_type,
 )
@@ -77,6 +78,23 @@ def test_okx_source_validates_instrument_then_returns_newest_first_bars():
     assert [bar.ts_open for bar in bars] == [3000.0, 2000.0, 1000.0]
 
 
+def test_okx_source_reads_higher_timeframe_without_changing_main_subscription():
+    client = _FakeOkxClient()
+    source = OkxSource(client=client)
+    source.connect()
+    source.subscribe("XAU-USDT-SWAP", "15m")
+
+    bars = source.latest_snapshot_for_timeframe("1h", 3)
+    source.latest_snapshot(2)
+
+    assert len(bars) == 3
+    assert source._timeframe == "15m"
+    assert client.candle_calls == [
+        ("XAU-USDT-SWAP", "1H", 3),
+        ("XAU-USDT-SWAP", "15m", 2),
+    ]
+
+
 def test_okx_source_failed_switch_preserves_previous_subscription():
     client = _FakeOkxClient()
     source = OkxSource(client=client)
@@ -106,3 +124,77 @@ def test_okx_source_translates_transport_errors_without_exposing_credentials():
 
 def test_okx_analysis_limit_reserves_indicator_warmup():
     assert OKX_MAX_ANALYSIS_BARS == 245
+
+
+def _five_minute_row(
+    timestamp: int,
+    open_price: str,
+    high: str,
+    low: str,
+    close: str,
+    volume: str,
+    amount: str,
+    confirm: str = "1",
+) -> list[str]:
+    return [
+        str(timestamp), open_price, high, low, close,
+        volume, "0", amount, confirm,
+    ]
+
+
+def test_okx_ten_minute_uses_two_closed_five_minute_bars() -> None:
+    rows = [
+        _five_minute_row(1_200_000, "14", "15", "13", "14", "1", "10", "0"),
+        _five_minute_row(900_000, "12", "15", "11", "14", "3", "30"),
+        _five_minute_row(600_000, "10", "13", "9", "12", "2", "20"),
+        _five_minute_row(300_000, "9", "11", "8", "10", "5", "50"),
+        _five_minute_row(0, "8", "10", "7", "9", "4", "40"),
+    ]
+
+    aggregated = aggregate_okx_five_minute_rows(rows, limit=2)
+
+    assert aggregated == [
+        ["600000", "10", "15", "9", "14", "5", "0", "50", "1"],
+        ["0", "8", "11", "7", "10", "9", "0", "90", "1"],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("rows", "message"),
+    [
+        (
+            [
+                _five_minute_row(900_000, "1", "2", "1", "2", "1", "1"),
+                _five_minute_row(300_000, "1", "2", "1", "2", "1", "1"),
+            ],
+            "缺根",
+        ),
+        (
+            [
+                _five_minute_row(600_001, "1", "2", "1", "2", "1", "1"),
+                _five_minute_row(300_000, "1", "2", "1", "2", "1", "1"),
+            ],
+            "UTC 5 分钟边界",
+        ),
+        (
+            [
+                _five_minute_row(600_000, "1", "2", "1", "2", "1", "1"),
+                _five_minute_row(900_000, "1", "2", "1", "2", "1", "1"),
+            ],
+            "严格从新到旧",
+        ),
+        (
+            [
+                _five_minute_row(900_000, "1", "2", "1", "2", "1", "1", "0"),
+                _five_minute_row(600_000, "1", "2", "1", "2", "1", "1"),
+            ],
+            "没有两根连续",
+        ),
+    ],
+)
+def test_okx_ten_minute_rejects_invalid_five_minute_inputs(
+    rows: list[list[str]],
+    message: str,
+) -> None:
+    with pytest.raises(DataSourceTransientError, match=message):
+        aggregate_okx_five_minute_rows(rows, limit=1)

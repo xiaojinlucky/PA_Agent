@@ -149,10 +149,10 @@ class TradingDialog(QDialog):
         order_group = QGroupBox("入场 / 主动离场下单方式")
         order_form = QFormLayout(order_group)
         self._entry_order_mode = QComboBox()
-        self._entry_order_mode.addItem("跟随 PA 信号（保持原行为）", "signal")
-        self._entry_order_mode.addItem("限价单（按 PA 价格挂单）", "limit")
-        self._entry_order_mode.addItem("限价单 + 允许滑点", "limit_with_slippage")
-        self._entry_order_mode.addItem("市价单", "market")
+        self._entry_order_mode.addItem("采用 AI 信号单型（不覆盖）", "signal")
+        self._entry_order_mode.addItem("强制限价单（按 PA 价格挂单）", "limit")
+        self._entry_order_mode.addItem("强制限价单 + ATR 滑点", "limit_with_slippage")
+        self._entry_order_mode.addItem("强制市价单", "market")
         self._entry_order_mode.setToolTip(
             "入场独立选择：限价单保持 PA 产生的价格；限价+滑点按方向把价格向成交侧移动；"
             "市价单直接成交。跟随 PA 信号只为兼容旧配置。"
@@ -822,6 +822,12 @@ class TradingDialog(QDialog):
         account = record.selected_account or record.plan.requested_account
         environment = "模拟" if record.plan.environment == "demo" else "实盘"
         attention = "是" if record.needs_attention else "否"
+        mode_labels = {
+            "signal": "采用 AI 信号单型",
+            "limit": "限价",
+            "limit_with_slippage": "限价 + ATR 滑点",
+            "market": "市价",
+        }
         detail = [
             (
                 f"{record.plan.broker} / {account} / {environment} / "
@@ -836,7 +842,8 @@ class TradingDialog(QDialog):
                 f"券商单号 {record.broker_order_id or '—'}"
             ),
             (
-                f"方式：入场 {record.plan.entry_order_mode}；主动离场 {record.plan.exit_order_mode}；"
+                f"方式：入场 {mode_labels.get(record.plan.entry_order_mode, record.plan.entry_order_mode)}；"
+                f"主动离场 {mode_labels.get(record.plan.exit_order_mode, record.plan.exit_order_mode)}；"
                 f"ATR14 {record.plan.entry_atr or '—'}；"
                 f"ATR 倍数 {record.plan.entry_slippage_atr_multiple}/"
                 f"{record.plan.exit_slippage_atr_multiple}"

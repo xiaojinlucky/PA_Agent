@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from pydantic import ValidationError as PydanticValidationError
 
 from pa_agent.execution.errors import BrokerRejected, PreflightError
 from pa_agent.execution.models import (
@@ -486,6 +487,35 @@ def test_exception_classification_and_masked_logging(tmp_path, caplog):
     assert store.get_command(refresh.id).failure_code == "RuntimeError"
     assert "abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
     assert "<redacted>" in caplog.text
+
+
+def test_invalid_execution_record_fails_before_broker_write(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+
+    def _invalid_record(_execution_id: str):
+        try:
+            ExecutionPlan.model_validate({})
+        except PydanticValidationError as exc:
+            raise exc
+        raise AssertionError("测试必须产生 Pydantic 字段校验错误")
+
+    service.store.get = _invalid_record
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        command = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.SUBMIT,
+            lease_id=lease.lease_id,
+        )
+        result = worker.run_once()
+    finally:
+        worker.close()
+
+    assert result.id == command.id
+    assert result.status is WorkerCommandStatus.FAILED
+    assert result.failure_code == "execution_record_invalid"
+    assert not [call for call in service.calls if call[0] == "submit"]
 
 
 def test_broker_rejected_exit_is_failed_not_uncertain(tmp_path):

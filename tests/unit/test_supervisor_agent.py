@@ -169,6 +169,56 @@ def test_supervisor_snapshot_deeply_rejects_nested_mutation():
         snapshot.stage2_decision["decision"] = {}
 
 
+def test_supervisor_snapshot_defaults_to_natural_pa_mode():
+    assert _snapshot().input_mode == "natural_pa"
+
+
+def test_controlled_demo_s_is_explicit_in_frozen_supervisor_snapshot():
+    record = _record(symbol="XAU-USDT-SWAP").model_copy(deep=True)
+    record.meta = record.meta.model_copy(
+        update={
+            "timeframe": "10m",
+            "data_source": "okx",
+            "market_data_provenance": (
+                "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+            ),
+        }
+    )
+    record.stage2_decision = {
+        "origin": "controlled_reproducible_demo_s",
+        "decision": record.stage2_decision["decision"],
+    }
+    record.kline_data = [
+        {
+            "seq": 1,
+            "ts_open": 1_784_300_400_000,
+            "open": 4000,
+            "high": 4010,
+            "low": 3990,
+            "close": 4005,
+            "volume": 100,
+            "closed": True,
+        }
+    ]
+    snapshot = build_supervisor_input(
+        campaign_id="campaign-one",
+        record=record,
+        bar_ms=1_784_300_400_000,
+        analysis_digest="controlled-one",
+        active_execution_count=0,
+        sizing=SimpleNamespace(
+            equity_usdt="5000",
+            max_buy="23000",
+            max_sell="23000",
+            quantity="21000",
+        ),
+    )
+
+    assert snapshot.input_mode == "controlled_reproducible"
+    with pytest.raises(ValueError):
+        snapshot.input_mode = "natural_pa"
+
+
 def test_ai_role_bindings_round_trip_without_copying_provider_secrets():
     settings = Settings()
     settings.ai_roles.supervisor_primary_profile_id = "primary"

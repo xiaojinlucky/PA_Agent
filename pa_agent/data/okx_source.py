@@ -13,6 +13,8 @@ _TIMEFRAME_TO_OKX_BAR: dict[str, str] = {
     "1m": "1m",
     "3m": "3m",
     "5m": "5m",
+    # OKX 没有原生 10m；读取真实 5m 后在本地按 UTC 边界两两聚合。
+    "10m": "5m",
     "15m": "15m",
     "30m": "30m",
     "1h": "1H",
@@ -30,9 +32,91 @@ _PRESET_INSTRUMENTS: tuple[str, ...] = (
 )
 _INSTRUMENT_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+){1,2}$")
 _MAX_CANDLES = 300
+_TEN_MINUTE_MS = 10 * 60 * 1000
+_FIVE_MINUTE_MS = 5 * 60 * 1000
 
 # RefreshLoop 还会额外请求 50 根指标预热和 5 根缓冲。
 OKX_MAX_ANALYSIS_BARS = _MAX_CANDLES - 55
+
+
+def aggregate_okx_five_minute_rows(
+    rows: list[list[str]],
+    *,
+    limit: int,
+) -> list[list[str]]:
+    """把 OKX 新到旧的真实 5m 行按 UTC 边界聚合成 10m 行。"""
+    groups: dict[int, list[list[str]]] = {}
+    previous_timestamp: int | None = None
+    for row in rows:
+        try:
+            if len(row) < 9 or row[8] not in {"0", "1"}:
+                raise ValueError("missing or invalid confirm")
+            timestamp = int(row[0])
+        except (IndexError, TypeError, ValueError) as exc:
+            raise DataSourceTransientError("OKX 5m K 线时间或收盘标记无法解析") from exc
+        if timestamp % _FIVE_MINUTE_MS != 0:
+            raise DataSourceTransientError("OKX 5m K 线没有对齐 UTC 5 分钟边界")
+        if previous_timestamp is not None:
+            if timestamp >= previous_timestamp:
+                raise DataSourceTransientError("OKX 5m K 线必须严格从新到旧")
+            if previous_timestamp - timestamp != _FIVE_MINUTE_MS:
+                raise DataSourceTransientError("OKX 5m K 线缺根，不能聚合 10m")
+        previous_timestamp = timestamp
+        bucket = timestamp - timestamp % _TEN_MINUTE_MS
+        groups.setdefault(bucket, []).append(row)
+
+    aggregated: list[list[str]] = []
+    newest_bucket = max(groups, default=None)
+    oldest_bucket = min(groups, default=None)
+    for bucket in sorted(groups, reverse=True):
+        parts = sorted(groups[bucket], key=lambda item: int(item[0]))
+        exact_pair = (
+            len(parts) == 2
+            and int(parts[0][0]) == bucket
+            and int(parts[1][0]) == bucket + _FIVE_MINUTE_MS
+        )
+        if not exact_pair:
+            if bucket == newest_bucket:
+                if len(parts) != 1 or parts[0][8] != "0":
+                    raise DataSourceTransientError(
+                        "OKX 最新 10m 桶缺根或状态异常，不能聚合"
+                    )
+                continue
+            if bucket == oldest_bucket:
+                continue
+            raise DataSourceTransientError("OKX 5m K 线跨越 10m 边界，不能聚合")
+        try:
+            open_price = Decimal(parts[0][1])
+            high_price = max(Decimal(part[2]) for part in parts)
+            low_price = min(Decimal(part[3]) for part in parts)
+            close_price = Decimal(parts[-1][4])
+            volume = sum((Decimal(part[5]) for part in parts), Decimal("0"))
+            volume_ccy = sum((Decimal(part[6]) for part in parts), Decimal("0"))
+            amount = sum((Decimal(part[7]) for part in parts), Decimal("0"))
+        except (IndexError, InvalidOperation, TypeError, ValueError) as exc:
+            raise DataSourceTransientError("OKX 5m K 线字段无法聚合") from exc
+        if not all(part[8] == "1" for part in parts):
+            if bucket == newest_bucket:
+                continue
+            raise DataSourceTransientError("OKX 5m K 线尚未全部收盘，不能聚合 10m")
+        aggregated.append(
+            [
+                str(bucket),
+                str(open_price),
+                str(high_price),
+                str(low_price),
+                str(close_price),
+                str(volume),
+                str(volume_ccy),
+                str(amount),
+                "1",
+            ]
+        )
+        if len(aggregated) >= limit:
+            break
+    if not aggregated:
+        raise DataSourceTransientError("OKX 没有两根连续且均已收盘的 5m K 线可聚合为 10m")
+    return aggregated
 
 
 def normalize_okx_instrument(symbol: str) -> str:
@@ -133,25 +217,52 @@ class OkxSource(DataSource):
             raise DataSourceTransientError("OKX 公共行情源尚未连接")
         if not self._symbol or not self._timeframe:
             raise DataSourceTransientError("OKX 尚未订阅品种和周期")
+        return self._latest_snapshot_for_timeframe(self._timeframe, n)
+
+    def latest_snapshot_for_timeframe(
+        self,
+        timeframe: str,
+        n: int,
+    ) -> list[KlineBar]:
+        """读取同一已订阅 OKX 品种的另一个周期，不改变主图订阅。"""
+        if not self._connected:
+            raise DataSourceTransientError("OKX 公共行情源尚未连接")
+        if not self._symbol:
+            raise DataSourceTransientError("OKX 尚未订阅品种")
+        if timeframe not in _TIMEFRAME_TO_OKX_BAR:
+            raise ValueError(
+                f"OKX 不支持周期 {timeframe!r}；可用周期：{list(_TIMEFRAME_TO_OKX_BAR)}"
+            )
+        return self._latest_snapshot_for_timeframe(timeframe, n)
+
+    def _latest_snapshot_for_timeframe(
+        self,
+        timeframe: str,
+        n: int,
+    ) -> list[KlineBar]:
         if n < 1:
             return []
-        if n > _MAX_CANDLES:
+        max_requested = _MAX_CANDLES // 2 if timeframe == "10m" else _MAX_CANDLES
+        if n > max_requested:
             raise DataSourceTransientError(
-                "OKX 最近 K 线接口单次最多返回 300 根；"
-                "PA_Agent 的分析 K 线数量请设为不超过 245"
+                f"OKX {timeframe} 单次最多返回 {max_requested} 根；"
+                "10m 由真实 5m 两两聚合，不能突破 OKX 300 行上限"
             )
+        raw_limit = min(_MAX_CANDLES, n * 2 + 2) if timeframe == "10m" else n
         try:
             rows = self._client.candles(
                 instrument=self._symbol,
-                bar=_TIMEFRAME_TO_OKX_BAR[self._timeframe],
-                limit=n,
+                bar=_TIMEFRAME_TO_OKX_BAR[timeframe],
+                limit=raw_limit,
             )
         except (BrokerApiError, BrokerTransportError) as exc:
             raise DataSourceTransientError(f"OKX K 线暂时不可用：{exc}") from exc
         if not rows:
             raise DataSourceTransientError(
-                f"OKX 未返回 K 线：{self._symbol} {self._timeframe}"
+                f"OKX 未返回 K 线：{self._symbol} {timeframe}"
             )
+        if timeframe == "10m":
+            rows = aggregate_okx_five_minute_rows(rows, limit=n)
 
         bars: list[KlineBar] = []
         previous_ts: int | None = None

@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from filelock import FileLock, Timeout
+from pydantic import ValidationError as PydanticValidationError
 
 from pa_agent.config.settings import load_settings
 from pa_agent.execution.errors import (
@@ -431,7 +432,10 @@ class ExecutionWorker:
             raise RuntimeError("ExecutionWorker 尚未启动")
 
     def _load_execution(self, command: WorkerCommand) -> Any:
-        record = self.service.store.get(command.execution_id)
+        try:
+            record = self.service.store.get(command.execution_id)
+        except PydanticValidationError as exc:
+            raise _CommandRejected("execution_record_invalid") from exc
         if record is None:
             raise _CommandRejected("execution_record_missing")
         trusted_account = (

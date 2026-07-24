@@ -68,7 +68,7 @@ class SupervisorAgent:
             reply = chat(
                 messages,
                 thinking=False,
-                reasoning_effort="minimal",
+                reasoning_effort="medium",
                 timeout_s=self.timeout_s,
                 max_output_tokens=512,
             )
@@ -79,7 +79,7 @@ class SupervisorAgent:
             reply = stream_chat(
                 messages,
                 thinking=False,
-                reasoning_effort="minimal",
+                reasoning_effort="medium",
                 cancel_token=CancelToken(),
                 timeout_s=self.timeout_s,
                 max_output_tokens=512,
@@ -187,7 +187,17 @@ def build_supervisor_input(
     stage2 = record.stage2_decision
     if not isinstance(stage1, dict) or not isinstance(stage2, dict):
         raise SupervisorConfigurationError("PA 记录缺少完整结构化决策")
+    input_mode = (
+        "controlled_reproducible"
+        if (
+            stage2.get("origin") == "controlled_reproducible_demo_s"
+            and record.meta.market_data_provenance
+            == "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+        )
+        else "natural_pa"
+    )
     return SupervisorInputSnapshot(
+        input_mode=input_mode,
         campaign_id=campaign_id,
         analysis_digest=analysis_digest,
         symbol=record.meta.symbol,

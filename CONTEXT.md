@@ -4,9 +4,14 @@
 
 > 静态代码、规则和文档事实可直接引用；进程、账户、服务、Live/Demo 配置、仓位和券商状态若没有本轮明确证据，均按历史快照处理，必须在本机重新核验。
 
+- 2026-07-24 当前正式配置已统一为：`OKX / XAU-USDT-SWAP / 10m / extreme_aggressive / min_trade_confidence=20`，入场与主动离场均为 `limit_with_slippage`，滑点为各自 `0.50 × 主周期 ATR14`；`10m` 不是 OKX 原生周期，而是两根连续、同一 UTC 10 分钟边界且均已收盘的官方 `5m` K 线严格聚合。高周期继续使用 OKX 原生已收盘 `1h/4h` 薄背景，只解释结构，不机械否决主周期；Session 与成交量本轮不变。GUI 已持久化并显式显示行情源、Demo 环境、进出场模式、ATR 倍数和高周期背景，OKX 执行拒绝接收 MT5 价格源。
+- 2026-07-24 已重新读取用户提供的网页版 GPT 共享对话并核对正式资金规则：资金转入、转出、充值、提现和账户划转应由 PA 逐页读取 OKX 资金流水自动识别，不能计为交易盈利或亏损，也不能虚假抬高或压低资金调整后的历史最高净值；识别结果、流水水位和基准调整必须耐久留痕。资金变化本身不是交易信号，不触发订单；下一次真实有效入场仍须重新读取最新账户权益与最大可开量，按既定 10% 风险公式重新定仓。本轮已验真 Demo 的 `account/bills` 与 `account/subtypes` 只读权限，新增最近七天严格分页、USDT 转入/转出分类、账户总权益资金流校正纯计算和硬失败测试；同时保留权益变化后的 10% 定仓重算与 `no_order` 不进入定仓/下单。资金流/高水位的生产账本持久化、七天以上归档补链、Funding 充值/提现、非 USDT 时点换算、`totalEq` 运行态接线、50% 停止与人工恢复仍属于路线图阶段 4，尚未实现，不能把本轮余额验收或纯函数说成完整能力已完成。
+- 2026-07-24 `WO-EXEC-03 Demo-S` 已完成真实 OKX Demo 单仓闭环：受控输入显式标记 `controlled_reproducible`，真实 SupervisorGate 使用 `codex-subscription / gpt-5.6-luna / medium` 返回 `allow_entry`；execution `328d0f7f-fef6-5e5e-bd39-dad92a66512b` 通过 `ExecutionController → ExecutionWorker → ExecutionService → OkxAdapter` 做空 `14921` 张，入场订单 `3769893223932182528` 全部成交，建立两笔原生保护后按主动离场流程撤销保护，离场订单 `3769895836211822592` 全部成交，账本最终 `closed`、剩余数量 `0`、已实现盈亏 `-21.3546079887406998`。收口只读回查为非零仓位 `0`、普通挂单 `0`、条件/OCO 挂单 `0`；这只证明 Demo 技术闭环，不是自然 PA 信号或 Live 绩效。
+- 2026-07-24 Campaign `0e8294bb-1cf0-4800-90b0-dc2f22bbb360` 已恢复为 `active`，最新耐久关联为 `execution:closed`。WinSW `PAAgentExecutionWorker` 已重启加载新 schema，现场 Worker PID `13384`、心跳与最后成功对账正常；这些进程与账户事实以后仍须重新现场核验。旧 execution `8c0f83ab-fc6b-589e-8967-c4bd8f538015` 因旧 Worker 在券商写入前无法解析新增计划字段，已通过 Controller 明确作废为 `canceled`，原 `uncertain` 命令作为审计证据保留，未盲目重提。
+- 2026-07-24 失败语义已补强：`max_size_exceeded` 记录为 `blocked:risk:max_size_exceeded` 并继续下一根已收盘 K 线；Worker 在券商调用前发现执行记录 schema 不兼容时明确返回 `failed:execution_record_invalid`；Demo 生命周期等待器允许 Worker 单次全局对账异常后继续读取执行账本，但 execution 自身进入 `needs_attention/unknown/error` 时仍立即硬阻断。九种入场/离场组合已通过真实生产链离线 Fake client 验收，ATR `2→4` 的价差翻倍、风险滑点率不改委托价、保护与主动离场模式隔离均有测试覆盖。
 - 用户当前 GitHub 用户名为 `xiaojinlucky`；已明确要求 `xiaojinlucky/PA_Agent` 保持 `PUBLIC` 并公开发布，因为网页版 GPT 可以读取私有仓库，但 BioMNI 读取本项目依赖公开访问。给网页版 GPT 或 BioMNI 的启动指令必须明确这一点，不得要求改回 private。本地 `origin` 已改为规范地址 `git@github.com:xiaojinlucky/PA_Agent.git`。上一次交接包实时核对确认登录账号为 `xiaojinlucky`、权限为 `ADMIN`，当时本地 `main`、`origin/main` 与 GitHub API 返回的基线 SHA 均为 `38876644430302f0e2ac3310f072b31f95252469`；本轮提交/推送状态必须重新按 Git 实时核验。交易执行与大模型供应商接入已纳入该发布基线；环境文件、密钥、数据库、日志和运行态记录一律排除。
-- 2026-07-23 本轮已按用户提供的 `E:\QQ文件\价格行为学资料` 做本地只读方法核查：价格行为是嵌套结构，高周期提供背景/关键位置，主周期负责当前判断；资料支持少量相关周期，不支持把日线、周线、月线全部塞进提示词。当前最小实验冻结为 `15m` 主周期 + `1h`/`4h` 薄背景标签；日线暂不接入决策，Session 只排在高周期实验之后，成交量维持现状。
-- 2026-07-23 本轮已实现入场和主动离场独立三选项：`limit`、`limit_with_slippage`、`market`；滑点改为分析时主周期 `ATR14 × 倍数`，首轮 Demo 倍数为 `0.50`，缺 ATR 直接阻断，不退回固定基点。`15m` Demo 运行器已读取同一 OKX 品种的已收盘 `1h/4h` K 线，生成薄 `EMA20/ATR14/方向/时间` 背景，写入 `htf_text` 并传入阶段一、阶段二提示词；高周期标签不直接否决主周期。
+- 2026-07-23 历史基线曾冻结为 `15m` 主周期 + `1h`/`4h` 薄背景；该主周期已被 2026-07-24 的 `10m` 正式决定取代，资料对“嵌套结构、少量相关周期、高周期只作背景”的约束继续有效。
+- 2026-07-23 历史实现已完成入场和主动离场独立三选项及 ATR 滑点；2026-07-24 现役 Demo-S 配置进一步固定为进出场均 `limit_with_slippage / 0.50 × ATR14`，主周期改为严格聚合 `10m`。
 - 2026-07-23 本轮离线验证：多周期/ATR/提示词/适配器/运行器定向套件 `209` 通过、`0` 失败；ExecutionService/Controller/Worker/Store/生命周期回归 `97` 通过、`0` 失败；`compileall`、改动范围未定义名/语法检查和 `git diff --check` 通过。新版 Campaign `e396d8eb-e3bf-498a-83c6-8654c0528fbb` 已启动，但当前被本机 GUI 会话持有的 `NEW_RISK` 短租约阻塞在首轮分析前，尚未产生本轮新的真实订单证据；不撤销 GUI 租约、不把等待说成交易。普通 GUI 行情源尚未接入自动高周期读取，本轮先把真实 Demo 主运行路径打通。
 - 2026-07-23 `WO-RISK-02` 已完成本机适配：新增纯 `Decimal` 风险计算器，按 Demo USDT 权益的 10% 风险预算、PA entry/stop、`ctVal`/`ctMult`、费用、滑点、`lotSz`/`minSz` 和方向最大可开张数计算首仓张数；风险结果在现有 `ExecutionController → ExecutionWorker` 链路中进入 `ExecutionPlan.quantity`。已有新增风险租约时，定仓改量会先撤销旧租约并按新配置指纹重新授权。没有 PA entry/stop 时只做只读预检、不计算数量、不回退 `equity_10pct_notional`；本轮未修改 `pa_agent/execution/`，未连接真实券商，未发送 Demo/Live 订单。
 - 用户已重新授权前端改版，但明确要求先由 Gemini Stitch 设计。`docs/FRONTEND_REDESIGN_PRD.md` 已完成，生产视觉改版、Pencil 状态流和 Figma 组件库尚未完成；OmicOS 只参考“订阅登录/API 接入”分组与信息层级，不照抄品牌风格。
@@ -17,7 +22,7 @@
 - 2026-07-23 02:47，旧版 5 分钟 Demo 运行器已完成 7 笔 `10` 张限价空单的真实 OKX Demo 提交；7 笔均被券商接受、成交量均为 `0`，在 `270` 秒内未回到挂单价后均已撤销，当前无仓位。为验证即时执行路径，已将运行器专用阶段二提示切为 `market_when_valid`：仅当能在最新已收盘 K1 附近构造合法三价时输出市价单，否则如实不下单；该规则不影响 GUI 和日常 PA 分析。新 campaign `c928e2bf...` 已连续完成 8 根 5 分钟 K 线的真实分析（0 失败、0 新 execution）；均因尖峰追单/下沿支撑/无回撤确认或区间转换被模型判为不下单。Runner、`ExecutionWorker`、心跳、账本和 OKX Demo 私有回查一致且正常。策略运行器短暂停止后，已通过同一 Controller/Worker 链路完成独立 `okx_demo_lifecycle_canary`：Demo `10` 张市价入场、成交回读、两笔原生保护、受控离场，最终 `closed`、剩余 `0`，Demo 无非零仓位；随后策略运行器已恢复。
 - 2026-07-23 22:26-22:41 的现场运行已重新核验：旧 Campaign 在唯一 `NEW_RISK` 租约到期前 7 秒启动，因租约竞争直接结束且只完成 `0` 根分析；本轮新增 `NewRiskLeaseUnavailable` 类型错误，Campaign 把这一个明确的短暂租约竞争放回循环重试，硬门关闭和其他真实错误仍直接失败。修复后的定向 Campaign/Controller 测试为 `55` 通过、`0` 失败，`compileall` 和 `git diff --check` 通过。
 - 同一现场按用户授权完成一次真实 OKX Demo 生命周期 canary：execution `3f57bed9-6997-58ff-9e6f-e3b6cd1554c2`，`15358` 张市价入场，成交回读后建立两笔原生保护，主动离场成交，账本最终 `closed`、`needs_attention=false`；随后 OKX Demo 只读回查为净仓 `0`、普通挂单 `0`、待生效算法单 `0`。该 canary 明确标记为 `okx_demo_lifecycle_canary`，不计入 PA 策略绩效。
-- 修复后的 15 分钟 Campaign `d6936271-7d86-49b7-8e94-e069ed5bac2f` 已重新启动并保持 `active`；截至该现场快照，已完成 `1` 根真实两阶段分析，结果为 `blocked:no_order`，模型给出的理由是空头方向但低位支撑/十字星/跟随不足，不构成即时市价方案；Worker 心跳和最后成功对账持续更新。该运行态仍须以后续现场探针重新确认。
+- 历史 15 分钟 Campaign `d6936271-7d86-49b7-8e94-e069ed5bac2f` 已由当前 10 分钟 Campaign 取代；该条只保留为旧现场快照。
 - `docs/GPT5_6SOL_HANDOFF.md` 与 `docs/LOCAL_EXECUTION_CONTEXT.md` 是开发前历史快照，已加醒目标记；当前实现真值以本文件与 `docs/LIVE_TRADING_DESIGN.md` 为准。
 - AI 模型首轮范围已按用户最新决定收敛为 Codex ChatGPT 订阅、Kimi API、DeepSeek API；小米 MiMo 暂不纳入本轮可用性验收。当前配置有 Codex Luna、Codex Terra、Kimi、DeepSeek 四个已验证档案，活动档案为 `codex-subscription` / `gpt-5.6-luna`；Luna 与 Terra 是同一 Codex 订阅通道下的两个模型档案，不是新增供应商。
 - Codex 登录故障根因是程序误选了 WindowsApps 中存在但不可执行的无后缀资源。现在每个 `.exe` 候选都必须实际通过 `--version`，当前使用 `C:\Users\Administrator\AppData\Local\OpenAI\Codex\bin\codex.exe`；ChatGPT 登录状态和独立随机挑战均通过。
@@ -54,12 +59,12 @@
 - PA 后端信息架构只有在提交边界核清并安全推送后，才交给网页版 ChatGPT 通过 GitHub 只读审查；仓库公开性已由用户明确接受。网页版工单仍必须由本机 Codex 按真实 skills、memory、运行态和交易安全边界校正后才能执行。
 - 用户给出的网页版 ChatGPT 项目对话需要登录态；本机内置浏览器当前被引导到登录页，因此本轮无法重新读取原文。已有 PRD/加固计划只可视为之前整理出的结果，不能冒充本轮已经重新核对过该对话。
 - 当前代码和 WinSW 验收不等于可以打开实盘。数据库备份、schema v2 核对、独立守护、GUI/Worker 进程树隔离、旧运行态文件 ACL 和历史 Demo execution 安全收口已经完成；更完整的券商启动扫描、持续持仓/保护真值核对、Longbridge 私有推送与全局限速仍未完成，因此不能宣称长期无人值守实盘已完成。
-- 当前持久交易配置经本地 `config/settings.json` 核对为 OKX、自动执行开启、`XAU-USDT-SWAP`、`15m`、cross、`10` 张、Demo，设置 revision 为 `63`；字段已经通过 `plan_builder` 的品种/数量校验。此前的 5 分钟快速运行器属于历史 Demo 实验记录，不能覆盖当前 15 分钟产品配置；它使用的执行置信度门槛为 30、推理强度为 medium、入场有效期为 270 秒。Longbridge paper 的共享模拟门和 Worker 健康链路此前已用一份不落盘的有效路由完成“启用 → 停用”复验。
+- 当前持久交易配置经本地 `config/settings.json` 核对为 revision `71`：OKX Demo、`XAU-USDT-SWAP`、严格聚合 `10m`、`extreme_aggressive`、决策与执行最低置信度均为 `20`、进出场均 `limit_with_slippage / 0.50 × ATR14`。数量不再把持久固定值当风险真值，每次候选计划按实时权益、止损距离、合约规格和最大可开数重新计算。
 - 2026-07-23 已按用户授权关闭原有的外部 Demo 10 张仓位；当前由 PA 自动循环创建、监控和收口自己的订单，不再存在阻塞同品种新计划的外部仓位。
 
 ## 上一轮接手现场快照（2026-07-23 UTC；本轮未重新核验）
 
-- 用户已把当前 PA 模式固定为 `aggressive`、最低交易置信度 `30`、周期 `15m`。本地持久设置当前已核对为 revision `63`；专用运行器同样固定为该三项，并继续限定 `OKX Demo`、`XAU-USDT-SWAP`、`cross`、有效即时方案只能市价入场、动态使用当前 Demo USDT 总权益的 10% 计算合约数。此配置不改变任何 OKX Live 路由。
+- 上一轮曾把 PA 模式固定为 `aggressive / 30 / 15m`；该历史配置已被 2026-07-24 的 `extreme_aggressive / 20 / 10m` 正式决定取代，仍只限定 OKX Demo，不改变任何 OKX Live 路由。
 - 在启动新运行器前已完成只读核验：Demo 无非零 XAU-USDT-SWAP 仓位、无普通挂单、无 OCO/触发保护单；本地无活动 execution/命令；`PAAgentExecutionWorker` 服务运行且心跳、最后成功对账均正常。实时预检成功，最近一次按约 5,000 USDT 权益、约 4,136 USDT 价格解析为 `120` 张；这是容量计算结果，不是策略下单。
 - 上次只读快照记录 Campaign `6c7bc424-6d00-4bd8-9c67-fca1cfa62b39` 于 `2026-07-22T20:12:56Z` 启动，并完成前两根 15 分钟 K 线真实两阶段分析（2 成功、0 失败、0 strategy execution）：第一根交易置信度 45、价格在下方支撑附近、信号 K 线无效且没有可定义的即时止损；第二根交易置信度 35、外包阳线没有确认跟随。两次订单类型都明确为“不下单”，Controller 均因 `no_order` 正确未创建计划。这不是漏单，也不是 canary 或策略绩效；本轮实时状态探针超时，当前是否仍 active 待重查。
 - 自动巡检 `okx-24` 已迁移为“PA Agent OKX Demo 5 分钟只读巡检”，绑定当前 PA 审查线程，到本 Campaign 到期前只读检查 Campaign、进程、Worker、账本和 Demo 仓位/订单/保护摘要。它不得写券商、改配置、启停进程、运行 canary 或修复代码。

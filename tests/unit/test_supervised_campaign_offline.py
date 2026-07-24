@@ -83,7 +83,7 @@ class _ScriptedOrchestrator:
                         "timestamp_local_ms": int(bar.ts_open),
                         "symbol": CAMPAIGN_SYMBOL,
                         "timeframe": CAMPAIGN_TIMEFRAME,
-                        "decision_stance": "aggressive",
+                        "decision_stance": "extreme_aggressive",
                     }
                 ),
                 "kline_data": [dataclasses.asdict(bar)],

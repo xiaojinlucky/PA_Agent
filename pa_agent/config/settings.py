@@ -675,13 +675,28 @@ def load_settings(path: Path | None = None) -> "Settings":
     provider = raw.get("provider", {})
     provider.pop("pricing", None)
     raw["provider"] = provider
+    execution_raw = raw.get("execution")
+    required_order_fields = {
+        "entry_order_mode",
+        "exit_order_mode",
+        "entry_slippage_atr_multiple",
+        "exit_slippage_atr_multiple",
+    }
+    migrated_order_fields = not isinstance(execution_raw, dict) or not (
+        required_order_fields <= set(execution_raw)
+    )
 
     # Migrate legacy encrypted key: drop it, api_key already in provider dict
     raw.setdefault("provider", {}).setdefault("api_key", "")
 
     migrated_feishu = _migrate_legacy_feishu_json(raw, path)
     settings = Settings.model_validate(raw)
-    dirty = migrated_feishu or migrated_ai_profiles or repaired_active_profile
+    dirty = (
+        migrated_feishu
+        or migrated_ai_profiles
+        or repaired_active_profile
+        or migrated_order_fields
+    )
     if settings.pushplus.enabled and not settings.pushplus.token.strip():
         if not (os.environ.get("PUSHPLUS_TOKEN") or "").strip():
             settings.pushplus.enabled = False
@@ -796,7 +811,11 @@ def _read_settings_snapshot(path: Path) -> "Settings":
 def _write_settings_candidate(path: Path, candidate: "Settings") -> None:
     """在调用方已持有设置锁时原子替换设置文件。"""
 
-    payload = json.dumps(candidate.model_dump(), ensure_ascii=False, indent=2)
+    payload = json.dumps(
+        candidate.model_dump(mode="json"),
+        ensure_ascii=False,
+        indent=2,
+    )
     temp_path: Path | None = None
     try:
         with tempfile.NamedTemporaryFile(

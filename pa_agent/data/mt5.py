@@ -193,13 +193,37 @@ class MT5Source(DataSource):
             raise DataSourceTransientError("Not connected — call connect() first")
         if not self._symbol or not self._timeframe:
             raise DataSourceTransientError("Not subscribed — call subscribe() first")
+        return self._latest_snapshot_for_timeframe(self._timeframe, n)
+
+    def latest_snapshot_for_timeframe(
+        self,
+        timeframe: str,
+        n: int,
+    ) -> list[KlineBar]:
+        """读取同一 MT5 品种的另一个周期，不改变主图订阅。"""
+        if not self._connected:
+            raise DataSourceTransientError("Not connected — call connect() first")
+        if not self._symbol:
+            raise DataSourceTransientError("Not subscribed — call subscribe() first")
+        if timeframe not in _TF_MAP:
+            raise ValueError(
+                f"Unsupported timeframe: {timeframe!r}. "
+                f"Use one of {list(_TF_MAP)}"
+            )
+        return self._latest_snapshot_for_timeframe(timeframe, n)
+
+    def _latest_snapshot_for_timeframe(
+        self,
+        timeframe: str,
+        n: int,
+    ) -> list[KlineBar]:
 
         try:
             import MetaTrader5 as mt5  # type: ignore[import]
         except ImportError as exc:
             raise DataSourceTransientError("MetaTrader5 not installed") from exc
 
-        tf_name = _TF_MAP[self._timeframe]
+        tf_name = _TF_MAP[timeframe]
         try:
             tf_const = getattr(mt5, tf_name)
         except AttributeError as exc:
@@ -219,7 +243,7 @@ class MT5Source(DataSource):
         if rates is None or len(rates) == 0:
             error = mt5.last_error()
             raise DataSourceTransientError(
-                f"MT5 copy_rates_from_pos failed for {self._symbol} {self._timeframe}: "
+                f"MT5 copy_rates_from_pos failed for {self._symbol} {timeframe}: "
                 f"{error}"
             )
 

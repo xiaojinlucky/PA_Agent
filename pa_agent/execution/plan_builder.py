@@ -256,6 +256,15 @@ def build_execution_plan(
         longbridge_allow_outside_rth = False
         if product == "spot" and direction == "short":
             raise PlanBlocked("spot_short_not_supported", "OKX 现货不能新开空仓，请选择永续")
+        analysis_data_source = str(
+            getattr(record.meta, "data_source", "unknown") or "unknown"
+        ).strip().lower()
+        if analysis_data_source != "okx":
+            raise PlanBlocked(
+                "price_source_mismatch",
+                "OKX 执行只接受同一 OKX 行情源生成的价格；"
+                f"当前分析来源为 {analysis_data_source or 'unknown'}",
+            )
     else:
         raise PlanBlocked("unknown_broker", f"未知执行券商：{broker}")
 

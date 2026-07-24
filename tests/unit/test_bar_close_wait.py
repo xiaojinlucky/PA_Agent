@@ -29,6 +29,7 @@ def _bar(ts: int) -> KlineBar:
 
 def test_timeframe_to_seconds() -> None:
     assert timeframe_to_seconds("5m") == 300
+    assert timeframe_to_seconds("10m") == 600
     assert timeframe_to_seconds("1h") == 3600
     assert timeframe_to_seconds("2h") == 7200
 
@@ -38,6 +39,20 @@ def test_seconds_until_bar_closes() -> None:
     now = ts_open + 240_000  # 4 min into 5m bar
     assert seconds_until_bar_closes(ts_open, "5m", now_ms=now) == 60
     assert seconds_until_bar_closes(ts_open, "5m", now_ms=ts_open + 300_000) == 0
+
+
+def test_ten_minute_close_boundary_does_not_trigger_on_five_minute_boundary() -> None:
+    ts_open = 1_200_000
+    assert seconds_until_bar_closes(
+        ts_open,
+        "10m",
+        now_ms=ts_open + 300_000,
+    ) == 300
+    assert seconds_until_bar_closes(
+        ts_open,
+        "10m",
+        now_ms=ts_open + 600_000,
+    ) == 0
 
 
 def test_seconds_until_bar_closes_offset_multiple_durations() -> None:

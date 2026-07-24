@@ -366,6 +366,40 @@ def test_saving_profile_switch_clears_dirty_guard_and_keeps_session_disarmed(
     assert dialog._execute_button.isEnabled() is True
 
 
+def test_saving_order_modes_and_atr_multiples_updates_settings(
+    qtbot,
+    monkeypatch,
+):
+    settings = Settings()
+    service = FakeService()
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.save_settings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.QMessageBox.information",
+        lambda *_args, **_kwargs: None,
+    )
+
+    dialog._entry_order_mode.setCurrentIndex(
+        dialog._entry_order_mode.findData("limit_with_slippage")
+    )
+    dialog._exit_order_mode.setCurrentIndex(
+        dialog._exit_order_mode.findData("limit")
+    )
+    dialog._entry_slippage_atr.setValue(0.75)
+    dialog._exit_slippage_atr.setValue(0.25)
+    dialog._save_configuration()
+
+    assert settings.execution.entry_order_mode == "limit_with_slippage"
+    assert settings.execution.exit_order_mode == "limit"
+    assert settings.execution.entry_slippage_atr_multiple == Decimal("0.75")
+    assert settings.execution.exit_slippage_atr_multiple == Decimal("0.25")
+    assert service.reload_calls == 1
+
+
 def test_dialog_switches_okx_product_and_margin_controls(qtbot):
     settings = Settings()
     dialog = TradingDialog(settings=settings, service=FakeService())

@@ -80,6 +80,7 @@ def _record() -> AnalysisRecord:
             timestamp_local_ms=1784476800000,
             symbol="XAU-USDT-SWAP",
             timeframe="30m",
+            data_source="okx",
             bar_count=100,
             ai_provider={"model": "test"},
             decision_stance="balanced",

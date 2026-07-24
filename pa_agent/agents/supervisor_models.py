@@ -57,6 +57,7 @@ class SupervisorInputSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal[1] = 1
+    input_mode: Literal["natural_pa", "controlled_reproducible"] = "natural_pa"
     campaign_id: str = Field(min_length=1, max_length=128)
     analysis_digest: str = Field(min_length=1, max_length=128)
     symbol: str = Field(min_length=1, max_length=128)

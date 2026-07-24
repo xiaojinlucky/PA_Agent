@@ -70,6 +70,8 @@ class OkxRestClient:
 
     _ALGO_PAGE_LIMIT = 100
     _MAX_ALGO_PAGES = 100
+    _BILL_PAGE_LIMIT = 100
+    _MAX_BILL_PAGES = 100
 
     def __init__(
         self,
@@ -328,6 +330,70 @@ class OkxRestClient:
     def balance(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/v5/account/balance", private=True)
         return [dict(item) for item in payload.get("data") or []]
+
+    def account_bill_types(self) -> list[dict[str, Any]]:
+        """读取当前账户实际启用的账单类型映射。"""
+        payload = self._request(
+            "GET",
+            "/api/v5/account/subtypes",
+            private=True,
+        )
+        return [dict(item) for item in payload.get("data") or []]
+
+    def account_bills(
+        self,
+        *,
+        currency: str | None = None,
+        begin_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """完整读取最近七天交易账户账单, 任何分页异常都失败关闭。"""
+        rows: list[dict[str, Any]] = []
+        seen_bill_ids: set[str] = set()
+        after = ""
+        for _page in range(self._MAX_BILL_PAGES):
+            payload = self._request(
+                "GET",
+                "/api/v5/account/bills",
+                params={
+                    "ccy": currency,
+                    "begin": begin_ms,
+                    "end": end_ms,
+                    "after": after,
+                    "limit": self._BILL_PAGE_LIMIT,
+                },
+                private=True,
+            )
+            page = payload.get("data") or []
+            if not page:
+                return rows
+            for item in page:
+                if not isinstance(item, dict):
+                    raise BrokerTransportError(
+                        "OKX 资金账单项不是对象",
+                        write_may_have_reached=False,
+                    )
+                bill_id = str(item.get("billId") or "").strip()
+                if not bill_id or bill_id in seen_bill_ids:
+                    raise BrokerTransportError(
+                        "OKX 资金账单分页 ID 缺失或重复",
+                        write_may_have_reached=False,
+                    )
+                seen_bill_ids.add(bill_id)
+                rows.append(dict(item))
+            if len(page) < self._BILL_PAGE_LIMIT:
+                return rows
+            next_after = str(page[-1].get("billId") or "").strip()
+            if not next_after or next_after == after:
+                raise BrokerTransportError(
+                    "OKX 资金账单分页游标缺失或重复",
+                    write_may_have_reached=False,
+                )
+            after = next_after
+        raise BrokerTransportError(
+            "OKX 资金账单分页超过安全上限",
+            write_may_have_reached=False,
+        )
 
     def positions(self, *, instrument: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(

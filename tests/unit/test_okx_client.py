@@ -255,6 +255,97 @@ def test_leverage_info_uses_read_only_private_endpoint():
     )
 
 
+def test_account_bills_read_all_pages_with_bill_id_cursor():
+    first_page = [
+        {
+            "billId": str(1000 - index),
+            "type": "2",
+            "subType": "1",
+            "ccy": "USDT",
+        }
+        for index in range(100)
+    ]
+    second_page = [
+        {
+            "billId": "900",
+            "type": "1",
+            "subType": "11",
+            "ccy": "USDT",
+        }
+    ]
+    transport = FakeTransport(
+        [
+            _response({"code": "0", "data": first_page, "msg": ""}),
+            _response({"code": "0", "data": second_page, "msg": ""}),
+        ]
+    )
+
+    rows = _client(transport, simulated=True).account_bills(
+        currency="USDT",
+        begin_ms=100,
+        end_ms=200,
+    )
+
+    assert len(rows) == 101
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/account/bills"
+        "?begin=100&ccy=USDT&end=200&limit=100"
+    )
+    assert "after=901" in transport.calls[1]["url"]
+
+
+def test_account_bills_duplicate_id_fails_closed():
+    first_page = [
+        {"billId": str(1000 - index)}
+        for index in range(100)
+    ]
+    second_page = [{"billId": "901"}]
+    transport = FakeTransport(
+        [
+            _response({"code": "0", "data": first_page, "msg": ""}),
+            _response({"code": "0", "data": second_page, "msg": ""}),
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as exc:
+        _client(transport, simulated=True).account_bills()
+
+    assert exc.value.write_may_have_reached is False
+    assert "ID 缺失或重复" in str(exc.value)
+
+
+def test_account_bill_types_use_read_only_private_endpoint():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [
+                        {
+                            "type": "1",
+                            "typeDesc": "Transfer",
+                            "subTypeDetails": [
+                                {
+                                    "subType": "11",
+                                    "subTypeDesc": "Transfer in",
+                                }
+                            ],
+                        }
+                    ],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+
+    rows = _client(transport, simulated=True).account_bill_types()
+
+    assert rows[0]["type"] == "1"
+    assert transport.calls[0]["method"] == "GET"
+    assert transport.calls[0]["url"].endswith("/api/v5/account/subtypes")
+
+
 def test_algo_lookup_confirms_absence_only_after_all_read_queries_succeed():
     transport = FakeTransport(
         [

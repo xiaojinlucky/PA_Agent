@@ -27,6 +27,7 @@ from PyQt6.QtCore import Qt
 
 from pa_agent.ai.response_extract import reasoning_from_response
 from pa_agent.app_context import AppContext
+from pa_agent.data.base import DataSourceTransientError
 from pa_agent.gui.validation_debug_dialog import show_validation_debug_dialog
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,7 @@ class _AnalysisWorker(QThread):
         cancel_token: Any,
         previous_record: Any = None,
         incremental_new_bar_count: int | None = None,
+        data_source: Any = None,
         parent: QObject | None = None,
     ) -> None:
         super().__init__(parent)
@@ -185,6 +187,41 @@ class _AnalysisWorker(QThread):
         self._cancel_token = cancel_token
         self._previous_record = previous_record
         self._incremental_new_bar_count = incremental_new_bar_count
+        self._data_source = data_source
+
+    def _higher_timeframe_text(self) -> str:
+        """在 AI Worker 内读取同源高周期，避免阻塞 GUI 线程。"""
+        from pa_agent.data.multi_timeframe import (
+            higher_timeframes_for,
+            render_higher_timeframe_context,
+        )
+        from pa_agent.data.snapshot import build_analysis_frame
+
+        timeframes = higher_timeframes_for(self._frame.timeframe)
+        if not timeframes:
+            return ""
+        reader = getattr(self._data_source, "latest_snapshot_for_timeframe", None)
+        if not callable(reader):
+            return ""
+        higher_count = min(50, max(20, len(self._frame.bars)))
+        fetch_count = min(245, higher_count + 50)
+        frames = {}
+        for timeframe in timeframes:
+            bars = reader(timeframe, fetch_count)
+            frame = build_analysis_frame(
+                bars,
+                higher_count,
+                self._frame.symbol,
+                timeframe,
+                now_ms=self._frame.snapshot_ts_local_ms,
+            )
+            if frame is None:
+                raise DataSourceTransientError(
+                    f"{self._frame.symbol} {timeframe} 已收盘 K 线不足，"
+                    "不能生成多周期背景"
+                )
+            frames[timeframe] = frame
+        return render_higher_timeframe_context(self._frame, frames)
 
     def _persist_program_error_record(self, exc: Exception) -> Any:
         """Write a minimal failed record to pending when submit() raises unexpectedly."""
@@ -254,6 +291,9 @@ class _AnalysisWorker(QThread):
             self.stage2_files_ready.emit(files)
 
         try:
+            higher_timeframe_text = self._higher_timeframe_text()
+            if higher_timeframe_text:
+                self.status_update.emit("高周期背景已冻结：1h / 4h")
             record = self._orchestrator.submit(
                 self._frame,
                 self._cancel_token,
@@ -266,6 +306,11 @@ class _AnalysisWorker(QThread):
                 on_stage2_files=on_stage2_files,
                 previous_record=self._previous_record,
                 incremental_new_bar_count=self._incremental_new_bar_count,
+                **(
+                    {"higher_timeframe_text": higher_timeframe_text}
+                    if higher_timeframe_text
+                    else {}
+                ),
             )
             decision = record.stage2_decision or {}
         except Exception as exc:  # noqa: BLE001
@@ -397,6 +442,7 @@ class MainWindow(QMainWindow):
         self._execution_status_label = QLabel("交易：停用")
         self._execution_status_label.setObjectName("mutedLabel")
         self._status_bar.addPermanentWidget(self._execution_status_label)
+        self._refresh_execution_configuration_status()
         self._status_bar.showMessage("就绪")
         self._refresh_ai_auth_ui_state()
 
@@ -573,7 +619,7 @@ class MainWindow(QMainWindow):
         # Timeframe
         ctrl_layout.addWidget(QLabel("周期:"))
         self._tf_combo = QComboBox()
-        self._tf_combo.addItems(["1m", "5m", "15m", "1h", "4h", "1d"])
+        self._tf_combo.addItems(["1m", "5m", "10m", "15m", "1h", "4h", "1d"])
         self._tf_combo.setCurrentText(_last_tf)
         self._tf_combo.setMinimumWidth(60)
         ctrl_layout.addWidget(self._tf_combo)
@@ -844,6 +890,77 @@ class MainWindow(QMainWindow):
             label.setToolTip("\n".join(item for item in (reason, error) if item))
         except RuntimeError:
             return
+
+    def _refresh_execution_configuration_status(self) -> None:
+        """在现有状态栏明确显示分析价格来源与执行配置是否同源。"""
+        label = getattr(self, "_execution_status_label", None)
+        settings = getattr(self._ctx, "settings", None)
+        execution = getattr(settings, "execution", None)
+        general = getattr(settings, "general", None)
+        if label is None or execution is None or general is None:
+            return
+        mode_labels = {
+            "signal": "跟随信号",
+            "limit": "限价",
+            "limit_with_slippage": "限价+ATR",
+            "market": "市价",
+        }
+        entry_mode = str(getattr(execution, "entry_order_mode", "signal"))
+        exit_mode = str(getattr(execution, "exit_order_mode", "market"))
+        analysis_source = str(
+            getattr(general, "last_data_source", "unknown") or "unknown"
+        ).lower()
+        analysis_symbol = str(
+            getattr(general, "last_symbol", "") or ""
+        ).strip().upper()
+        if execution.selected_broker == "okx":
+            route = execution.okx
+            environment = "模拟" if route.simulated else "实盘"
+            source_symbol = str(route.source_symbol or "").strip().upper()
+            instrument = str(route.instrument or "").strip().upper()
+            compatible = (
+                analysis_source == "okx"
+                and bool(analysis_symbol)
+                and analysis_symbol == source_symbol == instrument
+            )
+            route_text = f"OKX {environment} {instrument or '未配置品种'}"
+            boundary = "同源可执行" if compatible else "行情/执行不一致，已阻断"
+        else:
+            route = execution.longbridge
+            environment = (
+                "模拟" if route.preferred_account == "paper" else "实盘"
+            )
+            source_symbol = str(route.source_symbol or "").strip().upper()
+            instrument = str(route.instrument or "").strip().upper()
+            compatible = bool(analysis_symbol) and analysis_symbol == source_symbol == instrument
+            route_text = (
+                f"Longbridge {environment} {instrument or '未配置品种'}"
+            )
+            boundary = "价格品种一致" if compatible else "价格品种不一致，已阻断"
+        enabled = "启用" if execution.enabled else "停用"
+        label.setText(
+            f"交易：{enabled} · {analysis_source.upper()}/{analysis_symbol or '—'}"
+            f" → {route_text} · 入场 {mode_labels.get(entry_mode, entry_mode)}"
+            f" / 离场 {mode_labels.get(exit_mode, exit_mode)} · {boundary}"
+        )
+        label.setToolTip(
+            "\n".join(
+                (
+                    f"分析行情：{analysis_source}/{analysis_symbol or '—'}",
+                    f"执行映射：{source_symbol or '—'} → {instrument or '—'}",
+                    f"执行环境：{environment}",
+                    (
+                        f"入场：{mode_labels.get(entry_mode, entry_mode)}；"
+                        f"ATR 倍数 {execution.entry_slippage_atr_multiple}"
+                    ),
+                    (
+                        f"主动离场：{mode_labels.get(exit_mode, exit_mode)}；"
+                        f"ATR 倍数 {execution.exit_slippage_atr_multiple}"
+                    ),
+                    f"安全边界：{boundary}",
+                )
+            )
+        )
 
     def _refresh_workbench_read_model_status(self) -> None:
         """显示只读读取层快照，不把计划状态伪装成券商确认。"""
@@ -3460,6 +3577,7 @@ class MainWindow(QMainWindow):
             cancel_token=self._cancel_token,
             previous_record=previous_record,
             incremental_new_bar_count=incremental_new_bar_count,
+            data_source=getattr(self._ctx, "data_source", None),
             parent=None,
         )
         def _on_worker_finished(decision: dict) -> None:
@@ -3717,7 +3835,7 @@ class MainWindow(QMainWindow):
             self._future_trend_panel.set_prediction(inner)
             self._bind_decision_tree(decision, stage1_diag or None)
             order = inner.get("order_type", "—")
-            self._decision_badge.setText(f"决策: {order}")
+            self._decision_badge.setText(f"AI 信号单型: {order}")
             if self._maybe_alert_order_opportunity(inner):
                 self._spawn_post_order_followup(inner, decision)
 
@@ -4009,6 +4127,16 @@ class MainWindow(QMainWindow):
 
     def _on_record_ready_impl(self, record: Any) -> None:
         self._last_analysis_record = record
+        meta = getattr(record, "meta", None)
+        data_source = str(getattr(meta, "data_source", "unknown") or "unknown")
+        htf_text = str(getattr(record, "htf_text", "") or "")
+        self._decision_badge.setToolTip(
+            (
+                f"分析行情源：{data_source}\n{htf_text}"
+                if htf_text
+                else f"分析行情源：{data_source}\n高周期背景：本轮未启用"
+            )
+        )
         self._prepare_execution_from_record(record)
         import json as _json
 
@@ -4832,6 +4960,7 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         dialog.exec()
+        self._refresh_execution_configuration_status()
 
     def _apply_chart_display_settings(self) -> None:
         """Sync chart label font sizes and decision-flow zoom from persisted settings."""

@@ -37,6 +37,10 @@ def test_15m_uses_one_hour_and_four_hour_background() -> None:
     assert higher_timeframes_for("15m") == ("1h", "4h")
 
 
+def test_10m_uses_real_okx_one_hour_and_four_hour_background() -> None:
+    assert higher_timeframes_for("10m") == ("1h", "4h")
+
+
 def test_context_is_thin_and_does_not_turn_high_timeframe_into_veto() -> None:
     text = render_higher_timeframe_context(
         _frame("15m", 100, 99, 98),

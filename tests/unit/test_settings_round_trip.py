@@ -51,6 +51,31 @@ def test_round_trip(tmp_path):
     assert loaded.provider.model == original.provider.model
 
 
+def test_load_persists_missing_order_mode_and_atr_fields(tmp_path):
+    p = tmp_path / "settings.json"
+    raw = Settings().model_dump(mode="json")
+    for field in (
+        "entry_order_mode",
+        "exit_order_mode",
+        "entry_slippage_atr_multiple",
+        "exit_slippage_atr_multiple",
+    ):
+        raw["execution"].pop(field)
+    p.write_text(json.dumps(raw), encoding="utf-8")
+
+    loaded = load_settings(p)
+    persisted = json.loads(p.read_text(encoding="utf-8"))
+
+    assert loaded.execution.entry_order_mode == "signal"
+    assert loaded.execution.exit_order_mode == "market"
+    assert loaded.execution.entry_slippage_atr_multiple == 0.5
+    assert loaded.execution.exit_slippage_atr_multiple == 0.5
+    assert persisted["execution"]["entry_order_mode"] == "signal"
+    assert persisted["execution"]["exit_order_mode"] == "market"
+    assert persisted["execution"]["entry_slippage_atr_multiple"] == "0.50"
+    assert persisted["execution"]["exit_slippage_atr_multiple"] == "0.50"
+
+
 def test_longbridge_source_and_per_source_symbols_round_trip(tmp_path):
     p = tmp_path / "settings.json"
     original = Settings()
@@ -72,7 +97,7 @@ def test_longbridge_source_and_per_source_symbols_round_trip(tmp_path):
 
 def test_active_source_symbol_map_drives_startup_symbol(tmp_path):
     p = tmp_path / "settings.json"
-    raw = Settings().model_dump()
+    raw = Settings().model_dump(mode="json")
     raw["general"]["last_data_source"] = "longbridge"
     raw["general"]["last_symbol"] = "XAUUSD"
     raw["general"]["last_symbols_by_source"] = {"longbridge": "gld.us"}
@@ -106,7 +131,7 @@ def test_corrupt_json_returns_defaults(tmp_path):
 def test_missing_api_key_leaves_api_key_blank(tmp_path):
     """If api_key is absent, api_key stays empty string."""
     p = tmp_path / "settings.json"
-    data = Settings().model_dump()
+    data = Settings().model_dump(mode="json")
     data["provider"].pop("api_key", None)
     data["provider"].pop("api_key_encrypted", None)
     p.write_text(json.dumps(data), encoding="utf-8")

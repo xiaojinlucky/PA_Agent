@@ -30,6 +30,7 @@ def _record(
             timestamp_local_ms=1784217600000,
             symbol=symbol,
             timeframe="15m",
+            data_source="okx",
             bar_count=100,
             ai_provider={"model": "test"},
             decision_stance="balanced",
@@ -97,6 +98,19 @@ def test_plan_uses_only_local_route_fields(tmp_path, monkeypatch):
     assert plan.broker == "okx"
     assert plan.instrument == "XAU-USDT-SWAP"
     assert str(plan.quantity) == "2"
+
+
+def test_okx_plan_rejects_non_okx_price_source(tmp_path, monkeypatch):
+    record = _record().model_copy(
+        update={"meta": _record().meta.model_copy(update={"data_source": "mt5"})}
+    )
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    with pytest.raises(PlanBlocked) as exc_info:
+        build_execution_plan(record, _settings(), record_path=path)
+
+    assert exc_info.value.code == "price_source_mismatch"
 
 
 @pytest.mark.parametrize(

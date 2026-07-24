@@ -229,16 +229,26 @@ def _build_empty_record(
     from pa_agent.ai.decision_stance import normalize_stance
 
     decision_stance = "conservative"
+    data_source = "unknown"
     if settings is not None:
         decision_stance = normalize_stance(
             getattr(settings.general, "decision_stance", "conservative")
         )
+        data_source = str(
+            getattr(settings.general, "last_data_source", "unknown") or "unknown"
+        ).strip()
 
     meta = RecordMeta(
         timestamp_local_iso=ts_iso,
         timestamp_local_ms=ts_ms,
         symbol=frame.symbol,
         timeframe=frame.timeframe,
+        data_source=data_source,
+        market_data_provenance=(
+            "okx_5m_utc_pair_aggregation"
+            if data_source == "okx" and frame.timeframe == "10m"
+            else data_source
+        ),
         bar_count=len(frame.bars),
         ai_provider=ai_provider,
         decision_stance=decision_stance,

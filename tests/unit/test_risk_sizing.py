@@ -90,3 +90,25 @@ def test_same_inputs_are_bitwise_deterministic():
     second = _calculate()
 
     assert first == second
+
+
+def test_latest_equity_refreshes_ten_percent_risk_without_quantity_clamp():
+    before = _calculate(
+        account_equity="4893.97315732",
+        entry_price="4055.8",
+        stop_loss_price="4076.4",
+        side="short",
+        max_sz="42625",
+    )
+    after = _calculate(
+        account_equity="8899.30154170003",
+        entry_price="4055.8",
+        stop_loss_price="4076.4",
+        side="short",
+        max_sz="42625",
+    )
+
+    assert before.risk_budget_usdt == Decimal("489.3973157320")
+    assert after.risk_budget_usdt == Decimal("889.930154170003")
+    assert after.target_contract_size > before.target_contract_size
+    assert after.target_contract_size <= after.maximum_size

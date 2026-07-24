@@ -18,6 +18,7 @@ from pa_agent.data.base import (
 )
 from pa_agent.execution.errors import (
     BrokerTransportError,
+    LiveTradingDisabled,
     NewRiskLeaseUnavailable,
     PlanBlocked,
 )
@@ -42,15 +43,19 @@ from pa_agent.okx_demo_campaign import (
     CANARY_TIMEFRAME,
     CampaignError,
     CampaignProcessLock,
+    CampaignRiskBlocked,
     CampaignRuntime,
     CampaignSizing,
     CampaignStateStore,
     OkxCampaignSource,
     OkxDemoCampaign,
     _canary_price_triplet,
+    _wait_for_execution_state,
     build_campaign_settings,
+    build_controlled_demo_s_record,
     build_demo_canary_record,
     campaign_config_fingerprint,
+    find_latest_natural_campaign_record,
     okx_demo_private_preflight,
     resolve_campaign_sizing,
     validate_campaign_settings,
@@ -107,6 +112,46 @@ def _frame(bar_ms: int) -> KlineFrame:
         indicators=indicators,
         snapshot_ts_local_ms=bar_ms,
     )
+
+
+def test_wait_for_execution_state_tolerates_transient_worker_attention():
+    execution_id = "execution-transient-attention"
+
+    class _TransientAttentionService:
+        def __init__(self):
+            self.state = ExecutionState.EXIT_PENDING
+            self.waits = 0
+
+        def latest_successful_reconcile_at(self):
+            return datetime(2026, 7, 24, tzinfo=UTC)
+
+        def get_execution(self, requested_id):
+            assert requested_id == execution_id
+            return SimpleNamespace(
+                id=execution_id,
+                state=self.state,
+                state_reason="",
+                last_error="",
+            )
+
+        def wait_for_reconcile(self, *, after, timeout):
+            del after, timeout
+            self.waits += 1
+            if self.waits == 1:
+                raise LiveTradingDisabled("交易后台需要人工处理：RuntimeError")
+            self.state = ExecutionState.CLOSED
+            return datetime(2026, 7, 24, 0, 0, 1, tzinfo=UTC)
+
+    service = _TransientAttentionService()
+    closed = _wait_for_execution_state(
+        service,
+        execution_id,
+        accepted={ExecutionState.CLOSED},
+        timeout=2,
+    )
+
+    assert closed.state is ExecutionState.CLOSED
+    assert service.waits == 2
 
 
 class _FakeSource:
@@ -344,6 +389,7 @@ def _supervised_runtime(tmp_path, decision):
     writer = PendingWriter(tmp_path / "pending")
     gate = SupervisorGate(agent, SupervisorWriter(tmp_path / "supervisor"))
     service = _FakeExecutionService()
+    service.is_armed = True
     runtime = CampaignRuntime(
         settings=_settings(),
         source=_FakeSource(),
@@ -410,18 +456,18 @@ def test_campaign_settings_are_isolated_and_exact():
 def test_campaign_config_records_its_fast_execution_style():
     payload = campaign_module._campaign_config_payload()
 
-    assert CAMPAIGN_TIMEFRAME == "15m"
+    assert CAMPAIGN_TIMEFRAME == "10m"
     assert CAMPAIGN_HIGHER_TIMEFRAMES == ("1h", "4h")
     assert CAMPAIGN_STANCE == "extreme_aggressive"
-    assert CAMPAIGN_MIN_CONFIDENCE == 40
-    assert payload["timeframe"] == "15m"
+    assert CAMPAIGN_MIN_CONFIDENCE == 20
+    assert payload["timeframe"] == "10m"
     assert payload["decision_stance"] == "extreme_aggressive"
-    assert payload["min_trade_confidence"] == 40
-    assert payload["entry_order_mode"] == "market"
-    assert payload["exit_order_mode"] == "market"
+    assert payload["min_trade_confidence"] == 20
+    assert payload["entry_order_mode"] == "limit_with_slippage"
+    assert payload["exit_order_mode"] == "limit_with_slippage"
     assert payload["execution_style"] == CAMPAIGN_EXECUTION_STYLE
-    assert "市价单" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
-    assert "最高优先级覆盖" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
+    assert "limit_with_slippage" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
+    assert "0.50 ATR" in CAMPAIGN_FAST_EXECUTION_GUIDANCE
 
 
 def test_campaign_settings_reject_live_route():
@@ -478,6 +524,7 @@ def test_demo_canary_record_is_explicitly_non_strategy_and_builds_demo_plan(
         tp2=Decimal("4045.2"),
         stop=Decimal("3984.9"),
         bar=bar,
+        analysis_atr14=8.0,
         now=datetime(2026, 7, 17, tzinfo=UTC),
     )
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
@@ -494,11 +541,12 @@ def test_demo_canary_record_is_explicitly_non_strategy_and_builds_demo_plan(
     assert record.stage2_decision["origin"] == CANARY_ORIGIN
     assert "不是 PA 策略信号" in record.stage2_decision["decision"]["reason"]
     assert plan.environment == "demo"
-    assert plan.entry_type == "market"
+    assert plan.entry_type == "limit"
+    assert plan.entry_order_mode == "limit_with_slippage"
     assert str(plan.quantity) == "120"
 
 
-def test_demo_canary_record_is_never_reused_as_a_15m_strategy_record(tmp_path):
+def test_demo_canary_record_is_never_reused_as_a_10m_strategy_record(tmp_path):
     bar = KlineBar(
         seq=1,
         ts_open=1_784_304_000_000,
@@ -671,6 +719,129 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
     assert sizing.quantity == Decimal("22742")
 
 
+def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
+    base = _record(symbol=CAMPAIGN_SYMBOL).model_copy(deep=True)
+    base.meta = base.meta.model_copy(
+        update={
+            "timeframe": CAMPAIGN_TIMEFRAME,
+            "data_source": "okx",
+            "market_data_provenance": "okx_5m_utc_pair_aggregation",
+        }
+    )
+    base.kline_data = [
+        {
+            "seq": 1,
+            "ts_open": 1_784_826_000_000,
+            "open": 4000,
+            "high": 4010,
+            "low": 3990,
+            "close": 4005,
+            "volume": 100,
+            "closed": True,
+        }
+    ]
+    base.analysis_atr14 = 5.4
+
+    class _Client:
+        def account_config(self):
+            return {"posMode": "net_mode"}
+
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "state": "live",
+                    "tickSz": "0.1",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "ctVal": "0.001",
+                    "ctMult": "1",
+                }
+            ]
+
+        def balance(self):
+            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+
+        def ticker(self, instrument):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            return {"last": "4000"}
+
+        def max_order_size(self, *, instrument, trade_mode):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            assert trade_mode == "cross"
+            return {"maxBuy": "21000", "maxSell": "21000"}
+
+    record, sizing = build_controlled_demo_s_record(
+        base,
+        client=_Client(),
+        now=datetime(2026, 7, 24, 1, 12, tzinfo=UTC),
+    )
+
+    decision = record.stage2_decision["decision"]
+    assert record.meta.timeframe == "10m"
+    assert record.meta.market_data_provenance == (
+        "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+    )
+    assert record.stage2_decision["origin"] == "controlled_reproducible_demo_s"
+    assert "controlled_reproducible_demo_s" in record.strategy_files_used
+    assert decision["trade_confidence"] == 20
+    assert record.stage1_diagnosis["input_mode"] == "controlled_reproducible"
+    assert record.stage1_diagnosis["gate_result"] == "proceed"
+    assert record.stage1_diagnosis["direction"] == "bullish"
+    assert decision["order_direction"] == "做多"
+    assert record.stage1_diagnosis["controlled_basis"]["analysis_atr14"] == "5.4"
+    assert record.stage1_response["base_stage1_diagnosis"] == (
+        base.stage1_diagnosis
+    )
+    assert record.stage2_response["base_stage2_decision"] == (
+        base.stage2_decision
+    )
+    assert Decimal(decision["entry_price"]) - Decimal(
+        decision["stop_loss_price"]
+    ) > Decimal("10.8")
+    assert sizing.quantity <= sizing.max_buy
+    assert sizing.quantity != sizing.max_buy
+
+
+def test_demo_s_skips_newer_controlled_record_and_selects_natural_10m(
+    monkeypatch,
+    tmp_path,
+):
+    natural = _record(symbol=CAMPAIGN_SYMBOL).model_copy(deep=True)
+    natural.meta = natural.meta.model_copy(
+        update={
+            "timeframe": CAMPAIGN_TIMEFRAME,
+            "data_source": "okx",
+            "market_data_provenance": "okx_5m_utc_pair_aggregation",
+        }
+    )
+    natural.kline_data = [{"ts_open": 1_784_826_600_000, "closed": True}]
+    controlled = natural.model_copy(deep=True)
+    controlled.meta = controlled.meta.model_copy(
+        update={
+            "timestamp_local_iso": "2026-07-24T01:30:00+08:00",
+            "timestamp_local_ms": 1_784_831_400_000,
+            "market_data_provenance": (
+                "okx_public_5m_utc_pair_aggregation_controlled_reproducible"
+            ),
+        }
+    )
+    controlled.stage2_decision = {
+        "origin": "controlled_reproducible_demo_s",
+        "decision": controlled.stage2_decision["decision"],
+    }
+    writer = PendingWriter(tmp_path)
+    writer.save_full_durable(natural)
+    writer.save_full_durable(controlled)
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+
+    selected = find_latest_natural_campaign_record()
+
+    assert selected is not None
+    assert selected.meta.market_data_provenance == "okx_5m_utc_pair_aggregation"
+
+
 def test_dynamic_sizing_rejects_non_net_position_mode():
     class _Client:
         def account_config(self):
@@ -745,9 +916,20 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
 
         def candles(self, *, instrument, bar, limit):
             assert instrument == CAMPAIGN_INSTRUMENT
-            assert bar == CAMPAIGN_TIMEFRAME
-            assert limit == 2
+            assert bar == "5m"
+            assert limit == 4
             return [
+                [
+                    "1784304300000",
+                    "4005",
+                    "4012",
+                    "4000",
+                    "4008",
+                    "20",
+                    "0.02",
+                    "80160",
+                    "1",
+                ],
                 [
                     "1784304000000",
                     "4000",
@@ -788,6 +970,42 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
 
         def candles(self, *, instrument, bar, limit):
             self.calls.append((instrument, bar, limit))
+            if bar == "5m":
+                return [
+                    [
+                        "1784306400000",
+                        "4008",
+                        "4013",
+                        "4001",
+                        "4010",
+                        "5",
+                        "0.005",
+                        "20050",
+                        "0",
+                    ],
+                    [
+                        "1784306100000",
+                        "4005",
+                        "4012",
+                        "4000",
+                        "4008",
+                        "20",
+                        "0.02",
+                        "80160",
+                        "1",
+                    ],
+                    [
+                        "1784305800000",
+                        "4000",
+                        "4010",
+                        "3990",
+                        "4005",
+                        "10",
+                        "0.01",
+                        "40050",
+                        "1",
+                    ],
+                ]
             return [
                 [
                     "1784305800000",
@@ -822,18 +1040,17 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
     bars_4h = source.latest_snapshot_for_timeframe("4h", 150)
 
     assert client.calls == [
-        (CAMPAIGN_INSTRUMENT, "15m", 150),
+        (CAMPAIGN_INSTRUMENT, "5m", 300),
         (CAMPAIGN_INSTRUMENT, "1H", 150),
         (CAMPAIGN_INSTRUMENT, "4H", 150),
     ]
-    assert len(bars) == 2
+    assert len(bars) == 1
     assert len(bars_1h) == 2
     assert len(bars_4h) == 2
-    assert bars[0].seq == 0
-    assert bars[0].closed is False
-    assert bars[1].seq == 1
-    assert bars[1].closed is True
-    assert bars[1].close == 4005.0
+    assert bars[0].seq == 1
+    assert bars[0].closed is True
+    assert bars[0].open == 4000.0
+    assert bars[0].close == 4008.0
 
 
 def test_new_bar_is_processed_once(monkeypatch, tmp_path):
@@ -893,7 +1110,7 @@ def test_new_bar_passes_thin_higher_timeframe_context(
             self.calls = []
 
         def latest_snapshot(self, count):
-            self.calls.append(("15m", count))
+            self.calls.append((CAMPAIGN_TIMEFRAME, count))
             return [object()]
 
         def latest_snapshot_for_timeframe(self, timeframe, count):
@@ -929,8 +1146,8 @@ def test_new_bar_passes_thin_higher_timeframe_context(
     runner = OkxDemoCampaign(runtime, store, state)
 
     assert runner.process_latest_closed_bar() is True
-    assert source.calls == [("15m", 150), ("1h", 100), ("4h", 100)]
-    assert "主周期=15m" in orchestrator.context
+    assert source.calls == [("10m", 150), ("1h", 100), ("4h", 100)]
+    assert "主周期=10m" in orchestrator.context
     assert "背景 1h" in orchestrator.context
     assert "背景 4h" in orchestrator.context
 
@@ -985,6 +1202,60 @@ def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
     assert len(client.calls) == 1
+
+
+def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
+    monkeypatch,
+    tmp_path,
+):
+    first_bar_ms = 1_784_300_400_000
+    second_bar_ms = first_bar_ms + 15 * 60 * 1000
+    current_bar_ms = {"value": first_bar_ms}
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(current_bar_ms["value"]),
+    )
+    runtime, service, supervisor_client, _ = _supervised_runtime(
+        tmp_path,
+        "allow_entry",
+    )
+    sizing_calls = 0
+
+    def _resolve_sizing(record):
+        nonlocal sizing_calls
+        sizing_calls += 1
+        if sizing_calls == 1:
+            raise CampaignRiskBlocked(
+                "max_size_exceeded",
+                "风险定仓失败[max_size_exceeded]: 按止损风险计算出的数量超过 OKX 当前最大可开数量",
+            )
+        return _sizing(record)
+
+    runtime.sizing_resolver = _resolve_sizing
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert runner.state.status == "active"
+    assert runner.state.inflight_bar_ms is None
+    assert runner.state.last_completed_bar_ms == first_bar_ms
+    assert runner.state.last_plan_result == "blocked:risk:max_size_exceeded"
+    assert "max_size_exceeded" in runner.state.last_error
+    assert supervisor_client.calls == []
+    assert service.prepared == []
+    assert service.submitted == []
+
+    current_bar_ms["value"] = second_bar_ms
+
+    assert runner.process_latest_closed_bar() is True
+    assert runner.state.status == "active"
+    assert runner.state.last_completed_bar_ms == second_bar_ms
+    assert runner.state.last_plan_result == "execution:entry_pending"
+    assert len(supervisor_client.calls) == 1
+    assert service.prepared
+    assert service.submitted == ["execution-1"]
 
 
 def test_campaign_rearms_only_after_demo_read_check(monkeypatch, tmp_path):
@@ -1042,7 +1313,7 @@ def test_campaign_does_not_rearm_when_demo_read_check_is_unreachable(
     assert service.is_armed is False
 
 
-def test_campaign_retries_temporary_new_risk_lease_collision(
+def test_campaign_keeps_analyzing_while_new_risk_lease_is_owned_elsewhere(
     monkeypatch,
     tmp_path,
 ):
@@ -1086,7 +1357,7 @@ def test_campaign_retries_temporary_new_risk_lease_collision(
     monkeypatch.setattr(runner, "close_out", lambda: True)
 
     assert runner.run() is True
-    assert arm_attempts == 2
+    assert arm_attempts == 0
 
 
 def test_same_or_older_bar_is_never_processed(monkeypatch, tmp_path):
@@ -1154,16 +1425,21 @@ def test_no_order_is_recorded_without_execution(monkeypatch, tmp_path):
     )
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
-    runner = OkxDemoCampaign(
-        _runtime(orchestrator, service),
-        store,
-        state,
-    )
+    runtime = _runtime(orchestrator, service)
+    sizing_calls = []
+
+    def _unexpected_sizing(record):
+        sizing_calls.append(record)
+        raise AssertionError("不下单记录不应因余额变化进入风险定仓")
+
+    runtime.sizing_resolver = _unexpected_sizing
+    runner = OkxDemoCampaign(runtime, store, state)
 
     assert runner.process_latest_closed_bar() is True
     assert runner.state.last_plan_result == "blocked:no_order"
     assert runner.state.executions_prepared == 0
     assert service.submitted == []
+    assert sizing_calls == []
 
 
 def test_transient_model_failure_skips_bar_without_stopping_campaign(
