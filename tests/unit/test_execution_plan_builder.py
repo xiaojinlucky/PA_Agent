@@ -171,6 +171,40 @@ def test_plan_blocks_demo_replay_before_any_broker_work(tmp_path, monkeypatch):
     assert exc.value.code == "demo_replay"
 
 
+def test_plan_requires_atr_when_either_order_mode_uses_atr_slippage(
+    tmp_path,
+    monkeypatch,
+):
+    record = _record().model_copy(update={"analysis_atr14": None})
+    settings = _settings()
+    settings.execution.entry_order_mode = "limit_with_slippage"
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    with pytest.raises(PlanBlocked) as exc:
+        build_execution_plan(record, settings, record_path=path)
+
+    assert exc.value.code == "missing_atr_for_slippage"
+
+
+@pytest.mark.parametrize("invalid_atr", [0, -1, float("nan"), float("inf")])
+def test_plan_rejects_nonpositive_or_nonfinite_atr_without_fallback(
+    tmp_path,
+    monkeypatch,
+    invalid_atr,
+):
+    record = _record().model_copy(update={"analysis_atr14": invalid_atr})
+    settings = _settings()
+    settings.execution.entry_order_mode = "limit_with_slippage"
+    monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)
+    path = _persist(record, tmp_path)
+
+    with pytest.raises(PlanBlocked) as exc:
+        build_execution_plan(record, settings, record_path=path)
+
+    assert exc.value.code == "invalid_number"
+
+
 def test_plan_requires_file_content_to_match_memory_record(tmp_path, monkeypatch):
     record = _record()
     monkeypatch.setattr("pa_agent.config.paths.RECORDS_PENDING_DIR", tmp_path)

@@ -304,7 +304,9 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 ### 独立复核
 
 - 基线 `537eaf578fccddc62804dc672d70377f5be68dde` 上独立回查 Demo-S execution `328d0f7f-fef6-5e5e-bd39-dad92a66512b`：真实 SupervisorGate 为 `allow_entry`，origin 为 `controlled_reproducible_demo_s`，入场、两笔原生保护、主动离场和 `closed/remaining=0` 证据均在生产执行账本中。
-- 工单列出的 23 个执行、10m 聚合、多周期、GUI、监督、定仓和资金流测试文件最终复跑为 392 通过、0 失败。九组合走 Controller→Worker→Service→OkxAdapter→Fake client 的生产链；ATR 倍增、定仓滑点隔离、保护与主动离场隔离均保持硬断言。
+- Demo-S 的耐久事件按时间严格覆盖：`plan_created(state=ready)` → `preflight_passed` → `submit_intent(state=submitting)` → `entry_accepted(state=entry_pending)` → `reconciled(entry_pending→protecting)` → `reconciled(protecting→open)` → `exit_intent/exit_requested(state=exit_pending)` → `reconciled(exit_pending→closed)`。对应时间为 `2026-07-24T00:46:05.955506Z` 至 `2026-07-24T00:47:37.404471Z`；中间多轮 `protecting/exit_pending` 是保护建立、保护撤销和主动离场的只读对账，不是重复提交。
+- 工单列出的 23 个执行、10m 聚合、多周期、GUI、监督、定仓和资金流测试文件第一轮复跑为 392 通过、0 失败；补强 6 个硬验收用例后，最终同一 23 文件套件为 398 通过、0 失败。九组合走 Controller→Worker→Service→OkxAdapter→Fake client 的生产链；ATR 倍增、定仓滑点隔离、保护与主动离场隔离均保持硬断言。
+- 两个受影响测试文件的最终复跑为 66 通过、0 失败，其中新增 6 个硬验收：缺 ATR 明确 `missing_atr_for_slippage`；ATR 为 `0/负数/NaN/Infinity` 均 `invalid_number`，没有固定基点回退；同一主周期决策在空/反向 `htf_text` 下保持 `gate_result=proceed` 且风险数量、风险占用完全一致；canary 限价入场进入 `canceled` 后立即判失败，不继续等待、不切换市价。
 
 ### Demo-A：limit → market
 
@@ -324,13 +326,15 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 
 - 两笔均使用 `ctVal×ctMult=0.001`、`lotSz=minSz=1`、风险比例 `0.10`、费用率 `0.0005`、保守滑点率 `0.0010`。Demo-C 的入场前空仓账户快照为 `8714.71942600003 USDT`，entry/stop 为 `4047.9/4002.1`；同一 `calculate_risk_size()` 得到风险预算 `871.4719426000030`、单张最坏损失 `0.05787500`、风险占用 `871.42387500`、目标 `15057`，与 execution 完全一致。
 - Demo-A 在资金变化后到入场前没有紧邻的直接账户快照。耐久账本第一份成交后快照记录现金 `8843.74440770003`、入场费用 `55.557134`，可重建入场前权益 `8899.30154170003`；entry/stop 为 `4053.9/4033.6`，同一公式得到风险预算 `889.9301541700030`、单张最坏损失 `0.03243125`、风险占用 `889.91350000`、目标 `27440`，与 execution 完全一致。该权益明确标为可验证重建值，不称作直接快照。
-- 历史 Demo-A/C 记录没有保存当时 `maxBuy/maxSell` 的确切数值，无法事后诚实补写；只能确认生产定仓器在计划前执行容量硬门，且两笔真实订单均被 OKX Demo 接受。为消除后续证据缺口，现已在所有 Campaign 候选、Demo-S 和生命周期 canary 的耐久记录中写入完整 `risk_sizing`：权益口径与数值、10% 预算、入场/止损距离、费用/滑点、`minSz/lotSz`、`maxBuy/maxSell`、风险占用和最终数量。风险超限仍硬阻断，不截断。
+- 历史 Demo-A/C 记录没有保存当时 `maxBuy/maxSell` 的确切数值，无法事后诚实补写。但容量结论仍可二元证明：基线代码先把真实方向容量作为 `max_sz` 传入 `calculate_risk_size()`，随后 `OkxAdapter.preflight()` 再次读取真实 `maxBuy/maxSell`，只有 `plan.quantity <= max_quantity` 才可能保存 `preflight_passed` 并进入真实提交。两笔账本均有 `preflight_passed`、券商受理和完整成交，且不含截断路径；结合上面的风险公式分别独立得到 `27440/15057`，可证明两笔当时的真实容量至少等于目标风险数量，因此 `min(risk_quantity, real_max_size)` 仍严格等于账本数量。确切容量数值本身仍标记为“未保存”，不倒填。为消除后续取证缺口，现已在所有 Campaign 候选、Demo-S 和生命周期 canary 的耐久记录中写入完整 `risk_sizing`：权益口径与数值、10% 预算、入场/止损距离、费用/滑点、`minSz/lotSz`、`maxBuy/maxSell`、风险占用和最终数量。风险超限仍硬阻断，不截断。
 
 ### 最终运行态边界
 
 - OKX Demo 只读回查：非零 `XAU-USDT-SWAP` 仓位 `0`、普通挂单 `0`、待生效 OCO `0`；本地活动 execution `0`、有效 `NEW_RISK` 租约 `0`。
 - 旧 Campaign 历史 execution 全部经耐久账本确认终态后归档；新 Campaign `52a4f507-a8f8-4975-b0bf-ddddf9ff901c` 已恢复为 `active`，固定配置为严格聚合 `10m / min_trade_confidence=20 / extreme_aggressive / Demo`。WinSW ExecutionWorker 已加载最终代码，心跳和最后成功对账正常。
 - 共享环境已明确设置 `PA_AGENT_LIVE_TRADING_ENABLED=false`、`OKX_LIVE_ENABLED=false`，模拟门保持 `true`。本轮没有调用 Live 路由。
-- 本轮适配器、执行服务、Campaign 与生命周期定向回归：151 通过、0 失败。最终以无界面 Qt 平台运行完整 `not live` 套件，收集 1407 项：1376 通过、31 失败；本轮新增的 Worker 空账本账户刷新夹具、Campaign 单测误连私有预检和“历史 execution 仅终态才允许归档重启”均已通过。剩余 31 项位于本轮未修改的既有预测、严格/宽松校验、决策面板、连续性、数据源切换、OpenClaw 和音效范围，不能描述为全仓全绿。
+- 本轮适配器、执行服务、Campaign 与生命周期定向回归：151 通过、0 失败。第一轮以无界面 Qt 平台运行完整 `not live` 套件，收集 1407 项：1376 通过、31 失败；本轮新增的 Worker 空账本账户刷新夹具、Campaign 单测误连私有预检和“历史 execution 仅终态才允许归档重启”均已通过。剩余 31 项位于本轮未修改的既有预测、严格/宽松校验、决策面板、连续性、数据源切换、OpenClaw 和音效范围，不能描述为全仓全绿。
+- 补充硬验收后再次运行当前工作区非 Live 全量：1335 项中 1315 通过、20 失败、0 跳过；20 项仍全部位于上述既有范围，新增工单测试无失败。工单指定的 23 文件套件为 398 通过、0 失败。
 - 本轮改动 Python 文件的 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。
+- 发布补漏提交 `17e836d69530850cf0b7da235707b211536506f5` 已把文档先前引用、但首个收口提交漏掉的 `pa_agent/gui/read_models.py`、`tests/unit/test_workbench_read_models.py`、`tests/unit/test_cashflow.py` 精确推送到 `origin/main`；对应 14 个测试通过、0 失败，staged gitleaks 为 0 泄漏。价格行为、多周期与提示词的并发工作区改动未进入该提交。
 - 本节的运行态以后仍会变化；发布提交与远程 SHA 以本轮 Git 收口的实时核验为准。

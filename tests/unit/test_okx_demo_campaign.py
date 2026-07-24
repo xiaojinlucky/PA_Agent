@@ -59,6 +59,7 @@ from pa_agent.okx_demo_campaign import (
     find_latest_natural_campaign_record,
     okx_demo_private_preflight,
     resolve_campaign_sizing,
+    resolve_record_campaign_sizing,
     validate_campaign_settings,
 )
 from pa_agent.records.analysis_history import find_latest_successful_record
@@ -153,6 +154,44 @@ def test_wait_for_execution_state_tolerates_transient_worker_attention():
 
     assert closed.state is ExecutionState.CLOSED
     assert service.waits == 2
+
+
+def test_canary_canceled_limit_entry_fails_without_market_fallback():
+    execution_id = "canceled-limit-entry"
+
+    class _CanceledEntryService:
+        def __init__(self):
+            self.reconcile_waits = 0
+
+        def latest_successful_reconcile_at(self):
+            return datetime(2026, 7, 24, tzinfo=UTC)
+
+        def get_execution(self, requested_id):
+            assert requested_id == execution_id
+            return SimpleNamespace(
+                id=execution_id,
+                state=ExecutionState.CANCELED,
+                state_reason="限价入场超时并已撤单",
+                last_error="",
+                needs_attention=False,
+            )
+
+        def wait_for_reconcile(self, *, after, timeout):
+            del after, timeout
+            self.reconcile_waits += 1
+            raise AssertionError("已撤销的限价入场不能继续等待或改走市价")
+
+    service = _CanceledEntryService()
+
+    with pytest.raises(CampaignError, match="canceled"):
+        _wait_for_execution_state(
+            service,
+            execution_id,
+            accepted={ExecutionState.OPEN},
+            timeout=2,
+        )
+
+    assert service.reconcile_waits == 0
 
 
 class _FakeSource:
@@ -845,6 +884,55 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
     assert sizing.contract_notional_usdt == Decimal("4")
     assert sizing.stop_distance_usdt == Decimal("10")
     assert sizing.quantity == Decimal("22742")
+
+
+def test_higher_timeframe_text_cannot_change_gate_or_risk_quantity():
+    class _Client:
+        def account_config(self):
+            return {"posMode": "net_mode"}
+
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "state": "live",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "ctVal": "0.001",
+                    "ctMult": "1",
+                }
+            ]
+
+        def balance(self):
+            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+
+        def max_order_size(self, *, instrument, trade_mode):
+            assert instrument == CAMPAIGN_INSTRUMENT
+            assert trade_mode == "cross"
+            return {"maxBuy": "100000", "maxSell": "100000"}
+
+    without_htf = _record(symbol=CAMPAIGN_SYMBOL).model_copy(
+        update={"htf_text": "", "analysis_atr14": 5.4},
+        deep=True,
+    )
+    with_htf = without_htf.model_copy(
+        update={
+            "htf_text": (
+                "1h 方向：bearish；4h 方向：bearish。"
+                "仅作背景，不直接否决 10m。"
+            )
+        },
+        deep=True,
+    )
+
+    plain = resolve_record_campaign_sizing(without_htf, _Client())
+    contextual = resolve_record_campaign_sizing(with_htf, _Client())
+
+    assert without_htf.stage1_diagnosis["gate_result"] == "proceed"
+    assert with_htf.stage1_diagnosis["gate_result"] == "proceed"
+    assert contextual.quantity == plain.quantity
+    assert contextual.risk_used_usdt == plain.risk_used_usdt
 
 
 def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
