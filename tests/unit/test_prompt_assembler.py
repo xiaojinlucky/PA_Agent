@@ -70,7 +70,10 @@ def assembler(tmp_path: Path) -> PromptAssembler:
         "文件27-三角形与收敛形态.txt",
         "文件28-双重顶底与微型结构.txt",
     ]:
-        (tmp_path / fname).write_text(f"[CONTENT OF {fname}]", encoding="utf-8")
+        content = f"[CONTENT OF {fname}]"
+        if fname == "二元决策.txt":
+            content += "\n外部多周期背景\n主周期是唯一交易主线\n不额外切换到更小周期"
+        (tmp_path / fname).write_text(content, encoding="utf-8")
     return PromptAssembler(prompt_dir=tmp_path)
 
 
@@ -330,6 +333,12 @@ def test_stage1_includes_thin_higher_timeframe_context(assembler: PromptAssemble
     assert "多周期背景证据" in user
     assert "背景 1h" in user
     assert "不直接否决主周期方向" in user
+    assert "不要求多周期共识" in user
+
+    system = messages[0]["content"]
+    assert "外部多周期背景" in system
+    assert "主周期是唯一交易主线" in system
+    assert "不额外切换到更小周期" in system
 
 
 def test_stage2_message_roles(assembler: PromptAssembler):

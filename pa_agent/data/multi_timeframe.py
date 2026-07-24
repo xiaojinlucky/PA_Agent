@@ -68,6 +68,76 @@ def _direction_label(frame: KlineFrame) -> str:
     return "混合/过渡"
 
 
+def _recent_position_label(frame: KlineFrame, *, window: int = 20) -> str:
+    """Return the latest close's coarse position in the recent HTF range."""
+    bars = tuple(frame.bars[:window])
+    if len(bars) < 5:
+        return "数据不足"
+    highs: list[float] = []
+    lows: list[float] = []
+    close = _finite(bars[0].close)
+    for bar in bars:
+        high = _finite(bar.high)
+        low = _finite(bar.low)
+        if high is None or low is None:
+            continue
+        highs.append(max(high, low))
+        lows.append(min(high, low))
+    if close is None or not highs or not lows:
+        return "无法判断"
+    upper = max(highs)
+    lower = min(lows)
+    width = upper - lower
+    if width <= 0:
+        return "无法判断"
+    ratio = (close - lower) / width
+    if ratio >= 0.8:
+        return "靠近近期高位"
+    if ratio <= 0.2:
+        return "靠近近期低位"
+    return "区间中部"
+
+
+def _structure_label(frame: KlineFrame, *, window: int = 20) -> str:
+    """Return a deliberately coarse HTF structure label for model context only."""
+    bars = tuple(frame.bars[:window])
+    if len(bars) < 8:
+        return "数据不足"
+    closes = [_finite(bar.close) for bar in bars]
+    if any(value is None for value in closes):
+        return "无法判断"
+    atr = _finite(frame.indicators.atr14[0]) if frame.indicators.atr14 else None
+    net_move = abs(float(closes[0]) - float(closes[-1]))
+    net_move_atr = net_move / atr if atr is not None and atr > 0 else None
+
+    overlaps: list[float] = []
+    for current, previous in zip(bars, bars[1:], strict=False):
+        current_high = _finite(current.high)
+        current_low = _finite(current.low)
+        previous_high = _finite(previous.high)
+        previous_low = _finite(previous.low)
+        if None in (current_high, current_low, previous_high, previous_low):
+            continue
+        high = max(current_high, previous_high)
+        low = min(current_low, previous_low)
+        union = high - low
+        if union <= 0:
+            continue
+        overlap = max(
+            0.0,
+            min(current_high, previous_high) - max(current_low, previous_low),
+        )
+        overlaps.append(overlap / union)
+    if net_move_atr is None or len(overlaps) < 3:
+        return "过渡/不清晰"
+    mean_overlap = sum(overlaps) / len(overlaps)
+    if mean_overlap >= 0.55 and net_move_atr < 1.5:
+        return "区间/整理倾向"
+    if mean_overlap <= 0.35 and net_move_atr >= 1.5:
+        return "趋势/通道倾向"
+    return "过渡/混合"
+
+
 def _render_frame_line(frame: KlineFrame, *, role: str) -> str:
     if not frame.bars:
         return f"- {role} {frame.timeframe}: 无已收盘数据"
@@ -79,11 +149,14 @@ def _render_frame_line(frame: KlineFrame, *, role: str) -> str:
     close_side = "上方" if close is not None and ema is not None and close > ema else (
         "下方" if close is not None and ema is not None and close < ema else "附近"
     )
+    structure = _structure_label(frame)
+    position = _recent_position_label(frame)
     return (
         f"- {role} {frame.timeframe}: 标签={_direction_label(frame)}；"
         f"最新已收盘={ts}；收盘={close if close is not None else '—'}；"
         f"EMA20={ema if ema is not None else '—'}（收盘在其{close_side}）；"
-        f"ATR14={atr if atr is not None else '—'}"
+        f"ATR14={atr if atr is not None else '—'}；"
+        f"结构={structure}；位置={position}"
     )
 
 
@@ -94,7 +167,7 @@ def render_higher_timeframe_context(
     """Render compact context for prompts and durable records."""
     lines = [
         f"主周期={main_frame.timeframe}（当前交易决策周期）",
-        "高周期只提供背景标签，不直接否决主周期方向、不自动改仓位：",
+        "高周期只提供方向、结构、位置和波动背景，不直接否决主周期方向、不自动改置信度、仓位或价格：",
     ]
     for timeframe in higher_timeframes_for(main_frame.timeframe):
         frame = higher_frames.get(timeframe)
@@ -106,6 +179,7 @@ def render_higher_timeframe_context(
         lines.append("- 无配置的高周期背景")
     lines.append(
         "解释顺序：先读主周期的趋势/区间/位置，再判断主周期是高周期趋势延续、"
-        "回撤还是高周期区间中的运动；若不一致，写入风险说明，不把标签变成硬闸门。"
+        "回撤还是高周期区间中的运动；若关系不清就如实写不确定。若不一致，写入风险说明，"
+        "不要求多周期共识，不把标签变成硬闸门，也不切换低周期拼接触发理由。"
     )
     return "\n".join(lines)
