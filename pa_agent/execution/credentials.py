@@ -50,6 +50,11 @@ def account_identity_fingerprint(
 def shared_env_path() -> Path:
     from pa_agent.config.paths import PROJECT_ROOT
 
+    test_override = str(
+        os.environ.get("_PA_AGENT_TEST_SHARED_ENV_PATH") or ""
+    ).strip()
+    if test_override:
+        return Path(test_override)
     return PROJECT_ROOT.parent / "env"
 
 

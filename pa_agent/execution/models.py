@@ -84,6 +84,46 @@ class ExecutionPlan(BaseModel):
     exit_slippage_atr_multiple: Decimal = Field(
         default=Decimal("0.50"), ge=0, le=5
     )
+    # OKX 新增风险的耐久授权快照；totalEq 只审计，USDT 口径参与定仓。
+    authorized_sizing_mode: Literal["risk_budget", "fixed_quantity"] = (
+        "risk_budget"
+    )
+    authorized_fixed_quantity: Decimal | None = Field(default=None, gt=0)
+    risk_equity_basis: str = ""
+    authorized_account_total_equity_usd: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_account_equity_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_risk_capital_cap_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_effective_risk_capital_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_risk_percent: Decimal | None = Field(
+        default=None,
+        gt=0,
+        le=1,
+    )
+    authorized_risk_budget_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_risk_used_usdt: Decimal | None = Field(default=None, gt=0)
+    authorized_contract_notional_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
+    authorized_worst_case_loss_per_contract_usdt: Decimal | None = Field(
+        default=None,
+        gt=0,
+    )
 
 
 class PreflightResult(BaseModel):

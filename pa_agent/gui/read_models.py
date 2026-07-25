@@ -6,18 +6,24 @@ Worker 心跳、执行账本和账户快照组合成 UI 可以直接显示的快
 """
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 from enum import StrEnum
+from pathlib import Path
 from typing import Any
 
+from pa_agent.config.paths import PROJECT_ROOT
 from pa_agent.execution.models import AccountSnapshot, ExecutionRecord
 from pa_agent.execution.worker_protocol import WorkerHeartbeat
 
 _HEARTBEAT_STALE_SECONDS = 10
 _RECONCILE_STALE_SECONDS = 30
 _ACCOUNT_SNAPSHOT_STALE_SECONDS = 90
+_CAMPAIGN_STALE_SECONDS = 15 * 60
+_DEFAULT_CAMPAIGN_STATE_PATH = PROJECT_ROOT / "records" / "okx_demo_campaign.json"
 
 
 class FactCertainty(StrEnum):
@@ -52,11 +58,19 @@ class WorkbenchReadSnapshot:
     heartbeat: ReadFact
     reconcile: ReadFact
     account: ReadFact
+    risk_stop: ReadFact
     active_execution_count: ReadFact
     latest_execution_state: ReadFact
+    campaign_state: ReadFact
+    campaign_progress: ReadFact
+    campaign_last_result: ReadFact
+    campaign_risk_parameters: ReadFact
+    campaign_config_alignment: ReadFact
+    campaign_execution_ids: tuple[str, ...]
     active_executions: tuple[ExecutionRecord, ...]
     latest_execution: ExecutionRecord | None
     account_snapshot: AccountSnapshot | None
+    risk_runtime_state: Any | None
 
 
 class WorkbenchReadModel:
@@ -70,12 +84,14 @@ class WorkbenchReadModel:
         execution_store: Any,
         worker_store: Any,
         clock: Callable[[], datetime] | None = None,
+        campaign_state_path: Path = _DEFAULT_CAMPAIGN_STATE_PATH,
     ) -> None:
         self._settings = settings
         self._data_source = data_source
         self._execution_store = execution_store
         self._worker_store = worker_store
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._campaign_state_path = Path(campaign_state_path)
 
     @classmethod
     def from_context(cls, context: Any) -> WorkbenchReadModel:
@@ -121,10 +137,19 @@ class WorkbenchReadModel:
             account_snapshot,
             captured_at,
         )
+        risk_runtime_state = self._risk_runtime_state(
+            broker,
+            "demo" if account_profile == "okx-demo" else "live",
+            "okx" if broker == "okx" else account_profile,
+        )
+        risk_stop = self._risk_stop_fact(
+            risk_runtime_state,
+            captured_at,
+        )
 
         active_executions = tuple(self._execution_store.list_active())
-        recent = tuple(self._execution_store.list_recent(limit=1))
-        latest_execution = recent[0] if recent else None
+        campaign_execution_ids = self._campaign_execution_ids()
+        latest_execution = self._latest_execution(campaign_execution_ids)
         latest_execution_state = self._latest_execution_fact(
             latest_execution,
             captured_at,
@@ -135,7 +160,13 @@ class WorkbenchReadModel:
             source="records/execution.sqlite3",
             observed_at=captured_at,
         )
-
+        (
+            campaign_state,
+            campaign_progress,
+            campaign_last_result,
+            campaign_risk_parameters,
+            campaign_config_alignment,
+        ) = self._campaign_facts(captured_at)
         return WorkbenchReadSnapshot(
             captured_at=captured_at,
             source_kind=source_kind,
@@ -146,11 +177,113 @@ class WorkbenchReadModel:
             heartbeat=heartbeat_fact,
             reconcile=reconcile,
             account=account,
+            risk_stop=risk_stop,
             active_execution_count=active_execution_count,
             latest_execution_state=latest_execution_state,
+            campaign_state=campaign_state,
+            campaign_progress=campaign_progress,
+            campaign_last_result=campaign_last_result,
+            campaign_risk_parameters=campaign_risk_parameters,
+            campaign_config_alignment=campaign_config_alignment,
+            campaign_execution_ids=campaign_execution_ids,
             active_executions=active_executions,
             latest_execution=latest_execution,
             account_snapshot=account_snapshot,
+            risk_runtime_state=risk_runtime_state,
+        )
+
+    def _latest_execution(
+        self,
+        campaign_execution_ids: tuple[str, ...],
+    ) -> ExecutionRecord | None:
+        """当前 Campaign 有执行时，禁止被其他测试或旧任务记录覆盖。"""
+        if campaign_execution_ids:
+            getter = getattr(self._execution_store, "get", None)
+            if not callable(getter):
+                raise RuntimeError("执行账本缺少按 ID 读取能力")
+            for execution_id in reversed(campaign_execution_ids):
+                execution = getter(execution_id)
+                if execution is not None:
+                    return execution
+            return None
+
+        recent = tuple(self._execution_store.list_recent(limit=1))
+        return recent[0] if recent else None
+
+    def _campaign_execution_ids(self) -> tuple[str, ...]:
+        """读取当前 Campaign 自己创建的执行，避免把旧实验显示成最新决定。"""
+        if not self._campaign_state_path.is_file():
+            return ()
+        try:
+            payload = json.loads(
+                self._campaign_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return ()
+        if not isinstance(payload, dict):
+            return ()
+        raw_ids = payload.get("execution_ids")
+        if not isinstance(raw_ids, list):
+            return ()
+        return tuple(
+            value.strip()
+            for item in raw_ids
+            if (value := str(item or "").strip())
+        )
+
+    def _risk_runtime_state(
+        self,
+        broker: str,
+        environment: str,
+        account: str,
+    ) -> Any | None:
+        getter = getattr(self._worker_store, "get_risk_runtime_state", None)
+        if not callable(getter):
+            return None
+        return getter(f"{broker}:{environment}:{account}")
+
+    @staticmethod
+    def _risk_stop_fact(state: Any | None, observed_at: str) -> ReadFact:
+        if state is None:
+            return ReadFact(
+                value="尚无可信风险基线",
+                certainty=FactCertainty.UNKNOWN,
+                source="records/execution_control.sqlite3",
+                observed_at=observed_at,
+            )
+        if bool(getattr(state, "kill_active", False)):
+            reason = str(getattr(state, "kill_reason", "") or "未知原因")
+            reason_label = {
+                "drawdown_threshold_exceeded": "账户回撤达到停止线",
+                "account_identity_changed": "账户身份与已确认账户不一致",
+                "bill_chain_disconnected": "账户账单链不完整",
+                "risk_runtime_IncompleteRead": "风险账户数据读取中断",
+                "risk_runtime_BrokerTransportError": "风险账户数据暂时读取失败",
+            }.get(
+                reason,
+                (
+                    "风险账户数据读取失败"
+                    if reason.startswith("risk_runtime_")
+                    else reason
+                ),
+            )
+            return ReadFact(
+                value=f"已停止新增风险：{reason_label}",
+                certainty=FactCertainty.CONFIRMED,
+                source="records/execution_control.sqlite3 / risk_runtime_state",
+                observed_at=observed_at,
+            )
+        drawdown = getattr(state, "drawdown_fraction", None)
+        drawdown_text = (
+            f"；当前回撤 {Decimal(str(drawdown)) * 100:.2f}%"
+            if drawdown is not None
+            else ""
+        )
+        return ReadFact(
+            value=f"允许新增风险{drawdown_text}",
+            certainty=FactCertainty.CONFIRMED,
+            source="records/execution_control.sqlite3 / risk_runtime_state",
+            observed_at=observed_at,
         )
 
     def _now_iso(self) -> str:
@@ -364,3 +497,310 @@ class WorkbenchReadModel:
             ),
             observed_at=observed_at,
         )
+
+    def _campaign_facts(
+        self,
+        observed_at: str,
+    ) -> tuple[ReadFact, ReadFact, ReadFact, ReadFact, ReadFact]:
+        source = str(self._campaign_state_path)
+        if not self._campaign_state_path.is_file():
+            missing = ReadFact(
+                value="未启动",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return missing, missing, missing, missing, missing
+
+        try:
+            payload = json.loads(
+                self._campaign_state_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            invalid = ReadFact(
+                value=f"状态读取失败（{type(exc).__name__}）",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid, invalid, invalid, invalid
+        if not isinstance(payload, dict):
+            invalid = ReadFact(
+                value="状态格式无效",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid, invalid, invalid, invalid
+
+        status = str(payload.get("status") or "").strip()
+        updated_text = str(payload.get("updated_at") or "").strip()
+        try:
+            updated_at = datetime.fromisoformat(updated_text)
+            observed = datetime.fromisoformat(observed_at)
+        except ValueError:
+            invalid = ReadFact(
+                value="状态时间无效",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid, invalid, invalid, invalid
+        if updated_at.tzinfo is None or updated_at.utcoffset() is None:
+            invalid = ReadFact(
+                value="状态时间无时区",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid, invalid, invalid, invalid
+
+        raw_age_seconds = int(
+            (observed - updated_at.astimezone(UTC)).total_seconds()
+        )
+        age_seconds = max(0, raw_age_seconds)
+        status_labels = {
+            "active": "运行中",
+            "stopping": "正在安全收口",
+            "completed": "已完成",
+            "needs_attention": "需要人工处理",
+        }
+        status_value = status_labels.get(status, f"未知状态 {status or '—'}")
+        status_certainty = (
+            FactCertainty.CONFIRMED
+            if status in status_labels
+            else FactCertainty.UNKNOWN
+        )
+        if raw_age_seconds < -60:
+            status_value = (
+                f"状态时间比本机快 {-raw_age_seconds} 秒，无法确认是否新鲜"
+            )
+            status_certainty = FactCertainty.UNKNOWN
+        elif age_seconds > _CAMPAIGN_STALE_SECONDS:
+            status_value = (
+                f"状态文件显示{status_labels.get(status, status or '未知状态')}"
+                f"，但已 {age_seconds} 秒未更新"
+            )
+            status_certainty = FactCertainty.UNKNOWN
+        elif status == "active":
+            status_value = f"运行中（{age_seconds} 秒前更新）"
+        elif status in status_labels:
+            status_value = f"{status_labels[status]}（{age_seconds} 秒前更新）"
+        campaign_state = ReadFact(
+            value=status_value,
+            certainty=status_certainty,
+            source=source,
+            observed_at=observed_at,
+        )
+
+        count_fields = (
+            "analyses_completed",
+            "analyses_failed",
+            "executions_prepared",
+        )
+        counts: list[int] = []
+        for field in count_fields:
+            value = payload.get(field)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                invalid = ReadFact(
+                    value=f"计数字段无效（{field}）",
+                    certainty=FactCertainty.UNKNOWN,
+                    source=source,
+                    observed_at=observed_at,
+                )
+                risk, alignment = self._campaign_risk_facts(
+                    payload,
+                    status_certainty,
+                    source,
+                    observed_at,
+                )
+                return campaign_state, invalid, invalid, risk, alignment
+            counts.append(value)
+        campaign_progress = ReadFact(
+            value=(
+                f"分析 {counts[0]} / 失败 {counts[1]} / "
+                f"生成执行 {counts[2]}"
+            ),
+            certainty=status_certainty,
+            source=source,
+            observed_at=observed_at,
+        )
+        last_result = str(payload.get("last_plan_result") or "").strip()
+        last_action = str(payload.get("last_supervisor_action") or "").strip()
+        last_error = str(payload.get("last_error") or "").strip()
+        result_labels = {
+            "blocked:no_order": "PA 本轮判断不下单",
+            (
+                "blocked:risk:leverage:"
+                "user_max_leverage_capacity_insufficient"
+            ): "风险目标需要超过用户设置的最大杠杆，本轮不下单",
+            "execution:ready": "已生成执行计划",
+        }
+        readable_result = result_labels.get(last_result)
+        if readable_result is None:
+            if last_result.startswith("blocked:risk:"):
+                readable_result = "风险检查未通过，本轮不下单"
+            elif last_result.startswith("blocked:"):
+                readable_result = "本轮未生成订单"
+            elif last_result.startswith("execution:"):
+                readable_result = "执行计划正在处理"
+            else:
+                readable_result = last_result
+        campaign_last_result = ReadFact(
+            value=last_error or readable_result or last_action or "尚无结果",
+            certainty=status_certainty,
+            source=source,
+            observed_at=observed_at,
+        )
+        campaign_risk_parameters, campaign_config_alignment = (
+            self._campaign_risk_facts(
+                payload,
+                status_certainty,
+                source,
+                observed_at,
+            )
+        )
+        return (
+            campaign_state,
+            campaign_progress,
+            campaign_last_result,
+            campaign_risk_parameters,
+            campaign_config_alignment,
+        )
+
+    def _campaign_risk_facts(
+        self,
+        payload: dict[str, Any],
+        status_certainty: FactCertainty,
+        source: str,
+        observed_at: str,
+    ) -> tuple[ReadFact, ReadFact]:
+        names = (
+            "frozen_risk_capital_cap_usdt",
+            "frozen_risk_percent",
+            "frozen_maximum_leverage",
+        )
+        raw_values = [payload.get(name) for name in names]
+        if any(value is None for value in raw_values):
+            missing = ReadFact(
+                value="未记录（需由新的自动交易任务启动时冻结）",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return missing, missing
+        try:
+            capital, risk_percent, leverage = (
+                Decimal(str(value)) for value in raw_values
+            )
+        except (InvalidOperation, ValueError):
+            invalid = ReadFact(
+                value="冻结风险参数格式无效",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid
+        if (
+            capital < 0
+            or not Decimal("0") < risk_percent <= Decimal("1")
+            or leverage < 1
+        ):
+            invalid = ReadFact(
+                value="冻结风险参数范围无效",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid
+
+        sizing_mode = str(
+            payload.get("frozen_sizing_mode") or "risk_budget"
+        ).strip()
+        fixed_quantity: Decimal | None = None
+        if sizing_mode == "fixed_quantity":
+            try:
+                fixed_quantity = Decimal(
+                    str(payload.get("frozen_fixed_quantity"))
+                )
+            except (InvalidOperation, ValueError):
+                fixed_quantity = None
+            if fixed_quantity is None or fixed_quantity <= 0:
+                invalid = ReadFact(
+                    value="冻结固定张数无效",
+                    certainty=FactCertainty.UNKNOWN,
+                    source=source,
+                    observed_at=observed_at,
+                )
+                return invalid, invalid
+        elif sizing_mode != "risk_budget":
+            invalid = ReadFact(
+                value=f"冻结定仓模式无效（{sizing_mode or '空'}）",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return invalid, invalid
+
+        if sizing_mode == "fixed_quantity":
+            mode_text = f"固定 {fixed_quantity} 张"
+        else:
+            mode_text = f"按风险预算自动算张数 / 单笔风险 {risk_percent * 100}%"
+        risk_fact = ReadFact(
+            value=(
+                f"{mode_text} / 资金上限 {capital} USDT / "
+                f"杠杆上限 {leverage}×"
+            ),
+            certainty=status_certainty,
+            source=source,
+            observed_at=observed_at,
+        )
+        if status_certainty is FactCertainty.UNKNOWN:
+            alignment = ReadFact(
+                value="无法确认：自动交易状态不新鲜或无效",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+            return risk_fact, alignment
+
+        configured = self._settings.execution.okx
+        configured_mode = str(
+            getattr(configured, "sizing_mode", "risk_budget")
+        )
+        configured_fixed_quantity: Decimal | None = None
+        if configured_mode == "fixed_quantity":
+            try:
+                configured_fixed_quantity = Decimal(
+                    str(configured.quantity)
+                )
+            except (InvalidOperation, ValueError):
+                configured_fixed_quantity = None
+        current = (
+            Decimal(str(configured.risk_capital_cap_usdt)),
+            Decimal(str(configured.risk_percent)),
+            Decimal(str(configured.maximum_leverage)),
+            configured_mode,
+            configured_fixed_quantity,
+        )
+        frozen = (
+            capital,
+            risk_percent,
+            leverage,
+            sizing_mode,
+            fixed_quantity,
+        )
+        if current == frozen:
+            alignment_value = "一致：界面配置与运行中的自动交易相同"
+        else:
+            alignment_value = (
+                "不一致：运行中的自动交易仍使用上述启动值，"
+                "界面新值尚未生效"
+            )
+        alignment = ReadFact(
+            value=alignment_value,
+            certainty=FactCertainty.CONFIRMED,
+            source=f"{source} + settings.json",
+            observed_at=observed_at,
+        )
+        return risk_fact, alignment

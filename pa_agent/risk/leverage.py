@@ -92,6 +92,7 @@ def build_minimum_leverage_parameters(
     entry_price: object,
     expected_account_identity: str,
     okx_api_base_url: str,
+    maximum_leverage_cap: object,
 ) -> SetLeverageParameters | None:
     """返回有界策略网格中第一个经过逐点验证且容量足够的杠杆。"""
     current = _positive(current_leverage, "current_leverage")
@@ -109,12 +110,22 @@ def build_minimum_leverage_parameters(
             "pending_orders",
             "OKX 杠杆估算显示存在挂单",
         )
-    maximum = _positive(adjustment.get("maxLever"), "maxLever")
+    exchange_maximum = _positive(adjustment.get("maxLever"), "maxLever")
+    user_maximum = _positive(
+        maximum_leverage_cap,
+        "maximum_leverage_cap",
+    )
+    maximum = min(exchange_maximum, user_maximum)
     minimum = _positive(adjustment.get("minLever"), "minLever")
-    if current < minimum or current > maximum:
+    if current < minimum or current > exchange_maximum:
         raise LeveragePlanningFailure(
             "current_leverage_out_of_range",
             "OKX 当前杠杆不在官方允许范围内",
+        )
+    if current > user_maximum:
+        raise LeveragePlanningFailure(
+            "current_leverage_above_user_cap",
+            "OKX 当前杠杆已经高于用户设置的最大杠杆，禁止新增风险",
         )
 
     current_capacity = _capacity(
@@ -136,8 +147,6 @@ def build_minimum_leverage_parameters(
 
     first_sufficient: Decimal | None = None
     target_capacity: Decimal | None = None
-    previous_leverage = current
-    previous_capacity = current_capacity
     maximum_capacity = current_capacity
     verified_grid = [
         LeverageCapacityPoint(
@@ -153,13 +162,6 @@ def build_minimum_leverage_parameters(
             entry_price=price,
             leverage=candidate,
         )
-        if candidate_capacity < previous_capacity:
-            raise LeveragePlanningFailure(
-                "non_monotonic_capacity",
-                "OKX 候选网格容量不是逐点单调增加："
-                f"{previous_leverage}x={previous_capacity} → "
-                f"{candidate}x={candidate_capacity}；禁止猜测目标杠杆",
-            )
         verified_grid.append(
             LeverageCapacityPoint(
                 leverage=candidate,
@@ -169,16 +171,19 @@ def build_minimum_leverage_parameters(
         if first_sufficient is None and candidate_capacity >= required:
             first_sufficient = candidate
             target_capacity = candidate_capacity
-        previous_leverage = candidate
-        previous_capacity = candidate_capacity
         maximum_capacity = candidate_capacity
 
-    if maximum_capacity < required:
+    if first_sufficient is None:
+        if user_maximum < exchange_maximum:
+            raise LeveragePlanningFailure(
+                "user_max_leverage_capacity_insufficient",
+                "用户设置的最大杠杆仍不足以容纳风险目标张数",
+            )
         raise LeveragePlanningFailure(
             "max_leverage_capacity_insufficient",
             "OKX 最大允许杠杆仍不足以容纳风险目标张数",
         )
-    if first_sufficient is None or target_capacity is None:
+    if target_capacity is None:
         raise LeveragePlanningFailure(
             "capacity_proof_incomplete",
             "候选网格没有形成可审计的足够容量点",
@@ -195,8 +200,10 @@ def build_minimum_leverage_parameters(
         current_capacity=current_capacity,
         target_capacity=target_capacity,
         maximum_leverage=maximum,
+        exchange_maximum_leverage=exchange_maximum,
+        user_maximum_leverage=user_maximum,
         maximum_capacity=maximum_capacity,
-        planning_method="bounded_sequential_policy_grid_v1",
+        planning_method="bounded_sequential_policy_grid_v2",
         policy_grid_step=_POLICY_GRID_STEP,
         verified_grid=tuple(verified_grid),
         required_quantity=required,

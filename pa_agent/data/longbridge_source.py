@@ -195,13 +195,13 @@ def _credentials_from_mapping(values: Mapping[str, str]) -> LongbridgeCredential
 
 def load_longbridge_credentials(env_file: Path | None = None) -> LongbridgeCredentials:
     """先读进程环境，再读 Quant 根目录共享 ``env``。"""
-    from pa_agent.config.paths import PROJECT_ROOT
+    from pa_agent.execution.credentials import shared_env_path
 
     credentials = _credentials_from_mapping(os.environ)
     if credentials is not None:
         return credentials
 
-    shared_env = env_file or (PROJECT_ROOT.parent / "env")
+    shared_env = env_file or shared_env_path()
     credentials = _credentials_from_mapping(_read_env_file(shared_env))
     if credentials is not None:
         return credentials

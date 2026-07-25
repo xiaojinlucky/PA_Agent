@@ -7,10 +7,57 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sys
+import tempfile
 from pathlib import Path
 
-import pytest
+_BROKER_ENV_KEYS = (
+    "PA_AGENT_LIVE_TRADING_ENABLED",
+    "PA_AGENT_PAPER_TRADING_ENABLED",
+    "OKX_API_KEY",
+    "OKX_SECRET_KEY",
+    "OKX_API_SECRET",
+    "OKX_PASSPHRASE",
+    "OKX_DEMO_API_KEY",
+    "OKX_DEMO_SECRET_KEY",
+    "OKX_DEMO_API_SECRET",
+    "OKX_DEMO_PASSPHRASE",
+    "OKX_LIVE_API_KEY",
+    "OKX_LIVE_SECRET_KEY",
+    "OKX_LIVE_API_SECRET",
+    "OKX_LIVE_PASSPHRASE",
+    "OKX_LIVE_ENABLED",
+    "LONGBRIDGE_APP_KEY",
+    "LONGBRIDGE_APP_SECRET",
+    "LONGBRIDGE_ACCESS_TOKEN",
+    "LONGBRIDGE_PAPER_APP_KEY",
+    "LONGBRIDGE_PAPER_APP_SECRET",
+    "LONGBRIDGE_PAPER_ACCESS_TOKEN",
+    "LONGBRIDGE_PAPER_ACCOUNT_ID",
+    "LONGBRIDGE_COMPREHENSIVE_APP_KEY",
+    "LONGBRIDGE_COMPREHENSIVE_APP_SECRET",
+    "LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN",
+    "LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID",
+    "LONGBRIDGE_INTRADAY_APP_KEY",
+    "LONGBRIDGE_INTRADAY_APP_SECRET",
+    "LONGBRIDGE_INTRADAY_ACCESS_TOKEN",
+    "LONGBRIDGE_INTRADAY_ACCOUNT_ID",
+)
+
+# 这些隔离必须在 pytest 收集测试模块之前完成。子进程继承同一环境，
+# 因而也无法回退读取正式 Quant\env 或进程中的真实券商凭据。
+_COLLECTION_BROKER_ENV = (
+    Path(tempfile.gettempdir())
+    / f"pa-agent-pytest-{os.getpid()}"
+    / "broker.env"
+)
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
+os.environ["_PA_AGENT_TEST_SHARED_ENV_PATH"] = str(_COLLECTION_BROKER_ENV)
+for _broker_env_key in _BROKER_ENV_KEYS:
+    os.environ.pop(_broker_env_key, None)
+
+import pytest  # noqa: E402
 
 
 def _digest(path: Path) -> str | None:
@@ -23,11 +70,17 @@ def _digest(path: Path) -> str | None:
 def _isolate_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     import pa_agent.config.paths as config_paths
     import pa_agent.config.settings as settings_module
-
     real_path = Path(config_paths.PROJECT_ROOT) / "config" / "settings.json"
     before = _digest(real_path)
     isolated_path = tmp_path / "runtime" / "settings.json"
+    isolated_broker_env = tmp_path / "runtime" / "broker.env"
     monkeypatch.setattr(config_paths, "SETTINGS_JSON_PATH", isolated_path)
+    monkeypatch.setenv(
+        "_PA_AGENT_TEST_SHARED_ENV_PATH",
+        str(isolated_broker_env),
+    )
+    for key in _BROKER_ENV_KEYS:
+        monkeypatch.delenv(key, raising=False)
 
     original_save_settings = settings_module.save_settings
 

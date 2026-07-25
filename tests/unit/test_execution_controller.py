@@ -11,6 +11,9 @@ import pytest
 from pa_agent.config.settings import Settings
 from pa_agent.execution.controller import ExecutionController
 from pa_agent.execution.errors import BrokerRejected, LiveTradingDisabled
+from pa_agent.execution.leverage_authorization import (
+    validate_current_leverage_policy,
+)
 from pa_agent.execution.models import (
     AccountSnapshot,
     ExecutionPlan,
@@ -27,6 +30,7 @@ from pa_agent.execution.worker_protocol import (
     WorkerCommandResolutionEvidence,
     WorkerCommandStatus,
     WorkerState,
+    leverage_intent_snapshot,
 )
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
@@ -77,6 +81,9 @@ def _settings() -> Settings:
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.product = "swap"
     settings.execution.okx.quantity = "1"
+    settings.execution.okx.risk_capital_cap_usdt = "2"
+    settings.execution.okx.risk_percent = "0.10"
+    settings.execution.okx.maximum_leverage = "20"
     return settings
 
 
@@ -147,6 +154,112 @@ def _controller(tmp_path: Path, monkeypatch):
         last_successful_reconcile_at=datetime.now(UTC),
     )
     return controller, worker_store, settings, record
+
+
+def _strict_script_parameters(
+    *,
+    analysis_path: Path,
+    record: AnalysisRecord,
+    config_fingerprint: str,
+    expected_account_identity: str,
+) -> SetLeverageParameters:
+    parameters, authorized_record = authorized_leverage_parameters(
+        analysis_path=analysis_path,
+        record=record,
+        config_fingerprint=config_fingerprint,
+        expected_account_identity=expected_account_identity,
+    )
+    payload = parameters.model_dump(mode="python")
+    payload.update(
+        {
+            "planning_method": "bounded_sequential_policy_grid_v2",
+            "maximum_leverage": Decimal("20"),
+            "exchange_maximum_leverage": Decimal("125"),
+            "user_maximum_leverage": Decimal("20"),
+            "maximum_capacity": Decimal("20"),
+            "verified_grid": (
+                {"leverage": "5", "capacity": "10"},
+                {"leverage": "10", "capacity": "30"},
+                {"leverage": "15", "capacity": "25"},
+                {"leverage": "20", "capacity": "20"},
+            ),
+            "leverage_intent_digest": "",
+            "supervisor_record_id": "",
+            "supervisor_record_path": "",
+            "supervisor_record_digest": "",
+        }
+    )
+    draft = SetLeverageParameters.model_validate(payload)
+    response = dict(authorized_record.stage2_response)
+    response["risk_sizing"] = {
+        "equity_basis": "fixed_cap_or_usdt_equity_whichever_lower",
+        "account_total_equity_usd": "2",
+        "equity_usdt": "2",
+        "risk_capital_cap_usdt": "2",
+        "effective_risk_capital_usdt": "2",
+        "risk_percent": "0.10",
+        "risk_budget_usdt": "0.20",
+        "risk_used_usdt": "0.20",
+        "reference_price_usdt": "100",
+        "stop_distance_usdt": "5",
+        "contract_notional_usdt": "0.2",
+        "worst_case_loss_per_contract_usdt": "0.01",
+        "fee_per_contract_usdt": "0",
+        "slippage_per_contract_usdt": "0",
+        "fee_rate": "0",
+        "slippage_rate": "0",
+        "minimum_quantity": "1",
+        "quantity_step": "1",
+        "max_buy": "30",
+        "max_sell": "30",
+        "target_quantity": "20",
+    }
+    response["leverage_intent"] = leverage_intent_snapshot(draft)
+    authorized_record = authorized_record.model_copy(
+        update={"stage2_response": response}
+    )
+    analysis_path.write_text(
+        authorized_record.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    return SetLeverageParameters.model_validate(
+        {
+            **draft.model_dump(mode="python"),
+            "analysis_digest": hashlib.sha256(
+                analysis_path.read_bytes()
+            ).hexdigest(),
+        }
+    )
+
+
+def test_fixed_quantity_leverage_policy_ignores_hidden_risk_percent(
+    tmp_path,
+):
+    settings = _settings()
+    settings.execution.okx.sizing_mode = "fixed_quantity"
+    settings.execution.okx.quantity = "20"
+    # 固定张数模式下，这个保存值不参与杠杆授权。
+    settings.execution.okx.risk_percent = Decimal("0.99")
+    analysis_path = tmp_path / "fixed-leverage-analysis.json"
+    parameters = _strict_script_parameters(
+        analysis_path=analysis_path,
+        record=_record(),
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+    )
+    record = AnalysisRecord.model_validate_json(analysis_path.read_bytes())
+    response = dict(record.stage2_response)
+    risk_sizing = dict(response["risk_sizing"])
+    risk_sizing["sizing_mode"] = "fixed_quantity"
+    response["risk_sizing"] = risk_sizing
+    analysis_path.write_text(
+        record.model_copy(
+            update={"stage2_response": response}
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+
+    validate_current_leverage_policy(parameters, settings)
 
 
 def _controller_without_worker(
@@ -535,6 +648,134 @@ def test_controller_enqueues_strict_demo_leverage_command_under_same_lease(
     assert worker_store.get_command(command.id) == command
 
 
+def test_controller_accepts_scripted_leverage_without_supervisor_record(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, record_obj = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    scripted = _strict_script_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record_obj,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+    )
+
+    command = controller.set_leverage(scripted)
+
+    assert command.parameters == scripted
+    assert command.parameters.supervisor_record_id == ""
+    assert worker_store.get_command(command.id) == command
+
+
+def test_route_fingerprint_changes_with_each_okx_risk_setting():
+    settings = _settings()
+    baseline = execution_route_fingerprint(settings, "okx")
+
+    settings.execution.okx.risk_capital_cap_usdt = "3"
+    changed_cap = execution_route_fingerprint(settings, "okx")
+    settings.execution.okx.risk_capital_cap_usdt = "2"
+    settings.execution.okx.risk_percent = "0.20"
+    changed_risk = execution_route_fingerprint(settings, "okx")
+    settings.execution.okx.risk_percent = "0.10"
+    settings.execution.okx.maximum_leverage = "25"
+    changed_leverage = execution_route_fingerprint(settings, "okx")
+
+    assert len({baseline, changed_cap, changed_risk, changed_leverage}) == 4
+
+
+def test_controller_rejects_script_risk_quantity_tampering(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    parameters = _strict_script_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+    )
+    analysis_path = Path(parameters.analysis_record_path)
+    persisted = AnalysisRecord.model_validate_json(analysis_path.read_bytes())
+    response = dict(persisted.stage2_response)
+    response["risk_sizing"] = {
+        **response["risk_sizing"],
+        "target_quantity": "21",
+    }
+    analysis_path.write_text(
+        persisted.model_copy(
+            update={"stage2_response": response}
+        ).model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    tampered = parameters.model_copy(
+        update={
+            "analysis_digest": hashlib.sha256(
+                analysis_path.read_bytes()
+            ).hexdigest()
+        }
+    )
+
+    with pytest.raises(
+        LiveTradingDisabled,
+        match="脚本风险数量与杠杆所需数量不一致",
+    ):
+        controller.set_leverage(tampered)
+
+    assert worker_store.list_commands() == []
+
+
+def test_controller_rejects_self_signed_125x_above_current_20x(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, settings, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    parameters = _strict_script_parameters(
+        analysis_path=tmp_path / "pending" / "record.json",
+        record=record,
+        config_fingerprint=execution_route_fingerprint(settings, "okx"),
+        expected_account_identity="b" * 64,
+    )
+    payload = parameters.model_dump(mode="python")
+    payload.update(
+        {
+            "target_leverage": Decimal("25"),
+            "target_capacity": Decimal("30"),
+            "maximum_leverage": Decimal("125"),
+            "exchange_maximum_leverage": Decimal("125"),
+            "user_maximum_leverage": Decimal("125"),
+            "maximum_capacity": Decimal("40"),
+            "policy_grid_step": Decimal("100"),
+            "verified_grid": (
+                {"leverage": "5", "capacity": "10"},
+                {"leverage": "25", "capacity": "30"},
+                {"leverage": "125", "capacity": "40"},
+            ),
+            "leverage_intent_digest": "",
+        }
+    )
+    forged = SetLeverageParameters.model_validate(payload)
+
+    with pytest.raises(
+        LiveTradingDisabled,
+        match="超过当前用户最大杠杆",
+    ):
+        controller.set_leverage(forged)
+
+    assert worker_store.list_commands() == []
+
+
 def test_controller_authorizes_effective_limit_distinct_from_pa_signal(
     tmp_path,
     monkeypatch,
@@ -601,7 +842,7 @@ def test_controller_rejects_tampered_effective_limit_reference(
 
     with pytest.raises(
         LiveTradingDisabled,
-        match="没有匹配的耐久监督授权",
+        match="没有匹配的耐久脚本授权",
     ):
         controller.set_leverage(parameters)
 
@@ -650,7 +891,7 @@ def test_controller_rejects_tampered_supervised_leverage_intent(
 
     with pytest.raises(
         LiveTradingDisabled,
-        match="没有匹配的耐久监督授权",
+        match="没有匹配的耐久脚本授权",
     ):
         controller.set_leverage(tampered)
 
@@ -723,6 +964,10 @@ def test_controller_queue_worker_is_the_only_broker_write_path(
     worker_id = "worker-e2e"
     authority = WorkerNewRiskAuthority(worker_store, worker_id)
     adapter = FakeAdapter()
+    base_preflight = adapter.preflight
+    adapter.preflight = lambda plan: base_preflight(plan).model_copy(
+        update={"broker_metadata": {"current_leverage": "20"}}
+    )
     service = ExecutionService(
         settings=worker_settings,
         pending_writer=None,
@@ -813,6 +1058,10 @@ def test_rejected_risk_reduction_stops_worker_and_immediate_rearm(
     worker_id = f"worker-rejected-{action}"
     authority = WorkerNewRiskAuthority(worker_store, worker_id)
     adapter = FakeAdapter()
+    base_preflight = adapter.preflight
+    adapter.preflight = lambda plan: base_preflight(plan).model_copy(
+        update={"broker_metadata": {"current_leverage": "20"}}
+    )
     service = ExecutionService(
         settings=worker_settings,
         pending_writer=None,

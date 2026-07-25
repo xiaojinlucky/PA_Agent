@@ -30,9 +30,11 @@ class FakeOkxClient:
         self.algo_orders = {}
         self.order_counter = 0
         self.positions_rows = []
+        self.ignore_position_filter = False
         self.balance_rows = []
         self.place_order_error = None
         self.place_algo_error = None
+        self.get_algo_error = None
         self.cancel_algo_error = None
         self.orders = {}
         self.fills_by_order = {}
@@ -49,6 +51,8 @@ class FakeOkxClient:
         self.capacity_after = Decimal("30")
         self.pending_order_rows = []
         self.pending_algo_rows = {}
+        self.pending_algo_error = None
+        self.ticker_callback = None
         self.adjustment_exist_ord = False
         self.set_leverage_updates = True
         self.bill_rows = []
@@ -139,6 +143,8 @@ class FakeOkxClient:
 
     def pending_algo_orders(self, *, instrument, order_type="oco"):
         self.calls.append(("pending_algo_orders", instrument, order_type))
+        if self.pending_algo_error:
+            raise self.pending_algo_error
         return list(self.pending_algo_rows.get(order_type, []))
 
     def leverage_adjustment_info(self, **kwargs):
@@ -151,7 +157,7 @@ class FakeOkxClient:
 
     def positions(self, *, instrument=None):
         self.calls.append(("positions", instrument))
-        if instrument:
+        if instrument and not self.ignore_position_filter:
             return [
                 row for row in self.positions_rows if row.get("instId") == instrument
             ]
@@ -165,6 +171,8 @@ class FakeOkxClient:
         return list(self.bill_rows)
 
     def ticker(self, instrument):
+        if self.ticker_callback:
+            self.ticker_callback()
         return {"instId": instrument, "last": "105"}
 
     def place_order(self, body):
@@ -220,6 +228,8 @@ class FakeOkxClient:
 
     def get_algo_order(self, *, algo_id="", client_algo_id=""):
         self.calls.append(("get_algo_order", algo_id, client_algo_id))
+        if self.get_algo_error:
+            raise self.get_algo_error
         if algo_id and algo_id in self.algo_orders:
             return dict(self.algo_orders[algo_id])
         if client_algo_id:
@@ -303,6 +313,32 @@ def _plan(*, product="swap", direction="long", instrument=None) -> ExecutionPlan
         config_fingerprint="config",
         entry_atr=Decimal("2"),
     )
+
+
+def test_fixed_quantity_plan_uses_fixed_risk_recalculation_before_post():
+    client = FakeOkxClient()
+    client.capacity_before = Decimal("1000")
+    adapter = OkxAdapter(client, margin_mode="cross")
+    plan = _plan().model_copy(
+        update={
+            "quantity": Decimal("120"),
+            "authorized_sizing_mode": "fixed_quantity",
+            "authorized_fixed_quantity": Decimal("120"),
+        }
+    )
+
+    sizing = adapter.calculate_risk_size(
+        plan,
+        account_equity_usd=Decimal("5000"),
+        risk_capital_cap_usdt=Decimal("5000"),
+        # 固定张数模式不得使用这个残留比例重新计算数量。
+        risk_percent=Decimal("0.10"),
+    )
+
+    assert sizing is not None
+    assert sizing.target_contract_size == Decimal("120")
+    assert sizing.risk_percent != Decimal("0.10")
+    assert not [call for call in client.calls if call[0] == "place_order"]
 
 
 def _leverage_parameters() -> SetLeverageParameters:
@@ -2278,6 +2314,392 @@ def test_unknown_protection_cancel_is_resolved_while_disarmed_without_retry():
     assert len(
         [call for call in client.calls if call[0] == "cancel_algo_orders"]
     ) == 1
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_active_exit_recovers_canceled_protection_after_direct_lookup_returns_51603():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.algo_orders["protect-1"] = {
+        "algoId": "protect-1",
+        "algoClOrdId": "protect-client-1",
+        "state": "canceled",
+    }
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "cancel_protection",
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "cancel_requested": True,
+                    "cancel_status": "submitted",
+                }
+            ],
+        },
+    )
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+
+    recovered = adapter.reconcile(record, allow_writes=True)
+
+    assert recovered.broker_state["exit_phase"] == "submit_exit"
+    assert recovered.broker_state["protection_targets"][0]["state"] == "canceled"
+    assert recovered.needs_attention is False
+    assert [
+        call for call in client.calls if call[0] == "find_algo_order_by_client_id"
+    ]
+    assert not [call for call in client.calls if call[0] == "cancel_algo_orders"]
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_active_exit_confirms_known_absent_protection_only_from_fresh_empty_snapshot():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+    client.algo_absence_confirmed = True
+    client.positions_rows = [
+        {
+            "instId": plan.instrument,
+            "pos": "2",
+            "posSide": "net",
+        }
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "cancel_protection",
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "filled_quantity": "0",
+                    "exit_order_ids": [],
+                    "cancel_requested": True,
+                    "cancel_status": "submitted",
+                }
+            ],
+        },
+    )
+
+    recovered = adapter.reconcile(record, allow_writes=True)
+
+    target = recovered.broker_state["protection_targets"][0]
+    assert recovered.broker_state["exit_phase"] == "submit_exit"
+    assert target["state"] == "confirmed_canceled_absent"
+    assert target["cancel_status"] == "confirmed"
+    assert recovered.needs_attention is False
+    assert len(
+        [call for call in client.calls if call[0] == "pending_algo_orders"]
+    ) == len(OKX_PENDING_ALGO_ORDER_TYPES)
+    assert not [call for call in client.calls if call[0] == "cancel_algo_orders"]
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def _known_absent_exit_ready(*, hedge_mode: bool = False):
+    client = FakeOkxClient()
+    if hedge_mode:
+        client.account_config_row["posMode"] = "long_short_mode"
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+    client.algo_absence_confirmed = True
+    client.positions_rows = [
+        {
+            "instId": plan.instrument,
+            "pos": "2",
+            "posSide": "long" if hedge_mode else "net",
+        }
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "cancel_protection",
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "filled_quantity": "0",
+                    "exit_order_ids": [],
+                    "cancel_requested": True,
+                    "cancel_status": "submitted",
+                }
+            ],
+        },
+    )
+    confirmed = adapter.reconcile(record, allow_writes=True)
+    ready = adapter.reconcile(confirmed, allow_writes=True)
+    assert ready.broker_state["exit_phase"] == "submit_exit_ready"
+    return client, adapter, ready
+
+
+@pytest.mark.parametrize("late_change", ["regular_order", "algo_order", "position"])
+def test_known_absent_exit_rechecks_snapshot_immediately_before_post(late_change):
+    client, adapter, ready = _known_absent_exit_ready()
+    if late_change == "regular_order":
+        client.pending_order_rows = [{"ordId": "late-regular"}]
+    elif late_change == "algo_order":
+        client.pending_algo_rows["trigger"] = [{"algoId": "late-algo"}]
+    else:
+        client.positions_rows[0]["pos"] = "1"
+
+    stopped = adapter.reconcile(ready, allow_writes=True)
+
+    assert stopped.needs_attention is True
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_known_absent_exit_final_snapshot_read_failure_never_posts():
+    client, adapter, ready = _known_absent_exit_ready()
+    client.pending_algo_error = BrokerTransportError(
+        "read timeout",
+        write_may_have_reached=False,
+    )
+
+    stopped = adapter.reconcile(ready, allow_writes=True)
+
+    assert stopped.needs_attention is True
+    assert "read timeout" in stopped.last_error
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_known_absent_limit_exit_rechecks_after_ticker_before_post():
+    client, adapter, ready = _known_absent_exit_ready()
+    ready = ready.model_copy(
+        update={
+            "plan": ready.plan.model_copy(
+                update={"exit_order_mode": "limit_with_slippage"}
+            )
+        }
+    )
+
+    def _inject_late_algo():
+        client.pending_algo_rows["trigger"] = [{"algoId": "late-after-ticker"}]
+
+    client.ticker_callback = _inject_late_algo
+
+    stopped = adapter.reconcile(ready, allow_writes=True)
+
+    assert stopped.needs_attention is True
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+@pytest.mark.parametrize("bad_position", ["wrong_instrument", "negative_hedge"])
+def test_known_absent_exit_final_snapshot_rejects_invalid_position_rows(bad_position):
+    hedge_mode = bad_position == "negative_hedge"
+    client, adapter, ready = _known_absent_exit_ready(hedge_mode=hedge_mode)
+    if bad_position == "wrong_instrument":
+        client.ignore_position_filter = True
+        client.positions_rows[0]["instId"] = "BTC-USDT-SWAP"
+    else:
+        client.positions_rows[0]["pos"] = "-2"
+
+    stopped = adapter.reconcile(ready, allow_writes=True)
+
+    assert stopped.needs_attention is True
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_known_absent_exit_repeated_reconcile_submits_only_one_exit_order():
+    client, adapter, ready = _known_absent_exit_ready()
+
+    submitted = adapter.reconcile(ready, allow_writes=True)
+    repeated = adapter.reconcile(submitted, allow_writes=True)
+
+    assert submitted.broker_state["exit_phase"] == "wait_exit"
+    assert repeated.broker_state["exit_phase"] == "wait_exit"
+    assert len([call for call in client.calls if call[0] == "place_order"]) == 1
+
+
+def test_known_absent_exit_final_snapshot_uses_pre_chunk_remaining_quantity():
+    client, adapter, ready = _known_absent_exit_ready()
+    ready.broker_state["exit_order"]["quantity"] = "1"
+
+    submitted = adapter.reconcile(ready, allow_writes=True)
+
+    place = [call for call in client.calls if call[0] == "place_order"]
+    assert submitted.broker_state["exit_phase"] == "wait_exit"
+    assert len(place) == 1
+    assert place[0][1]["sz"] == "1"
+
+
+def test_active_exit_known_absent_protection_preserves_prior_fill_evidence_and_stops():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+    client.algo_absence_confirmed = True
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "cancel_protection",
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "filled_quantity": "1",
+                    "exit_order_ids": ["child-1"],
+                    "average_fill_price": "105",
+                    "cancel_requested": True,
+                    "cancel_status": "submitted",
+                }
+            ],
+        },
+    )
+
+    stopped = adapter.reconcile(record, allow_writes=True)
+
+    target = stopped.broker_state["protection_targets"][0]
+    assert stopped.broker_state["exit_phase"] == "cancel_protection"
+    assert stopped.needs_attention is True
+    assert stopped.remaining_quantity == Decimal("1")
+    assert target["state"] == "known_algo_absent"
+    assert target["filled_quantity"] == "1"
+    assert target["exit_order_ids"] == ["child-1"]
+    assert target["average_fill_price"] == "105"
+    assert not [call for call in client.calls if call[0] == "pending_orders"]
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_open_known_absent_protection_stops_without_silent_replacement():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+    client.algo_absence_confirmed = True
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.OPEN,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "filled_quantity": "0",
+                    "exit_order_ids": [],
+                }
+            ],
+        },
+    )
+
+    stopped = adapter.reconcile(record, allow_writes=True)
+
+    assert stopped.state is ExecutionState.OPEN
+    assert stopped.needs_attention is True
+    assert stopped.broker_state["protection_targets"][0]["state"] == "known_algo_absent"
+    assert not [call for call in client.calls if call[0] == "place_algo_order"]
+    assert not [call for call in client.calls if call[0] == "place_order"]
+
+
+def test_active_exit_known_absent_protection_stops_when_any_order_is_pending():
+    client = FakeOkxClient()
+    adapter = OkxAdapter(client)
+    plan = _plan()
+    preflight = adapter.preflight(plan)
+    client.get_algo_error = BrokerApiError("51603", "Order does not exist")
+    client.algo_absence_confirmed = True
+    client.pending_order_rows = [{"ordId": "unresolved-order"}]
+    client.positions_rows = [
+        {
+            "instId": plan.instrument,
+            "pos": "2",
+            "posSide": "net",
+        }
+    ]
+    record = ExecutionRecord(
+        id=plan.id,
+        plan=plan,
+        state=ExecutionState.EXIT_PENDING,
+        selected_account="okx",
+        preflight=preflight,
+        filled_quantity=Decimal("2"),
+        remaining_quantity=Decimal("2"),
+        average_fill_price=Decimal("100"),
+        broker_state={
+            "exit_phase": "cancel_protection",
+            "protection_base_quantity": "2",
+            "protection_targets": [
+                {
+                    "client_algo_id": "protect-client-1",
+                    "algo_id": "protect-1",
+                    "state": "live",
+                    "quantity": "2",
+                    "take_profit": "110",
+                    "filled_quantity": "0",
+                    "exit_order_ids": [],
+                    "cancel_requested": True,
+                    "cancel_status": "submitted",
+                }
+            ],
+        },
+    )
+
+    stopped = adapter.reconcile(record, allow_writes=True)
+
+    assert stopped.broker_state["exit_phase"] == "cancel_protection"
+    assert stopped.needs_attention is True
+    assert not [call for call in client.calls if call[0] == "cancel_algo_orders"]
     assert not [call for call in client.calls if call[0] == "place_order"]
 
 

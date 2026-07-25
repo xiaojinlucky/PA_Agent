@@ -33,6 +33,7 @@ ExecutionBroker = Literal["longbridge", "okx"]
 LongbridgeAccountProfile = Literal["paper", "comprehensive", "intraday"]
 OkxProduct = Literal["spot", "swap"]
 OkxMarginMode = Literal["cross", "isolated"]
+OkxSizingMode = Literal["risk_budget", "fixed_quantity"]
 EntryOrderMode = Literal["signal", "limit", "limit_with_slippage", "market"]
 ExitOrderMode = Literal["limit", "limit_with_slippage", "market"]
 _SETTINGS_PROCESS_LOCK = RLock()
@@ -357,9 +358,14 @@ class OkxExecutionSettings(BaseModel):
 
     source_symbol: str = ""
     instrument: str = ""
+    sizing_mode: OkxSizingMode = "risk_budget"
     quantity: str = ""
     product: OkxProduct = "spot"
     margin_mode: OkxMarginMode = "cross"
+    # 0 表示用户尚未设置；新增风险必须失败关闭，禁止退回全余额动态定仓。
+    risk_capital_cap_usdt: Decimal = Field(default=Decimal("0"), ge=0)
+    risk_percent: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
+    maximum_leverage: Decimal = Field(default=Decimal("20"), ge=1, le=125)
     simulated: bool = False
     api_base_url: str = "https://www.okx.com"
 

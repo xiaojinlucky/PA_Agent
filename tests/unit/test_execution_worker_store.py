@@ -222,6 +222,42 @@ def test_enqueue_deduplicates_active_but_failed_command_can_retry(tmp_path):
     assert retried.id != first.id
 
 
+@pytest.mark.parametrize(
+    ("first_reason", "second_reason"),
+    [
+        ("", "recover_transient_risk_read_failure"),
+        ("recover_transient_risk_read_failure", ""),
+    ],
+)
+def test_clear_and_transient_recovery_never_silently_deduplicate(
+    tmp_path,
+    first_reason,
+    second_reason,
+):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    store.enqueue(
+        action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+        requester="controller",
+        broker="okx",
+        environment="demo",
+        account="okx",
+        reason_code=first_reason,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="不同类型的风险停止处置命令",
+    ):
+        store.enqueue(
+            action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+            requester="controller",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            reason_code=second_reason,
+        )
+
+
 def test_claim_next_is_atomic_across_processes(tmp_path):
     path = tmp_path / "worker.sqlite3"
     seed = WorkerStore(path)
@@ -622,10 +658,69 @@ def test_existing_worker_tables_without_version_are_not_adopted(tmp_path):
     assert meta_table is None
 
 
-def test_worker_schema_v1_migration_preserves_existing_uncertain_write(
+def test_worker_schema_v1_migration_preserves_all_unresolved_without_claim_or_replay(
     tmp_path,
 ):
     path = tmp_path / "worker.sqlite3"
+    legacy_rows = (
+        (
+            "old-submit",
+            "execution:old-submit-execution",
+            "submit",
+            "old-submit-execution",
+            "campaign",
+            "okx",
+            "demo",
+            "okx",
+            "old-submit-lease",
+            "",
+            "uncertain",
+            "old-worker",
+            "2026-07-24T00:00:00+00:00",
+            "2026-07-24T00:00:01+00:00",
+            "2026-07-24T00:00:02+00:00",
+            "",
+            "BrokerTransportError",
+        ),
+        (
+            "old-cancel",
+            "execution:old-cancel-execution",
+            "cancel_entry",
+            "old-cancel-execution",
+            "campaign",
+            "okx",
+            "demo",
+            "okx",
+            "",
+            "",
+            "uncertain",
+            "old-worker",
+            "2026-07-24T00:00:03+00:00",
+            "2026-07-24T00:00:04+00:00",
+            "2026-07-24T00:00:05+00:00",
+            "",
+            "BrokerTransportError",
+        ),
+        (
+            "old-exit",
+            "execution:old-exit-execution",
+            "request_exit",
+            "old-exit-execution",
+            "campaign",
+            "okx",
+            "demo",
+            "okx",
+            "",
+            "risk_exit",
+            "uncertain",
+            "old-worker",
+            "2026-07-24T00:00:06+00:00",
+            "2026-07-24T00:00:07+00:00",
+            "2026-07-24T00:00:08+00:00",
+            "",
+            "BrokerTransportError",
+        ),
+    )
     with sqlite3.connect(path) as connection:
         connection.executescript(
             """
@@ -654,41 +749,89 @@ def test_worker_schema_v1_migration_preserves_existing_uncertain_write(
                 result_code TEXT NOT NULL,
                 failure_code TEXT NOT NULL
             );
+            """
+        )
+        connection.executemany(
+            """
             INSERT INTO worker_commands(
                 id, scope_key, action, execution_id, requester,
                 broker, environment, account, new_risk_lease_id,
                 reason_code, status, worker_id, created_at, started_at,
                 finished_at, result_code, failure_code
-            ) VALUES (
-                'old-command', 'execution:old-execution', 'submit',
-                'old-execution', 'campaign', 'okx', 'demo', 'okx',
-                'old-lease', '', 'uncertain', 'old-worker',
-                '2026-07-24T00:00:00+00:00',
-                '2026-07-24T00:00:01+00:00',
-                '2026-07-24T00:00:02+00:00',
-                '', 'ValidationError'
-            );
-            """
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            legacy_rows,
+        )
+        before_rows = tuple(
+            connection.execute(
+                """
+                SELECT
+                    id, scope_key, action, execution_id, requester,
+                    broker, environment, account, new_risk_lease_id,
+                    reason_code, status, worker_id, created_at, started_at,
+                    finished_at, result_code, failure_code
+                FROM worker_commands
+                ORDER BY created_at, id
+                """
+            )
         )
 
     store = WorkerStore(path)
     assert store.schema_version == 1
     with FileLock(str(tmp_path / "worker.lock")) as worker_lock:
         store.migrate_to_current(worker_lock=worker_lock)
-    command = store.get_command("old-command")
 
-    assert command is not None
-    assert command.status is WorkerCommandStatus.UNCERTAIN
-    assert command.parameters is None
-    assert command.result is None
     with sqlite3.connect(path) as connection:
+        after_rows = tuple(
+            connection.execute(
+                """
+                SELECT
+                    id, scope_key, action, execution_id, requester,
+                    broker, environment, account, new_risk_lease_id,
+                    reason_code, status, worker_id, created_at, started_at,
+                    finished_at, result_code, failure_code
+                FROM worker_commands
+                ORDER BY created_at, id
+                """
+            )
+        )
         columns = {
             row[1]
             for row in connection.execute(
                 "PRAGMA table_info(worker_commands)"
             ).fetchall()
         }
+        version = connection.execute(
+            "SELECT value FROM worker_meta "
+            "WHERE key='worker_schema_version'"
+        ).fetchone()
+        integrity = connection.execute("PRAGMA integrity_check").fetchone()
+        resolution_count = connection.execute(
+            "SELECT COUNT(*) FROM worker_command_resolutions"
+        ).fetchone()
+
+    unresolved = store.list_unresolved_write_commands(
+        broker="okx",
+        environment="demo",
+        account="okx",
+    )
+
+    assert after_rows == before_rows
+    assert [command.id for command in unresolved] == [
+        "old-submit",
+        "old-cancel",
+        "old-exit",
+    ]
+    assert all(
+        command.status is WorkerCommandStatus.UNCERTAIN
+        and command.parameters is None
+        and command.result is None
+        for command in unresolved
+    )
     assert {"parameters_json", "result_json"} <= columns
+    assert version == ("4",)
+    assert integrity == ("ok",)
+    assert resolution_count == (0,)
 
 
 def test_new_risk_lease_route_expiry_renew_and_revoke(tmp_path):

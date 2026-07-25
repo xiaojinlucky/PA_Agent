@@ -62,8 +62,21 @@ class SetLeverageParameters(BaseModel):
     current_capacity: Decimal = Field(gt=0)
     target_capacity: Decimal = Field(gt=0)
     maximum_leverage: Decimal = Field(gt=0, le=125)
+    exchange_maximum_leverage: Decimal | None = Field(
+        default=None,
+        gt=0,
+        le=125,
+    )
+    user_maximum_leverage: Decimal | None = Field(
+        default=None,
+        gt=0,
+        le=125,
+    )
     maximum_capacity: Decimal = Field(gt=0)
-    planning_method: Literal["bounded_sequential_policy_grid_v1"]
+    planning_method: Literal[
+        "bounded_sequential_policy_grid_v1",
+        "bounded_sequential_policy_grid_v2",
+    ]
     policy_grid_step: Decimal = Field(gt=0)
     verified_grid: tuple[LeverageCapacityPoint, ...] = Field(
         min_length=2,
@@ -112,7 +125,17 @@ class SetLeverageParameters(BaseModel):
         if self.target_leverage <= self.current_leverage:
             raise ValueError("目标杠杆必须高于已确认的当前杠杆")
         if self.target_leverage > self.maximum_leverage:
-            raise ValueError("目标杠杆超过 OKX 已确认最大杠杆")
+            raise ValueError("目标杠杆超过有效最大杠杆")
+        if (
+            self.exchange_maximum_leverage is not None
+            and self.maximum_leverage > self.exchange_maximum_leverage
+        ):
+            raise ValueError("有效最大杠杆超过 OKX 官方上限")
+        if (
+            self.user_maximum_leverage is not None
+            and self.maximum_leverage > self.user_maximum_leverage
+        ):
+            raise ValueError("有效最大杠杆超过用户设置上限")
         if self.current_capacity >= self.required_quantity:
             raise ValueError("当前容量已经足够，不应创建杠杆命令")
         if self.target_capacity < self.required_quantity:
@@ -130,8 +153,6 @@ class SetLeverageParameters(BaseModel):
                 raise ValueError("容量验证网格杠杆必须严格递增")
             if current.leverage - previous.leverage > self.policy_grid_step:
                 raise ValueError("容量验证网格存在未验证的杠杆空档")
-            if current.capacity < previous.capacity:
-                raise ValueError("容量验证网格不是单调递增")
         sufficient = [
             point
             for point in points
@@ -162,7 +183,7 @@ class SetLeverageParameters(BaseModel):
 def leverage_intent_payload(
     parameters: SetLeverageParameters,
 ) -> dict[str, object]:
-    """Return the exact leverage facts that supervision must authorize."""
+    """Return the exact leverage facts that durable script evidence authorizes."""
     return {
         "schema_version": 1,
         "analysis_record_path": parameters.analysis_record_path,
@@ -176,6 +197,16 @@ def leverage_intent_payload(
         "current_capacity": str(parameters.current_capacity),
         "target_capacity": str(parameters.target_capacity),
         "maximum_leverage": str(parameters.maximum_leverage),
+        "exchange_maximum_leverage": (
+            str(parameters.exchange_maximum_leverage)
+            if parameters.exchange_maximum_leverage is not None
+            else ""
+        ),
+        "user_maximum_leverage": (
+            str(parameters.user_maximum_leverage)
+            if parameters.user_maximum_leverage is not None
+            else ""
+        ),
         "maximum_capacity": str(parameters.maximum_capacity),
         "planning_method": parameters.planning_method,
         "policy_grid_step": str(parameters.policy_grid_step),
@@ -502,18 +533,30 @@ class WorkerCommand(BaseModel):
         if self.action is WorkerCommandAction.REQUEST_EXIT:
             if not self.reason_code:
                 raise ValueError("request_exit 命令必须提供 reason_code")
+        elif self.action is WorkerCommandAction.CLEAR_DRAWDOWN_STOP:
+            if self.reason_code not in {
+                "",
+                "recover_transient_risk_read_failure",
+            }:
+                raise ValueError(
+                    "clear_drawdown_stop 命令包含不支持的 reason_code"
+                )
         elif self.reason_code:
-            raise ValueError("只有 request_exit 命令可以提供 reason_code")
+            raise ValueError(
+                "只有 request_exit 或风险停止复核命令可以提供 reason_code"
+            )
         if self.action is WorkerCommandAction.SET_LEVERAGE:
             if self.parameters is None:
                 raise ValueError("set_leverage 命令必须提供严格参数")
-            if not (
-                self.parameters.analysis_record_path
-                and self.parameters.supervisor_record_id
-                and self.parameters.supervisor_record_path
-                and self.parameters.supervisor_record_digest
-            ):
-                raise ValueError("set_leverage 命令缺少耐久分析或监督授权证据")
+            if not self.parameters.analysis_record_path:
+                raise ValueError("set_leverage 命令缺少耐久分析证据")
+            supervisor_fields = (
+                self.parameters.supervisor_record_id,
+                self.parameters.supervisor_record_path,
+                self.parameters.supervisor_record_digest,
+            )
+            if any(supervisor_fields) and not all(supervisor_fields):
+                raise ValueError("set_leverage 旧监督证据字段不完整")
             if (
                 self.status is WorkerCommandStatus.SUCCEEDED
                 and self.result is None

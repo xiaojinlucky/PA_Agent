@@ -289,7 +289,12 @@ def test_context_window_is_model_derived_and_not_user_editable(qtbot) -> None:
     assert dialog._context_window_label.text() == "尚未确认（模型固定）"
 
 
-def test_live_catalog_context_survives_profile_save_and_reload(qtbot, tmp_path) -> None:
+def test_live_catalog_context_survives_profile_save_and_reload(
+    qtbot,
+    tmp_path,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("KIMI_API_KEY", "test-kimi-key")
     path = tmp_path / "settings.json"
     settings = _verified_settings()
     dialog = AIModelSettingsDialog(settings, settings_path=path)
@@ -1152,7 +1157,8 @@ def test_kimi_non_reasoning_model_disables_thinking_and_effort(qtbot) -> None:
     assert dialog._connection_form.isRowVisible(dialog._speed_combo) is False
 
 
-def test_manual_model_entry_requires_explicit_opt_in(qtbot) -> None:
+def test_manual_model_entry_requires_explicit_opt_in(qtbot, monkeypatch) -> None:
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "test-deepseek-key")
     dialog = AIModelSettingsDialog(Settings())
     qtbot.addWidget(dialog)
     dialog._adapter_combo.setCurrentIndex(

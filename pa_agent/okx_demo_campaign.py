@@ -5,7 +5,7 @@
 - OKX XAU-USDT-SWAP / 10m（由真实已收盘 5m 两两聚合）
 - PA 极度激进
 - 执行置信度门槛 20
-- OKX Demo XAU-USDT-SWAP / cross / 当前 Demo 权益 10% 的动态张数
+- OKX Demo XAU-USDT-SWAP / cross / 固定风险资金上限与实时权益较小值的动态张数
 - 运行窗口 24 小时
 """
 from __future__ import annotations
@@ -33,11 +33,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from pa_agent.agents.supervisor import (
-    SupervisorGate,
-    build_supervisor_gate,
-    resolve_verified_profile,
-)
+from pa_agent.agents.supervisor import resolve_verified_profile
 from pa_agent.ai.client_factory import create_ai_client
 from pa_agent.ai.json_validator import JsonValidator
 from pa_agent.ai.prompt_assembler import PromptAssembler
@@ -88,11 +84,17 @@ from pa_agent.records.analysis_history import (
 from pa_agent.records.experience_reader import ExperienceReader
 from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.schema import AnalysisRecord, RecordMeta
-from pa_agent.records.supervisor_writer import SupervisorWriter
-from pa_agent.risk.sizing import RiskCalculationFailure, calculate_risk_size
 from pa_agent.risk.leverage import (
     LeveragePlanningFailure,
     build_minimum_leverage_parameters,
+)
+from pa_agent.risk.runtime import (
+    RECOVERABLE_TRANSIENT_RISK_STOP_REASONS,
+)
+from pa_agent.risk.sizing import (
+    RiskCalculationFailure,
+    calculate_fixed_quantity_risk,
+    calculate_risk_size,
 )
 from pa_agent.util.logging import configure_logging
 from pa_agent.util.threading import CancelToken
@@ -102,16 +104,14 @@ CAMPAIGN_SYMBOL = CAMPAIGN_INSTRUMENT
 CAMPAIGN_TIMEFRAME = "10m"
 CAMPAIGN_PRODUCT = "swap"
 CAMPAIGN_MARGIN_MODE = "cross"
-# PA Demo 是 USDT 结算合约；10% 风险基数明确使用 USDT 币种权益 eq，
-# 不是账户 totalEq，也不是 availBal/availEq。
-CAMPAIGN_RISK_EQUITY_BASIS = "usdt_equity"
-# 每个单仓生命周期的首仓最多使用 Demo USDT 总权益的 10% 止损风险。
-# 数量在每次准备新计划前重新读取账户权益、合约规格和最大可开张数；
-# 费用和滑点是假设输入，不是券商返回的已确认成交费用。
+# PA Demo 是 USDT 结算合约；定仓资本取用户固定上限与最新 USDT eq 较小值。
+# totalEq 只用于资金流、高水位和 50% 回撤。
+CAMPAIGN_RISK_EQUITY_BASIS = "fixed_cap_or_usdt_equity_whichever_lower"
+# 仅保留为旧测试/默认配置的 10% 示例；生产定仓读取用户 risk_percent。
 CAMPAIGN_EQUITY_FRACTION = Decimal("0.10")
 CAMPAIGN_FEE_RATE = Decimal("0.0005")
 CAMPAIGN_SLIPPAGE_RATE = Decimal("0.0010")
-CAMPAIGN_SIZING_MODE = "equity_10pct_stop_loss_risk"
+CAMPAIGN_DEFAULT_SIZING_MODE = "risk_budget"
 CAMPAIGN_BOOTSTRAP_QUANTITY = "1"
 CAMPAIGN_OKX_API_BASE_URL = "https://www.okx.com"
 CAMPAIGN_STANCE = "extreme_aggressive"
@@ -199,6 +199,14 @@ class CampaignState(BaseModel):
     version: int = 1
     campaign_id: str
     config_fingerprint: str
+    frozen_risk_capital_cap_usdt: Decimal | None = Field(
+        default=None,
+        ge=0,
+    )
+    frozen_risk_percent: Decimal | None = Field(default=None, gt=0, le=1)
+    frozen_maximum_leverage: Decimal | None = Field(default=None, ge=1)
+    frozen_sizing_mode: Literal["risk_budget", "fixed_quantity"] | None = None
+    frozen_fixed_quantity: Decimal | None = Field(default=None, gt=0)
     started_at: str
     expires_at: str
     status: Literal[
@@ -208,6 +216,8 @@ class CampaignState(BaseModel):
         "needs_attention",
     ] = "active"
     inflight_bar_ms: int | None = None
+    risk_recovery_bar_ms: int | None = None
+    risk_recovery_command_id: str = ""
     last_completed_bar_ms: int | None = None
     analyses_completed: int = Field(default=0, ge=0)
     analyses_failed: int = Field(default=0, ge=0)
@@ -243,7 +253,9 @@ def _parse_utc(value: str, field_name: str) -> datetime:
     return parsed.astimezone(UTC)
 
 
-def _campaign_config_payload() -> dict[str, Any]:
+def _campaign_config_payload(settings: Any | None = None) -> dict[str, Any]:
+    active_settings = settings or load_settings(SETTINGS_JSON_PATH)
+    risk_route = active_settings.execution.okx
     return {
         "symbol": CAMPAIGN_SYMBOL,
         "timeframe": CAMPAIGN_TIMEFRAME,
@@ -252,9 +264,31 @@ def _campaign_config_payload() -> dict[str, Any]:
         "product": CAMPAIGN_PRODUCT,
         "margin_mode": CAMPAIGN_MARGIN_MODE,
         "sizing": {
-            "mode": CAMPAIGN_SIZING_MODE,
+            "mode": str(
+                getattr(
+                    risk_route,
+                    "sizing_mode",
+                    CAMPAIGN_DEFAULT_SIZING_MODE,
+                )
+            ),
             "equity_basis": CAMPAIGN_RISK_EQUITY_BASIS,
-            "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+            "fixed_quantity": (
+                str(risk_route.quantity)
+                if str(
+                    getattr(
+                        risk_route,
+                        "sizing_mode",
+                        CAMPAIGN_DEFAULT_SIZING_MODE,
+                    )
+                )
+                == "fixed_quantity"
+                else None
+            ),
+            "risk_capital_cap_usdt": str(
+                risk_route.risk_capital_cap_usdt
+            ),
+            "risk_percent": str(risk_route.risk_percent),
+            "maximum_leverage": str(risk_route.maximum_leverage),
             "fee_rate": str(CAMPAIGN_FEE_RATE),
             "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
             "price_source": (
@@ -278,14 +312,39 @@ def _campaign_config_payload() -> dict[str, Any]:
     }
 
 
-def campaign_config_fingerprint() -> str:
+def campaign_config_fingerprint(settings: Any | None = None) -> str:
     encoded = json.dumps(
-        _campaign_config_payload(),
+        _campaign_config_payload(settings),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _campaign_frozen_risk_values(
+    settings: Any,
+) -> dict[str, Any]:
+    route = settings.execution.okx
+    sizing_mode = str(
+        getattr(route, "sizing_mode", CAMPAIGN_DEFAULT_SIZING_MODE)
+    )
+    fixed_quantity = (
+        _positive_decimal(route.quantity)
+        if sizing_mode == "fixed_quantity"
+        else None
+    )
+    if sizing_mode == "fixed_quantity" and fixed_quantity <= 0:
+        raise CampaignError("固定张数模式必须设置正数合约张数")
+    return {
+        "frozen_risk_capital_cap_usdt": Decimal(
+            str(route.risk_capital_cap_usdt)
+        ),
+        "frozen_risk_percent": Decimal(str(route.risk_percent)),
+        "frozen_maximum_leverage": Decimal(str(route.maximum_leverage)),
+        "frozen_sizing_mode": sizing_mode,
+        "frozen_fixed_quantity": fixed_quantity,
+    }
 
 
 def build_campaign_settings(
@@ -379,6 +438,37 @@ def validate_campaign_settings(settings) -> None:
         )
 
 
+def _campaign_execution_bar_ms(execution: Any) -> int:
+    """从耐久分析记录核验一个 Campaign execution 所属的 K 线。"""
+
+    path = Path(execution.plan.analysis_record_path)
+    try:
+        path.resolve().relative_to(RECORDS_PENDING_DIR.resolve())
+    except (OSError, ValueError) as exc:
+        raise CampaignError(
+            f"execution {execution.id} 的分析记录不在实验记录目录"
+        ) from exc
+    record = load_record(path)
+    if record is None or not record.kline_data:
+        raise CampaignError(
+            f"execution {execution.id} 的分析记录不存在或不可读取"
+        )
+    if (
+        record.meta.symbol != CAMPAIGN_SYMBOL
+        or record.meta.timeframe != CAMPAIGN_TIMEFRAME
+        or record.meta.decision_stance != CAMPAIGN_STANCE
+    ):
+        raise CampaignError(
+            f"execution {execution.id} 的分析记录不属于本实验"
+        )
+    try:
+        return int(ts_open_to_ms(record.kline_data[0]["ts_open"]))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CampaignError(
+            f"execution {execution.id} 的分析记录缺少有效 K 线时间"
+        ) from exc
+
+
 class CampaignStateStore:
     """同目录原子替换实验状态。"""
 
@@ -395,21 +485,42 @@ class CampaignStateStore:
         except (OSError, ValueError) as exc:
             raise CampaignError(f"无法读取实验状态: {self.path}") from exc
 
-    def create_or_resume(self, *, now: datetime | None = None) -> CampaignState:
+    def create_or_resume(
+        self,
+        *,
+        now: datetime | None = None,
+        settings: Any | None = None,
+    ) -> CampaignState:
         current = (now or _utc_now()).astimezone(UTC)
         existing = self.load()
-        fingerprint = campaign_config_fingerprint()
+        active_settings = settings or load_settings(SETTINGS_JSON_PATH)
+        fingerprint = campaign_config_fingerprint(active_settings)
+        frozen_risk = _campaign_frozen_risk_values(active_settings)
         if existing is not None:
             if existing.config_fingerprint != fingerprint:
                 raise CampaignError("现有实验状态与当前固定配置不一致, 禁止覆盖")
             if existing.status == "completed":
                 raise CampaignError("该 24 小时实验已经完成, 禁止自动重新计时")
+            existing_frozen = {
+                field: getattr(existing, field)
+                for field in frozen_risk
+            }
+            if (
+                any(value is not None for value in existing_frozen.values())
+                and existing_frozen != frozen_risk
+            ):
+                raise CampaignError("现有实验状态的冻结风险参数与指纹不一致")
             return existing.model_copy(
-                update={"status": "active", "updated_at": current.isoformat()}
+                update={
+                    "status": "active",
+                    "updated_at": current.isoformat(),
+                    **frozen_risk,
+                }
             )
         return CampaignState(
             campaign_id=str(uuid.uuid4()),
             config_fingerprint=fingerprint,
+            **frozen_risk,
             started_at=current.isoformat(),
             expires_at=(current + CAMPAIGN_DURATION).isoformat(),
             updated_at=current.isoformat(),
@@ -421,11 +532,18 @@ class CampaignStateStore:
         reason: str,
         now: datetime | None = None,
         execution_lookup: Callable[[str], Any] | None = None,
+        settings: Any | None = None,
     ) -> CampaignState:
         """保留旧状态快照后，以明确新配置开启新的 Demo Campaign。"""
         current = (now or _utc_now()).astimezone(UTC)
         existing = self.load()
+        restart_last_completed_bar_ms = (
+            existing.last_completed_bar_ms
+            if existing is not None
+            else None
+        )
         if existing is not None:
+            owned_executions: dict[str, Any] = {}
             if existing.execution_ids:
                 if execution_lookup is None:
                     raise CampaignError(
@@ -433,20 +551,42 @@ class CampaignStateStore:
                     )
                 allowed_terminal_states = {
                     ExecutionState.CLOSED,
+                    ExecutionState.BLOCKED,
                     ExecutionState.CANCELED,
                     ExecutionState.REJECTED,
                 }
                 unresolved = []
                 for execution_id in existing.execution_ids:
                     execution = execution_lookup(execution_id)
+                    if execution is not None:
+                        owned_executions[execution_id] = execution
                     if (
                         execution is None
                         or execution.state not in allowed_terminal_states
+                        or bool(
+                            getattr(execution, "needs_attention", False)
+                        )
                     ):
                         unresolved.append(execution_id)
                 if unresolved:
                     raise CampaignError(
                         "旧 Campaign 仍有未确认终态的 execution，禁止直接切换配置"
+                    )
+            if (
+                existing.inflight_bar_ms is not None
+                and existing.last_execution_id in owned_executions
+            ):
+                execution_bar_ms = _campaign_execution_bar_ms(
+                    owned_executions[existing.last_execution_id]
+                )
+                if execution_bar_ms == existing.inflight_bar_ms:
+                    restart_last_completed_bar_ms = max(
+                        value
+                        for value in (
+                            restart_last_completed_bar_ms,
+                            execution_bar_ms,
+                        )
+                        if value is not None
                     )
             CAMPAIGN_HISTORY_DIR.mkdir(parents=True, exist_ok=True)
             archive = CAMPAIGN_HISTORY_DIR / (
@@ -457,19 +597,17 @@ class CampaignStateStore:
             archive_payload = {
                 "superseded_at": current.isoformat(),
                 "reason": reason,
-                "state": existing.model_dump(),
+                "state": existing.model_dump(mode="json"),
             }
             self._write_json(archive, archive_payload)
+        active_settings = settings or load_settings(SETTINGS_JSON_PATH)
         return CampaignState(
             campaign_id=str(uuid.uuid4()),
-            config_fingerprint=campaign_config_fingerprint(),
+            config_fingerprint=campaign_config_fingerprint(active_settings),
+            **_campaign_frozen_risk_values(active_settings),
             started_at=current.isoformat(),
             expires_at=(current + CAMPAIGN_DURATION).isoformat(),
-            last_completed_bar_ms=(
-                existing.last_completed_bar_ms
-                if existing is not None
-                else None
-            ),
+            last_completed_bar_ms=restart_last_completed_bar_ms,
             updated_at=current.isoformat(),
         )
 
@@ -483,13 +621,20 @@ class CampaignStateStore:
                 handle.write("\n")
                 handle.flush()
                 os.fsync(handle.fileno())
-            os.replace(temp_path, path)
+            for attempt in range(3):
+                try:
+                    os.replace(temp_path, path)
+                    break
+                except PermissionError:
+                    if attempt == 2:
+                        raise
+                    time.sleep(0.02 * (attempt + 1))
         except OSError as exc:
             raise CampaignError(f"无法耐久保存实验状态: {path}") from exc
 
     def save(self, state: CampaignState) -> None:
         updated = state.model_copy(update={"updated_at": _utc_now().isoformat()})
-        self._write_json(self.path, updated.model_dump())
+        self._write_json(self.path, updated.model_dump(mode="json"))
 
 
 class CampaignProcessLock:
@@ -553,8 +698,13 @@ def _positive_decimal(value: object) -> Decimal:
 class CampaignSizing:
     """一次 Demo 新开仓所需的不可变风险数量快照。"""
 
+    sizing_mode: Literal["risk_budget", "fixed_quantity"]
     quantity: Decimal
+    account_total_equity_usd: Decimal
     equity_usdt: Decimal
+    risk_capital_cap_usdt: Decimal
+    effective_risk_capital_usdt: Decimal
+    risk_percent: Decimal
     risk_budget_usdt: Decimal
     risk_used_usdt: Decimal
     reference_price_usdt: Decimal
@@ -583,9 +733,17 @@ class CampaignLeverageCandidate:
 def _campaign_sizing_snapshot(sizing: CampaignSizing) -> dict[str, str]:
     """把真实定仓输入和结果写成可长期复核的非秘密快照。"""
     return {
+        "sizing_mode": sizing.sizing_mode,
         "equity_basis": sizing.equity_basis,
+        "account_total_equity_usd": str(
+            sizing.account_total_equity_usd
+        ),
         "equity_usdt": str(sizing.equity_usdt),
-        "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+        "risk_capital_cap_usdt": str(sizing.risk_capital_cap_usdt),
+        "effective_risk_capital_usdt": str(
+            sizing.effective_risk_capital_usdt
+        ),
+        "risk_percent": str(sizing.risk_percent),
         "risk_budget_usdt": str(sizing.risk_budget_usdt),
         "risk_used_usdt": str(sizing.risk_used_usdt),
         "reference_price_usdt": str(sizing.reference_price_usdt),
@@ -703,15 +861,94 @@ def _demo_usdt_equity(balance_rows: list[dict[str, Any]]) -> Decimal:
     return sum(equities, Decimal("0"))
 
 
+def _demo_total_equity(balance_rows: list[dict[str, Any]]) -> Decimal:
+    totals = [
+        _positive_decimal(account.get("totalEq"))
+        for account in balance_rows
+        if _positive_decimal(account.get("totalEq")) > 0
+    ]
+    if len(totals) != 1:
+        raise CampaignError("OKX Demo 账户未返回唯一有效的 totalEq")
+    return totals[0]
+
+
+def _campaign_risk_policy(
+    *,
+    risk_capital_cap_usdt: object | None = None,
+    risk_percent: object | None = None,
+    maximum_leverage: object | None = None,
+) -> tuple[object, object, object]:
+    """返回冻结的用户风险配置；缺项只从正式设置读取，不使用动态余额兜底。"""
+
+    if (
+        risk_capital_cap_usdt is None
+        or risk_percent is None
+        or maximum_leverage is None
+    ):
+        route = load_settings(SETTINGS_JSON_PATH).execution.okx
+        risk_capital_cap_usdt = (
+            route.risk_capital_cap_usdt
+            if risk_capital_cap_usdt is None
+            else risk_capital_cap_usdt
+        )
+        risk_percent = (
+            route.risk_percent if risk_percent is None else risk_percent
+        )
+        maximum_leverage = (
+            route.maximum_leverage
+            if maximum_leverage is None
+            else maximum_leverage
+        )
+    return risk_capital_cap_usdt, risk_percent, maximum_leverage
+
+
+def _campaign_sizing_mode_policy(
+    *,
+    sizing_mode: object | None = None,
+    fixed_quantity: object | None = None,
+) -> tuple[Literal["risk_budget", "fixed_quantity"], object | None]:
+    """读取本轮冻结的定仓模式；固定张数缺失时明确失败。"""
+
+    if sizing_mode is None:
+        route = load_settings(SETTINGS_JSON_PATH).execution.okx
+        sizing_mode = getattr(
+            route,
+            "sizing_mode",
+            CAMPAIGN_DEFAULT_SIZING_MODE,
+        )
+        if fixed_quantity is None:
+            fixed_quantity = route.quantity
+    mode = str(sizing_mode or "").strip()
+    if mode not in {"risk_budget", "fixed_quantity"}:
+        raise CampaignError(f"不支持的 Campaign 定仓模式：{mode or '空'}")
+    if mode == "fixed_quantity" and _positive_decimal(fixed_quantity) <= 0:
+        raise CampaignError("固定张数模式必须设置正数合约张数")
+    return mode, fixed_quantity  # type: ignore[return-value]
+
+
 def resolve_campaign_sizing(
     client: OkxRestClient | None = None,
     *,
     entry_price: object | None = None,
     stop_loss_price: object | None = None,
     side: object | None = None,
+    risk_capital_cap_usdt: object | None = None,
+    risk_percent: object | None = None,
     leverage: object | None = None,
+    sizing_mode: object | None = None,
+    fixed_quantity: object | None = None,
 ) -> CampaignSizing:
     """用 PA 的入场/止损和 OKX 实时规格计算 Demo 首仓张数。"""
+    risk_capital_cap_usdt, risk_percent, _maximum_leverage = (
+        _campaign_risk_policy(
+            risk_capital_cap_usdt=risk_capital_cap_usdt,
+            risk_percent=risk_percent,
+        )
+    )
+    resolved_sizing_mode, fixed_quantity = _campaign_sizing_mode_policy(
+        sizing_mode=sizing_mode,
+        fixed_quantity=fixed_quantity,
+    )
     active_client = client or OkxRestClient(
         load_okx_credentials("demo"),
         base_url=CAMPAIGN_OKX_API_BASE_URL,
@@ -728,7 +965,9 @@ def resolve_campaign_sizing(
     if min(minimum, lot, contract_value, contract_multiplier) <= 0:
         raise CampaignError("OKX 黄金永续缺少有效的合约规格")
 
-    equity_usdt = _demo_usdt_equity(active_client.balance())
+    balance_rows = active_client.balance()
+    account_total_equity_usd = _demo_total_equity(balance_rows)
+    equity_usdt = _demo_usdt_equity(balance_rows)
     maximum = active_client.max_order_size(
         instrument=CAMPAIGN_INSTRUMENT,
         trade_mode=CAMPAIGN_MARGIN_MODE,
@@ -751,20 +990,30 @@ def resolve_campaign_sizing(
         raise CampaignError("PA 方向不是可计算风险的 long/short")
     selected_max = max_buy if side == "long" else max_sell
     try:
-        result = calculate_risk_size(
-            account_equity=equity_usdt,
-            risk_percent=CAMPAIGN_EQUITY_FRACTION,
-            entry_price=entry_price,
-            stop_loss_price=stop_loss_price,
-            side=side,
-            ct_val=contract_value,
-            ct_mult=contract_multiplier,
-            lot_sz=lot,
-            min_sz=minimum,
-            max_sz=selected_max,
-            fee_rate=CAMPAIGN_FEE_RATE,
-            slippage_rate=CAMPAIGN_SLIPPAGE_RATE,
-        )
+        common_inputs = {
+            "account_equity": equity_usdt,
+            "risk_capital_cap": risk_capital_cap_usdt,
+            "entry_price": entry_price,
+            "stop_loss_price": stop_loss_price,
+            "side": side,
+            "ct_val": contract_value,
+            "ct_mult": contract_multiplier,
+            "lot_sz": lot,
+            "min_sz": minimum,
+            "max_sz": selected_max,
+            "fee_rate": CAMPAIGN_FEE_RATE,
+            "slippage_rate": CAMPAIGN_SLIPPAGE_RATE,
+        }
+        if resolved_sizing_mode == "fixed_quantity":
+            result = calculate_fixed_quantity_risk(
+                **common_inputs,
+                quantity=fixed_quantity,
+            )
+        else:
+            result = calculate_risk_size(
+                **common_inputs,
+                risk_percent=risk_percent,
+            )
     except RiskCalculationFailure as exc:
         raise CampaignRiskBlocked(
             exc.code,
@@ -773,8 +1022,13 @@ def resolve_campaign_sizing(
             maximum_size=exc.maximum_size,
         ) from exc
     return CampaignSizing(
+        sizing_mode=resolved_sizing_mode,
         quantity=result.target_contract_size,
+        account_total_equity_usd=account_total_equity_usd,
         equity_usdt=equity_usdt,
+        risk_capital_cap_usdt=result.risk_capital_cap_usdt,
+        effective_risk_capital_usdt=result.effective_risk_capital_usdt,
+        risk_percent=result.risk_percent,
         risk_budget_usdt=result.risk_budget_usdt,
         risk_used_usdt=result.risk_used_usdt,
         reference_price_usdt=_positive_decimal(entry_price),
@@ -840,6 +1094,11 @@ def _record_effective_entry_price(
 def resolve_record_campaign_sizing(
     record: AnalysisRecord,
     client: OkxRestClient | None = None,
+    *,
+    risk_capital_cap_usdt: object | None = None,
+    risk_percent: object | None = None,
+    sizing_mode: object | None = None,
+    fixed_quantity: object | None = None,
 ) -> CampaignSizing:
     """把一份 PA 记录转换成唯一的 Demo 风险数量。"""
     entry_price, stop_loss_price, side = _record_risk_inputs(record)
@@ -859,14 +1118,33 @@ def resolve_record_campaign_sizing(
         entry_price=effective_entry_price,
         stop_loss_price=stop_loss_price,
         side=side,
+        risk_capital_cap_usdt=risk_capital_cap_usdt,
+        risk_percent=risk_percent,
+        sizing_mode=sizing_mode,
+        fixed_quantity=fixed_quantity,
     )
 
 
 def resolve_record_campaign_leverage(
     record: AnalysisRecord,
     analysis_digest: str,
+    *,
+    risk_capital_cap_usdt: object | None = None,
+    risk_percent: object | None = None,
+    maximum_leverage: object | None = None,
+    sizing_mode: object | None = None,
+    fixed_quantity: object | None = None,
 ) -> CampaignLeverageCandidate:
     """Build a Demo leverage candidate only after current capacity blocks."""
+    (
+        risk_capital_cap_usdt,
+        risk_percent,
+        maximum_leverage,
+    ) = _campaign_risk_policy(
+        risk_capital_cap_usdt=risk_capital_cap_usdt,
+        risk_percent=risk_percent,
+        maximum_leverage=maximum_leverage,
+    )
     entry_price, stop_loss_price, side = _record_risk_inputs(record)
     client = OkxRestClient(
         load_okx_credentials("demo"),
@@ -885,6 +1163,10 @@ def resolve_record_campaign_leverage(
             entry_price=effective_entry_price,
             stop_loss_price=stop_loss_price,
             side=side,
+            risk_capital_cap_usdt=risk_capital_cap_usdt,
+            risk_percent=risk_percent,
+            sizing_mode=sizing_mode,
+            fixed_quantity=fixed_quantity,
         )
     except CampaignRiskBlocked as exc:
         if exc.code != "max_size_exceeded" or exc.required_size is None:
@@ -935,6 +1217,7 @@ def resolve_record_campaign_leverage(
         entry_price=effective_entry_price,
         expected_account_identity=account_identity,
         okx_api_base_url=CAMPAIGN_OKX_API_BASE_URL,
+        maximum_leverage_cap=maximum_leverage,
     )
     if parameters is None:
         raise LeveragePlanningFailure(
@@ -946,7 +1229,11 @@ def resolve_record_campaign_leverage(
         entry_price=effective_entry_price,
         stop_loss_price=stop_loss_price,
         side=side,
+        risk_capital_cap_usdt=risk_capital_cap_usdt,
+        risk_percent=risk_percent,
         leverage=parameters.target_leverage,
+        sizing_mode=sizing_mode,
+        fixed_quantity=fixed_quantity,
     )
     if sizing.quantity != required_quantity:
         raise LeveragePlanningFailure(
@@ -1036,6 +1323,10 @@ def _canary_price_triplet(
                 entry_price=entry,
                 stop_loss_price=stop,
                 side=CANARY_DIRECTION,
+                risk_capital_cap_usdt=(
+                    runtime.settings.execution.okx.risk_capital_cap_usdt
+                ),
+                risk_percent=runtime.settings.execution.okx.risk_percent,
             )
             if sizing.quantity <= maximum_market_quantity:
                 break
@@ -1158,6 +1449,8 @@ def build_controlled_demo_s_record(
     base_record: AnalysisRecord,
     *,
     client: OkxRestClient,
+    risk_capital_cap_usdt: object | None = None,
+    risk_percent: object | None = None,
     now: datetime | None = None,
 ) -> tuple[AnalysisRecord, CampaignSizing]:
     """基于真实 10m 快照构造可复现的 Demo-S 三价，不伪装成自然信号。"""
@@ -1273,6 +1566,8 @@ def build_controlled_demo_s_record(
                 entry_price=shifted_entry,
                 stop_loss_price=stop,
                 side=direction,
+                risk_capital_cap_usdt=risk_capital_cap_usdt,
+                risk_percent=risk_percent,
             )
             break
         except CampaignRiskBlocked as exc:
@@ -1642,7 +1937,7 @@ def run_demo_lifecycle_canary(
 
 
 def run_controlled_demo_s() -> dict[str, str]:
-    """用真实 10m 记录、真实监督和生产执行链完成 Demo-S。"""
+    """用真实 10m 记录和确定性生产执行链完成 Demo-S。"""
     preflight = okx_demo_private_preflight()
     state = CampaignStateStore().load()
     if state is None or state.status != "active":
@@ -1678,45 +1973,13 @@ def run_controlled_demo_s() -> dict[str, str]:
         record, sizing = build_controlled_demo_s_record(
             base_record,
             client=client,
+            risk_capital_cap_usdt=(
+                runtime.settings.execution.okx.risk_capital_cap_usdt
+            ),
+            risk_percent=runtime.settings.execution.okx.risk_percent,
         )
         runtime.writer.save_full_durable(record)
         _apply_campaign_sizing(runtime, sizing)
-        record_path = Path(runtime.writer.full_path(record))
-        digest = hashlib.sha256(record_path.read_bytes()).hexdigest()
-        supervision = runtime.supervisor.review(
-            campaign_id=state.campaign_id,
-            record=record,
-            bar_ms=bar_ms,
-            analysis_digest=digest,
-            active_execution_count=0,
-            sizing=sizing,
-        )
-        state = state.model_copy(
-            update={
-                "supervisor_record_ids": list(
-                    dict.fromkeys(
-                        [
-                            *state.supervisor_record_ids,
-                            supervision.record_id,
-                        ]
-                    )
-                ),
-                "last_supervisor_action": supervision.action,
-                "last_plan_result": (
-                    f"blocked:supervisor:{supervision.fallback_level}"
-                    if supervision.action != "allow_entry"
-                    else state.last_plan_result
-                ),
-                "last_error": "",
-                "updated_at": _utc_now().isoformat(),
-            }
-        )
-        CampaignStateStore().save(state)
-        if supervision.action != "allow_entry":
-            raise CampaignError(
-                "Demo-S 真实监督未放行: "
-                f"{supervision.fallback_level}: {supervision.reason}"
-            )
 
         execution = service.prepare_analysis(record)
         execution_id = execution.id
@@ -1725,16 +1988,7 @@ def run_controlled_demo_s() -> dict[str, str]:
                 "execution_ids": list(
                     dict.fromkeys([*state.execution_ids, execution.id])
                 ),
-                "supervisor_record_ids": list(
-                    dict.fromkeys(
-                        [
-                            *state.supervisor_record_ids,
-                            supervision.record_id,
-                        ]
-                    )
-                ),
                 "last_execution_id": execution.id,
-                "last_supervisor_action": supervision.action,
                 "executions_prepared": state.executions_prepared + 1,
                 "last_plan_result": f"execution:{execution.state.value}",
                 "last_error": "",
@@ -1791,9 +2045,8 @@ def run_controlled_demo_s() -> dict[str, str]:
             "state": closed.state.value,
             "origin": CONTROLLED_DEMO_S_ORIGIN,
             "provenance": record.meta.market_data_provenance,
-            "supervision_record_id": supervision.record_id,
-            "supervision_action": supervision.action,
-            "supervised_quantity": str(sizing.quantity),
+            "authorization_mode": "deterministic_script",
+            "risk_sized_quantity": str(sizing.quantity),
             "quantity": str(closed.plan.quantity),
             "equity_usdt": str(sizing.equity_usdt),
             "max_buy": str(sizing.max_buy),
@@ -1841,12 +2094,16 @@ def run_controlled_demo_s() -> dict[str, str]:
             runtime.source.disconnect()
 
 
-def okx_demo_private_preflight() -> dict[str, Any]:
+def okx_demo_private_preflight(
+    settings: Any | None = None,
+) -> dict[str, Any]:
     """用模拟标头完成账户、规格、容量和行情只读验证。
 
     这里没有 PA 的入场和止损，所以不计算可下单数量；缺少止损时风险引擎
     必须阻断，而不是偷偷退回旧固定数量。
     """
+    settings = settings or load_settings(SETTINGS_JSON_PATH)
+    risk_route = settings.execution.okx
     client = OkxRestClient(
         load_okx_credentials("demo"),
         base_url=CAMPAIGN_OKX_API_BASE_URL,
@@ -1870,6 +2127,10 @@ def okx_demo_private_preflight() -> dict[str, Any]:
     if min(minimum, lot, contract_value, contract_multiplier) <= 0:
         raise CampaignError("OKX 黄金永续缺少有效的合约规格")
     equity_usdt = _demo_usdt_equity(client.balance())
+    effective_risk_capital_usdt = min(
+        equity_usdt,
+        risk_route.risk_capital_cap_usdt,
+    )
     ticker = client.ticker(CAMPAIGN_INSTRUMENT)
     reference_price = _positive_decimal(ticker.get("last"))
     if reference_price <= 0:
@@ -1900,10 +2161,25 @@ def okx_demo_private_preflight() -> dict[str, Any]:
         "account_identity_present": True,
         "instrument": CAMPAIGN_INSTRUMENT,
         "instrument_state": "live",
-        "sizing_mode": CAMPAIGN_SIZING_MODE,
+        "sizing_mode": risk_route.sizing_mode,
+        "fixed_quantity": (
+            str(risk_route.quantity)
+            if risk_route.sizing_mode == "fixed_quantity"
+            else ""
+        ),
         "equity_basis": CAMPAIGN_RISK_EQUITY_BASIS,
         "equity_usdt": str(equity_usdt),
-        "risk_percent": str(CAMPAIGN_EQUITY_FRACTION),
+        "risk_capital_cap_usdt": str(risk_route.risk_capital_cap_usdt),
+        "effective_risk_capital_usdt": str(
+            effective_risk_capital_usdt
+        ),
+        "risk_percent": str(risk_route.risk_percent),
+        "risk_budget_usdt": (
+            str(effective_risk_capital_usdt * risk_route.risk_percent)
+            if risk_route.sizing_mode == "risk_budget"
+            else "requires_entry_and_stop"
+        ),
+        "maximum_leverage": str(risk_route.maximum_leverage),
         "fee_rate": str(CAMPAIGN_FEE_RATE),
         "slippage_rate": str(CAMPAIGN_SLIPPAGE_RATE),
         "reference_price_usdt": str(reference_price),
@@ -2049,7 +2325,9 @@ class CampaignRuntime:
     writer: PendingWriter
     orchestrator: TwoStageOrchestrator
     execution_service: ExecutionController
-    supervisor: SupervisorGate
+    # 普通交易不依赖逐笔 AI 审批；外部只读监控 Agent 负责异常反馈。
+    # 保留可选字段仅兼容历史测试构造，不参与生产交易路径。
+    supervisor: Any | None = None
     sizing_resolver: Callable[[AnalysisRecord], CampaignSizing] = (
         resolve_record_campaign_sizing
     )
@@ -2075,7 +2353,9 @@ def _apply_campaign_sizing(
 
 _CAMPAIGN_SIZING_FINGERPRINT_FIELDS = (
     "equity_basis",
-    "equity_usdt",
+    "risk_capital_cap_usdt",
+    "effective_risk_capital_usdt",
+    "risk_percent",
     "risk_budget_usdt",
     "risk_used_usdt",
     "quantity",
@@ -2084,8 +2364,6 @@ _CAMPAIGN_SIZING_FINGERPRINT_FIELDS = (
     "worst_case_loss_per_contract_usdt",
     "fee_per_contract_usdt",
     "slippage_per_contract_usdt",
-    "max_buy",
-    "max_sell",
 )
 
 
@@ -2102,7 +2380,7 @@ def _require_fresh_campaign_sizing(
     record: AnalysisRecord,
     initial: CampaignSizing,
 ) -> CampaignSizing:
-    """提交前重新读 USDT 权益，余额变化就让旧计划失效。"""
+    """提交前重算风险；仅真正改变授权风险数量的输入才让计划失效。"""
     current = runtime.sizing_resolver(record)
     if _campaign_sizing_fingerprint(current) != _campaign_sizing_fingerprint(initial):
         raise CampaignRiskBlocked(
@@ -2114,13 +2392,14 @@ def _require_fresh_campaign_sizing(
 
 def build_runtime(
     *,
+    base_settings: Any | None = None,
     resolved_quantity: Decimal | str | None = None,
     entry_order_mode: str | None = None,
     exit_order_mode: str | None = None,
     entry_slippage_atr_multiple: Decimal | float | str | None = None,
     exit_slippage_atr_multiple: Decimal | float | str | None = None,
 ) -> CampaignRuntime:
-    base_settings = load_settings(SETTINGS_JSON_PATH)
+    base_settings = base_settings or load_settings(SETTINGS_JSON_PATH)
     # 分析结果尚未产生时没有 entry/stop，不能预先猜数量；只用合法的内存
     # 启动值，真正创建计划前必须由风险引擎覆盖。
     sizing_quantity = resolved_quantity or CAMPAIGN_BOOTSTRAP_QUANTITY
@@ -2166,15 +2445,6 @@ def build_runtime(
         exp_reader=exp_reader,
         settings=settings,
     )
-    supervisor_writer = SupervisorWriter(
-        RECORDS_PENDING_DIR.parent / "supervisor"
-    )
-    supervisor = build_supervisor_gate(
-        settings,
-        prompt_path=PROMPT_DIR / "交易监督智能体.txt",
-        writer=supervisor_writer,
-        logger_=logger,
-    )
     service = ExecutionController(
         settings=settings,
         pending_writer=writer,
@@ -2183,13 +2453,39 @@ def build_runtime(
     source = OkxCampaignSource()
     source.connect()
     source.subscribe(CAMPAIGN_SYMBOL, CAMPAIGN_TIMEFRAME)
+    risk_route = settings.execution.okx
+
+    def _sizing_resolver(record: AnalysisRecord) -> CampaignSizing:
+        return resolve_record_campaign_sizing(
+            record,
+            risk_capital_cap_usdt=risk_route.risk_capital_cap_usdt,
+            risk_percent=risk_route.risk_percent,
+            sizing_mode=risk_route.sizing_mode,
+            fixed_quantity=risk_route.quantity,
+        )
+
+    def _leverage_resolver(
+        record: AnalysisRecord,
+        analysis_digest: str,
+    ) -> CampaignLeverageCandidate:
+        return resolve_record_campaign_leverage(
+            record,
+            analysis_digest,
+            risk_capital_cap_usdt=risk_route.risk_capital_cap_usdt,
+            risk_percent=risk_route.risk_percent,
+            maximum_leverage=risk_route.maximum_leverage,
+            sizing_mode=risk_route.sizing_mode,
+            fixed_quantity=risk_route.quantity,
+        )
+
     return CampaignRuntime(
         settings=settings,
         source=source,
         writer=writer,
         orchestrator=orchestrator,
         execution_service=service,
-        supervisor=supervisor,
+        sizing_resolver=_sizing_resolver,
+        leverage_resolver=_leverage_resolver,
     )
 
 
@@ -2205,6 +2501,19 @@ class OkxDemoCampaign:
         poll_seconds: float = CAMPAIGN_POLL_SECONDS,
         closeout_seconds: float = CAMPAIGN_CLOSEOUT_SECONDS,
     ) -> None:
+        expected_fingerprint = campaign_config_fingerprint(runtime.settings)
+        expected_frozen = _campaign_frozen_risk_values(runtime.settings)
+        actual_frozen = {
+            field: getattr(state, field)
+            for field in expected_frozen
+        }
+        if (
+            state.config_fingerprint != expected_fingerprint
+            or actual_frozen != expected_frozen
+        ):
+            raise CampaignError(
+                "Campaign 运行时设置与状态文件冻结参数不一致，禁止启动"
+            )
         self.runtime = runtime
         self.state_store = state_store
         self.state = state
@@ -2214,6 +2523,108 @@ class OkxDemoCampaign:
     def _save_state(self, **updates: Any) -> None:
         self.state = self.state.model_copy(update=updates)
         self.state_store.save(self.state)
+
+    def _recover_transient_risk_stop_for_bar(self, bar_ms: int) -> bool:
+        """每根新 K 线最多复核一次明确允许的临时只读故障。"""
+
+        service = self.runtime.execution_service
+        attempted_bar = self.state.risk_recovery_bar_ms
+        if attempted_bar is not None and attempted_bar != bar_ms:
+            if (
+                self.state.last_completed_bar_ms is not None
+                and attempted_bar <= self.state.last_completed_bar_ms
+            ):
+                self._save_state(
+                    risk_recovery_bar_ms=None,
+                    risk_recovery_command_id="",
+                )
+                attempted_bar = None
+            else:
+                raise CampaignError(
+                    "上一根 K 线的临时风险恢复结果尚未确认，禁止进入下一根"
+                )
+
+        if attempted_bar == bar_ms:
+            command_id = self.state.risk_recovery_command_id
+            if not command_id:
+                # 可能崩溃在命令入队后、命令 ID 落盘前。此时宁可跳过本根，
+                # 也不能猜测命令未入队后再创建第二条恢复命令。
+                self._save_state(
+                    inflight_bar_ms=None,
+                    risk_recovery_bar_ms=None,
+                    risk_recovery_command_id="",
+                    last_completed_bar_ms=bar_ms,
+                    last_plan_result="blocked:risk:recovery_command_unconfirmed",
+                    last_error="临时风险恢复命令是否入队无法确认，本轮不下单",
+                )
+                return False
+            try:
+                result = service.wait_for_command(command_id, timeout=30.0)
+            except (LiveTradingDisabled, TimeoutError) as exc:
+                raise DataSourceTransientError(
+                    "临时风险恢复仍在等待同一条命令结果"
+                ) from exc
+            return self._finish_transient_risk_recovery(bar_ms, result)
+
+        risk_state = service.worker_store.get_risk_runtime_state(
+            "okx:demo:okx"
+        )
+        if (
+            risk_state is None
+            or not risk_state.kill_active
+            or risk_state.kill_reason
+            not in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS
+        ):
+            return True
+
+        # 先落“本根已尝试”标记，再创建命令。若进程在两次落盘之间崩溃，
+        # 重启后会跳过本根，不会重复创建恢复命令。
+        self._save_state(
+            risk_recovery_bar_ms=bar_ms,
+            risk_recovery_command_id="",
+        )
+        command = service.recover_transient_risk_stop()
+        self._save_state(risk_recovery_command_id=command.id)
+        try:
+            result = service.wait_for_command(command.id, timeout=30.0)
+        except (LiveTradingDisabled, TimeoutError) as exc:
+            raise DataSourceTransientError(
+                "临时风险恢复仍在等待同一条命令结果"
+            ) from exc
+        return self._finish_transient_risk_recovery(bar_ms, result)
+
+    def _finish_transient_risk_recovery(
+        self,
+        bar_ms: int,
+        result,
+    ) -> bool:
+        """收口一条已耐久记录的临时风险恢复命令。"""
+
+        if result.status is WorkerCommandStatus.SUCCEEDED:
+            self._save_state(
+                risk_recovery_bar_ms=None,
+                risk_recovery_command_id="",
+            )
+            logger.info(
+                "临时风险读取故障已由新鲜完整证据恢复: command=%s",
+                result.id,
+            )
+            return True
+
+        failure = result.failure_code or result.status.value
+        self._save_state(
+            inflight_bar_ms=None,
+            risk_recovery_bar_ms=None,
+            risk_recovery_command_id="",
+            last_completed_bar_ms=bar_ms,
+            last_plan_result="blocked:risk:transient_read_unavailable",
+            last_error="风险账户读取尚未恢复，本轮不下单",
+        )
+        logger.warning(
+            "临时风险读取故障复核未通过，本根 K 线不分析、不下单: %s",
+            failure,
+        )
+        return False
 
     def _recover_record_for_bar(self, bar_ms: int):
         record = find_latest_successful_record(
@@ -2235,32 +2646,7 @@ class OkxDemoCampaign:
         return record if record_bar_ms == bar_ms else None
 
     def _execution_bar_ms(self, execution) -> int:
-        path = Path(execution.plan.analysis_record_path)
-        try:
-            path.resolve().relative_to(RECORDS_PENDING_DIR.resolve())
-        except (OSError, ValueError) as exc:
-            raise CampaignError(
-                f"execution {execution.id} 的分析记录不在实验记录目录"
-            ) from exc
-        record = load_record(path)
-        if record is None or not record.kline_data:
-            raise CampaignError(
-                f"execution {execution.id} 的分析记录不存在或不可读取"
-            )
-        if (
-            record.meta.symbol != CAMPAIGN_SYMBOL
-            or record.meta.timeframe != CAMPAIGN_TIMEFRAME
-            or record.meta.decision_stance != CAMPAIGN_STANCE
-        ):
-            raise CampaignError(
-                f"execution {execution.id} 的分析记录不属于本实验"
-            )
-        try:
-            return int(ts_open_to_ms(record.kline_data[0]["ts_open"]))
-        except (KeyError, TypeError, ValueError) as exc:
-            raise CampaignError(
-                f"execution {execution.id} 的分析记录缺少有效 K 线时间"
-            ) from exc
+        return _campaign_execution_bar_ms(execution)
 
     def _owned_ready_executions(self):
         ready = []
@@ -2379,9 +2765,25 @@ class OkxDemoCampaign:
             if execution_bar_ms != bar_ms:
                 continue
             state = execution.state
-            if state is ExecutionState.UNKNOWN:
+            if (
+                state in {ExecutionState.UNKNOWN, ExecutionState.ERROR}
+                or bool(getattr(execution, "needs_attention", False))
+            ):
                 raise CampaignError(
-                    f"execution {execution.id} 的提交结果未知，禁止自动重试"
+                    f"execution {execution.id} 需要人工核对，禁止自动进入下一根"
+                )
+            safe_terminal_states = {
+                ExecutionState.BLOCKED,
+                ExecutionState.CANCELED,
+                ExecutionState.REJECTED,
+                ExecutionState.CLOSED,
+            }
+            if (
+                state not in ACTIVE_EXECUTION_STATES
+                and state not in safe_terminal_states
+            ):
+                raise CampaignError(
+                    f"execution {execution.id} 状态 {state.value} 不允许自动恢复"
                 )
             self._save_state(
                 inflight_bar_ms=None,
@@ -2411,7 +2813,7 @@ class OkxDemoCampaign:
             )
 
     def _refresh_order_quantity(self, record: AnalysisRecord) -> CampaignSizing:
-        """在监督和计划耐久化前，用此刻风险快照刷新本次实际合约数。"""
+        """在计划耐久化前，用此刻风险快照刷新本次实际合约数。"""
         sizing = self.runtime.sizing_resolver(record)
         _apply_campaign_sizing(self.runtime, sizing)
         logger.info(
@@ -2429,19 +2831,149 @@ class OkxDemoCampaign:
         return sizing
 
     @staticmethod
-    def _is_supervision_candidate(record: Any) -> bool:
+    def _record_order_direction(record: Any) -> str | None:
         if getattr(record, "exception", None) is not None:
-            return False
+            return None
         stage2 = getattr(record, "stage2_decision", None)
         if not isinstance(stage2, dict) or stage2.get("gate_shortcircuited"):
-            return False
+            return None
         decision = stage2.get("decision")
         if not isinstance(decision, dict):
-            return False
-        return str(decision.get("order_type") or "").strip() not in {
+            return None
+        if str(decision.get("order_type") or "").strip() in {
             "",
             "不下单",
-        }
+        }:
+            return None
+        direction = {
+            "做多": "long",
+            "做空": "short",
+        }.get(str(decision.get("order_direction") or "").strip())
+        if direction is None:
+            raise CampaignError("PA 可执行决策缺少明确的做多/做空方向")
+        return direction
+
+    @classmethod
+    def _is_new_risk_candidate(cls, record: Any) -> bool:
+        return cls._record_order_direction(record) is not None
+
+    def _apply_existing_position_script(
+        self,
+        record: AnalysisRecord,
+        bar_ms: int,
+        completed_count: int,
+    ) -> bool:
+        """同向持有；反向先清掉旧执行，再允许走完整的新风险链。"""
+        active = self._owned_active_executions()
+        if not active:
+            return False
+        if len(active) != 1:
+            raise CampaignError(
+                f"同一 Campaign 出现 {len(active)} 条活动执行，禁止脚本自动处置"
+            )
+
+        execution = active[0]
+        current_direction = str(
+            getattr(getattr(execution, "plan", None), "direction", "")
+        ).strip()
+        if current_direction not in {"long", "short"}:
+            raise CampaignError("活动执行缺少可核验的持仓方向")
+        proposed_direction = self._record_order_direction(record)
+
+        if (
+            execution.state is ExecutionState.UNKNOWN
+            or bool(getattr(execution, "needs_attention", False))
+        ):
+            raise CampaignError(
+                "活动执行状态不明或需要人工关注，禁止脚本自动处置"
+            )
+        if (
+            proposed_direction is None
+            or proposed_direction == current_direction
+            or execution.state
+            in {
+                ExecutionState.SUBMITTING,
+                ExecutionState.EXIT_PENDING,
+            }
+        ):
+            self._save_state(
+                inflight_bar_ms=None,
+                last_completed_bar_ms=bar_ms,
+                analyses_completed=completed_count,
+                last_execution_id=execution.id,
+                last_plan_result=f"script:hold:{execution.state.value}",
+                last_error="",
+            )
+            return True
+
+        service = self.runtime.execution_service
+        timeout = float(self.runtime.settings.execution.entry_timeout_seconds) + 60
+        if execution.state in {
+            ExecutionState.ENTRY_PENDING,
+            ExecutionState.PARTIALLY_FILLED,
+        }:
+            cancel = service.cancel_entry(execution.id)
+            cancel_result = self._wait_for_worker_command(
+                cancel.id,
+                action="反向前撤销旧入场",
+                allow_failed=True,
+            )
+            if cancel_result.status is WorkerCommandStatus.FAILED:
+                raced = service.get_execution(execution.id)
+                if raced is None:
+                    raise CampaignError("撤单竞态后旧 execution 消失")
+                if raced.state not in {
+                    ExecutionState.CANCELED,
+                    ExecutionState.CLOSED,
+                    ExecutionState.PROTECTING,
+                    ExecutionState.OPEN,
+                }:
+                    raise CampaignError(
+                        "反向前撤单失败且旧执行未进入可安全续接状态："
+                        f"{raced.state.value}"
+                    )
+                execution = raced
+            else:
+                execution = _wait_for_execution_state(
+                    service,
+                    execution.id,
+                    accepted={
+                        ExecutionState.CANCELED,
+                        ExecutionState.CLOSED,
+                        ExecutionState.PROTECTING,
+                        ExecutionState.OPEN,
+                    },
+                    timeout=timeout,
+                )
+            if execution.state in {
+                ExecutionState.CANCELED,
+                ExecutionState.CLOSED,
+            }:
+                return False
+
+        if execution.state in {
+            ExecutionState.PROTECTING,
+            ExecutionState.OPEN,
+        }:
+            exit_command = service.request_exit(
+                execution.id,
+                reason="PA 已收盘 K 线出现反向可执行信号",
+            )
+            self._wait_for_worker_command(
+                exit_command.id,
+                action="反向前主动离场",
+            )
+            _wait_for_execution_state(
+                service,
+                execution.id,
+                accepted={ExecutionState.CLOSED},
+                timeout=timeout,
+            )
+            return False
+
+        raise CampaignError(
+            f"活动执行状态 {execution.state.value} 不允许脚本自动反向"
+        )
 
     def _analysis_digest(self, record: AnalysisRecord) -> str:
         """Use the exact durable analysis bytes consumed by plan_builder."""
@@ -2458,7 +2990,7 @@ class OkxDemoCampaign:
                 separators=(",", ":"),
             ).encode("utf-8")
             return hashlib.sha256(payload).hexdigest()
-        raise CampaignError("无法为监督结论建立 PA 分析摘要")
+        raise CampaignError("无法为确定性执行脚本建立 PA 分析摘要")
 
     @staticmethod
     def _validate_record_context(
@@ -2508,10 +3040,13 @@ class OkxDemoCampaign:
 
         sizing: CampaignSizing | None = None
         leverage_parameters: SetLeverageParameters | None = None
-        if self._is_supervision_candidate(record):
-            active_execution_count = len(
-                self.runtime.execution_service.list_active()
-            )
+        if self._apply_existing_position_script(
+            record,
+            bar_ms,
+            completed_count,
+        ):
+            return
+        if self._is_new_risk_candidate(record):
             try:
                 sizing = self._refresh_order_quantity(record)
             except CampaignRiskBlocked as exc:
@@ -2588,59 +3123,7 @@ class OkxDemoCampaign:
                     leverage_parameters,
                     analysis_digest=self._analysis_digest(record),
                 )
-            supervision = self.runtime.supervisor.review(
-                campaign_id=self.state.campaign_id,
-                record=record,
-                bar_ms=bar_ms,
-                analysis_digest=self._analysis_digest(record),
-                active_execution_count=active_execution_count,
-                sizing=sizing,
-            )
-            supervisor_ids = list(
-                dict.fromkeys(
-                    [*self.state.supervisor_record_ids, supervision.record_id]
-                )
-            )
-            self._save_state(
-                supervisor_record_ids=supervisor_ids,
-                last_supervisor_action=supervision.action,
-                last_error="",
-            )
-            if supervision.action != "allow_entry":
-                self._save_state(
-                    inflight_bar_ms=None,
-                    last_completed_bar_ms=bar_ms,
-                    analyses_completed=completed_count,
-                    last_plan_result=(
-                        f"blocked:supervisor:{supervision.fallback_level}"
-                    ),
-                    last_error="",
-                )
-                logger.info(
-                    "监督智能体阻断入场: action=%s fallback=%s reason=%s",
-                    supervision.action,
-                    supervision.fallback_level,
-                    supervision.reason,
-                )
-                return
             if leverage_parameters is not None:
-                supervisor_path = (
-                    self.runtime.supervisor.writer.path_for_key(
-                        campaign_id=self.state.campaign_id,
-                        bar_ms=bar_ms,
-                        analysis_digest=leverage_parameters.analysis_digest,
-                    ).resolve()
-                )
-                if not supervisor_path.is_file():
-                    raise CampaignError("监督放行记录没有耐久落盘")
-                leverage_parameters = _rebuild_leverage_parameters(
-                    leverage_parameters,
-                    supervisor_record_id=supervision.record_id,
-                    supervisor_record_path=str(supervisor_path),
-                    supervisor_record_digest=hashlib.sha256(
-                        supervisor_path.read_bytes()
-                    ).hexdigest(),
-                )
                 self._ensure_demo_write_session()
                 leverage_command = (
                     self.runtime.execution_service.set_leverage(
@@ -2715,7 +3198,7 @@ class OkxDemoCampaign:
                     != leverage_parameters.analysis_digest
                 ):
                     raise CampaignError(
-                        "监督放行后的耐久分析摘要发生变化"
+                        "杠杆执行后的耐久分析摘要发生变化"
                     )
 
         try:
@@ -2771,13 +3254,41 @@ class OkxDemoCampaign:
                     logger.info("提交前风险快照已失效：%s", exc)
                     return
             command = self.runtime.execution_service.submit(execution.id)
-            self._wait_for_worker_command(command.id, action="提交入场")
+            submit_result = self._wait_for_worker_command(
+                command.id,
+                action="提交入场",
+                allow_failed=True,
+            )
             refreshed = self.runtime.execution_service.get_execution(
                 execution.id
             )
             if refreshed is None:
                 raise CampaignError("提交后执行记录消失")
             execution = refreshed
+            if submit_result.status is WorkerCommandStatus.FAILED:
+                if execution.state is not ExecutionState.BLOCKED:
+                    raise CampaignError(
+                        "提交命令确定失败，但执行记录没有进入安全阻断终态"
+                    )
+                reason = str(
+                    getattr(execution, "state_reason", "")
+                    or getattr(execution, "last_error", "")
+                    or "提交前风险闸门阻断"
+                )
+                self._save_state(
+                    inflight_bar_ms=None,
+                    last_completed_bar_ms=bar_ms,
+                    last_plan_result=(
+                        "blocked:submit:"
+                        f"{submit_result.failure_code or 'blocked'}"
+                    ),
+                    last_error=reason,
+                )
+                logger.info(
+                    "提交前确定性阻断，未触达券商写入，本轮结束: %s",
+                    reason,
+                )
+                return
         logger.info(
             "执行记录已准备: id=%s state=%s",
             execution.id,
@@ -2812,6 +3323,8 @@ class OkxDemoCampaign:
             and bar_ms <= self.state.last_completed_bar_ms
         ):
             return False
+        if not self._recover_transient_risk_stop_for_bar(bar_ms):
+            return True
 
         if self.state.inflight_bar_ms == bar_ms:
             recovered = self._recover_record_for_bar(bar_ms)
@@ -2929,17 +3442,25 @@ class OkxDemoCampaign:
                 "OKX Demo 新增风险短租约未能生效"
             )
 
-    def _wait_for_worker_command(self, command_id: str, *, action: str) -> None:
+    def _wait_for_worker_command(
+        self,
+        command_id: str,
+        *,
+        action: str,
+        allow_failed: bool = False,
+    ):
         result = self.runtime.execution_service.wait_for_command(
             command_id,
             timeout=30.0,
         )
         if result.status is WorkerCommandStatus.SUCCEEDED:
-            return
+            return result
         if result.status is WorkerCommandStatus.UNCERTAIN:
             raise CampaignError(
                 f"{action}结果不明，禁止自动重试；请先完成券商只读对账"
             )
+        if allow_failed:
+            return result
         raise CampaignError(
             f"{action}失败：{result.failure_code or result.status.value}"
         )
@@ -3036,10 +3557,12 @@ class OkxDemoCampaign:
                 logger.info("OKX Demo 实验已完成, 活动执行为 0")
                 return True
             for execution in active:
-                if execution.state == ExecutionState.ENTRY_PENDING:
+                if execution.state in {
+                    ExecutionState.ENTRY_PENDING,
+                    ExecutionState.PARTIALLY_FILLED,
+                }:
                     self.runtime.execution_service.cancel_entry(execution.id)
                 elif execution.state in {
-                    ExecutionState.PARTIALLY_FILLED,
                     ExecutionState.PROTECTING,
                     ExecutionState.OPEN,
                 }:
@@ -3066,9 +3589,15 @@ def _safe_status(state_store: CampaignStateStore) -> dict[str, Any]:
     state = state_store.load()
     if state is None:
         return {"exists": False}
-    payload = state.model_dump()
+    payload = state.model_dump(mode="json")
     payload["exists"] = True
-    payload["config"] = _campaign_config_payload()
+    payload["config"] = {
+        "sizing_mode": payload["frozen_sizing_mode"],
+        "fixed_quantity": payload["frozen_fixed_quantity"],
+        "risk_capital_cap_usdt": payload["frozen_risk_capital_cap_usdt"],
+        "risk_percent": payload["frozen_risk_percent"],
+        "maximum_leverage": payload["frozen_maximum_leverage"],
+    }
     return payload
 
 
@@ -3122,7 +3651,7 @@ def main(argv: list[str] | None = None) -> int:
     base_settings = load_settings(SETTINGS_JSON_PATH)
     configure_logging(api_key=base_settings.provider.api_key)
     try:
-        preflight = okx_demo_private_preflight()
+        preflight = okx_demo_private_preflight(base_settings)
     except Exception as exc:
         logger.error("OKX Demo 私有只读预检失败: %s", exc)
         return 2
@@ -3177,12 +3706,13 @@ def main(argv: list[str] | None = None) -> int:
                 state_store.restart(
                     reason="用户授权更新 10m OKX Demo 运行器配置",
                     execution_lookup=execution_store.get,
+                    settings=base_settings,
                 )
                 if args.command == "restart"
-                else state_store.create_or_resume()
+                else state_store.create_or_resume(settings=base_settings)
             )
             state_store.save(state)
-            runtime = build_runtime()
+            runtime = build_runtime(base_settings=base_settings)
             campaign = OkxDemoCampaign(runtime, state_store, state)
             completed = campaign.run()
             return 0 if completed else 3

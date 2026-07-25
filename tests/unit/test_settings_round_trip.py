@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from decimal import Decimal
 from threading import Event, Thread
 from unittest.mock import patch
 
@@ -182,9 +183,13 @@ def test_execution_routes_round_trip_without_credentials(tmp_path):
     original.execution.selected_broker = "okx"
     original.execution.okx.source_symbol = "BTCUSD"
     original.execution.okx.instrument = "BTC-USDT-SWAP"
+    original.execution.okx.sizing_mode = "fixed_quantity"
     original.execution.okx.quantity = "0.25"
     original.execution.okx.product = "swap"
     original.execution.okx.margin_mode = "isolated"
+    original.execution.okx.risk_capital_cap_usdt = "5000"
+    original.execution.okx.risk_percent = "0.08"
+    original.execution.okx.maximum_leverage = "25"
 
     save_settings(original, p)
     loaded = load_settings(p)
@@ -193,7 +198,11 @@ def test_execution_routes_round_trip_without_credentials(tmp_path):
     assert loaded.execution.enabled is True
     assert loaded.execution.selected_broker == "okx"
     assert loaded.execution.okx.instrument == "BTC-USDT-SWAP"
+    assert loaded.execution.okx.sizing_mode == "fixed_quantity"
     assert loaded.execution.okx.margin_mode == "isolated"
+    assert loaded.execution.okx.risk_capital_cap_usdt == 5000
+    assert loaded.execution.okx.risk_percent == Decimal("0.08")
+    assert loaded.execution.okx.maximum_leverage == 25
     assert "api_key" not in raw["execution"]["okx"]
     assert "passphrase" not in raw["execution"]["okx"]
 

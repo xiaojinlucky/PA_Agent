@@ -40,10 +40,10 @@ from pa_agent.execution.worker_protocol import (
 )
 from pa_agent.risk.sizing import (
     DEFAULT_FEE_RATE,
-    DEFAULT_RISK_PERCENT,
     DEFAULT_SLIPPAGE_RATE,
     RiskCalculationFailure,
     RiskSizingResult,
+    calculate_fixed_quantity_risk,
     calculate_risk_size,
 )
 
@@ -368,12 +368,35 @@ class OkxAdapter:
         parameters: SetLeverageParameters,
         *,
         environment: str,
+        maximum_leverage_cap: object | None = None,
     ) -> SetLeverageResult:
         """Set leverage once, then require authoritative leverage/capacity reads."""
         before = self.read_leverage_state(
             parameters,
             environment=environment,
         )
+        try:
+            policy_cap = Decimal(
+                str(
+                    maximum_leverage_cap
+                    if maximum_leverage_cap is not None
+                    else (
+                        parameters.user_maximum_leverage
+                        or parameters.maximum_leverage
+                    )
+                )
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise PreflightError("用户最大杠杆无效，禁止调整杠杆") from exc
+        if not policy_cap.is_finite() or policy_cap <= 0:
+            raise PreflightError("用户最大杠杆无效，禁止调整杠杆")
+        if (
+            before.confirmed_leverage > policy_cap
+            or parameters.target_leverage > policy_cap
+        ):
+            raise PreflightError(
+                "OKX 当前或目标杠杆高于用户设置上限，禁止调整杠杆"
+            )
         if before.confirmed_leverage != parameters.current_leverage:
             raise PreflightError("OKX 当前杠杆已变化，旧杠杆计划失效")
         if before.confirmed_max_size >= parameters.required_quantity:
@@ -425,8 +448,10 @@ class OkxAdapter:
         plan: ExecutionPlan,
         *,
         account_equity_usd: object,
+        risk_capital_cap_usdt: object,
+        risk_percent: object,
     ) -> RiskSizingResult | None:
-        """按实时账户总权益计算 OKX 永续首仓，不接受计划数量作为真值。"""
+        """按固定资本上限和实时 USDT 权益计算永续首仓。"""
 
         if plan.product != "swap":
             return None
@@ -499,19 +524,36 @@ class OkxAdapter:
                     else min(maximum_size, market_limit)
                 )
         try:
+            common = {
+                "account_equity": account_equity_usd,
+                "risk_capital_cap": risk_capital_cap_usdt,
+                "entry_price": entry,
+                "stop_loss_price": plan.stop_loss,
+                "side": plan.direction,
+                "ct_val": instrument.get("ctVal"),
+                "ct_mult": instrument.get("ctMult"),
+                "lot_sz": instrument.get("lotSz"),
+                "min_sz": instrument.get("minSz"),
+                "max_sz": maximum_size,
+                "fee_rate": DEFAULT_FEE_RATE,
+                "slippage_rate": DEFAULT_SLIPPAGE_RATE,
+            }
+            if plan.authorized_sizing_mode == "fixed_quantity":
+                if (
+                    plan.authorized_fixed_quantity is None
+                    or plan.authorized_fixed_quantity != plan.quantity
+                ):
+                    raise RiskCalculationFailure(
+                        "invalid_input",
+                        "固定张数计划缺少一致的不可变数量授权",
+                    )
+                return calculate_fixed_quantity_risk(
+                    **common,
+                    quantity=plan.authorized_fixed_quantity,
+                )
             return calculate_risk_size(
-                account_equity=account_equity_usd,
-                risk_percent=DEFAULT_RISK_PERCENT,
-                entry_price=entry,
-                stop_loss_price=plan.stop_loss,
-                side=plan.direction,
-                ct_val=instrument.get("ctVal"),
-                ct_mult=instrument.get("ctMult"),
-                lot_sz=instrument.get("lotSz"),
-                min_sz=instrument.get("minSz"),
-                max_sz=maximum_size,
-                fee_rate=DEFAULT_FEE_RATE,
-                slippage_rate=DEFAULT_SLIPPAGE_RATE,
+                **common,
+                risk_percent=risk_percent,
             )
         except RiskCalculationFailure:
             raise
@@ -1691,7 +1733,23 @@ class OkxAdapter:
         algo_id = str(target.get("algo_id") or "")
         if not algo_id:
             return target
-        algo = self._client.get_algo_order(algo_id=algo_id)
+        try:
+            algo = self._client.get_algo_order(algo_id=algo_id)
+        except BrokerApiError as exc:
+            if exc.code != "51603":
+                raise
+            client_algo_id = str(target.get("client_algo_id") or "")
+            if not client_algo_id:
+                raise
+            algo = self._client.find_algo_order_by_client_id(
+                client_algo_id=client_algo_id,
+                order_type="oco",
+                instrument=record.plan.instrument,
+            )
+            if algo is None:
+                target["state"] = "known_algo_absent"
+                target["child_active"] = False
+                return target
         state = str(algo.get("state") or "").lower()
         target["state"] = state or "unknown"
         child_ids = algo.get("ordIdList") or []
@@ -1844,6 +1902,17 @@ class OkxAdapter:
                 }
             )
         state["protection_targets"] = targets
+        if any(item.get("state") == "known_algo_absent" for item in targets):
+            return record.model_copy(
+                update={
+                    "broker_state": state,
+                    "needs_attention": True,
+                    "state_reason": (
+                        "曾确认存在的 OKX 保护单已查无，"
+                        "禁止静默重建或继续交易并等待人工核对"
+                    ),
+                }
+            )
         exited = sum(
             (
                 _decimal(target.get("filled_quantity"), default=Decimal("0"))
@@ -2007,6 +2076,58 @@ class OkxAdapter:
         pnl = (last - entry) * remaining
         return pnl, str(preflight.broker_metadata.get("quote_currency") or "")
 
+    def _exit_snapshot_matches(
+        self,
+        record: ExecutionRecord,
+        *,
+        expected_quantity: Decimal,
+    ) -> tuple[bool, str]:
+        """用券商最新仓位和全部在途订单证明本次减仓数量仍然准确。"""
+
+        if record.plan.product != "swap" or record.preflight is None:
+            return False, "unsupported_product_or_missing_preflight"
+        pending_algos = [
+            item
+            for order_type in OKX_PENDING_ALGO_ORDER_TYPES
+            for item in self._client.pending_algo_orders(
+                instrument=record.plan.instrument,
+                order_type=order_type,
+            )
+        ]
+        pending_orders = self._client.pending_orders(
+            instrument=record.plan.instrument
+        )
+        position_rows = self._client.positions(
+            instrument=record.plan.instrument
+        )
+        if pending_orders or pending_algos:
+            return False, "pending_orders_present"
+        actual_quantity = Decimal("0")
+        expected_side = self._position_side(record.plan, record.preflight)
+        for row in position_rows:
+            if str(row.get("instId") or "") != record.plan.instrument:
+                return False, "unexpected_instrument_position"
+            quantity = _decimal(row.get("pos"))
+            if quantity is None:
+                return False, "invalid_position_quantity"
+            if quantity == 0:
+                continue
+            position_side = str(row.get("posSide") or "net")
+            if expected_side == "net":
+                direction_matches = (
+                    quantity > 0
+                    if record.plan.direction == "long"
+                    else quantity < 0
+                )
+                if position_side != "net" or not direction_matches:
+                    return False, "position_direction_mismatch"
+            elif position_side != expected_side or quantity <= 0:
+                return False, "position_direction_mismatch"
+            actual_quantity += abs(quantity)
+        if actual_quantity != expected_quantity:
+            return False, "position_quantity_mismatch"
+        return True, ""
+
     def _cancel_one_protection(self, record: ExecutionRecord) -> ExecutionRecord:
         state = dict(record.broker_state)
         targets = [dict(item) for item in state.get("protection_targets") or []]
@@ -2041,11 +2162,89 @@ class OkxAdapter:
         )
         remaining = max(base_quantity - exited, Decimal("0"))
         realized = self._realized_with_baseline(record, targets, state)
+        absent_targets = [
+            item for item in targets if item.get("state") == "known_algo_absent"
+        ]
+        if absent_targets:
+            has_prior_fill_evidence = any(
+                (
+                    _decimal(item.get("filled_quantity"), default=Decimal("0"))
+                    or Decimal("0")
+                )
+                > 0
+                or bool(item.get("exit_order_ids"))
+                for item in absent_targets
+            )
+            if (
+                has_prior_fill_evidence
+                or record.plan.product != "swap"
+                or record.preflight is None
+            ):
+                state["protection_targets"] = targets
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "remaining_quantity": remaining,
+                        "realized_pnl": realized,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "已知 OKX 保护单查无但仍有历史成交证据，"
+                            "禁止继续离场并等待人工核对"
+                        ),
+                    }
+                )
+            try:
+                snapshot_matches, mismatch_reason = self._exit_snapshot_matches(
+                    record,
+                    expected_quantity=remaining,
+                )
+            except (BrokerApiError, BrokerTransportError) as exc:
+                state["protection_targets"] = targets
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "remaining_quantity": remaining,
+                        "realized_pnl": realized,
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": (
+                            "已知 OKX 保护单查无，正在复核真实仓位与全部在途订单"
+                        ),
+                    }
+                )
+            if not snapshot_matches:
+                state["protection_targets"] = targets
+                return record.model_copy(
+                    update={
+                        "broker_state": state,
+                        "remaining_quantity": remaining,
+                        "realized_pnl": realized,
+                        "needs_attention": True,
+                        "state_reason": (
+                            "已知 OKX 保护单查无，但真实仓位或在途订单"
+                            "与执行账本不一致，禁止继续离场："
+                            f"{mismatch_reason}"
+                        ),
+                    }
+                )
+            for item in absent_targets:
+                item["state"] = "confirmed_canceled_absent"
+                item["cancel_requested"] = True
+                item["cancel_status"] = "confirmed"
+                item["cancel_confirmation"] = (
+                    "fresh_position_and_all_pending_orders_snapshot"
+                )
         recovered_live_cancel = False
         for item in targets:
             if (
                 item.get("cancel_status") == "unknown"
-                and item.get("state") in {"canceled", "effective", "order_failed"}
+                and item.get("state")
+                in {
+                    "canceled",
+                    "effective",
+                    "order_failed",
+                    "confirmed_canceled_absent",
+                }
             ):
                 item["cancel_status"] = "confirmed"
             elif (
@@ -2100,7 +2299,13 @@ class OkxAdapter:
         if any(
             item.get("cancel_requested")
             and item.get("cancel_status") in {"submitted", "unknown"}
-            and item.get("state") not in {"canceled", "effective", "order_failed"}
+            and item.get("state")
+            not in {
+                "canceled",
+                "effective",
+                "order_failed",
+                "confirmed_canceled_absent",
+            }
             for item in targets
         ):
             unknown = any(
@@ -2187,7 +2392,13 @@ class OkxAdapter:
                 item
                 for item in targets
                 if item.get("algo_id")
-                and item.get("state") not in {"canceled", "effective", "order_failed"}
+                and item.get("state")
+                not in {
+                    "canceled",
+                    "effective",
+                    "order_failed",
+                    "confirmed_canceled_absent",
+                }
                 and not item.get("cancel_requested")
             ),
             None,
@@ -2282,6 +2493,45 @@ class OkxAdapter:
             body["posSide"] = pos_side
             if pos_side == "net":
                 body["reduceOnly"] = True
+        requires_final_snapshot = any(
+            item.get("cancel_confirmation")
+            == "fresh_position_and_all_pending_orders_snapshot"
+            for item in state.get("protection_targets") or []
+        )
+        if requires_final_snapshot:
+            expected_quantity = _decimal(
+                exit_order.get("remaining_before_exit"),
+                default=record.remaining_quantity,
+            )
+            if expected_quantity is None or expected_quantity <= 0:
+                raise ReconciliationError("OKX 主动离场缺少有效的最终复核数量")
+            try:
+                snapshot_matches, mismatch_reason = self._exit_snapshot_matches(
+                    record,
+                    expected_quantity=expected_quantity,
+                )
+            except (BrokerApiError, BrokerTransportError) as exc:
+                return record.model_copy(
+                    update={
+                        "needs_attention": True,
+                        "last_error": str(exc),
+                        "state_reason": (
+                            "OKX 主动离场发送前的最终仓位与在途订单复核失败，"
+                            "已停写"
+                        ),
+                    }
+                )
+            if not snapshot_matches:
+                return record.model_copy(
+                    update={
+                        "needs_attention": True,
+                        "last_error": mismatch_reason,
+                        "state_reason": (
+                            "OKX 主动离场发送前的最终仓位或在途订单"
+                            "已变化，禁止发送"
+                        ),
+                    }
+                )
         try:
             response = self._write(lambda: self._client.place_order(body))
         except BrokerApiError as exc:

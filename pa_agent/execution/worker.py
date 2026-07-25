@@ -18,7 +18,9 @@ from pydantic import ValidationError as PydanticValidationError
 
 from pa_agent.config.settings import load_settings
 from pa_agent.execution.errors import (
+    BrokerApiError,
     BrokerRejected,
+    BrokerTransportError,
     CredentialError,
     LiveTradingDisabled,
     PreflightError,
@@ -370,6 +372,10 @@ class ExecutionWorker:
         if signature == self._settings_signature:
             return False
         loaded = self._settings_loader(self.settings_path)
+        self._revoke_lease(
+            require_owned=True,
+            reason_code="settings_changed",
+        )
         self.service.reload_settings(loaded, revoke_new_risk=False)
         self.settings = loaded
         self._poll_interval_seconds = self._configured_poll_interval(loaded)
@@ -419,6 +425,9 @@ class ExecutionWorker:
         try:
             self._stop_event.clear()
             self.store.migrate_to_current(worker_lock=self._file_lock)
+            self.store.backfill_risk_runtime_baselines(
+                worker_lock=self._file_lock
+            )
             self._set_heartbeat(WorkerState.STARTING)
             self.store.recover_inflight(failure_code="worker_restarted")
             self._revoke_lease(
@@ -635,7 +644,20 @@ class ExecutionWorker:
             self._validate_write_result(command.action, result)
             structured_result = None
         elif command.action is WorkerCommandAction.CLEAR_DRAWDOWN_STOP:
-            self.service.clear_drawdown_stop()
+            if command.reason_code == "recover_transient_risk_read_failure":
+                self.service.recover_transient_risk_stop(
+                    broker=command.broker,
+                    environment=command.environment,
+                    account=command.account,
+                )
+            elif not command.reason_code:
+                self.service.clear_drawdown_stop(
+                    broker=command.broker,
+                    environment=command.environment,
+                    account=command.account,
+                )
+            else:
+                raise _CommandRejected("unsupported_risk_clear_reason")
             structured_result = None
         elif command.action is WorkerCommandAction.REFRESH_ACCOUNT:
             if command.execution_id:
@@ -758,17 +780,22 @@ class ExecutionWorker:
     ) -> WorkerCommandStatus:
         if isinstance(exc, _CommandUncertain):
             return WorkerCommandStatus.UNCERTAIN
+        if isinstance(exc, BrokerTransportError):
+            return (
+                WorkerCommandStatus.UNCERTAIN
+                if exc.write_may_have_reached
+                else WorkerCommandStatus.FAILED
+            )
         if isinstance(
             exc,
             (
                 _CommandRejected,
                 _ReconciliationNeedsAttention,
+                BrokerApiError,
                 *_DEFINITELY_NOT_WRITTEN,
             ),
         ):
             return WorkerCommandStatus.FAILED
-        if action in _WRITE_ACTIONS:
-            return WorkerCommandStatus.UNCERTAIN
         return WorkerCommandStatus.FAILED
 
     def run_once(self) -> WorkerCommand | None:
@@ -916,7 +943,10 @@ def _build_default_worker() -> ExecutionWorker:
 
     configure_logging()
     settings = load_settings(SETTINGS_JSON_PATH)
-    worker_store = WorkerStore(EXECUTION_CONTROL_DB_PATH)
+    worker_store = WorkerStore(
+        EXECUTION_CONTROL_DB_PATH,
+        worker_lock_path=EXECUTION_WORKER_LOCK_PATH,
+    )
     worker_id = str(uuid.uuid4())
     try:
         execution_store = ExecutionStore(

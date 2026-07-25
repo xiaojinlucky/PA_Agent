@@ -33,6 +33,7 @@ from pa_agent.execution.errors import (
 )
 from pa_agent.execution.leverage_authorization import (
     LeverageAuthorizationError,
+    validate_current_leverage_policy,
     validate_leverage_authorization,
 )
 from pa_agent.execution.models import ExecutionRecord, ExecutionState
@@ -419,10 +420,11 @@ class ExecutionController:
         ):
             raise LiveTradingDisabled("杠杆计划与当前 OKX 路由配置不一致")
         try:
+            validate_current_leverage_policy(parameters, self._settings)
             validate_leverage_authorization(parameters)
         except LeverageAuthorizationError as exc:
             raise LiveTradingDisabled(
-                f"杠杆命令没有匹配的耐久监督授权：{exc}"
+                f"杠杆命令没有匹配的耐久脚本授权：{exc}"
             ) from exc
         command, _created = self._worker_store.enqueue(
             action=WorkerCommandAction.SET_LEVERAGE,
@@ -518,6 +520,20 @@ class ExecutionController:
             broker=broker,
             environment=environment,
             account=account,
+        )
+        return command
+
+    def recover_transient_risk_stop(self) -> WorkerCommand:
+        """排队一个需要新鲜完整读取证据的临时故障恢复命令。"""
+
+        broker, environment, account = self._selected_route_identity()
+        command, _created = self._worker_store.enqueue(
+            action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+            requester=self._requester_id,
+            broker=broker,
+            environment=environment,
+            account=account,
+            reason_code="recover_transient_risk_read_failure",
         )
         return command
 

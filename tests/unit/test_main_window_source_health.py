@@ -1,6 +1,7 @@
 """主窗口数据源状态提示测试。"""
 from __future__ import annotations
 
+import inspect
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -109,4 +110,21 @@ def test_execution_status_shows_okx_demo_order_modes_and_atr(qtbot) -> None:
 
     assert "同源可执行" in window._execution_status_label.text()
     assert "入场 限价+ATR / 离场 限价+ATR" in window._execution_status_label.text()
+    assert (
+        "GUI 配置：资金上限 0 USDT / 单笔风险 10.00% / 杠杆上限 20×"
+        in (
+        window._execution_status_label.text()
+        )
+    )
     assert "ATR 倍数 0.50" in window._execution_status_label.toolTip()
+
+
+def test_live_trading_is_built_as_a_top_level_workspace() -> None:
+    source = inspect.getsource(MainWindow._setup_ui)
+
+    assert 'self._central = QTabWidget()' in source
+    assert 'self._central.addTab(self._analysis_workbench, "分析工作台")' in source
+    assert '"实盘交易",' in source
+    assert "TradingDialog" not in inspect.getsource(
+        MainWindow._open_trading_dialog
+    )

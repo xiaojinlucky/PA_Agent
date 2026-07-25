@@ -111,9 +111,13 @@
     "okx": {
       "source_symbol": "",
       "instrument": "",
+      "sizing_mode": "risk_budget",
       "quantity": "",
       "product": "spot",
       "margin_mode": "cross",
+      "risk_capital_cap_usdt": "0",
+      "risk_percent": "0.10",
+      "maximum_leverage": "20",
       "simulated": false,
       "api_base_url": "https://www.okx.com"
     }

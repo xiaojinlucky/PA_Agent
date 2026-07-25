@@ -338,3 +338,12 @@ def test_route_fingerprint_changes_when_order_mode_changes():
     settings.execution.entry_order_mode = "market"
     settings.execution.exit_order_mode = "limit"
     assert execution_route_fingerprint(settings) != original
+
+
+def test_okx_route_fingerprint_changes_when_sizing_mode_changes():
+    settings = _settings()
+    original = execution_route_fingerprint(settings)
+
+    settings.execution.okx.sizing_mode = "fixed_quantity"
+
+    assert execution_route_fingerprint(settings) != original

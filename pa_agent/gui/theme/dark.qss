@@ -124,6 +124,11 @@ QPushButton#primaryButton {
 QPushButton#primaryButton:hover {
     background-color: #16a34a;
 }
+QPushButton#primaryButton:disabled {
+    color: #6e7681;
+    background-color: #161b22;
+    border-color: #30363d;
+}
 QPushButton#dangerButton {
     border-color: #ef4444;
     color: #ef4444;
@@ -131,8 +136,13 @@ QPushButton#dangerButton {
 QPushButton#dangerButton:hover {
     background-color: rgba(239,68,68,0.15);
 }
+QPushButton#dangerButton:disabled {
+    color: #6e7681;
+    background-color: #161b22;
+    border-color: #30363d;
+}
 
-QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {
+QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: #0a0e14;
     color: #e6edf3;
     border: 1px solid #30363d;
@@ -140,7 +150,8 @@ QLineEdit, QPlainTextEdit, QTextEdit, QSpinBox, QComboBox {
     padding: 4px 8px;
     selection-background-color: #38bdf866;
 }
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus {
+QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QSpinBox:focus,
+QDoubleSpinBox:focus, QComboBox:focus {
     border-color: #38bdf8;
 }
 QComboBox::drop-down {
@@ -226,7 +237,7 @@ QLabel#toolbarTitle {
 }
 QLabel#mutedLabel {
     color: #8b949e;
-    font-size: 11px;
+    font-size: 12px;
 }
 QLabel#stageHeader {
     font-size: 14px;
@@ -264,7 +275,7 @@ QListWidget#timelineList {
     background-color: #0a0e14;
     border: 1px solid #30363d;
     border-radius: 6px;
-    font-size: 11px;
+    font-size: 12px;
 }
 QListWidget#timelineList::item {
     padding: 8px 10px;

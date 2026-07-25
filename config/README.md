@@ -204,13 +204,17 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.longbridge.allow_outside_rth` | bool | `false` | 美股是否允许盘前/盘后 |
 | `execution.okx.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
 | `execution.okx.instrument` | string | `""` | OKX 精确 `instId`，不限制黄金，如 `XAUT-USDT`、`BTC-USDT-SWAP` |
-| `execution.okx.quantity` | string | `""` | 现货为基础币数量，永续为合约张数 |
+| `execution.okx.sizing_mode` | string | `"risk_budget"` | `risk_budget` 为按资金和风险比例自动算张数；`fixed_quantity` 为用户固定张数并由系统反算风险 |
+| `execution.okx.quantity` | string | `""` | 固定张数模式的输入；风险预算模式中只保存兼容值，不是最终下单真值 |
 | `execution.okx.product` | string | `"spot"` | `spot` 或 `swap`；现货不新开空仓 |
-| `execution.okx.margin_mode` | string | `"cross"` | 永续 `cross` 或 `isolated`；程序只读取当前杠杆，不自动修改 |
+| `execution.okx.margin_mode` | string | `"cross"` | 永续 `cross` 或 `isolated`；当前自动交易固定使用 `cross` |
+| `execution.okx.risk_capital_cap_usdt` | decimal | `0` | 用户设置的风险资本上限。有效定仓资金取该值与最新 USDT 权益中较小者；`0` 表示未设置并禁止新增风险 |
+| `execution.okx.risk_percent` | decimal | `0.10` | 单笔最坏止损风险占有效定仓资金的比例，范围 `(0, 1]` |
+| `execution.okx.maximum_leverage` | decimal | `20` | 用户允许的最大杠杆，范围 `[1, 125]`；程序只在该上限内选择经过容量回读的最低可行候选 |
 | `execution.okx.simulated` | bool | `false` | 是否发送 OKX 模拟交易标头 |
 | `execution.okx.api_base_url` | string | `"https://www.okx.com"` | 必须使用 HTTPS |
 
-保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。券商、账户、品种、数量、保证金模式和开关全部来自本地配置；大模型输出中的同名字段会被忽略。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
+风险预算模式由资金上限、风险比例和止损距离确定张数；固定张数模式由张数确定最坏损失金额和风险比例。杠杆只影响保证金与券商容量，不直接改变止损价差损失。保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
 
 执行窗口按选中的持久化记录显示成交/剩余数量、入场单号、保护与离场状态、直接错误、事件流以及该记录所属账户的最新资金快照。刷新历史记录时以选中记录的券商、环境和账户为准，不会改读当前配置中的另一个账户。
 
@@ -219,10 +223,9 @@ Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Leg
 ### OKX Demo 黄金 10 分钟自动循环
 
 当前产品运行器固定使用严格聚合的 10 分钟主周期；它由两根连续、同一 UTC 10 分钟边界且均已收盘的 OKX 官方 5 分钟 K 线生成，不会冒充 OKX 原生 10 分钟周期。此前的 5 分钟循环、7 笔限价单和生命周期 canary 只属于历史 Demo 实验，不是当前产品周期或策略绩效。该循环使用独立进程内设置；当前 `settings.json` 也已同步为相同路线。固定范围是
-`OKX XAU-USDT-SWAP / 5m→10m` → `OKX Demo XAU-USDT-SWAP / cross / 当前 Demo USDT 权益
-10% 的动态风险张数`，PA 倾向为 `extreme_aggressive`，执行置信度门槛为 `20`。当前运行器的入场和主动离场均为
+`OKX XAU-USDT-SWAP / 5m→10m` → `OKX Demo XAU-USDT-SWAP / cross / min(用户风险资本上限, 最新 USDT 权益) × 用户风险比例`，PA 倾向为 `extreme_aggressive`，执行置信度门槛为 `20`。账户资金高于上限不会放大仓位，低于上限会缩小仓位；杠杆只负责保证金和容量，不改变已批准的止损风险数量。当前运行器的入场和主动离场均为
 `limit_with_slippage / 0.50 × 主周期 ATR14`；原生保护单继续独立管理。自然分析只能在最新已收盘 K 线附近构造合法三价时给出订单，否则如实记录 `no_order` 并继续下一根 10 分钟 K 线，
-不会新建限价单或突破单。日常 GUI / PA 分析不继承此规则。`270` 秒的限价超时仍用于
+不会新建限价单或突破单。已有活动执行时，同向信号或 `no_order` 由脚本继续持有；反向可执行信号必须先撤销旧入场或清空旧仓位，确认旧执行安全终态后才重新执行固定资金、风险闸门、杠杆、入场和原生保护全链。监控智能体不参与正常逐笔审批。日常 GUI / PA 分析不继承此规则。`270` 秒的限价超时仍用于
 恢复或收口历史限价记录。
 
 当策略连续返回“不下单”而需要单独验证技术闭环时，可运行：

@@ -67,23 +67,32 @@ from pa_agent.okx_demo_campaign import (
     resolve_record_campaign_sizing,
     validate_campaign_settings,
 )
-from pa_agent.risk.leverage import LeveragePlanningFailure
 from pa_agent.records.analysis_history import find_latest_successful_record
 from pa_agent.records.pending_writer import PendingWriter
 from pa_agent.records.supervisor_writer import SupervisorWriter
+from pa_agent.risk.leverage import LeveragePlanningFailure
 from tests.unit.test_execution_plan_builder import _persist, _record
 
 
 def _settings(quantity="120"):
-    return build_campaign_settings(Settings(), quantity=quantity)
+    settings = Settings()
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("5000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
+    return build_campaign_settings(settings, quantity=quantity)
 
 
 def _sizing(_record=None, quantity="120"):
     del _record
     resolved = Decimal(quantity)
     return CampaignSizing(
+        sizing_mode="risk_budget",
         quantity=resolved,
+        account_total_equity_usd=Decimal("5000"),
         equity_usdt=Decimal("5000"),
+        risk_capital_cap_usdt=Decimal("5000"),
+        effective_risk_capital_usdt=Decimal("5000"),
+        risk_percent=Decimal("0.10"),
         risk_budget_usdt=Decimal("500"),
         risk_used_usdt=Decimal("12"),
         reference_price_usdt=Decimal("4000"),
@@ -380,6 +389,15 @@ class _FakeStore:
         return None
 
 
+class _FakeWorkerStore:
+    def __init__(self):
+        self.risk_state = None
+
+    def get_risk_runtime_state(self, route_key):
+        assert route_key == "okx:demo:okx"
+        return self.risk_state
+
+
 class _FakeExecutionService:
     def __init__(
         self,
@@ -409,6 +427,12 @@ class _FakeExecutionService:
         self.started = 0
         self._commands = {}
         self._last_reconcile_at = datetime(2026, 7, 17, tzinfo=UTC)
+        self.worker_store = _FakeWorkerStore()
+        self.transient_risk_recoveries = 0
+        self.transient_risk_recovery_status = WorkerCommandStatus.SUCCEEDED
+        self.transient_risk_recovery_failure_code = ""
+        self.waited_command_ids = []
+        self.wait_error = None
 
     def _command(
         self,
@@ -473,8 +497,19 @@ class _FakeExecutionService:
         self.refreshed += 1
         return self._command("refresh")
 
+    def recover_transient_risk_stop(self):
+        self.transient_risk_recoveries += 1
+        return self._command(
+            "recover_transient_risk_stop",
+            status=self.transient_risk_recovery_status,
+            failure_code=self.transient_risk_recovery_failure_code,
+        )
+
     def wait_for_command(self, command_id, *, timeout):
         del timeout
+        self.waited_command_ids.append(command_id)
+        if self.wait_error is not None:
+            raise self.wait_error
         return self._commands[command_id]
 
     def get_execution(self, execution_id):
@@ -604,7 +639,7 @@ def _supervised_runtime(tmp_path, decision):
 
 
 def _state(store: CampaignStateStore, now: datetime):
-    state = store.create_or_resume(now=now)
+    state = store.create_or_resume(now=now, settings=_settings())
     store.save(state)
     return state
 
@@ -630,6 +665,9 @@ def _stable_campaign_clock(monkeypatch):
 
 def test_campaign_settings_are_isolated_and_exact():
     base = Settings()
+    base.execution.okx.risk_capital_cap_usdt = Decimal("5000")
+    base.execution.okx.risk_percent = Decimal("0.10")
+    base.execution.okx.maximum_leverage = Decimal("20")
     original_broker = base.execution.selected_broker
     original_threshold = base.execution.min_trade_confidence
     base.execution.okx.api_base_url = "https://attacker.invalid"
@@ -860,9 +898,19 @@ def test_demo_market_entry_expands_stop_until_risk_size_fits_max_market_order(
     quantities = iter((Decimal("25000"), Decimal("15000")))
     stops = []
 
-    def _sizing(_client, *, entry_price, stop_loss_price, side):
+    def _sizing(
+        _client,
+        *,
+        entry_price,
+        stop_loss_price,
+        side,
+        risk_capital_cap_usdt,
+        risk_percent,
+    ):
         del _client, entry_price
         assert side == "long"
+        assert risk_capital_cap_usdt == Decimal("5000")
+        assert risk_percent == Decimal("0.10")
         stops.append(stop_loss_price)
         return SimpleNamespace(quantity=next(quantities))
 
@@ -875,6 +923,10 @@ def test_demo_market_entry_expands_stop_until_risk_size_fits_max_market_order(
             execution=SimpleNamespace(
                 entry_order_mode="market",
                 exit_order_mode="limit",
+                okx=SimpleNamespace(
+                    risk_capital_cap_usdt=Decimal("5000"),
+                    risk_percent=Decimal("0.10"),
+                ),
             )
         ),
     )
@@ -902,6 +954,89 @@ def test_campaign_state_resume_never_extends_deadline(tmp_path):
     assert resumed.started_at == state.started_at
     assert resumed.expires_at == state.expires_at
     assert resumed.expires_at_utc - resumed.started_at_utc == CAMPAIGN_DURATION
+
+
+def test_campaign_state_freezes_actual_risk_settings(tmp_path):
+    settings = Settings()
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("20000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+
+    state = store.create_or_resume(
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+        settings=settings,
+    )
+    store.save(state)
+    persisted = store.load()
+
+    assert persisted is not None
+    assert persisted.frozen_risk_capital_cap_usdt == Decimal("20000")
+    assert persisted.frozen_risk_percent == Decimal("0.10")
+    assert persisted.frozen_maximum_leverage == Decimal("20")
+    assert persisted.frozen_sizing_mode == "risk_budget"
+    assert persisted.frozen_fixed_quantity is None
+    status = campaign_module._safe_status(store)
+    assert status["config"] == {
+        "sizing_mode": "risk_budget",
+        "fixed_quantity": None,
+        "risk_capital_cap_usdt": "20000",
+        "risk_percent": "0.10",
+        "maximum_leverage": "20",
+    }
+    campaign_module.json.dumps(status)
+
+
+def test_campaign_state_rejects_frozen_risk_values_that_disagree_with_hash(
+    tmp_path,
+):
+    settings = Settings()
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("20000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = store.create_or_resume(
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+        settings=settings,
+    )
+    store.save(
+        state.model_copy(
+            update={"frozen_maximum_leverage": Decimal("25")}
+        )
+    )
+
+    with pytest.raises(CampaignError, match="冻结风险参数与指纹不一致"):
+        store.create_or_resume(
+            now=datetime(2026, 7, 17, 1, tzinfo=UTC),
+            settings=settings,
+        )
+
+
+def test_campaign_state_save_retries_transient_windows_replace_lock(
+    monkeypatch,
+    tmp_path,
+):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    real_replace = campaign_module.os.replace
+    replace_calls = []
+
+    def _flaky_replace(source, destination):
+        replace_calls.append((source, destination))
+        if len(replace_calls) < 3:
+            raise PermissionError(5, "测试中的短暂文件占用")
+        return real_replace(source, destination)
+
+    monkeypatch.setattr(campaign_module.os, "replace", _flaky_replace)
+    monkeypatch.setattr(campaign_module.time, "sleep", lambda _seconds: None)
+
+    store.save(state)
+
+    assert len(replace_calls) == 3
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.campaign_id == state.campaign_id
+    assert persisted.status == state.status
 
 
 def test_completed_campaign_cannot_restart_automatically(tmp_path):
@@ -943,13 +1078,20 @@ def test_explicit_restart_allows_only_durable_terminal_owned_executions(
     original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
     store.save(
         original.model_copy(
-            update={"execution_ids": ["closed-id", "canceled-id"]}
+            update={
+                "execution_ids": [
+                    "closed-id",
+                    "blocked-id",
+                    "canceled-id",
+                ]
+            }
         )
     )
     history = tmp_path / "history"
     monkeypatch.setattr(campaign_module, "CAMPAIGN_HISTORY_DIR", history)
     executions = {
         "closed-id": SimpleNamespace(state=ExecutionState.CLOSED),
+        "blocked-id": SimpleNamespace(state=ExecutionState.BLOCKED),
         "canceled-id": SimpleNamespace(state=ExecutionState.CANCELED),
     }
 
@@ -963,6 +1105,46 @@ def test_explicit_restart_allows_only_durable_terminal_owned_executions(
     assert len(list(history.glob("*.json"))) == 1
 
 
+def test_restart_carries_forward_terminal_inflight_execution_bar(
+    monkeypatch,
+    tmp_path,
+):
+    previous_bar_ms = 1_784_913_800_000
+    inflight_bar_ms = 1_784_918_400_000
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(
+        original.model_copy(
+            update={
+                "inflight_bar_ms": inflight_bar_ms,
+                "last_completed_bar_ms": previous_bar_ms,
+                "execution_ids": ["blocked-id"],
+                "last_execution_id": "blocked-id",
+            }
+        )
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "CAMPAIGN_HISTORY_DIR",
+        tmp_path / "history",
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "_campaign_execution_bar_ms",
+        lambda _execution: inflight_bar_ms,
+    )
+
+    restarted = store.restart(
+        reason="configuration changed",
+        now=datetime(2026, 7, 17, 1, tzinfo=UTC),
+        execution_lookup=lambda _execution_id: SimpleNamespace(
+            state=ExecutionState.BLOCKED
+        ),
+    )
+
+    assert restarted.last_completed_bar_ms == inflight_bar_ms
+
+
 @pytest.mark.parametrize(
     "execution",
     [
@@ -970,6 +1152,22 @@ def test_explicit_restart_allows_only_durable_terminal_owned_executions(
         SimpleNamespace(state=ExecutionState.READY),
         SimpleNamespace(state=ExecutionState.UNKNOWN),
         SimpleNamespace(state=ExecutionState.ERROR),
+        SimpleNamespace(
+            state=ExecutionState.CLOSED,
+            needs_attention=True,
+        ),
+        SimpleNamespace(
+            state=ExecutionState.BLOCKED,
+            needs_attention=True,
+        ),
+        SimpleNamespace(
+            state=ExecutionState.CANCELED,
+            needs_attention=True,
+        ),
+        SimpleNamespace(
+            state=ExecutionState.REJECTED,
+            needs_attention=True,
+        ),
     ],
 )
 def test_explicit_restart_rejects_missing_or_nonterminal_owned_execution(
@@ -1025,7 +1223,12 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
             ]
 
         def balance(self):
-            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+            return [
+                {
+                    "totalEq": "5000",
+                    "details": [{"ccy": "USDT", "eq": "5000"}],
+                }
+            ]
 
         def ticker(self, instrument):
             assert instrument == CAMPAIGN_INSTRUMENT
@@ -1048,6 +1251,8 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
         entry_price="4000",
         stop_loss_price="3990",
         side="long",
+        risk_capital_cap_usdt="5000",
+        risk_percent="0.10",
     )
 
     assert sizing.equity_usdt == Decimal("5000")
@@ -1055,6 +1260,55 @@ def test_dynamic_sizing_uses_stop_loss_risk_and_contract_spec():
     assert sizing.contract_notional_usdt == Decimal("4")
     assert sizing.stop_distance_usdt == Decimal("10")
     assert sizing.quantity == Decimal("22742")
+
+
+def test_fixed_quantity_campaign_keeps_quantity_and_derives_risk():
+    class _Client:
+        def account_config(self):
+            return {"posMode": "net_mode"}
+
+        def instruments(self, inst_type):
+            assert inst_type == "SWAP"
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "state": "live",
+                    "tickSz": "0.1",
+                    "minSz": "1",
+                    "lotSz": "1",
+                    "ctVal": "0.001",
+                    "ctMult": "1",
+                }
+            ]
+
+        def balance(self):
+            return [
+                {
+                    "totalEq": "5000",
+                    "details": [{"ccy": "USDT", "eq": "5000"}],
+                }
+            ]
+
+        def max_order_size(self, **_kwargs):
+            return {"maxBuy": "100000", "maxSell": "100000"}
+
+    sizing = resolve_campaign_sizing(
+        _Client(),
+        entry_price="4000",
+        stop_loss_price="3990",
+        side="long",
+        risk_capital_cap_usdt="5000",
+        risk_percent="0.10",
+        sizing_mode="fixed_quantity",
+        fixed_quantity="120",
+    )
+
+    assert sizing.sizing_mode == "fixed_quantity"
+    assert sizing.quantity == Decimal("120")
+    assert sizing.risk_budget_usdt == sizing.risk_used_usdt
+    assert sizing.risk_percent == (
+        sizing.risk_used_usdt / Decimal("5000")
+    )
 
 
 def test_higher_timeframe_text_cannot_change_gate_or_risk_quantity():
@@ -1077,7 +1331,12 @@ def test_higher_timeframe_text_cannot_change_gate_or_risk_quantity():
             ]
 
         def balance(self):
-            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+            return [
+                {
+                    "totalEq": "5000",
+                    "details": [{"ccy": "USDT", "eq": "5000"}],
+                }
+            ]
 
         def max_order_size(
             self,
@@ -1105,8 +1364,18 @@ def test_higher_timeframe_text_cannot_change_gate_or_risk_quantity():
         deep=True,
     )
 
-    plain = resolve_record_campaign_sizing(without_htf, _Client())
-    contextual = resolve_record_campaign_sizing(with_htf, _Client())
+    plain = resolve_record_campaign_sizing(
+        without_htf,
+        _Client(),
+        risk_capital_cap_usdt="5000",
+        risk_percent="0.10",
+    )
+    contextual = resolve_record_campaign_sizing(
+        with_htf,
+        _Client(),
+        risk_capital_cap_usdt="5000",
+        risk_percent="0.10",
+    )
     decision = without_htf.stage2_decision["decision"]
     signal_entry = Decimal(str(decision["entry_price"]))
     expected_entry = (
@@ -1169,7 +1438,12 @@ def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
             ]
 
         def balance(self):
-            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+            return [
+                {
+                    "totalEq": "5000",
+                    "details": [{"ccy": "USDT", "eq": "5000"}],
+                }
+            ]
 
         def ticker(self, instrument):
             assert instrument == CAMPAIGN_INSTRUMENT
@@ -1194,6 +1468,8 @@ def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
     record, sizing = build_controlled_demo_s_record(
         base,
         client=_Client(),
+        risk_capital_cap_usdt="5000",
+        risk_percent="0.10",
         now=datetime(2026, 7, 24, 1, 12, tzinfo=UTC),
     )
 
@@ -1235,8 +1511,12 @@ def test_controlled_demo_s_uses_real_10m_record_and_expands_stop_for_capacity():
     assert sizing.quantity <= sizing.max_buy
     assert sizing.quantity != sizing.max_buy
     assert record.stage2_response["risk_sizing"] == {
-        "equity_basis": "usdt_equity",
+        "sizing_mode": "risk_budget",
+        "equity_basis": "fixed_cap_or_usdt_equity_whichever_lower",
+        "account_total_equity_usd": "5000",
         "equity_usdt": "5000",
+        "risk_capital_cap_usdt": "5000",
+        "effective_risk_capital_usdt": "5000",
         "risk_percent": "0.10",
         "risk_budget_usdt": "500.00",
         "risk_used_usdt": str(sizing.risk_used_usdt),
@@ -1312,6 +1592,8 @@ def test_dynamic_sizing_rejects_non_net_position_mode():
             entry_price="4000",
             stop_loss_price="3990",
             side="long",
+            risk_capital_cap_usdt="5000",
+            risk_percent="0.10",
         )
 
 
@@ -1362,7 +1644,12 @@ def test_private_preflight_always_uses_demo_header(monkeypatch):
             return {"maxBuy": "500", "maxSell": "500"}
 
         def balance(self):
-            return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+            return [
+                {
+                    "totalEq": "5000",
+                    "details": [{"ccy": "USDT", "eq": "5000"}],
+                }
+            ]
 
         def ticker(self, instrument):
             assert instrument == CAMPAIGN_INSTRUMENT
@@ -1547,10 +1834,288 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     assert runner.runtime.settings.execution.okx.quantity == "120"
 
 
+def test_new_bar_recovers_allowlisted_transient_risk_stop_once(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    record = SimpleNamespace(exception=None)
+    orchestrator = _FakeOrchestrator(record)
+    service = _FakeExecutionService()
+    service.is_armed = True
+    service.worker_store.risk_state = SimpleNamespace(
+        kill_active=True,
+        kill_reason="risk_runtime_BrokerTransportError",
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(orchestrator, service),
+        store,
+        state,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+    assert runner.process_latest_closed_bar() is False
+    assert service.transient_risk_recoveries == 1
+    assert orchestrator.calls == 1
+    assert service.submitted == ["execution-1"]
+
+
+def test_failed_transient_risk_recovery_skips_bar_without_analysis_or_order(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService()
+    service.worker_store.risk_state = SimpleNamespace(
+        kill_active=True,
+        kill_reason="risk_runtime_IncompleteRead",
+    )
+    service.transient_risk_recovery_status = WorkerCommandStatus.FAILED
+    service.transient_risk_recovery_failure_code = "BrokerTransportError"
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(orchestrator, service),
+        store,
+        state,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+    assert runner.process_latest_closed_bar() is False
+    assert service.transient_risk_recoveries == 1
+    assert orchestrator.calls == 0
+    assert service.prepared == []
+    assert service.submitted == []
+    assert runner.state.last_completed_bar_ms == bar_ms
+    assert (
+        runner.state.last_plan_result
+        == "blocked:risk:transient_read_unavailable"
+    )
+    assert runner.state.last_error == "风险账户读取尚未恢复，本轮不下单"
+
+
+def test_persisted_transient_recovery_command_is_reused_without_second_enqueue(
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    service = _FakeExecutionService()
+    command = service._command("recover_transient_risk_stop")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    state = state.model_copy(
+        update={
+            "risk_recovery_bar_ms": bar_ms,
+            "risk_recovery_command_id": command.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace()), service),
+        store,
+        state,
+    )
+
+    assert runner._recover_transient_risk_stop_for_bar(bar_ms)
+    assert service.transient_risk_recoveries == 0
+    assert service.waited_command_ids == [command.id]
+    assert runner.state.risk_recovery_bar_ms is None
+    assert runner.state.risk_recovery_command_id == ""
+
+
+def test_transient_recovery_crash_before_command_id_skips_bar_without_enqueue(
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    service = _FakeExecutionService()
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    state = state.model_copy(
+        update={
+            "risk_recovery_bar_ms": bar_ms,
+            "risk_recovery_command_id": "",
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace()), service),
+        store,
+        state,
+    )
+
+    assert not runner._recover_transient_risk_stop_for_bar(bar_ms)
+    assert service.transient_risk_recoveries == 0
+    assert service.waited_command_ids == []
+    assert runner.state.last_completed_bar_ms == bar_ms
+    assert (
+        runner.state.last_plan_result
+        == "blocked:risk:recovery_command_unconfirmed"
+    )
+
+
+def test_transient_recovery_timeout_keeps_same_durable_command_for_retry(
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    service = _FakeExecutionService()
+    service.worker_store.risk_state = SimpleNamespace(
+        kill_active=True,
+        kill_reason="risk_runtime_BrokerTransportError",
+    )
+    service.wait_error = TimeoutError("still running")
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace()), service),
+        store,
+        state,
+    )
+
+    with pytest.raises(
+        DataSourceTransientError,
+        match="同一条命令",
+    ):
+        runner._recover_transient_risk_stop_for_bar(bar_ms)
+    command_id = runner.state.risk_recovery_command_id
+    with pytest.raises(
+        DataSourceTransientError,
+        match="同一条命令",
+    ):
+        runner._recover_transient_risk_stop_for_bar(bar_ms)
+
+    assert service.transient_risk_recoveries == 1
+    assert service.waited_command_ids == [command_id, command_id]
+    assert runner.state.risk_recovery_bar_ms == bar_ms
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "needs_attention"),
+    [
+        (ExecutionState.ERROR, False),
+        (ExecutionState.OPEN, True),
+    ],
+)
+def test_campaign_restart_never_advances_execution_requiring_manual_review(
+    tmp_path,
+    execution_state,
+    needs_attention,
+):
+    bar_ms = 1_784_300_400_000
+    execution = SimpleNamespace(
+        id="owned-execution",
+        state=execution_state,
+        needs_attention=needs_attention,
+        plan=SimpleNamespace(),
+    )
+    service = _FakeExecutionService(records={execution.id: execution})
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    state = state.model_copy(update={"execution_ids": [execution.id]})
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace()), service),
+        store,
+        state,
+    )
+    runner._execution_bar_ms = lambda _execution: bar_ms
+
+    with pytest.raises(CampaignError, match="需要人工核对"):
+        runner._recover_owned_execution_for_bar(bar_ms)
+    assert runner.state.last_completed_bar_ms is None
+
+
+def test_submit_risk_block_is_a_completed_bar_and_campaign_keeps_running(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    record = SimpleNamespace(exception=None)
+    orchestrator = _FakeOrchestrator(record)
+
+    class _RiskBlockedSubmitService(_FakeExecutionService):
+        def submit(self, execution_id):
+            self.submitted.append(execution_id)
+            self.store.records[execution_id] = SimpleNamespace(
+                id=execution_id,
+                state=ExecutionState.BLOCKED,
+                state_reason="资金流/回撤风险闸门阻断新增风险",
+                last_error="risk_runtime_BrokerTransportError",
+            )
+            return self._command(
+                "submit",
+                status=WorkerCommandStatus.FAILED,
+                failure_code="submit_result_needs_attention",
+            )
+
+    service = _RiskBlockedSubmitService()
+    service.is_armed = True
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(orchestrator, service),
+        store,
+        state,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+    assert runner.process_latest_closed_bar() is False
+    assert runner.state.status == "active"
+    assert runner.state.inflight_bar_ms is None
+    assert runner.state.last_completed_bar_ms == bar_ms
+    assert (
+        runner.state.last_plan_result
+        == "blocked:submit:submit_result_needs_attention"
+    )
+    assert (
+        runner.state.last_error
+        == "资金流/回撤风险闸门阻断新增风险"
+    )
+
+
+def test_integrity_risk_stop_is_never_auto_recovered(tmp_path):
+    service = _FakeExecutionService()
+    service.worker_store.risk_state = SimpleNamespace(
+        kill_active=True,
+        kill_reason="risk_runtime_account_identity_changed",
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace()), service),
+        store,
+        state,
+    )
+
+    assert runner._recover_transient_risk_stop_for_bar(1_784_300_400_000)
+    assert service.transient_risk_recoveries == 0
+
+
 def test_new_bar_passes_thin_higher_timeframe_context(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: None,
+    )
     bar_ms = 1_784_300_400_000
 
     def _build_frame(*args, **kwargs):
@@ -1633,7 +2198,10 @@ def test_new_bar_passes_thin_higher_timeframe_context(
     assert "背景 4h" in orchestrator.context
 
 
-def test_supervisor_block_prevents_plan_and_worker_command(monkeypatch, tmp_path):
+def test_normal_script_does_not_call_monitor_for_routine_entry(
+    monkeypatch,
+    tmp_path,
+):
     bar_ms = 1_784_300_400_000
     monkeypatch.setattr(
         campaign_module,
@@ -1646,17 +2214,16 @@ def test_supervisor_block_prevents_plan_and_worker_command(monkeypatch, tmp_path
     runner = OkxDemoCampaign(runtime, store, state)
 
     assert runner.process_latest_closed_bar() is True
-    assert client.calls
-    assert service.prepared == []
-    assert service.submitted == []
-    assert runner.state.last_plan_result == "blocked:supervisor:primary"
+    assert client.calls == []
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert runner.state.last_plan_result == "execution:entry_pending"
     persisted = list((tmp_path / "supervisor").glob("*.json"))
-    assert len(persisted) == 1
-    assert json.loads(persisted[0].read_text(encoding="utf-8"))["action"] == "block_entry"
+    assert persisted == []
     assert record.stage2_decision["decision"]["order_type"] == "限价单"
 
 
-def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
+def test_normal_script_creates_one_plan_and_restart_reuses_conclusion(
     monkeypatch,
     tmp_path,
 ):
@@ -1674,7 +2241,7 @@ def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
     assert runner.process_latest_closed_bar() is True
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
-    assert len(client.calls) == 1
+    assert client.calls == []
 
     restarted_state = store.load()
     assert restarted_state is not None
@@ -1682,7 +2249,190 @@ def test_supervisor_allow_creates_one_plan_and_restart_reuses_conclusion(
     assert restarted.process_latest_closed_bar() is False
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
-    assert len(client.calls) == 1
+    assert client.calls == []
+
+
+def test_normal_script_holds_same_direction_execution_without_new_order(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, monitor_client, record = _supervised_runtime(
+        tmp_path,
+        "block_entry",
+    )
+    direction = OkxDemoCampaign._record_order_direction(record)
+    active = SimpleNamespace(
+        id="existing-open",
+        state=ExecutionState.OPEN,
+        plan=SimpleNamespace(direction=direction),
+    )
+    service.store.active_batches = [[active]]
+    service.store.records[active.id] = active
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC)).model_copy(
+        update={"execution_ids": [active.id], "last_execution_id": active.id}
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(runtime, store, state)
+    monkeypatch.setattr(
+        runner,
+        "_recover_owned_execution_for_bar",
+        lambda _bar_ms: False,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+
+    assert service.exited == []
+    assert service.canceled == []
+    assert service.prepared == []
+    assert service.submitted == []
+    assert monitor_client.calls == []
+    assert runner.state.last_plan_result == "script:hold:open"
+
+
+def test_normal_script_closes_opposite_execution_before_reversal(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, monitor_client, record = _supervised_runtime(
+        tmp_path,
+        "block_entry",
+    )
+    proposed = OkxDemoCampaign._record_order_direction(record)
+    active = SimpleNamespace(
+        id="existing-open",
+        state=ExecutionState.OPEN,
+        plan=SimpleNamespace(
+            direction="short" if proposed == "long" else "long"
+        ),
+    )
+    service.store.active_batches = [[active]]
+    service.store.records[active.id] = active
+    original_request_exit = service.request_exit
+
+    def _request_exit(execution_id, *, reason):
+        command = original_request_exit(execution_id, reason=reason)
+        service.store.records[execution_id] = SimpleNamespace(
+            id=execution_id,
+            state=ExecutionState.CLOSED,
+            plan=active.plan,
+        )
+        return command
+
+    service.request_exit = _request_exit
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC)).model_copy(
+        update={"execution_ids": [active.id], "last_execution_id": active.id}
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(runtime, store, state)
+    monkeypatch.setattr(
+        runner,
+        "_recover_owned_execution_for_bar",
+        lambda _bar_ms: False,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+
+    assert service.exited == [
+        (active.id, "PA 已收盘 K 线出现反向可执行信号")
+    ]
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert monitor_client.calls == []
+    assert runner.state.last_plan_result == "execution:entry_pending"
+
+
+def test_normal_script_handles_partial_fill_race_before_reversal(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, monitor_client, record = _supervised_runtime(
+        tmp_path,
+        "block_entry",
+    )
+    proposed = OkxDemoCampaign._record_order_direction(record)
+    active = SimpleNamespace(
+        id="existing-entry-pending",
+        state=ExecutionState.ENTRY_PENDING,
+        plan=SimpleNamespace(
+            direction="short" if proposed == "long" else "long"
+        ),
+    )
+    service.store.active_batches = [[active]]
+    service.store.records[active.id] = active
+    original_cancel_entry = service.cancel_entry
+    original_request_exit = service.request_exit
+
+    def _cancel_entry(execution_id):
+        command = original_cancel_entry(execution_id)
+        service.store.records[execution_id] = SimpleNamespace(
+            id=execution_id,
+            state=ExecutionState.PARTIALLY_FILLED,
+            plan=active.plan,
+        )
+        return command
+
+    def _request_exit(execution_id, *, reason):
+        command = original_request_exit(execution_id, reason=reason)
+        service.store.records[execution_id] = SimpleNamespace(
+            id=execution_id,
+            state=ExecutionState.CLOSED,
+            plan=active.plan,
+        )
+        return command
+
+    original_wait_for_reconcile = service.wait_for_reconcile
+
+    def _wait_for_reconcile(*, after, timeout):
+        service.store.records[active.id] = SimpleNamespace(
+            id=active.id,
+            state=ExecutionState.OPEN,
+            plan=active.plan,
+        )
+        return original_wait_for_reconcile(after=after, timeout=timeout)
+
+    service.cancel_entry = _cancel_entry
+    service.request_exit = _request_exit
+    service.wait_for_reconcile = _wait_for_reconcile
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC)).model_copy(
+        update={"execution_ids": [active.id], "last_execution_id": active.id}
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(runtime, store, state)
+    monkeypatch.setattr(
+        runner,
+        "_recover_owned_execution_for_bar",
+        lambda _bar_ms: False,
+    )
+
+    assert runner.process_latest_closed_bar() is True
+
+    assert service.canceled == [active.id]
+    assert service.exited == [
+        (active.id, "PA 已收盘 K 线出现反向可执行信号")
+    ]
+    assert service.submitted == ["execution-1"]
+    assert monitor_client.calls == []
 
 
 def test_balance_change_after_plan_creation_expires_old_plan_before_submit(
@@ -1728,6 +2478,49 @@ def test_balance_change_after_plan_creation_expires_old_plan_before_submit(
     ]
     assert runner.state.last_plan_result == "blocked:risk:stale_risk_sizing"
     assert "旧计划禁止提交" in runner.state.last_error
+
+
+def test_balance_change_above_fixed_cap_keeps_authorized_plan(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, _client, _record_value = _supervised_runtime(
+        tmp_path,
+        "allow_entry",
+    )
+    sizing_calls = 0
+
+    def _changing_raw_equity_only(record):
+        nonlocal sizing_calls
+        sizing_calls += 1
+        initial = replace(
+            _sizing(record),
+            equity_usdt=Decimal("8000"),
+        )
+        if sizing_calls == 2:
+            return replace(
+                initial,
+                equity_usdt=Decimal("9000"),
+                max_buy=Decimal("700000"),
+                max_sell=Decimal("700000"),
+            )
+        return initial
+
+    runtime.sizing_resolver = _changing_raw_equity_only
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert len(service.prepared) == 1
+    assert service.submitted == ["execution-1"]
+    assert service.expired == []
 
 
 def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
@@ -1797,12 +2590,12 @@ def test_risk_size_exceeded_blocks_current_bar_and_next_closed_bar_continues(
     assert runner.state.status == "active"
     assert runner.state.last_completed_bar_ms == second_bar_ms
     assert runner.state.last_plan_result == "execution:entry_pending"
-    assert len(supervisor_client.calls) == 1
+    assert supervisor_client.calls == []
     assert service.prepared
     assert service.submitted == ["execution-1"]
 
 
-def test_campaign_changes_leverage_only_after_supervisor_allow_and_rechecks_sizing(
+def test_campaign_changes_leverage_from_durable_script_and_rechecks_sizing(
     monkeypatch,
     tmp_path,
 ):
@@ -1837,11 +2630,14 @@ def test_campaign_changes_leverage_only_after_supervisor_allow_and_rechecks_sizi
     )
     original_set_leverage = service.set_leverage
 
-    def _set_leverage_after_supervision(parameters):
-        assert len(supervisor_client.calls) == 1
+    def _set_leverage_after_script_authorization(parameters):
+        assert supervisor_client.calls == []
+        assert parameters.supervisor_record_id == ""
+        assert parameters.supervisor_record_path == ""
+        assert parameters.supervisor_record_digest == ""
         return original_set_leverage(parameters)
 
-    service.set_leverage = _set_leverage_after_supervision
+    service.set_leverage = _set_leverage_after_script_authorization
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
     runner = OkxDemoCampaign(runtime, store, state)
@@ -1852,6 +2648,7 @@ def test_campaign_changes_leverage_only_after_supervisor_allow_and_rechecks_sizi
     assert service.leverage_parameters[0].analysis_digest != "a" * 64
     assert len(service.leverage_parameters[0].analysis_digest) == 64
     assert service.leverage_parameters[0].required_quantity == Decimal("580000")
+    assert service.leverage_parameters[0].supervisor_record_id == ""
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
     assert runner.state.last_plan_result == "execution:entry_pending"
@@ -2142,6 +2939,11 @@ def test_transient_model_failure_skips_bar_without_stopping_campaign(
 
 
 def test_inflight_bar_reuses_durable_record(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: None,
+    )
     bar_ms = 1_784_300_400_000
     monkeypatch.setattr(
         campaign_module,
@@ -2217,6 +3019,11 @@ def test_current_bar_ready_is_submitted_without_new_model_call(
     monkeypatch,
     tmp_path,
 ):
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: None,
+    )
     bar_ms = 1_784_302_200_000
     monkeypatch.setattr(
         campaign_module,

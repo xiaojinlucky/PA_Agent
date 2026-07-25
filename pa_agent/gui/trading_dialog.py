@@ -29,6 +29,10 @@ from PyQt6.QtWidgets import (
 from pa_agent.config.paths import SETTINGS_JSON_PATH
 from pa_agent.config.settings import save_settings
 from pa_agent.execution.models import AccountSnapshot, ExecutionRecord
+from pa_agent.execution.okx_client import (
+    okx_fixed_proxy_label,
+    okx_fixed_proxy_url,
+)
 from pa_agent.execution.worker_protocol import WorkerCommandStatus
 
 
@@ -90,13 +94,22 @@ def _exit_text(record: ExecutionRecord) -> str:
 class TradingDialog(QDialog):
     """Configure one active route and operate the latest durable execution."""
 
-    def __init__(self, *, settings, service, event_bus=None, parent=None) -> None:
+    def __init__(
+        self,
+        *,
+        settings,
+        service,
+        event_bus=None,
+        read_model=None,
+        parent=None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("实盘交易")
         self.setMinimumSize(780, 680)
         self._settings = settings
         self._service = service
         self._event_bus = event_bus
+        self._read_model = read_model
         self._configuration_dirty = False
         self._setup_ui()
         self._load_values()
@@ -104,10 +117,10 @@ class TradingDialog(QDialog):
         self._connect_configuration_guard()
         self._refresh_recent()
         self._update_arm_state(self._service.is_armed)
-        self._refresh_worker_health()
+        self._refresh_runtime_status()
         self._health_timer = QTimer(self)
         self._health_timer.setInterval(1000)
-        self._health_timer.timeout.connect(self._refresh_worker_health)
+        self._health_timer.timeout.connect(self._refresh_runtime_status)
         self._health_timer.start()
 
     def _setup_ui(self) -> None:
@@ -120,6 +133,9 @@ class TradingDialog(QDialog):
         labels.addWidget(self._arm_label)
         self._worker_health_label = QLabel()
         labels.addWidget(self._worker_health_label)
+        self._campaign_status_label = QLabel()
+        self._campaign_status_label.setWordWrap(True)
+        labels.addWidget(self._campaign_status_label)
         gate_layout.addLayout(labels, 1)
         self._arm_button = QPushButton("启用本次实盘会话")
         self._arm_button.clicked.connect(self._arm_session)
@@ -328,7 +344,38 @@ class TradingDialog(QDialog):
         form.addRow("OKX instId:", self._okx_instrument)
         self._okx_quantity = QLineEdit()
         self._okx_quantity.setPlaceholderText("现货=基础币数量；永续=合约张数")
-        form.addRow("数量:", self._okx_quantity)
+        self._okx_quantity.setToolTip(
+            "这是普通手动计划的基础数量。10 分钟 Campaign 会在每次下单前，"
+            "按风险资本、单笔风险、止损距离和杠杆上限重新计算最终数量。"
+        )
+        form.addRow("基础数量（Campaign 按风险重算）:", self._okx_quantity)
+        self._okx_risk_capital_cap = QDoubleSpinBox()
+        self._okx_risk_capital_cap.setRange(0, 1_000_000_000)
+        self._okx_risk_capital_cap.setDecimals(2)
+        self._okx_risk_capital_cap.setSingleStep(100)
+        self._okx_risk_capital_cap.setSuffix(" USDT")
+        self._okx_risk_capital_cap.setToolTip(
+            "定仓只使用“该上限”和最新 USDT 权益中较小者；0 表示尚未设置，禁止新增风险。"
+        )
+        form.addRow("风险资本上限:", self._okx_risk_capital_cap)
+        self._okx_risk_percent = QDoubleSpinBox()
+        self._okx_risk_percent.setRange(0.01, 100)
+        self._okx_risk_percent.setDecimals(2)
+        self._okx_risk_percent.setSingleStep(0.5)
+        self._okx_risk_percent.setSuffix(" %")
+        self._okx_risk_percent.setToolTip(
+            "每笔交易在止损、手续费和滑点全部发生时，最多损失有效风险资本的这个比例。"
+        )
+        form.addRow("单笔风险比例:", self._okx_risk_percent)
+        self._okx_maximum_leverage = QDoubleSpinBox()
+        self._okx_maximum_leverage.setRange(1, 125)
+        self._okx_maximum_leverage.setDecimals(2)
+        self._okx_maximum_leverage.setSingleStep(1)
+        self._okx_maximum_leverage.setSuffix(" ×")
+        self._okx_maximum_leverage.setToolTip(
+            "系统只会在这个上限内选择经过 OKX 容量回读验证的最低可行杠杆。"
+        )
+        form.addRow("最大允许杠杆:", self._okx_maximum_leverage)
         self._okx_product = QComboBox()
         self._okx_product.addItem("现货", "spot")
         self._okx_product.addItem("永续合约", "swap")
@@ -345,6 +392,12 @@ class TradingDialog(QDialog):
         form.addRow("环境:", self._okx_simulated)
         self._okx_base_url = QLineEdit()
         form.addRow("API 地址:", self._okx_base_url)
+        self._okx_network_route = QLabel(
+            f"{okx_fixed_proxy_label()} · {okx_fixed_proxy_url()} · "
+            "不跟随 v2rayN 当前节点"
+        )
+        self._okx_network_route.setWordWrap(True)
+        form.addRow("网络通道:", self._okx_network_route)
         return group
 
     def _connect_bus(self) -> None:
@@ -390,6 +443,15 @@ class TradingDialog(QDialog):
         self._min_confidence.valueChanged.connect(self._mark_configuration_dirty)
         self._entry_slippage_atr.valueChanged.connect(self._mark_configuration_dirty)
         self._exit_slippage_atr.valueChanged.connect(self._mark_configuration_dirty)
+        self._okx_risk_capital_cap.valueChanged.connect(
+            self._mark_configuration_dirty
+        )
+        self._okx_risk_percent.valueChanged.connect(
+            self._mark_configuration_dirty
+        )
+        self._okx_maximum_leverage.valueChanged.connect(
+            self._mark_configuration_dirty
+        )
 
     def _mark_configuration_dirty(self, *_args) -> None:
         if self._configuration_dirty:
@@ -443,6 +505,11 @@ class TradingDialog(QDialog):
         self._okx_source.setText(okx.source_symbol)
         self._okx_instrument.setText(okx.instrument)
         self._okx_quantity.setText(okx.quantity)
+        self._okx_risk_capital_cap.setValue(
+            float(okx.risk_capital_cap_usdt)
+        )
+        self._okx_risk_percent.setValue(float(okx.risk_percent * 100))
+        self._okx_maximum_leverage.setValue(float(okx.maximum_leverage))
         index = self._okx_product.findData(okx.product)
         self._okx_product.setCurrentIndex(max(0, index))
         index = self._okx_margin.findData(okx.margin_mode)
@@ -453,8 +520,9 @@ class TradingDialog(QDialog):
         self._sync_okx_margin_enabled()
         self._sync_order_slippage_controls()
 
-    def _apply_widgets(self) -> None:
-        execution = self._settings.execution.model_copy(deep=True)
+    def _candidate_settings_from_widgets(self):
+        candidate = self._settings.model_copy(deep=True)
+        execution = candidate.execution
         execution.enabled = self._enabled.isChecked()
         execution.auto_execute = self._auto_execute.isChecked()
         execution.selected_broker = self._broker.currentData()
@@ -480,11 +548,33 @@ class TradingDialog(QDialog):
         okx.source_symbol = self._okx_source.text().strip()
         okx.instrument = self._okx_instrument.text().strip()
         okx.quantity = self._okx_quantity.text().strip()
+        okx.risk_capital_cap_usdt = Decimal(
+            str(self._okx_risk_capital_cap.value())
+        )
+        okx.risk_percent = Decimal(
+            str(self._okx_risk_percent.value())
+        ) / Decimal("100")
+        okx.maximum_leverage = Decimal(
+            str(self._okx_maximum_leverage.value())
+        )
         okx.product = self._okx_product.currentData()
         okx.margin_mode = self._okx_margin.currentData()
         okx.simulated = self._okx_simulated.isChecked()
         okx.api_base_url = self._okx_base_url.text().strip()
-        self._settings.execution = execution
+        return candidate
+
+    def _apply_widgets(self) -> None:
+        candidate = self._candidate_settings_from_widgets()
+        self._settings.execution = candidate.execution.model_copy(deep=True)
+
+    def _apply_saved_settings(self, saved) -> None:
+        replacement = saved.model_copy(deep=True)
+        for field_name in type(replacement).model_fields:
+            setattr(
+                self._settings,
+                field_name,
+                getattr(replacement, field_name),
+            )
 
     def _sync_order_slippage_controls(self) -> None:
         self._entry_slippage_atr.setEnabled(
@@ -496,8 +586,9 @@ class TradingDialog(QDialog):
 
     def _save_configuration(self) -> None:
         try:
-            self._apply_widgets()
-            save_settings(self._settings, SETTINGS_JSON_PATH)
+            candidate = self._candidate_settings_from_widgets()
+            save_settings(candidate, SETTINGS_JSON_PATH)
+            self._apply_saved_settings(candidate)
             self._service.reload_settings(self._settings)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "保存失败", str(exc))
@@ -684,12 +775,14 @@ class TradingDialog(QDialog):
             return
         if armed:
             self._arm_label.setText(
-                "本次会话：已启用模拟写操作"
+                "桌面手动会话：已启用模拟写操作"
                 if self._is_demo_route()
-                else "本次会话：已启用实盘写操作"
+                else "桌面手动会话：已启用实盘写操作"
             )
         else:
-            self._arm_label.setText("本次会话：停用（仍可只读监控账户与订单）")
+            self._arm_label.setText(
+                "桌面手动会话：停用（自动 Campaign 状态见下一行）"
+            )
         self._arm_button.setEnabled(not armed)
         self._disarm_button.setEnabled(armed)
         self._execute_button.setEnabled(True)
@@ -742,6 +835,47 @@ class TradingDialog(QDialog):
         self._worker_health_label.setText(
             f"交易后台：{process_text} / {state}；"
             f"最近成功对账：{reconcile_text}{error_text}"
+        )
+
+    def _refresh_runtime_status(self) -> None:
+        self._okx_network_route.setText(
+            f"{okx_fixed_proxy_label()} · {okx_fixed_proxy_url()} · "
+            "不跟随 v2rayN 当前节点"
+        )
+        self._refresh_worker_health()
+        self._refresh_campaign_status()
+
+    def _refresh_campaign_status(self) -> None:
+        if self._read_model is None:
+            self._campaign_status_label.setText("10 分钟模拟盘：当前窗口未接入只读状态")
+            return
+        try:
+            snapshot = self._read_model.capture()
+        except Exception as exc:  # noqa: BLE001
+            self._campaign_status_label.setText(
+                f"10 分钟模拟盘：状态读取失败（{type(exc).__name__}）"
+            )
+            return
+        self._campaign_status_label.setText(
+            "10 分钟模拟盘："
+            f"{snapshot.campaign_state.value}；"
+            f"{snapshot.campaign_progress.value}；"
+            f"最近 {snapshot.campaign_last_result.value}；"
+            f"实际冻结参数 {snapshot.campaign_risk_parameters.value}；"
+            f"{snapshot.campaign_config_alignment.value}"
+        )
+        if (
+            snapshot.campaign_config_alignment.certainty.value == "unknown"
+            or snapshot.campaign_config_alignment.value.startswith("不一致")
+        ):
+            self._campaign_status_label.setStyleSheet(
+                "color: #ff5c5c; font-weight: 600;"
+            )
+        else:
+            self._campaign_status_label.setStyleSheet("")
+        self._campaign_status_label.setToolTip(
+            "“实际冻结参数”来自 Campaign 状态文件。"
+            "在此保存的新配置要经过安全重启后才会进入下一轮 Campaign。"
         )
 
     def _on_execution_update(self, record: ExecutionRecord) -> None:

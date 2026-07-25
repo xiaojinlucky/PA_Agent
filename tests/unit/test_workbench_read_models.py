@@ -1,7 +1,9 @@
 """工作台只读读取层测试。"""
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -13,10 +15,18 @@ from pa_agent.gui.read_models import FactCertainty, WorkbenchReadModel
 
 
 class _ExecutionStore:
-    def __init__(self, *, active=(), recent=(), account=None) -> None:
+    def __init__(
+        self,
+        *,
+        active=(),
+        recent=(),
+        account=None,
+        by_id=None,
+    ) -> None:
         self.active = list(active)
         self.recent = list(recent)
         self.account = account
+        self.by_id = dict(by_id or {})
         self.account_route: tuple[str, str] | None = None
 
     def list_active(self):
@@ -25,6 +35,9 @@ class _ExecutionStore:
     def list_recent(self, limit: int = 50):
         assert limit == 1
         return self.recent
+
+    def get(self, execution_id: str):
+        return self.by_id.get(execution_id)
 
     def latest_account_snapshot(self, broker: str, account_profile: str):
         self.account_route = (broker, account_profile)
@@ -58,6 +71,9 @@ def _settings() -> Settings:
     settings.general.last_timeframe = "15m"
     settings.execution.selected_broker = "okx"
     settings.execution.okx.simulated = True
+    settings.execution.okx.risk_capital_cap_usdt = 20000
+    settings.execution.okx.risk_percent = 0.10
+    settings.execution.okx.maximum_leverage = 20
     return settings
 
 
@@ -69,13 +85,20 @@ def _source(*, connected: bool, symbol: str, timeframe: str):
     )
 
 
-def _model(*, source, execution_store, worker_store):
+def _model(
+    *,
+    source,
+    execution_store,
+    worker_store,
+    campaign_state_path: Path = Path("unit-test-campaign-does-not-exist.json"),
+):
     return WorkbenchReadModel(
         settings=_settings(),
         data_source=source,
         execution_store=execution_store,
         worker_store=worker_store,
         clock=lambda: datetime(2026, 7, 23, 12, 0, tzinfo=UTC),
+        campaign_state_path=campaign_state_path,
     )
 
 
@@ -170,6 +193,279 @@ def test_capture_keeps_missing_worker_and_account_as_unknown():
     assert snapshot.account.certainty is FactCertainty.UNKNOWN
     assert snapshot.latest_execution_state.value == "无"
     assert snapshot.active_executions == ()
+    assert snapshot.campaign_state.value == "未启动"
+    assert snapshot.campaign_state.certainty is FactCertainty.UNKNOWN
+
+
+def test_capture_uses_latest_current_campaign_execution_instead_of_global_latest(
+    tmp_path,
+):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "execution_ids": ["campaign-old", "campaign-current"],
+                "analyses_completed": 2,
+                "analyses_failed": 0,
+                "executions_prepared": 2,
+                "last_plan_result": "execution:open",
+                "frozen_risk_capital_cap_usdt": "20000",
+                "frozen_risk_percent": "0.10",
+                "frozen_maximum_leverage": "20",
+                "updated_at": "2026-07-23T11:59:30+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+    foreign_newer = SimpleNamespace(
+        id="controlled-canary",
+        state=ExecutionState.CLOSED,
+    )
+    campaign_old = SimpleNamespace(
+        id="campaign-old",
+        state=ExecutionState.CANCELED,
+    )
+    campaign_current = SimpleNamespace(
+        id="campaign-current",
+        state=ExecutionState.OPEN,
+    )
+
+    snapshot = _model(
+        source=_source(
+            connected=True,
+            symbol="XAU-USDT-SWAP",
+            timeframe="10m",
+        ),
+        execution_store=_ExecutionStore(
+            recent=[foreign_newer],
+            by_id={
+                "campaign-old": campaign_old,
+                "campaign-current": campaign_current,
+            },
+        ),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert snapshot.campaign_execution_ids == (
+        "campaign-old",
+        "campaign-current",
+    )
+    assert snapshot.latest_execution is campaign_current
+    assert snapshot.latest_execution_state.value == "open"
+
+
+def test_risk_stop_hides_backend_exception_name_from_primary_ui():
+    fact = WorkbenchReadModel._risk_stop_fact(
+        SimpleNamespace(
+            kill_active=True,
+            kill_reason="risk_runtime_IncompleteRead",
+        ),
+        "2026-07-23T12:00:00+00:00",
+    )
+
+    assert fact.value == "已停止新增风险：风险账户数据读取中断"
+    assert "IncompleteRead" not in fact.value
+
+
+def test_capture_reads_fresh_ten_minute_campaign_state(tmp_path):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "analyses_completed": 4,
+                "analyses_failed": 0,
+                "executions_prepared": 0,
+                "last_plan_result": "blocked:no_order",
+                "last_supervisor_action": "",
+                "last_error": "",
+                "frozen_risk_capital_cap_usdt": "20000",
+                "frozen_risk_percent": "0.10",
+                "frozen_maximum_leverage": "20",
+                "updated_at": "2026-07-23T11:59:30+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _model(
+        source=_source(connected=True, symbol="XAU-USDT-SWAP", timeframe="10m"),
+        execution_store=_ExecutionStore(),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert snapshot.campaign_state.value == "运行中（30 秒前更新）"
+    assert snapshot.campaign_state.certainty is FactCertainty.CONFIRMED
+    assert snapshot.campaign_progress.value == "分析 4 / 失败 0 / 生成执行 0"
+    assert snapshot.campaign_last_result.value == "PA 本轮判断不下单"
+    assert (
+        snapshot.campaign_risk_parameters.value
+        == "按风险预算自动算张数 / 单笔风险 10.00% / "
+        "资金上限 20000 USDT / 杠杆上限 20×"
+    )
+    assert snapshot.campaign_config_alignment.value.startswith("一致")
+    assert (
+        snapshot.campaign_config_alignment.certainty
+        is FactCertainty.CONFIRMED
+    )
+
+
+def test_capture_marks_stale_active_campaign_unknown(tmp_path):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "analyses_completed": 4,
+                "analyses_failed": 0,
+                "executions_prepared": 0,
+                "last_plan_result": "blocked:no_order",
+                "last_supervisor_action": "",
+                "last_error": "",
+                "frozen_risk_capital_cap_usdt": "20000",
+                "frozen_risk_percent": "0.10",
+                "frozen_maximum_leverage": "20",
+                "updated_at": "2026-07-23T11:40:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _model(
+        source=_source(connected=True, symbol="XAU-USDT-SWAP", timeframe="10m"),
+        execution_store=_ExecutionStore(),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert "已 1200 秒未更新" in snapshot.campaign_state.value
+    assert snapshot.campaign_state.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_progress.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_last_result.certainty is FactCertainty.UNKNOWN
+    assert (
+        snapshot.campaign_risk_parameters.certainty
+        is FactCertainty.UNKNOWN
+    )
+    assert snapshot.campaign_config_alignment.certainty is FactCertainty.UNKNOWN
+
+
+@pytest.mark.parametrize(
+    ("status", "updated_at", "expected"),
+    [
+        ("unexpected", "2026-07-23T11:59:30+00:00", "未知状态 unexpected"),
+        (
+            "active",
+            "2026-07-23T12:02:00+00:00",
+            "状态时间比本机快 120 秒",
+        ),
+    ],
+)
+def test_capture_does_not_confirm_unknown_or_future_campaign_state(
+    tmp_path,
+    status,
+    updated_at,
+    expected,
+):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": status,
+                "analyses_completed": 4,
+                "analyses_failed": 0,
+                "executions_prepared": 0,
+                "last_plan_result": "blocked:no_order",
+                "frozen_risk_capital_cap_usdt": "20000",
+                "frozen_risk_percent": "0.10",
+                "frozen_maximum_leverage": "20",
+                "updated_at": updated_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _model(
+        source=_source(connected=True, symbol="XAU-USDT-SWAP", timeframe="10m"),
+        execution_store=_ExecutionStore(),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert expected in snapshot.campaign_state.value
+    assert snapshot.campaign_state.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_progress.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_last_result.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_config_alignment.certainty is FactCertainty.UNKNOWN
+
+
+@pytest.mark.parametrize("status", ["stopping", "needs_attention", "completed"])
+def test_capture_marks_every_stale_campaign_status_unknown(tmp_path, status):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": status,
+                "analyses_completed": 4,
+                "analyses_failed": 0,
+                "executions_prepared": 0,
+                "last_plan_result": "blocked:no_order",
+                "frozen_risk_capital_cap_usdt": "20000",
+                "frozen_risk_percent": "0.10",
+                "frozen_maximum_leverage": "20",
+                "updated_at": "2026-07-23T11:40:00+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _model(
+        source=_source(connected=True, symbol="XAU-USDT-SWAP", timeframe="10m"),
+        execution_store=_ExecutionStore(),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert "已 1200 秒未更新" in snapshot.campaign_state.value
+    assert snapshot.campaign_state.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_progress.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_last_result.certainty is FactCertainty.UNKNOWN
+    assert snapshot.campaign_config_alignment.certainty is FactCertainty.UNKNOWN
+
+
+def test_capture_exposes_frozen_campaign_risk_mismatch(tmp_path):
+    campaign_state_path = tmp_path / "okx_demo_campaign.json"
+    campaign_state_path.write_text(
+        json.dumps(
+            {
+                "status": "active",
+                "analyses_completed": 4,
+                "analyses_failed": 0,
+                "executions_prepared": 0,
+                "frozen_risk_capital_cap_usdt": "5000",
+                "frozen_risk_percent": "0.08",
+                "frozen_maximum_leverage": "25",
+                "updated_at": "2026-07-23T11:59:30+00:00",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    snapshot = _model(
+        source=_source(connected=True, symbol="XAU-USDT-SWAP", timeframe="10m"),
+        execution_store=_ExecutionStore(),
+        worker_store=_WorkerStore(None),
+        campaign_state_path=campaign_state_path,
+    ).capture()
+
+    assert "资金上限 5000 USDT" in snapshot.campaign_risk_parameters.value
+    assert snapshot.campaign_config_alignment.value.startswith("不一致")
+    assert (
+        snapshot.campaign_config_alignment.certainty
+        is FactCertainty.CONFIRMED
+    )
 
 
 def test_capture_rejects_naive_clock():

@@ -22,6 +22,7 @@ from pa_agent.execution.models import (
 )
 from pa_agent.execution.service import ExecutionService
 from pa_agent.execution.store import ExecutionStore
+from pa_agent.risk.runtime import RiskRuntimeBlocked
 from tests.unit.test_execution_plan_builder import _persist, _record
 
 
@@ -31,6 +32,83 @@ class FakePendingWriter:
 
     def full_path(self, _record):
         return self.path
+
+
+def test_recover_transient_risk_stop_refreshes_before_recovery():
+    events: list[tuple[str, object]] = []
+    recovered_state = object()
+
+    class _RiskRuntime:
+        def recover_transient_read_failure(self, route_key: str):
+            events.append(("recover", route_key))
+            return recovered_state
+
+    service = object.__new__(ExecutionService)
+    service._lock = threading.RLock()
+    service._risk_runtime = _RiskRuntime()
+
+    def _refresh_account_route(
+        *,
+        broker,
+        environment,
+        account,
+        raise_on_risk_failure,
+    ):
+        events.append(
+            (
+                "refresh",
+                (
+                    broker,
+                    environment,
+                    account,
+                    raise_on_risk_failure,
+                ),
+            )
+        )
+
+    service.refresh_account_route = _refresh_account_route
+
+    result = service.recover_transient_risk_stop(
+        broker="okx",
+        environment="demo",
+        account="okx",
+    )
+
+    assert result is recovered_state
+    assert events == [
+        ("refresh", ("okx", "demo", "okx", True)),
+        ("recover", "okx:demo:okx"),
+    ]
+
+
+def test_recover_transient_risk_stop_does_not_recover_after_refresh_failure():
+    events: list[str] = []
+
+    class _RiskRuntime:
+        def recover_transient_read_failure(self, _route_key: str):
+            events.append("recover")
+
+    service = object.__new__(ExecutionService)
+    service._lock = threading.RLock()
+    service._risk_runtime = _RiskRuntime()
+
+    def _refresh_account_route(**_kwargs):
+        events.append("refresh")
+        raise RiskRuntimeBlocked(
+            "risk_runtime_BrokerTransportError",
+            "最新风险读取失败",
+        )
+
+    service.refresh_account_route = _refresh_account_route
+
+    with pytest.raises(RiskRuntimeBlocked):
+        service.recover_transient_risk_stop(
+            broker="okx",
+            environment="demo",
+            account="okx",
+        )
+
+    assert events == ["refresh"]
 
 
 class FakeAdapter:
@@ -71,6 +149,7 @@ class FakeAdapter:
             price_tick=Decimal("0.1"),
             quantity_step=Decimal("1"),
             minimum_quantity=Decimal("1"),
+            broker_metadata={"current_leverage": "20"},
         )
 
     def prepare_submit(self, record):
@@ -198,6 +277,9 @@ def _settings():
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.quantity = "2"
     settings.execution.okx.product = "swap"
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("20000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
     return settings
 
 

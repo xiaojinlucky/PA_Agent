@@ -3,16 +3,22 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
+import urllib.request
+from unittest.mock import Mock, patch
 
 import pytest
 
 from pa_agent.execution.credentials import OkxCredentials
 from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
 from pa_agent.execution.okx_client import (
+    OKX_FIXED_PROXY_URL,
     OKX_PENDING_ALGO_ORDER_TYPES,
     HttpResponse,
     OkxRestClient,
+    UrlLibTransport,
+    okx_fixed_proxy_label,
 )
 
 
@@ -55,6 +61,122 @@ def _algo_rows(count: int, *, start: int = 0) -> list[dict[str, str]]:
         }
         for index in range(start, start + count)
     ]
+
+
+def test_urllib_incomplete_read_is_normalized_as_read_only_transport_failure():
+    class _Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            raise http.client.IncompleteRead(b"{", 10)
+
+    opener = Mock()
+    opener.open.return_value = _Response()
+    with pytest.raises(BrokerTransportError) as caught:
+        UrlLibTransport(opener=opener).request(
+            "GET",
+            "https://www.okx.com/api/v5/account/bills",
+            headers={},
+            body=None,
+            timeout=10,
+        )
+
+    assert caught.value.write_may_have_reached is False
+    assert "IncompleteRead" in str(caught.value)
+
+
+def test_urllib_transport_binds_fixed_proxy_even_when_no_proxy_is_wildcard(
+    monkeypatch,
+):
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:65530")
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:65530")
+    monkeypatch.setenv("NO_PROXY", "*")
+    monkeypatch.setenv("no_proxy", "*")
+    monkeypatch.delenv("PA_AGENT_OKX_PROXY_URL", raising=False)
+    opener = Mock()
+    response = Mock()
+    response.status = 200
+    response.read.return_value = b"{}"
+    response.__enter__ = Mock(return_value=response)
+    response.__exit__ = Mock(return_value=False)
+    opener.open.return_value = response
+
+    with patch(
+        "pa_agent.execution.okx_client.urllib.request.build_opener",
+        return_value=opener,
+    ) as build_opener:
+        transport = UrlLibTransport()
+        transport.request(
+            "GET",
+            "https://www.okx.com/api/v5/public/time",
+            headers={},
+            body=None,
+            timeout=10,
+        )
+
+    proxy_handler = build_opener.call_args.args[0]
+    assert proxy_handler.proxies == {
+        "http": OKX_FIXED_PROXY_URL,
+        "https": OKX_FIXED_PROXY_URL,
+    }
+    assert transport.proxy_url == OKX_FIXED_PROXY_URL
+    request = urllib.request.Request(
+        "https://www.okx.com/api/v5/public/time"
+    )
+    with patch(
+        "pa_agent.execution.okx_client.urllib.request.proxy_bypass",
+        side_effect=AssertionError("不得读取系统 bypass"),
+    ):
+        proxy_handler.proxy_open(
+            request,
+            OKX_FIXED_PROXY_URL,
+            "https",
+        )
+    assert request.host == "127.0.0.1:10981"
+    assert request._tunnel_host == "www.okx.com"  # noqa: SLF001
+
+
+@pytest.mark.parametrize(
+    "proxy_url",
+    (
+        "https://proxy.example:8443",
+        "http://192.0.2.1:8080",
+        "http://user:pass@127.0.0.1:10981",
+    ),
+)
+def test_urllib_transport_rejects_non_loopback_or_credential_proxy(proxy_url):
+    with pytest.raises(ValueError, match="OKX 独立代理"):
+        UrlLibTransport(proxy_url=proxy_url)
+
+
+def test_fixed_proxy_label_reads_activated_runtime_metadata(
+    tmp_path,
+    monkeypatch,
+):
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "node_label": "新固定节点",
+                "listen_host": "127.0.0.1",
+                "listen_port": 10981,
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "pa_agent.execution.okx_client.OKX_FIXED_PROXY_METADATA_PATH",
+        metadata_path,
+    )
+    monkeypatch.delenv("PA_AGENT_OKX_PROXY_LABEL", raising=False)
+
+    assert okx_fixed_proxy_label() == "新固定节点"
 
 
 def test_private_request_signature_uses_exact_path_query_and_compact_body():

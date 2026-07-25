@@ -92,8 +92,14 @@ class WorkerStore:
         path: Path,
         *,
         clock: Callable[[], datetime] | None = None,
+        worker_lock_path: Path | None = None,
     ) -> None:
         self._path = Path(path)
+        self._worker_lock_path = (
+            Path(worker_lock_path).resolve()
+            if worker_lock_path is not None
+            else None
+        )
         self._clock = clock or _system_utc_now
         self._lock = threading.RLock()
         self._schema_version = 0
@@ -149,12 +155,72 @@ class WorkerStore:
         """Upgrade durable state only while the caller owns the Worker lock."""
         if not bool(getattr(worker_lock, "is_locked", False)):
             raise RuntimeError("Worker 单例锁未持有, 禁止迁移 worker schema")
+        if self._worker_lock_path is not None:
+            actual_lock_path = getattr(worker_lock, "lock_file", None)
+            if (
+                actual_lock_path is None
+                or Path(str(actual_lock_path)).resolve()
+                != self._worker_lock_path
+            ):
+                raise RuntimeError(
+                    "持有的不是该控制库配置的 Worker 单例锁，禁止迁移"
+                )
         self._initialise(allow_migration=True)
 
+    def _read_existing_schema_version(self) -> int:
+        """只读探测已有控制库版本，绝不创建 WAL、事务、表或目录。"""
+
+        uri = f"file:{self._path.resolve().as_posix()}?mode=ro"
+        try:
+            with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
+                connection.row_factory = sqlite3.Row
+                meta_exists = connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type='table' AND name='worker_meta'
+                    """
+                ).fetchone()
+                if meta_exists is None:
+                    existing_worker_state = connection.execute(
+                        """
+                        SELECT 1 FROM sqlite_master
+                        WHERE type='table'
+                          AND name LIKE 'worker_%'
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if existing_worker_state is None:
+                        return 0
+                    raise RuntimeError(
+                        "worker schema 缺少版本号（worker_meta 不存在）, "
+                        "禁止猜测或自动改写"
+                    )
+                version = connection.execute(
+                    """
+                    SELECT value FROM worker_meta
+                    WHERE key='worker_schema_version'
+                    """
+                ).fetchone()
+        except sqlite3.Error as exc:
+            raise RuntimeError("无法只读探测 worker schema 版本") from exc
+        if version is None:
+            raise RuntimeError("worker schema 缺少版本号, 禁止猜测或自动改写")
+        try:
+            parsed_version = int(version["value"])
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("worker schema 版本无效") from exc
+        if parsed_version not in {1, 2, 3, _WORKER_SCHEMA_VERSION}:
+            raise RuntimeError("不支持的 worker schema 版本")
+        return parsed_version
+
     def _initialise(self, *, allow_migration: bool) -> None:
+        if self._path.exists() and not allow_migration:
+            existing_version = self._read_existing_schema_version()
+            if existing_version:
+                self._schema_version = existing_version
+                return
         self._path.parent.mkdir(parents=True, exist_ok=True)
         with self._lock, self._connect() as connection:
-            connection.execute("PRAGMA journal_mode = WAL")
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
@@ -401,11 +467,23 @@ class WorkerStore:
                         """,
                         (str(_WORKER_SCHEMA_VERSION),),
                     )
-                self._schema_version = _WORKER_SCHEMA_VERSION
+                integrity = connection.execute(
+                    "PRAGMA integrity_check"
+                ).fetchone()
+                if integrity is None or str(integrity[0]).lower() != "ok":
+                    raise RuntimeError(
+                        "worker schema 迁移后完整性检查未通过"
+                    )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
+            journal_mode = connection.execute(
+                "PRAGMA journal_mode = WAL"
+            ).fetchone()
+            if journal_mode is None or str(journal_mode[0]).lower() != "wal":
+                raise RuntimeError("worker schema 已提交，但 WAL 模式启用失败")
+            self._schema_version = _WORKER_SCHEMA_VERSION
 
     @staticmethod
     def _scope_key(
@@ -573,6 +651,9 @@ class WorkerStore:
     def save_risk_runtime_state(
         self,
         state: RiskRuntimeState,
+        *,
+        baseline: dict[str, object] | None = None,
+        evidence: dict[str, object] | None = None,
     ) -> RiskRuntimeState:
         if self._schema_version != _WORKER_SCHEMA_VERSION:
             raise RuntimeError("worker schema 尚未迁移，不能保存 risk runtime")
@@ -658,11 +739,202 @@ class WorkerStore:
                         self._iso(state.updated_at),
                     ),
                 )
+                if baseline is not None:
+                    baseline_json = json.dumps(
+                        baseline,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    baseline_key = (
+                        f"risk_runtime_baseline:{state.route_key}"
+                    )
+                    existing_baseline = connection.execute(
+                        "SELECT value FROM worker_meta WHERE key=?",
+                        (baseline_key,),
+                    ).fetchone()
+                    if existing_baseline is None:
+                        connection.execute(
+                            """
+                            INSERT INTO worker_meta(key, value)
+                            VALUES (?, ?)
+                            """,
+                            (baseline_key, baseline_json),
+                        )
+                    elif str(existing_baseline["value"]) != baseline_json:
+                        raise RuntimeError(
+                            "risk runtime 切换基线已存在且内容不一致"
+                        )
+                if evidence is not None:
+                    evidence_json = json.dumps(
+                        evidence,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    evidence_digest = hashlib.sha256(
+                        evidence_json.encode("utf-8")
+                    ).hexdigest()
+                    evidence_key = (
+                        f"risk_runtime_evidence:{state.route_key}:"
+                        f"{evidence_digest}"
+                    )
+                    connection.execute(
+                        """
+                        INSERT OR IGNORE INTO worker_meta(key, value)
+                        VALUES (?, ?)
+                        """,
+                        (evidence_key, evidence_json),
+                    )
                 connection.execute("COMMIT")
             except Exception:
                 connection.execute("ROLLBACK")
                 raise
         return state
+
+    def get_runtime_metadata(self, key: str) -> dict[str, object] | None:
+        """只读返回一条非秘密风险元数据。"""
+
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            return None
+        with self._lock, self._connect() as connection:
+            row = connection.execute(
+                "SELECT value FROM worker_meta WHERE key=?",
+                (str(key),),
+            ).fetchone()
+        if row is None:
+            return None
+        value = json.loads(str(row["value"]))
+        if not isinstance(value, dict):
+            raise RuntimeError("worker_meta 风险元数据不是对象")
+        return value
+
+    def backfill_risk_runtime_baselines(
+        self,
+        *,
+        worker_lock: object,
+    ) -> int:
+        """持锁补录旧 v4 风险态的切换标记，不改写风险态本身。"""
+
+        if self._schema_version != _WORKER_SCHEMA_VERSION:
+            raise RuntimeError("worker schema 尚未迁移，不能补录风险切换基线")
+        if not bool(getattr(worker_lock, "is_locked", False)):
+            raise RuntimeError("Worker 单例锁未持有, 禁止补录风险切换基线")
+        if self._worker_lock_path is not None:
+            actual_lock_path = getattr(worker_lock, "lock_file", None)
+            if (
+                actual_lock_path is None
+                or Path(str(actual_lock_path)).resolve()
+                != self._worker_lock_path
+            ):
+                raise RuntimeError(
+                    "持有的不是该控制库配置的 Worker 单例锁，"
+                    "禁止补录风险切换基线"
+                )
+        recorded_at = self._iso(self._now())
+        created = 0
+        with self._lock, self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                rows = connection.execute(
+                    """
+                    SELECT * FROM risk_runtime_state
+                    ORDER BY route_key
+                    """
+                ).fetchall()
+                for row in rows:
+                    route_key_value = str(row["route_key"])
+                    baseline_key = (
+                        f"risk_runtime_baseline:{route_key_value}"
+                    )
+                    existing = connection.execute(
+                        "SELECT value FROM worker_meta WHERE key=?",
+                        (baseline_key,),
+                    ).fetchone()
+                    if existing is not None:
+                        try:
+                            existing_payload = json.loads(
+                                str(existing["value"])
+                            )
+                        except (TypeError, ValueError) as exc:
+                            raise RuntimeError(
+                                "risk runtime 切换基线不是有效 JSON"
+                            ) from exc
+                        if (
+                            not isinstance(existing_payload, dict)
+                            or existing_payload.get("kind")
+                            != "v4_cutover_baseline"
+                            or existing_payload.get("route_key")
+                            != route_key_value
+                            or not isinstance(
+                                existing_payload.get("backfilled"),
+                                bool,
+                            )
+                        ):
+                            raise RuntimeError(
+                                "risk runtime 切换基线元数据无效"
+                            )
+                        continue
+                    if (
+                        not str(row["account_identity"]).strip()
+                        or row["last_bill_scan_at"] is None
+                        or row["adjusted_high_water_usd"] is None
+                        or row["last_total_equity_usd"] is None
+                    ):
+                        continue
+                    baseline = {
+                        "kind": "v4_cutover_baseline",
+                        "route_key": route_key_value,
+                        "account_identity_digest": str(
+                            row["account_identity"]
+                        ),
+                        "baseline_total_equity_usd": str(
+                            row["last_total_equity_usd"]
+                        ),
+                        "adjusted_high_water_usd": str(
+                            row["adjusted_high_water_usd"]
+                        ),
+                        "last_external_cashflow_bill_id": str(
+                            row["last_external_cashflow_bill_id"]
+                        ),
+                        "last_account_bill_id": str(
+                            row["last_account_bill_id"]
+                        ),
+                        "last_account_bill_timestamp_ms": row[
+                            "last_account_bill_timestamp_ms"
+                        ],
+                        "last_bill_scan_at": str(row["last_bill_scan_at"]),
+                        # 这是“补录标记建立时间”，不是原始风险基线建立时间。
+                        "established_at": recorded_at,
+                        "recorded_at": recorded_at,
+                        "backfilled": True,
+                        "baseline_origin": (
+                            "existing_v4_risk_runtime_state_snapshot"
+                        ),
+                        "source_schema_version": _WORKER_SCHEMA_VERSION,
+                        "source_state_updated_at": str(row["updated_at"]),
+                        "original_baseline_established_at": None,
+                        "historical_maximum_claimed": False,
+                    }
+                    baseline_json = json.dumps(
+                        baseline,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO worker_meta(key, value)
+                        VALUES (?, ?)
+                        """,
+                        (baseline_key, baseline_json),
+                    )
+                    created += 1
+                connection.execute("COMMIT")
+            except Exception:
+                connection.execute("ROLLBACK")
+                raise
+        return created
 
     def enqueue(
         self,
@@ -739,6 +1011,16 @@ class WorkerStore:
                     ):
                         raise RuntimeError(
                             "同一路由已有不同参数的 set_leverage 命令, "
+                            "禁止静默复用"
+                        )
+                    if (
+                        candidate.action
+                        is WorkerCommandAction.CLEAR_DRAWDOWN_STOP
+                        and existing_command.reason_code
+                        != candidate.reason_code
+                    ):
+                        raise RuntimeError(
+                            "同一路由已有不同类型的风险停止处置命令, "
                             "禁止静默复用"
                         )
                     connection.execute("COMMIT")

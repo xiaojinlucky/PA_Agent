@@ -16,6 +16,17 @@ from pa_agent.risk.cashflow import (
 
 RISK_DRAWDOWN_STOP_FRACTION = Decimal("0.50")
 _OKX_BILL_WINDOW = timedelta(days=7)
+_MANUALLY_CLEARABLE_KILL_REASONS = frozenset(
+    {"drawdown_threshold_exceeded"}
+)
+RECOVERABLE_TRANSIENT_RISK_STOP_REASONS = frozenset(
+    {
+        "risk_runtime_BrokerApiError",
+        "risk_runtime_BrokerTransportError",
+        "risk_runtime_IncompleteRead",
+        "risk_runtime_50004",
+    }
+)
 
 
 class RiskRuntimeStateStore(Protocol):
@@ -27,6 +38,9 @@ class RiskRuntimeStateStore(Protocol):
     def save_risk_runtime_state(
         self,
         state: RiskRuntimeState,
+        *,
+        baseline: dict[str, object] | None = None,
+        evidence: dict[str, object] | None = None,
     ) -> RiskRuntimeState: ...
 
 
@@ -163,12 +177,29 @@ class RiskRuntime:
             kill_activated_at=now,
             updated_at=now,
         )
+        preserve_existing_reason = (
+            previous is not None
+            and previous.kill_active
+            and bool(previous.kill_reason)
+            and previous.kill_reason
+            not in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS
+            and reason in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS
+        )
+        effective_reason = (
+            previous.kill_reason if preserve_existing_reason else reason
+        )
+        if preserve_existing_reason:
+            effective_activated_at = previous.kill_activated_at or now
+        elif reason in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS:
+            effective_activated_at = now
+        else:
+            effective_activated_at = state.kill_activated_at or now
         return replace(
             state,
-            account_identity=account_identity or state.account_identity,
+            account_identity=state.account_identity or account_identity,
             kill_active=True,
-            kill_reason=reason,
-            kill_activated_at=state.kill_activated_at or now,
+            kill_reason=effective_reason,
+            kill_activated_at=effective_activated_at,
             updated_at=now,
         )
 
@@ -200,7 +231,41 @@ class RiskRuntime:
             previous=previous,
             now=now,
         )
-        return self._store.save_risk_runtime_state(state)
+        evidence = None
+        preserves_non_transient_stop = (
+            previous is not None
+            and previous.kill_active
+            and bool(previous.kill_reason)
+            and previous.kill_reason
+            not in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS
+            and reason in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS
+        )
+        if preserves_non_transient_stop:
+            evidence = {
+                "kind": "transient_risk_read_failure_while_stopped",
+                "route_key": route_key_value,
+                "transient_reason": reason,
+                "preserved_kill_reason": previous.kill_reason,
+                "observed_at": now.isoformat(timespec="microseconds"),
+            }
+        elif (
+            previous is not None
+            and previous.account_identity
+            and account_identity
+            and previous.account_identity != account_identity
+        ):
+            evidence = {
+                "kind": "account_identity_mismatch",
+                "route_key": route_key_value,
+                "trusted_account_identity_digest": previous.account_identity,
+                "observed_account_identity_digest": account_identity,
+                "reason": reason,
+                "observed_at": now.isoformat(timespec="microseconds"),
+            }
+        return self._store.save_risk_runtime_state(
+            state,
+            evidence=evidence,
+        )
 
     def refresh(
         self,
@@ -275,7 +340,26 @@ class RiskRuntime:
                     kill_activated_at=None,
                     updated_at=now,
                 )
-                return self._store.save_risk_runtime_state(state)
+                baseline = {
+                    "kind": "v4_cutover_baseline",
+                    "route_key": route_key_value,
+                    "account_identity_digest": account_identity,
+                    "baseline_total_equity_usd": str(current_equity),
+                    "adjusted_high_water_usd": str(current_equity),
+                    "last_account_bill_id": newest_bill_id,
+                    "last_account_bill_timestamp_ms": (
+                        newest_bill_timestamp_ms
+                    ),
+                    "established_at": now.isoformat(
+                        timespec="microseconds"
+                    ),
+                    "recorded_at": now.isoformat(timespec="microseconds"),
+                    "backfilled": False,
+                }
+                return self._store.save_risk_runtime_state(
+                    state,
+                    baseline=baseline,
+                )
 
             if (
                 previous.account_identity
@@ -317,14 +401,15 @@ class RiskRuntime:
                 reason=f"risk_runtime_{exc.code}",
             )
 
-        kill_active = previous.kill_active or (
+        drawdown_stop_active = (
             result.drawdown_fraction >= self._stop_fraction
         )
+        kill_active = previous.kill_active or drawdown_stop_active
         kill_reason = previous.kill_reason
         activated_at = previous.kill_activated_at
-        if not previous.kill_active and kill_active:
+        if drawdown_stop_active:
             kill_reason = "drawdown_threshold_exceeded"
-            activated_at = now
+            activated_at = previous.kill_activated_at or now
         state = RiskRuntimeState(
             route_key=route_key_value,
             broker=broker,
@@ -429,6 +514,19 @@ class RiskRuntime:
                 "risk_runtime_unavailable",
                 "没有可用于人工清除停止状态的有效账户总权益",
             )
+        if state.kill_reason not in _MANUALLY_CLEARABLE_KILL_REASONS:
+            raise RiskRuntimeBlocked(
+                "risk_clear_reason_not_allowed",
+                "人工清除只允许解除回撤停止",
+            )
+        if (
+            state.drawdown_fraction is None
+            or state.drawdown_fraction >= self._stop_fraction
+        ):
+            raise RiskRuntimeBlocked(
+                "drawdown_threshold_exceeded",
+                "当前账户回撤仍达到停止阈值。不能重锚并清除停止状态",
+            )
         now = _now_utc(self._clock)
         cleared = replace(
             state,
@@ -441,3 +539,89 @@ class RiskRuntime:
             updated_at=now,
         )
         return self._store.save_risk_runtime_state(cleared)
+
+    def recover_transient_read_failure(
+        self,
+        route_key_value: str,
+    ) -> RiskRuntimeState:
+        """显式解除已被最新完整读取证明恢复的临时只读故障。"""
+
+        state = self._store.get_risk_runtime_state(route_key_value)
+        if state is None:
+            raise RiskRuntimeBlocked(
+                "risk_runtime_unavailable",
+                "没有可用于复核恢复的风险运行态",
+            )
+        if state.kill_reason not in RECOVERABLE_TRANSIENT_RISK_STOP_REASONS:
+            raise RiskRuntimeBlocked(
+                "risk_recovery_reason_not_allowed",
+                "该停止原因不能通过临时读取故障复核恢复",
+            )
+        if (
+            not state.account_identity
+            or state.adjusted_high_water_usd is None
+            or state.last_total_equity_usd is None
+            or state.last_bill_scan_at is None
+            or state.kill_activated_at is None
+            or state.last_bill_scan_at <= state.kill_activated_at
+        ):
+            raise RiskRuntimeBlocked(
+                "risk_recovery_evidence_incomplete",
+                "停止发生后尚无完整的新鲜权益、身份和账单链读取证据",
+            )
+        if (
+            state.drawdown_fraction is None
+            or state.drawdown_fraction >= self._stop_fraction
+        ):
+            raise RiskRuntimeBlocked(
+                "drawdown_threshold_exceeded",
+                "当前账户回撤仍达到停止阈值，禁止恢复新增风险",
+            )
+        now = _now_utc(self._clock)
+        recovered = replace(
+            state,
+            kill_active=False,
+            kill_reason="",
+            kill_activated_at=None,
+            updated_at=now,
+        )
+        evidence = {
+            "kind": "transient_risk_read_recovery",
+            "route_key": route_key_value,
+            "recovered_reason": state.kill_reason,
+            "failure_at": state.kill_activated_at.isoformat(
+                timespec="microseconds"
+            ),
+            "account_identity_digest": state.account_identity,
+            "preserved_adjusted_high_water_usd": str(
+                state.adjusted_high_water_usd
+            ),
+            "preserved_last_total_equity_usd": str(
+                state.last_total_equity_usd
+            ),
+            "preserved_drawdown_usd": (
+                str(state.drawdown_usd)
+                if state.drawdown_usd is not None
+                else None
+            ),
+            "preserved_drawdown_fraction": (
+                str(state.drawdown_fraction)
+                if state.drawdown_fraction is not None
+                else None
+            ),
+            "last_external_cashflow_bill_id": (
+                state.last_external_cashflow_bill_id
+            ),
+            "last_account_bill_id": state.last_account_bill_id,
+            "last_account_bill_timestamp_ms": (
+                state.last_account_bill_timestamp_ms
+            ),
+            "last_bill_scan_at": state.last_bill_scan_at.isoformat(
+                timespec="microseconds"
+            ),
+            "recovered_at": now.isoformat(timespec="microseconds"),
+        }
+        return self._store.save_risk_runtime_state(
+            recovered,
+            evidence=evidence,
+        )

@@ -4,13 +4,16 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import http.client
 import json
+import os
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 
 from pa_agent.execution.credentials import OkxCredentials
@@ -26,6 +29,16 @@ OKX_PENDING_ALGO_ORDER_TYPES = (
     "chase",
     "smart_iceberg",
 )
+OKX_FIXED_PROXY_URL = "http://127.0.0.1:10981"
+OKX_FIXED_PROXY_LABEL = "固定节点（身份未确认）"
+OKX_FIXED_PROXY_METADATA_PATH = (
+    Path(__file__).resolve().parents[2]
+    / "records"
+    / "okx_fixed_proxy"
+    / "metadata.json"
+)
+_OKX_PROXY_URL_ENV = "PA_AGENT_OKX_PROXY_URL"
+_OKX_PROXY_LABEL_ENV = "PA_AGENT_OKX_PROXY_LABEL"
 
 
 @dataclass(frozen=True)
@@ -46,8 +59,76 @@ class HttpTransport(Protocol):
     ) -> HttpResponse: ...
 
 
+class _FixedLocalProxyHandler(urllib.request.ProxyHandler):
+    """绑定本机代理，但永不读取系统代理绕过规则。"""
+
+    def proxy_open(self, request, proxy, request_type):
+        original_type = request.type
+        parsed = urllib.parse.urlsplit(proxy)
+        assert parsed.hostname is not None
+        assert parsed.port is not None
+        host_port = (
+            f"[{parsed.hostname}]:{parsed.port}"
+            if ":" in parsed.hostname
+            else f"{parsed.hostname}:{parsed.port}"
+        )
+        request.set_proxy(host_port, parsed.scheme or request_type)
+        if original_type == (parsed.scheme or request_type) or (
+            original_type == "https"
+        ):
+            return None
+        return self.parent.open(request, timeout=request.timeout)
+
+
 class UrlLibTransport:
-    """urllib transport kept injectable for deterministic adapter tests."""
+    """只通过 PA Agent 独立的本机 OKX 代理联网。"""
+
+    def __init__(
+        self,
+        *,
+        proxy_url: str | None = None,
+        opener: Any | None = None,
+    ) -> None:
+        self._proxy_url = self._validated_proxy_url(
+            os.environ.get(_OKX_PROXY_URL_ENV, OKX_FIXED_PROXY_URL)
+            if proxy_url is None
+            else proxy_url
+        )
+        self._opener = opener or urllib.request.build_opener(
+            _FixedLocalProxyHandler(
+                {
+                    "http": self._proxy_url,
+                    "https": self._proxy_url,
+                }
+            )
+        )
+
+    @staticmethod
+    def _validated_proxy_url(value: object) -> str:
+        text = str(value or "").strip().rstrip("/")
+        try:
+            parsed = urllib.parse.urlsplit(text)
+            port = parsed.port
+        except ValueError as exc:
+            raise ValueError("OKX 独立代理地址无效") from exc
+        if (
+            parsed.scheme != "http"
+            or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+            or port is None
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(
+                "OKX 独立代理必须是无凭据的本机 HTTP 地址"
+            )
+        return text
+
+    @property
+    def proxy_url(self) -> str:
+        return self._proxy_url
 
     def request(
         self,
@@ -64,16 +145,55 @@ class UrlLibTransport:
             headers=headers,
             method=method,
         )
+        if request.type not in {"http", "https"}:
+            raise ValueError("OKX 请求只允许 HTTP(S) 地址")
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with self._opener.open(request, timeout=timeout) as response:
                 return HttpResponse(int(response.status), response.read())
         except urllib.error.HTTPError as exc:
             return HttpResponse(int(exc.code), exc.read())
-        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        except (
+            urllib.error.URLError,
+            TimeoutError,
+            OSError,
+            http.client.HTTPException,
+        ) as exc:
             raise BrokerTransportError(
                 f"OKX 网络请求失败（{type(exc).__name__}）",
                 write_may_have_reached=method.upper() != "GET",
             ) from exc
+
+
+def okx_fixed_proxy_label() -> str:
+    """返回 GUI 可展示的固定节点名称。"""
+    environment_label = os.environ.get(_OKX_PROXY_LABEL_ENV, "").strip()
+    if environment_label:
+        return environment_label
+    try:
+        metadata = json.loads(
+            OKX_FIXED_PROXY_METADATA_PATH.read_text(encoding="utf-8")
+        )
+        metadata_label = str(metadata.get("node_label") or "").strip()
+        metadata_host = str(metadata.get("listen_host") or "").strip()
+        metadata_port = int(metadata.get("listen_port"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        return OKX_FIXED_PROXY_LABEL
+    if (
+        metadata_label
+        and metadata_host in {"127.0.0.1", "localhost", "::1"}
+        and metadata_port == urllib.parse.urlsplit(
+            okx_fixed_proxy_url()
+        ).port
+    ):
+        return metadata_label
+    return OKX_FIXED_PROXY_LABEL
+
+
+def okx_fixed_proxy_url() -> str:
+    """返回经过同一安全约束校验的固定本机代理地址。"""
+    return UrlLibTransport._validated_proxy_url(
+        os.environ.get(_OKX_PROXY_URL_ENV, OKX_FIXED_PROXY_URL)
+    )
 
 
 class OkxRestClient:

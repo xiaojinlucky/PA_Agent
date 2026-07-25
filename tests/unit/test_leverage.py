@@ -61,6 +61,7 @@ def _build(client, **overrides):
         "entry_price": "4000",
         "expected_account_identity": "b" * 64,
         "okx_api_base_url": "https://www.okx.com",
+        "maximum_leverage_cap": "50",
     }
     kwargs.update(overrides)
     return build_minimum_leverage_parameters(**kwargs)
@@ -77,7 +78,7 @@ def test_planner_selects_first_sufficient_point_on_verified_policy_grid():
     assert parameters.target_capacity == Decimal("250")
     assert parameters.maximum_leverage == Decimal("50")
     assert parameters.maximum_capacity == Decimal("500")
-    assert parameters.planning_method == "bounded_sequential_policy_grid_v1"
+    assert parameters.planning_method == "bounded_sequential_policy_grid_v2"
     assert parameters.policy_grid_step == Decimal("5")
     assert [
         (point.leverage, point.capacity)
@@ -145,7 +146,7 @@ def test_planner_refuses_exchange_reported_pending_orders():
     assert caught.value.code == "pending_orders"
 
 
-def test_planner_refuses_internal_capacity_drop_after_a_sufficient_point():
+def test_planner_uses_first_sufficient_verified_point_when_capacity_is_non_monotonic():
     client = _CapacityClient(
         max_leverage=Decimal("30"),
         capacity_override={
@@ -155,19 +156,48 @@ def test_planner_refuses_internal_capacity_drop_after_a_sufficient_point():
         },
     )
 
-    with pytest.raises(
-        LeveragePlanningFailure,
-        match="逐点单调增加",
-    ) as caught:
-        _build(client, required_quantity="201")
+    parameters = _build(client, required_quantity="201")
 
-    assert caught.value.code == "non_monotonic_capacity"
-    assert "25x=260 → 30x=250" in str(caught.value)
+    assert parameters.target_leverage == Decimal("25")
+    assert parameters.target_capacity == Decimal("260")
     assert client.quoted == [
         Decimal("20"),
         Decimal("25"),
         Decimal("30"),
     ]
+
+
+def test_planner_never_reads_or_selects_above_user_maximum_leverage():
+    client = _CapacityClient(max_leverage=Decimal("50"))
+
+    parameters = _build(
+        client,
+        required_quantity="249",
+        maximum_leverage_cap="25",
+    )
+
+    assert parameters.target_leverage == Decimal("25")
+    assert parameters.maximum_leverage == Decimal("25")
+    assert parameters.exchange_maximum_leverage == Decimal("50")
+    assert parameters.user_maximum_leverage == Decimal("25")
+    assert client.quoted == [Decimal("20"), Decimal("25")]
+
+
+def test_planner_blocks_when_user_maximum_leverage_is_insufficient():
+    client = _CapacityClient(max_leverage=Decimal("50"))
+
+    with pytest.raises(
+        LeveragePlanningFailure,
+        match="用户设置的最大杠杆",
+    ) as caught:
+        _build(
+            client,
+            required_quantity="251",
+            maximum_leverage_cap="25",
+        )
+
+    assert caught.value.code == "user_max_leverage_capacity_insufficient"
+    assert client.quoted == [Decimal("20"), Decimal("25")]
 
 
 def test_planner_accepts_exact_capacity_read_budget_boundary():
@@ -180,6 +210,7 @@ def test_planner_accepts_exact_capacity_read_budget_boundary():
         client,
         current_leverage="1",
         required_quantity="75",
+        maximum_leverage_cap="75",
     )
 
     assert parameters.target_leverage == Decimal("75")
@@ -202,6 +233,7 @@ def test_planner_blocks_before_exceeding_capacity_read_budget():
             client,
             current_leverage="1",
             required_quantity="80",
+            maximum_leverage_cap="80",
         )
 
     assert caught.value.code == "capacity_grid_exceeds_read_budget"

@@ -20,7 +20,13 @@ from pa_agent.execution.worker_protocol import (
 )
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.records.schema import AnalysisRecord
-from pa_agent.risk.sizing import calculate_risk_size
+from pa_agent.risk.runtime import RiskRuntime
+from pa_agent.risk.sizing import (
+    DEFAULT_FEE_RATE,
+    DEFAULT_SLIPPAGE_RATE,
+    calculate_fixed_quantity_risk,
+    calculate_risk_size,
+)
 from tests.unit.leverage_authorization_helpers import (
     authorized_leverage_parameters,
 )
@@ -61,6 +67,9 @@ def _settings(
     settings.execution.okx.instrument = "XAU-USDT-SWAP"
     settings.execution.okx.product = "swap"
     settings.execution.okx.quantity = str(quantity)
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("5000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
     return settings
 
 
@@ -86,8 +95,10 @@ def _run_worker_command(worker: ExecutionWorker, command) -> None:
     assert finished.status is WorkerCommandStatus.SUCCEEDED
 
 
+@pytest.mark.parametrize("sizing_mode", ["risk_budget", "fixed_quantity"])
 def test_set_leverage_uses_controller_worker_service_adapter_chain(
     tmp_path,
+    sizing_mode,
 ):
     controller_settings = _settings(
         entry_mode="limit_with_slippage",
@@ -95,10 +106,9 @@ def test_set_leverage_uses_controller_worker_service_adapter_chain(
         atr=Decimal("2"),
         quantity=Decimal("20"),
     )
-    worker_settings = Settings()
+    controller_settings.execution.okx.sizing_mode = sizing_mode
+    worker_settings = controller_settings.model_copy(deep=True)
     worker_settings.execution.enabled = False
-    worker_settings.execution.selected_broker = "longbridge"
-    worker_settings.execution.longbridge.instrument = "700.HK"
     execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
     worker_store = WorkerStore(tmp_path / "control.sqlite3")
     worker_id = "worker-leverage-chain"
@@ -146,6 +156,8 @@ def test_set_leverage_uses_controller_worker_service_adapter_chain(
             "1001",
             "0",
         ),
+        risk_capital_cap_usdt=Decimal("5000"),
+        sizing_mode=sizing_mode,
     )
     controller = ExecutionController(
         settings=controller_settings,
@@ -171,6 +183,153 @@ def test_set_leverage_uses_controller_worker_service_adapter_chain(
     assert len(
         [call for call in client.calls if call[0] == "set_leverage"]
     ) == 1
+
+
+def test_fixed_quantity_reaches_worker_and_entry_post_with_exact_snapshot(
+    tmp_path,
+    monkeypatch,
+):
+    pending = tmp_path / "pending"
+    pending.mkdir()
+    settings = _settings(
+        entry_mode="limit",
+        exit_mode="market",
+        atr=Decimal("2"),
+        quantity=Decimal("2"),
+    )
+    settings.execution.okx.sizing_mode = "fixed_quantity"
+    sizing = calculate_fixed_quantity_risk(
+        account_equity="10000",
+        risk_capital_cap="5000",
+        quantity="2",
+        entry_price="100",
+        stop_loss_price="95",
+        side="long",
+        ct_val="0.01",
+        ct_mult="1",
+        lot_sz="1",
+        min_sz="1",
+        max_sz="10",
+        fee_rate=DEFAULT_FEE_RATE,
+        slippage_rate=DEFAULT_SLIPPAGE_RATE,
+    )
+    analysis = _analysis(atr=Decimal("2"))
+    response = dict(analysis.stage2_response)
+    response["risk_sizing"] = {
+        "sizing_mode": "fixed_quantity",
+        "equity_basis": "fixed_cap_or_usdt_equity_whichever_lower",
+        "account_total_equity_usd": "10000",
+        "equity_usdt": "10000",
+        "risk_capital_cap_usdt": "5000",
+        "effective_risk_capital_usdt": "5000",
+        "risk_percent": str(sizing.risk_percent),
+        "risk_budget_usdt": str(sizing.risk_budget_usdt),
+        "risk_used_usdt": str(sizing.risk_used_usdt),
+        "reference_price_usdt": "100",
+        "stop_distance_usdt": str(sizing.stop_distance_usdt),
+        "contract_notional_usdt": str(sizing.contract_notional_usdt),
+        "worst_case_loss_per_contract_usdt": str(
+            sizing.worst_case_loss_per_contract_usdt
+        ),
+        "fee_per_contract_usdt": str(sizing.fee_per_contract_usdt),
+        "slippage_per_contract_usdt": str(
+            sizing.slippage_per_contract_usdt
+        ),
+        "fee_rate": str(DEFAULT_FEE_RATE),
+        "slippage_rate": str(DEFAULT_SLIPPAGE_RATE),
+        "minimum_quantity": "1",
+        "quantity_step": "1",
+        "max_buy": "10",
+        "max_sell": "10",
+        "target_quantity": "2",
+    }
+    analysis = analysis.model_copy(update={"stage2_response": response})
+    record_path = pending / "fixed-record.json"
+    record_path.write_text(
+        analysis.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "pa_agent.config.paths.RECORDS_PENDING_DIR",
+        pending,
+    )
+
+    execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
+    worker_store = WorkerStore(tmp_path / "control.sqlite3")
+    worker_id = "worker-fixed-full-chain"
+    authority = WorkerNewRiskAuthority(worker_store, worker_id)
+    client = FakeOkxClient()
+    client.simulated = True
+    client.balance_rows = [
+        {
+            "totalEq": "10000",
+            "details": [
+                {
+                    "ccy": "USDT",
+                    "eq": "10000",
+                    "availBal": "9000",
+                }
+            ],
+        }
+    ]
+    adapter = OkxAdapter(client, margin_mode="cross")
+    worker_settings = settings.model_copy(deep=True)
+    service = ExecutionService(
+        settings=worker_settings,
+        pending_writer=None,
+        store=execution_store,
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+        new_risk_authorizer=authority.is_authorized,
+        new_risk_revoker=lambda: worker_store.revoke_current_new_risk_lease(
+            failure_code="service_disarmed",
+        ),
+        risk_runtime=RiskRuntime(worker_store),
+    )
+    worker = ExecutionWorker(
+        store=worker_store,
+        service=service,
+        settings=worker_settings,
+        lock_path=tmp_path / "worker.lock",
+        worker_id=worker_id,
+        new_risk_authority=authority,
+    )
+    controller = ExecutionController(
+        settings=settings,
+        pending_writer=_PendingWriter(record_path),
+        store=execution_store,
+        worker_store=worker_store,
+        worker_launcher=lambda: None,
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+    )
+
+    worker.start()
+    try:
+        controller.arm("启用模拟交易")
+        prepared = controller.prepare_analysis(analysis)
+        assert prepared.plan.authorized_sizing_mode == "fixed_quantity"
+        assert prepared.plan.authorized_fixed_quantity == Decimal("2")
+        command = controller.submit(prepared.id)
+        _run_worker_command(worker, command)
+    finally:
+        worker.close()
+
+    submitted = controller.get_execution(prepared.id)
+    assert submitted is not None
+    assert submitted.state is ExecutionState.ENTRY_PENDING
+    assert submitted.plan.quantity == Decimal("2")
+    entry_posts = [
+        call[1] for call in client.calls if call[0] == "place_order"
+    ]
+    assert len(entry_posts) == 1
+    assert entry_posts[0]["sz"] == "2"
 
 
 def _reconcile(
@@ -208,10 +367,7 @@ def _run_full_chain(
         atr=atr,
         quantity=quantity,
     )
-    worker_settings = Settings()
-    worker_settings.execution.enabled = False
-    worker_settings.execution.selected_broker = "longbridge"
-    worker_settings.execution.longbridge.instrument = "700.HK"
+    worker_settings = controller_settings.model_copy(deep=True)
     execution_store = ExecutionStore(root / "execution.sqlite3")
     worker_store = WorkerStore(root / "control.sqlite3")
     worker_id = f"worker-{root.name}"
@@ -452,6 +608,7 @@ def test_risk_sizing_slippage_changes_quantity_but_not_submitted_price(
 ):
     common = {
         "account_equity": "2",
+        "risk_capital_cap": "2",
         "risk_percent": "0.10",
         "entry_price": "100",
         "stop_loss_price": "95",

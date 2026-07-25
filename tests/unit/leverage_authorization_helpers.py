@@ -27,6 +27,9 @@ def authorized_leverage_parameters(
     target_capacity: Decimal = Decimal("30"),
     required_quantity: Decimal = Decimal("20"),
     effective_entry_price: Decimal | None = None,
+    risk_capital_cap_usdt: Decimal = Decimal("2"),
+    risk_percent: Decimal = Decimal("0.10"),
+    sizing_mode: str = "risk_budget",
 ) -> tuple[SetLeverageParameters, AnalysisRecord]:
     decision = record.stage2_decision["decision"]
     direction = (
@@ -69,7 +72,16 @@ def authorized_leverage_parameters(
         else {}
     )
     response["risk_sizing"] = {
+        "sizing_mode": sizing_mode,
+        "equity_basis": "fixed_cap_or_usdt_equity_whichever_lower",
+        "account_total_equity_usd": str(risk_capital_cap_usdt),
+        "equity_usdt": str(risk_capital_cap_usdt),
+        "risk_capital_cap_usdt": str(risk_capital_cap_usdt),
+        "effective_risk_capital_usdt": str(risk_capital_cap_usdt),
+        "risk_percent": str(risk_percent),
+        "risk_budget_usdt": str(risk_capital_cap_usdt * risk_percent),
         "reference_price_usdt": str(draft.entry_price),
+        "target_quantity": str(required_quantity),
     }
     response["leverage_intent"] = leverage_intent_snapshot(draft)
     record = record.model_copy(update={"stage2_response": response})

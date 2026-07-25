@@ -13,7 +13,11 @@ import pytest
 from filelock import FileLock
 from pydantic import ValidationError as PydanticValidationError
 
-from pa_agent.execution.errors import BrokerRejected, PreflightError
+from pa_agent.execution.errors import (
+    BrokerRejected,
+    BrokerTransportError,
+    PreflightError,
+)
 from pa_agent.execution.models import (
     ExecutionPlan,
     ExecutionState,
@@ -118,6 +122,18 @@ class _FakeService:
             ("refresh_account_route", broker, environment, account)
         )
         self._fail("refresh_account_route")
+
+    def clear_drawdown_stop(self, *, broker, environment, account):
+        self.calls.append(
+            ("clear_drawdown_stop", broker, environment, account)
+        )
+        self._fail("clear_drawdown_stop")
+
+    def recover_transient_risk_stop(self, *, broker, environment, account):
+        self.calls.append(
+            ("recover_transient_risk_stop", broker, environment, account)
+        )
+        self._fail("recover_transient_risk_stop")
 
     def reconcile_once(self):
         self.calls.append(("reconcile",))
@@ -260,8 +276,16 @@ def _enqueue_execution(
     return command
 
 
-def test_worker_uses_nonblocking_single_instance_lock(tmp_path):
+def test_worker_uses_nonblocking_single_instance_lock(tmp_path, monkeypatch):
     worker, store, service = _runtime(tmp_path)
+    baseline_calls = []
+    backfill = store.backfill_risk_runtime_baselines
+
+    def _backfill(*, worker_lock):
+        baseline_calls.append(bool(worker_lock.is_locked))
+        return backfill(worker_lock=worker_lock)
+
+    monkeypatch.setattr(store, "backfill_risk_runtime_baselines", _backfill)
     contender = ExecutionWorker(
         store=store,
         service=_FakeService(service.store),
@@ -272,6 +296,7 @@ def test_worker_uses_nonblocking_single_instance_lock(tmp_path):
 
     worker.start()
     try:
+        assert baseline_calls == [True]
         with pytest.raises(WorkerAlreadyRunning):
             contender.start()
     finally:
@@ -505,6 +530,73 @@ def test_route_only_account_refresh_rejects_forged_live_route(tmp_path):
     ]
 
 
+def test_clear_uses_persisted_command_route(tmp_path):
+    settings = SimpleNamespace(
+        execution=SimpleNamespace(
+            poll_interval_seconds=1.0,
+            selected_broker="longbridge",
+            longbridge=SimpleNamespace(preferred_account="comprehensive"),
+            okx=SimpleNamespace(simulated=False),
+        )
+    )
+    worker, store, service = _runtime(tmp_path, settings=settings)
+    worker.start()
+    try:
+        command, _ = store.enqueue(
+            action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+            requester="controller",
+            broker="okx",
+            environment="demo",
+            account="okx",
+        )
+        result = worker.run_once()
+    finally:
+        worker.close()
+
+    assert result.id == command.id
+    assert result.status is WorkerCommandStatus.SUCCEEDED
+    assert (
+        "clear_drawdown_stop",
+        "okx",
+        "demo",
+        "okx",
+    ) in service.calls
+
+
+def test_transient_risk_recovery_uses_persisted_command_route(tmp_path):
+    settings = SimpleNamespace(
+        execution=SimpleNamespace(
+            poll_interval_seconds=1.0,
+            selected_broker="longbridge",
+            longbridge=SimpleNamespace(preferred_account="comprehensive"),
+            okx=SimpleNamespace(simulated=False),
+        )
+    )
+    worker, store, service = _runtime(tmp_path, settings=settings)
+    worker.start()
+    try:
+        command, _ = store.enqueue(
+            action=WorkerCommandAction.CLEAR_DRAWDOWN_STOP,
+            requester="controller",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            reason_code="recover_transient_risk_read_failure",
+        )
+        result = worker.run_once()
+    finally:
+        worker.close()
+
+    assert result.id == command.id
+    assert result.status is WorkerCommandStatus.SUCCEEDED
+    assert (
+        "recover_transient_risk_stop",
+        "okx",
+        "demo",
+        "okx",
+    ) in service.calls
+
+
 def test_startup_revokes_old_lease_and_expired_lease_cannot_submit(tmp_path):
     clock = _MutableClock(datetime(2026, 7, 20, 8, 0, tzinfo=UTC))
     worker, store, service = _runtime(tmp_path, clock=clock)
@@ -628,8 +720,9 @@ def test_worker_marks_set_leverage_unknown_and_never_replays(tmp_path):
     worker.start()
     try:
         lease = _grant_submit(worker, store)
-        service.failures["set_leverage"] = RuntimeError(
-            "readback unavailable"
+        service.failures["set_leverage"] = BrokerTransportError(
+            "readback unavailable",
+            write_may_have_reached=True,
         )
         command, _ = store.enqueue(
             action=WorkerCommandAction.SET_LEVERAGE,
@@ -654,11 +747,42 @@ def test_worker_marks_set_leverage_unknown_and_never_replays(tmp_path):
     ) == 1
 
 
+def test_worker_marks_prewrite_leverage_transport_failure_as_failed(tmp_path):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        service.failures["set_leverage"] = BrokerTransportError(
+            "prewrite read unavailable",
+            write_may_have_reached=False,
+        )
+        command, _ = store.enqueue(
+            action=WorkerCommandAction.SET_LEVERAGE,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="okx",
+            new_risk_lease_id=lease.lease_id,
+            parameters=_leverage_parameters(),
+        )
+
+        finished = worker.run_once()
+    finally:
+        worker.close()
+
+    assert finished.id == command.id
+    assert finished.status is WorkerCommandStatus.FAILED
+    assert store.get_command_resolution(command.id) is None
+
+
 def test_successful_work_and_reconcile_keep_unresolved_write_attention(tmp_path):
     worker, store, service = _runtime(tmp_path)
     worker.start()
     try:
-        service.failures["cancel_entry"] = RuntimeError("write uncertain")
+        service.failures["cancel_entry"] = BrokerTransportError(
+            "write uncertain",
+            write_may_have_reached=True,
+        )
         uncertain = _enqueue_execution(
             store,
             action=WorkerCommandAction.CANCEL_ENTRY,
@@ -747,8 +871,9 @@ def test_worker_restart_resolves_unknown_leverage_by_readback_only(tmp_path):
     worker.start()
     try:
         lease = _grant_submit(worker, store)
-        service.failures["set_leverage"] = RuntimeError(
-            "readback unavailable"
+        service.failures["set_leverage"] = BrokerTransportError(
+            "readback unavailable",
+            write_may_have_reached=True,
         )
         command, _ = store.enqueue(
             action=WorkerCommandAction.SET_LEVERAGE,
@@ -807,8 +932,9 @@ def test_exception_classification_and_masked_logging(tmp_path, caplog):
             lease_id=lease.lease_id,
         )
         assert worker.run_once().status is WorkerCommandStatus.FAILED
-        service.failures["cancel_entry"] = RuntimeError(
-            "token=abcdefghijklmnopqrstuvwxyz0123456789"
+        service.failures["cancel_entry"] = BrokerTransportError(
+            "token=abcdefghijklmnopqrstuvwxyz0123456789",
+            write_may_have_reached=True,
         )
         cancel = _enqueue_execution(
             store,
@@ -825,7 +951,7 @@ def test_exception_classification_and_masked_logging(tmp_path, caplog):
         worker.close()
 
     assert store.get_command(submit.id).failure_code == "PreflightError"
-    assert store.get_command(cancel.id).failure_code == "RuntimeError"
+    assert store.get_command(cancel.id).failure_code == "BrokerTransportError"
     assert store.get_command(refresh.id).failure_code == "RuntimeError"
     assert "abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
     assert "<redacted>" in caplog.text
@@ -998,7 +1124,10 @@ def test_needs_attention_revokes_lease_and_fails_pending_submit(tmp_path):
     worker.start()
     try:
         lease = _grant_submit(worker, store)
-        service.failures["cancel_entry"] = RuntimeError("write uncertain")
+        service.failures["cancel_entry"] = BrokerTransportError(
+            "write uncertain",
+            write_may_have_reached=True,
+        )
         cancel = _enqueue_execution(
             store,
             action=WorkerCommandAction.CANCEL_ENTRY,
@@ -1133,7 +1262,7 @@ def test_heartbeat_survives_blocked_reconcile_without_false_success(tmp_path):
         worker.close()
 
 
-def test_settings_change_reloads_without_revoking_new_risk(tmp_path):
+def test_settings_change_reloads_and_revokes_worker_owned_new_risk(tmp_path):
     settings_path = tmp_path / "settings.json"
     settings_path.write_text("old", encoding="utf-8")
     initial = SimpleNamespace(
@@ -1142,7 +1271,7 @@ def test_settings_change_reloads_without_revoking_new_risk(tmp_path):
     loaded = SimpleNamespace(
         execution=SimpleNamespace(poll_interval_seconds=2.0)
     )
-    worker, _store, service = _runtime(
+    worker, store, service = _runtime(
         tmp_path,
         settings=initial,
         settings_path=settings_path,
@@ -1150,8 +1279,22 @@ def test_settings_change_reloads_without_revoking_new_risk(tmp_path):
     )
     worker.start()
     try:
+        lease = _grant_submit(worker, store)
+        assert (
+            store.current_new_risk_lease().lease_id
+            == lease.lease_id
+        )
+        command = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.SUBMIT,
+            lease_id=lease.lease_id,
+        )
         settings_path.write_text("new-settings", encoding="utf-8")
         assert worker.run_once() is None
+        result = store.get_command(command.id)
+        assert result.status is WorkerCommandStatus.FAILED
+        assert result.failure_code == "settings_changed"
+        assert store.current_new_risk_lease() is None
     finally:
         worker.close()
 

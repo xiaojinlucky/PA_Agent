@@ -138,7 +138,12 @@ class _RiskSizingClient:
         ]
 
     def balance(self):
-        return [{"details": [{"ccy": "USDT", "eq": "5000"}]}]
+        return [
+            {
+                "totalEq": "5000",
+                "details": [{"ccy": "USDT", "eq": "5000"}],
+            }
+        ]
 
     def max_order_size(
         self,
@@ -188,6 +193,9 @@ class _DynamicLeverageClient(FakeOkxClient):
 
 def _build_runtime(tmp_path: Path):
     settings = build_campaign_settings(Settings(), quantity="120")
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("5000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
     pending = PendingWriter(tmp_path / "pending")
     source = _Source(_frame(1_784_300_400_000))
     orchestrator = _ScriptedOrchestrator(pending)
@@ -245,7 +253,12 @@ def _build_runtime(tmp_path: Path):
     risk_client = _RiskSizingClient()
 
     def _resolve_risk_sizing(record):
-        return campaign_module.resolve_record_campaign_sizing(record, risk_client)
+        return campaign_module.resolve_record_campaign_sizing(
+            record,
+            risk_client,
+            risk_capital_cap_usdt="5000",
+            risk_percent="0.10",
+        )
 
     runtime = CampaignRuntime(
         settings=settings,
@@ -265,6 +278,9 @@ def _build_dynamic_leverage_runtime(
     supervisor_action: str,
 ):
     settings = build_campaign_settings(Settings(), quantity="120")
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("5000")
+    settings.execution.okx.risk_percent = Decimal("0.10")
+    settings.execution.okx.maximum_leverage = Decimal("20")
     pending = PendingWriter(tmp_path / "pending")
     source = _Source(_frame(1_784_300_400_000))
     orchestrator = _ScriptedOrchestrator(pending)
@@ -329,7 +345,21 @@ def _build_dynamic_leverage_runtime(
         execution_service=controller,
         supervisor=supervisor,
         sizing_resolver=lambda record: (
-            campaign_module.resolve_record_campaign_sizing(record, client)
+            campaign_module.resolve_record_campaign_sizing(
+                record,
+                client,
+                risk_capital_cap_usdt="5000",
+                risk_percent="0.10",
+            )
+        ),
+        leverage_resolver=lambda record, analysis_digest: (
+            campaign_module.resolve_record_campaign_leverage(
+                record,
+                analysis_digest,
+                risk_capital_cap_usdt="5000",
+                risk_percent="0.10",
+                maximum_leverage="20",
+            )
         ),
     )
     return (
@@ -405,7 +435,8 @@ def _dynamic_runner(
     )
     state_store = CampaignStateStore(tmp_path / "campaign.json")
     state = state_store.create_or_resume(
-        now=datetime(2026, 7, 17, tzinfo=UTC)
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+        settings=runtime.settings,
     )
     state_store.save(state)
     return (
@@ -418,14 +449,12 @@ def _dynamic_runner(
     )
 
 
-def test_supervised_campaign_uses_real_controller_worker_offline(
+def test_scripted_campaign_uses_real_controller_worker_offline(
     monkeypatch,
     tmp_path,
 ):
     first_bar_ms = 1_784_300_400_000
-    second_bar_ms = first_bar_ms + 10 * 60 * 1000
     first_frame = _frame(first_bar_ms)
-    second_frame = _frame(second_bar_ms)
     current_frame = {"value": first_frame}
     monkeypatch.setattr(
         campaign_module,
@@ -467,7 +496,8 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
     worker_thread.start()
     state_store = CampaignStateStore(tmp_path / "campaign.json")
     state = state_store.create_or_resume(
-        now=datetime(2026, 7, 17, tzinfo=UTC)
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+        settings=runtime.settings,
     )
     state_store.save(state)
     runner = OkxDemoCampaign(runtime, state_store, state)
@@ -477,17 +507,6 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
         initial_lease = worker_store.current_new_risk_lease()
         assert initial_lease is not None
 
-        assert runner.process_latest_closed_bar() is True
-        assert runner.state.last_plan_result == "blocked:supervisor:primary"
-        assert runtime.execution_service.list_active() == []
-        assert runtime.execution_service.execution_store.list_recent() == []
-        assert worker_store.list_commands() == []
-        first_sized_lease = worker_store.current_new_risk_lease()
-        assert first_sized_lease is not None
-        assert first_sized_lease.lease_id != initial_lease.lease_id
-        assert first_sized_lease.config_fingerprint != initial_lease.config_fingerprint
-
-        current_frame["value"] = second_frame
         assert runner.process_latest_closed_bar() is True
         commands = worker_store.list_commands()
         submit_commands = [
@@ -503,17 +522,18 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
         assert executions[0].plan.quantity == 79440
         final_lease = worker_store.current_new_risk_lease()
         assert final_lease is not None
-        assert final_lease.lease_id != first_sized_lease.lease_id
         assert executions[0].plan.config_fingerprint == final_lease.config_fingerprint
-        assert len(client.calls) == 2
-        assert orchestrator.calls == 2
+        assert final_lease.lease_id != initial_lease.lease_id
+        assert client.calls == []
+        assert orchestrator.calls == 1
 
         restarted_state = state_store.load()
         assert restarted_state is not None
         restarted = OkxDemoCampaign(runtime, state_store, restarted_state)
         assert restarted.process_latest_closed_bar() is True
         assert len(worker_store.list_commands()) == 1
-        assert len(client.calls) == 2
+        assert client.calls == []
+        assert orchestrator.calls == 1
         assert len([call for call in adapter.calls if call[0] == "submit_entry"]) == 1
     finally:
         runtime.execution_service.disarm()
@@ -524,7 +544,7 @@ def test_supervised_campaign_uses_real_controller_worker_offline(
     assert worker_errors == []
 
 
-def test_max_size_leverage_supervision_controller_worker_okx_chain(
+def test_max_size_leverage_script_controller_worker_okx_chain(
     monkeypatch,
     tmp_path,
 ):
@@ -562,8 +582,8 @@ def test_max_size_leverage_supervision_controller_worker_okx_chain(
         assert leverage_commands[0].status is WorkerCommandStatus.SUCCEEDED
         assert submit_commands[0].status is WorkerCommandStatus.SUCCEEDED
         assert leverage_commands[0].parameters.target_leverage == Decimal("10")
-        assert leverage_commands[0].parameters.supervisor_record_id
-        assert leverage_commands[0].parameters.supervisor_record_digest
+        assert leverage_commands[0].parameters.supervisor_record_id == ""
+        assert leverage_commands[0].parameters.supervisor_record_digest == ""
 
         executions = runtime.execution_service.list_recent()
         assert len(executions) == 1
@@ -580,7 +600,7 @@ def test_max_size_leverage_supervision_controller_worker_okx_chain(
             "set_leverage",
             "place_order",
         ]
-        assert len(supervisor_client.calls) == 1
+        assert supervisor_client.calls == []
         assert runner.state.last_plan_result == "execution:entry_pending"
     finally:
         runtime.execution_service.disarm()
@@ -591,7 +611,7 @@ def test_max_size_leverage_supervision_controller_worker_okx_chain(
     assert worker_errors == []
 
 
-def test_dynamic_leverage_supervisor_block_has_zero_broker_writes(
+def test_normal_dynamic_leverage_does_not_invoke_monitor_block_response(
     monkeypatch,
     tmp_path,
 ):
@@ -612,15 +632,23 @@ def test_dynamic_leverage_supervisor_block_has_zero_broker_writes(
     try:
         runtime.execution_service.arm("启用模拟交易")
         assert runner.process_latest_closed_bar() is True
-        assert runner.state.last_plan_result == "blocked:supervisor:primary"
-        assert worker_store.list_commands() == []
-        assert runtime.execution_service.list_recent() == []
+        assert runner.state.last_plan_result == "execution:entry_pending"
+        commands = worker_store.list_commands()
+        assert [command.action for command in commands] == [
+            WorkerCommandAction.SET_LEVERAGE,
+            WorkerCommandAction.SUBMIT,
+        ]
+        assert all(
+            command.status is WorkerCommandStatus.SUCCEEDED
+            for command in commands
+        )
+        assert len(runtime.execution_service.list_recent()) == 1
         assert [
-            call
+            call[0]
             for call in client.calls
             if call[0] in {"set_leverage", "place_order"}
-        ] == []
-        assert len(supervisor_client.calls) == 1
+        ] == ["set_leverage", "place_order"]
+        assert supervisor_client.calls == []
     finally:
         runtime.execution_service.disarm()
         stop_worker.set()

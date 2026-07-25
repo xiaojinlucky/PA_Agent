@@ -29,17 +29,19 @@ from pa_agent.execution.errors import (
     PreflightError,
     SubmissionUnknown,
 )
-from pa_agent.execution.longbridge_adapter import LongbridgeAdapter
 from pa_agent.execution.leverage_authorization import (
     LeverageAuthorizationError,
+    validate_current_leverage_policy,
     validate_leverage_authorization,
 )
+from pa_agent.execution.longbridge_adapter import LongbridgeAdapter
 from pa_agent.execution.longbridge_session import LongbridgeSession
 from pa_agent.execution.models import (
     AccountSnapshot,
     ExecutionPlan,
     ExecutionRecord,
     ExecutionState,
+    PreflightResult,
     utc_now_iso,
 )
 from pa_agent.execution.okx_adapter import OkxAdapter
@@ -475,7 +477,7 @@ class ExecutionService:
         record: ExecutionRecord,
         adapter: BrokerAdapter,
     ) -> tuple[ExecutionRecord, BrokerAdapter]:
-        """在券商预检前刷新回撤闸门并按真实总权益定仓。"""
+        """在券商预检前刷新回撤闸门并按固定资本上限定仓。"""
 
         if self._risk_runtime is None or record.plan.broker != "okx":
             return record, adapter
@@ -508,13 +510,58 @@ class ExecutionService:
         sizing = calculate_size(
             record.plan,
             account_equity_usd=risk_equity,
+            risk_capital_cap_usdt=(
+                self._settings.execution.okx.risk_capital_cap_usdt
+            ),
+            risk_percent=self._settings.execution.okx.risk_percent,
         )
         if sizing is None:
             return record, adapter
-        if sizing.target_contract_size != record.plan.quantity:
+        authorized_risk_values = (
+            record.plan.authorized_risk_capital_cap_usdt,
+            record.plan.authorized_effective_risk_capital_usdt,
+            record.plan.authorized_risk_percent,
+            record.plan.authorized_risk_budget_usdt,
+            record.plan.authorized_risk_used_usdt,
+            record.plan.authorized_contract_notional_usdt,
+            record.plan.authorized_worst_case_loss_per_contract_usdt,
+        )
+        if (
+            record.plan.risk_equity_basis
+            != "fixed_cap_or_usdt_equity_whichever_lower"
+            or any(value is None for value in authorized_risk_values)
+            or (
+                record.plan.authorized_sizing_mode == "fixed_quantity"
+                and record.plan.authorized_fixed_quantity
+                != record.plan.quantity
+            )
+        ):
             raise RiskRuntimeBlocked(
-                "risk_sizing_changed_after_supervision",
-                "提交前风险数量已变化，旧监督计划作废",
+                "risk_sizing_authorization_missing",
+                "耐久计划缺少固定资本风险授权快照",
+            )
+        if (
+            sizing.risk_capital_cap_usdt
+            != record.plan.authorized_risk_capital_cap_usdt
+            or sizing.effective_risk_capital_usdt
+            != record.plan.authorized_effective_risk_capital_usdt
+            or sizing.risk_percent != record.plan.authorized_risk_percent
+            or sizing.risk_budget_usdt
+            != record.plan.authorized_risk_budget_usdt
+            or sizing.risk_used_usdt
+            != record.plan.authorized_risk_used_usdt
+            or sizing.contract_notional_usdt
+            != record.plan.authorized_contract_notional_usdt
+            or sizing.worst_case_loss_per_contract_usdt
+            != (
+                record.plan.authorized_worst_case_loss_per_contract_usdt
+            )
+            or sizing.target_contract_size != record.plan.quantity
+        ):
+            raise RiskRuntimeBlocked(
+                "risk_sizing_changed_after_authorization",
+                "提交前有效风险资本、预算、单张损失或数量已变化，"
+                "旧脚本计划作废",
             )
         updated_plan = record.plan.model_copy(
             update={"quantity": sizing.target_contract_size}
@@ -526,11 +573,21 @@ class ExecutionService:
                 "broker_state": {
                     **record.broker_state,
                     "risk_sizing": {
-                        "account_equity_usdt": str(risk_equity),
+                        "sizing_mode": record.plan.authorized_sizing_mode,
+                        "equity_basis": record.plan.risk_equity_basis,
+                        "account_equity_usdt": str(
+                            sizing.account_equity_usdt
+                        ),
                         "account_total_equity_usd": str(
                             state.last_total_equity_usd
                         ),
-                        "risk_percent": "0.10",
+                        "risk_capital_cap_usdt": str(
+                            sizing.risk_capital_cap_usdt
+                        ),
+                        "effective_risk_capital_usdt": str(
+                            sizing.effective_risk_capital_usdt
+                        ),
+                        "risk_percent": str(sizing.risk_percent),
                         "target_contract_size": str(
                             sizing.target_contract_size
                         ),
@@ -549,9 +606,18 @@ class ExecutionService:
             updated_record,
             event_kind="risk_sizing_calculated",
             event_payload={
+                "equity_basis": record.plan.risk_equity_basis,
+                "account_equity_usdt": str(sizing.account_equity_usdt),
                 "account_total_equity_usd": str(
                     state.last_total_equity_usd
                 ),
+                "risk_capital_cap_usdt": str(
+                    sizing.risk_capital_cap_usdt
+                ),
+                "effective_risk_capital_usdt": str(
+                    sizing.effective_risk_capital_usdt
+                ),
+                "risk_percent": str(sizing.risk_percent),
                 "target_contract_size": str(sizing.target_contract_size),
                 "maximum_size": str(sizing.maximum_size),
             },
@@ -609,10 +675,11 @@ class ExecutionService:
         if self._store.list_active():
             raise PreflightError("存在活动 execution，禁止调整杠杆")
         try:
+            validate_current_leverage_policy(parameters, self._settings)
             validate_leverage_authorization(parameters)
         except LeverageAuthorizationError as exc:
             raise PreflightError(
-                f"杠杆命令没有匹配的耐久监督授权：{exc}"
+                f"杠杆命令没有匹配的耐久脚本授权：{exc}"
             ) from exc
         plan = _LeverageWritePlan(
             id=parameters.analysis_digest,
@@ -645,7 +712,43 @@ class ExecutionService:
         return adapter.set_leverage(
             parameters,
             environment=command.environment,
+            maximum_leverage_cap=(
+                self._settings.execution.okx.maximum_leverage
+            ),
         )
+
+    def _require_current_leverage_within_user_cap(
+        self,
+        record: ExecutionRecord,
+        preflight: PreflightResult,
+    ) -> None:
+        """在入场 POST 前用 Worker 当前配置核对券商实际杠杆。"""
+
+        if record.plan.broker != "okx" or record.plan.product != "swap":
+            return
+        raw_leverage = preflight.broker_metadata.get("current_leverage")
+        try:
+            current_leverage = Decimal(str(raw_leverage))
+            maximum_leverage = Decimal(
+                str(self._settings.execution.okx.maximum_leverage)
+            )
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise PreflightError(
+                "OKX 当前杠杆或用户最大杠杆无效，禁止新增风险"
+            ) from exc
+        if (
+            not current_leverage.is_finite()
+            or current_leverage <= 0
+            or not maximum_leverage.is_finite()
+            or maximum_leverage <= 0
+        ):
+            raise PreflightError(
+                "OKX 当前杠杆或用户最大杠杆无效，禁止新增风险"
+            )
+        if current_leverage > maximum_leverage:
+            raise PreflightError(
+                "OKX 当前杠杆高于用户设置上限，禁止新增风险"
+            )
 
     @staticmethod
     def _expected_account_identity(record: ExecutionRecord) -> str:
@@ -994,6 +1097,10 @@ class ExecutionService:
                 return blocked
             try:
                 preflight = adapter.preflight(record.plan)
+                self._require_current_leverage_within_user_cap(
+                    record,
+                    preflight,
+                )
             except (
                 PreflightError,
                 CredentialError,
@@ -1672,6 +1779,7 @@ class ExecutionService:
         broker: str,
         environment: str,
         account: str,
+        raise_on_risk_failure: bool = False,
     ) -> AccountSnapshot:
         """Read the fixed OKX Demo campaign route without changing settings."""
         with self._lock:
@@ -1715,22 +1823,76 @@ class ExecutionService:
                     self._settings.execution.entry_timeout_seconds
                 ),
             )
-            return self._refresh_account_plan(plan)
+            return self._refresh_account_plan(
+                plan,
+                raise_on_risk_failure=raise_on_risk_failure,
+            )
 
-    def clear_drawdown_stop(self) -> RiskRuntimeState:
+    def clear_drawdown_stop(
+        self,
+        *,
+        broker: str,
+        environment: str,
+        account: str,
+    ) -> RiskRuntimeState:
         """经 Worker 控制命令显式清除停止，并重锚当前总权益。"""
 
         with self._lock:
             if self._risk_runtime is None:
                 raise PreflightError("当前执行服务未接入风险运行态")
-            plan = self._target_plan_from_settings()
-            if plan.broker != "okx":
-                raise PreflightError("资金流回撤停止当前只支持 OKX 路由")
-            self._refresh_account_plan(
-                plan,
+            route_identity = (
+                str(broker or "").strip().lower(),
+                str(environment or "").strip().lower(),
+                str(account or "").strip().lower(),
+            )
+            if route_identity != ("okx", "demo", "okx"):
+                raise PreflightError("资金流回撤停止只允许固定 OKX Demo 路由")
+            self.refresh_account_route(
+                broker=route_identity[0],
+                environment=route_identity[1],
+                account=route_identity[2],
                 raise_on_risk_failure=True,
             )
-            return self._risk_runtime.clear(self._risk_route_key(plan))
+            return self._risk_runtime.clear(
+                route_key(
+                    broker=route_identity[0],
+                    environment=route_identity[1],
+                    account=route_identity[2],
+                )
+            )
+
+    def recover_transient_risk_stop(
+        self,
+        *,
+        broker: str,
+        environment: str,
+        account: str,
+    ) -> RiskRuntimeState:
+        """新鲜完整读取成功后，显式恢复临时券商读取故障。"""
+
+        with self._lock:
+            if self._risk_runtime is None:
+                raise PreflightError("当前执行服务未接入风险运行态")
+            route_identity = (
+                str(broker or "").strip().lower(),
+                str(environment or "").strip().lower(),
+                str(account or "").strip().lower(),
+            )
+            if route_identity != ("okx", "demo", "okx"):
+                raise PreflightError("风险停止复核只允许固定 OKX Demo 路由")
+            self.refresh_account_route(
+                broker=route_identity[0],
+                environment=route_identity[1],
+                account=route_identity[2],
+                raise_on_risk_failure=True,
+            )
+            return self._risk_runtime.recover_transient_read_failure(
+                route_key(
+                    broker=route_identity[0],
+                    environment=route_identity[1],
+                    account=route_identity[2],
+                )
+            )
 
     def _refresh_account_plan(
         self,

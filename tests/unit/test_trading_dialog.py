@@ -17,6 +17,7 @@ from pa_agent.execution.models import (
     PositionSnapshot,
 )
 from pa_agent.execution.worker_protocol import WorkerCommandStatus
+from pa_agent.gui.read_models import FactCertainty
 from pa_agent.gui.trading_dialog import TradingDialog
 
 
@@ -105,6 +106,27 @@ class _CommandService(FakeService):
         if self.error:
             raise self.error
         return self.result
+
+
+class _CampaignReadModel:
+    def capture(self):
+        return SimpleNamespace(
+            campaign_state=SimpleNamespace(value="运行中（5 秒前更新）"),
+            campaign_progress=SimpleNamespace(
+                value="分析 4 / 失败 0 / 生成执行 0"
+            ),
+            campaign_last_result=SimpleNamespace(value="blocked:no_order"),
+            campaign_risk_parameters=SimpleNamespace(
+                value=(
+                    "资金上限 20000 USDT / 单笔风险 10.00% / "
+                    "杠杆上限 20×"
+                )
+            ),
+            campaign_config_alignment=SimpleNamespace(
+                value="一致：GUI 配置与运行中 Campaign 相同",
+                certainty=FactCertainty.CONFIRMED,
+            ),
+        )
 
 
 def _execution(
@@ -229,6 +251,56 @@ def test_dialog_round_trips_longbridge_route_without_credentials(qtbot):
     assert settings.execution.longbridge.quantity == "10"
     assert settings.execution.longbridge.preferred_account == "intraday"
     assert settings.execution.longbridge.allow_comprehensive_fallback is True
+
+
+def test_dialog_round_trips_okx_fixed_risk_controls(qtbot):
+    settings = Settings()
+    dialog = TradingDialog(
+        settings=settings,
+        service=FakeService(),
+    )
+    qtbot.addWidget(dialog)
+
+    dialog._broker.setCurrentIndex(dialog._broker.findData("okx"))
+    dialog._okx_risk_capital_cap.setValue(5000)
+    dialog._okx_risk_percent.setValue(8)
+    dialog._okx_maximum_leverage.setValue(25)
+    dialog._apply_widgets()
+
+    assert settings.execution.okx.risk_capital_cap_usdt == Decimal("5000")
+    assert settings.execution.okx.risk_percent == Decimal("0.08")
+    assert settings.execution.okx.maximum_leverage == Decimal("25")
+
+
+def test_dialog_shows_okx_fixed_proxy_route(qtbot, monkeypatch):
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.okx_fixed_proxy_label",
+        lambda: "橘子云 / V1-137|美国|x2.0",
+    )
+    dialog = TradingDialog(
+        settings=Settings(),
+        service=FakeService(),
+    )
+    qtbot.addWidget(dialog)
+
+    assert "橘子云 / V1-137|美国|x2.0" in dialog._okx_network_route.text()
+    assert "127.0.0.1:10981" in dialog._okx_network_route.text()
+    assert "不跟随 v2rayN 当前节点" in dialog._okx_network_route.text()
+
+
+def test_dialog_shows_same_campaign_state_as_backend(qtbot):
+    dialog = TradingDialog(
+        settings=Settings(),
+        service=FakeService(),
+        read_model=_CampaignReadModel(),
+    )
+    qtbot.addWidget(dialog)
+
+    assert "运行中（5 秒前更新）" in dialog._campaign_status_label.text()
+    assert "分析 4 / 失败 0 / 生成执行 0" in (
+        dialog._campaign_status_label.text()
+    )
+    assert "blocked:no_order" in dialog._campaign_status_label.text()
 
 
 @pytest.mark.parametrize(
@@ -400,6 +472,43 @@ def test_saving_order_modes_and_atr_multiples_updates_settings(
     assert service.reload_calls == 1
 
 
+def test_save_failure_keeps_memory_disk_and_service_on_old_configuration(
+    qtbot,
+    monkeypatch,
+    tmp_path,
+):
+    settings = Settings()
+    settings.execution.okx.risk_capital_cap_usdt = Decimal("20000")
+    service = FakeService()
+    dialog = TradingDialog(settings=settings, service=service)
+    qtbot.addWidget(dialog)
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text("old-settings", encoding="utf-8")
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.SETTINGS_JSON_PATH",
+        settings_path,
+    )
+
+    def _fail_save(*_args, **_kwargs):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.save_settings",
+        _fail_save,
+    )
+    monkeypatch.setattr(
+        "pa_agent.gui.trading_dialog.QMessageBox.critical",
+        lambda *_args, **_kwargs: None,
+    )
+    dialog._okx_risk_capital_cap.setValue(5000)
+
+    dialog._save_configuration()
+
+    assert settings.execution.okx.risk_capital_cap_usdt == Decimal("20000")
+    assert settings_path.read_text(encoding="utf-8") == "old-settings"
+    assert service.reload_calls == 0
+
+
 def test_dialog_switches_okx_product_and_margin_controls(qtbot):
     settings = Settings()
     dialog = TradingDialog(settings=settings, service=FakeService())
@@ -427,7 +536,7 @@ def test_okx_demo_is_clearly_labelled_as_simulated(qtbot):
     assert dialog._arm_button.text() == "启用本次模拟会话"
     dialog._configuration_dirty = False
     dialog._update_arm_state(True)
-    assert dialog._arm_label.text() == "本次会话：已启用模拟写操作"
+    assert dialog._arm_label.text() == "桌面手动会话：已启用模拟写操作"
 
 
 def test_dialog_separates_worker_heartbeat_from_reconciliation_health(qtbot):

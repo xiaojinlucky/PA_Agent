@@ -108,6 +108,10 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
             "exit_slippage_atr_multiple": str(
                 getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50"))
             ),
+            "risk_capital_cap_usdt": "",
+            "risk_percent": "",
+            "sizing_mode": "",
+            "maximum_leverage": "",
         }
     elif target == "okx":
         route = execution.okx
@@ -133,6 +137,12 @@ def execution_route_fingerprint(settings, broker: str | None = None) -> str:
             "exit_slippage_atr_multiple": str(
                 getattr(execution, "exit_slippage_atr_multiple", Decimal("0.50"))
             ),
+            "risk_capital_cap_usdt": str(route.risk_capital_cap_usdt),
+            "risk_percent": str(route.risk_percent),
+            "sizing_mode": str(
+                getattr(route, "sizing_mode", "risk_budget")
+            ),
+            "maximum_leverage": str(route.maximum_leverage),
         }
     else:
         raise PlanBlocked("unknown_broker", f"未知执行券商：{target}")
@@ -287,6 +297,30 @@ def build_execution_plan(
             f"当前分析 {source_symbol}，下单 {instrument}",
         )
     quantity = _positive_decimal(route.quantity, "quantity")
+    risk_snapshot = (
+        record.stage2_response.get("risk_sizing")
+        if isinstance(record.stage2_response, dict)
+        and isinstance(record.stage2_response.get("risk_sizing"), dict)
+        else {}
+    )
+
+    def _risk_decimal(field: str) -> Decimal | None:
+        value = risk_snapshot.get(field)
+        if value in {None, ""}:
+            return None
+        return _positive_decimal(value, f"risk_sizing.{field}")
+
+    sizing_mode = str(risk_snapshot.get("sizing_mode") or "risk_budget")
+    if sizing_mode not in {"risk_budget", "fixed_quantity"}:
+        raise PlanBlocked(
+            "risk_sizing_mode_invalid",
+            f"风险定仓模式无效：{sizing_mode}",
+        )
+    fixed_quantity = (
+        _risk_decimal("target_quantity")
+        if sizing_mode == "fixed_quantity"
+        else None
+    )
 
     digest = _verify_durable_record(record, record_path)
     plan_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"pa-agent:{digest}"))
@@ -320,4 +354,26 @@ def build_execution_plan(
         entry_atr=entry_atr,
         entry_slippage_atr_multiple=entry_slippage_atr_multiple,
         exit_slippage_atr_multiple=exit_slippage_atr_multiple,
+        authorized_sizing_mode=sizing_mode,
+        authorized_fixed_quantity=fixed_quantity,
+        risk_equity_basis=str(risk_snapshot.get("equity_basis") or ""),
+        authorized_account_total_equity_usd=_risk_decimal(
+            "account_total_equity_usd"
+        ),
+        authorized_account_equity_usdt=_risk_decimal("equity_usdt"),
+        authorized_risk_capital_cap_usdt=_risk_decimal(
+            "risk_capital_cap_usdt"
+        ),
+        authorized_effective_risk_capital_usdt=_risk_decimal(
+            "effective_risk_capital_usdt"
+        ),
+        authorized_risk_percent=_risk_decimal("risk_percent"),
+        authorized_risk_budget_usdt=_risk_decimal("risk_budget_usdt"),
+        authorized_risk_used_usdt=_risk_decimal("risk_used_usdt"),
+        authorized_contract_notional_usdt=_risk_decimal(
+            "contract_notional_usdt"
+        ),
+        authorized_worst_case_loss_per_contract_usdt=_risk_decimal(
+            "worst_case_loss_per_contract_usdt"
+        ),
     )

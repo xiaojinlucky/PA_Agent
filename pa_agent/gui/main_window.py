@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from typing import Any
 
-from PyQt6.QtCore import QThread, QTimer, pyqtSignal, QObject
+from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QShowEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
@@ -20,13 +21,15 @@ from PyQt6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStatusBar,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
-from PyQt6.QtCore import Qt
 
+from pa_agent import __version__
 from pa_agent.ai.response_extract import reasoning_from_response
 from pa_agent.app_context import AppContext
+from pa_agent.config.paths import PROJECT_ROOT
 from pa_agent.data.base import DataSourceTransientError
 from pa_agent.gui.validation_debug_dialog import show_validation_debug_dialog
 
@@ -337,8 +340,12 @@ class MainWindow(QMainWindow):
 
     def __init__(self, ctx: AppContext, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self._gui_started_at = datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        )
         self.setWindowTitle(
-            "PA Agent — Trading Terminal（分析仅供参考，不构成投资建议）"
+            f"PA Agent v{__version__} — Trading Terminal"
+            "（分析仅供参考，不构成投资建议）"
         )
         self.resize(1440, 900)
         self._ctx = ctx
@@ -427,7 +434,35 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
 
-        self._central = self._build_workbench()
+        self._analysis_workbench = self._build_workbench()
+        self._central = QTabWidget()
+        self._central.setObjectName("primaryWorkspaceTabs")
+        self._central.addTab(self._analysis_workbench, "分析工作台")
+        service = getattr(self._ctx, "execution_service", None)
+        settings = getattr(self._ctx, "settings", None)
+        if service is not None and settings is not None:
+            from pa_agent.gui.trading_workbench import TradingWorkbench
+
+            self._trading_workbench = TradingWorkbench(
+                settings=settings,
+                service=service,
+                event_bus=getattr(self._ctx, "event_bus", None),
+                read_model=self._workbench_read_model,
+                parent=self,
+            )
+            self._trading_workbench.configuration_saved.connect(
+                self._refresh_execution_configuration_status
+            )
+        else:
+            self._trading_workbench = QWidget()
+            unavailable_layout = QVBoxLayout(self._trading_workbench)
+            unavailable_layout.addWidget(
+                QLabel("实盘执行服务尚未初始化。")
+            )
+        self._trading_tab_index = self._central.addTab(
+            self._trading_workbench,
+            "实盘交易",
+        )
         self.setCentralWidget(self._central)
 
         # ── Status bar ────────────────────────────────────────────────────────
@@ -736,6 +771,22 @@ class MainWindow(QMainWindow):
         )
         outer_layout.addWidget(self._disclaimer_label)
 
+        self._runtime_identity_label = QLabel(
+            f"桌面 GUI：{PROJECT_ROOT} · 本次代码加载：{self._gui_started_at}"
+        )
+        self._runtime_identity_label.setObjectName("mutedLabel")
+        self._runtime_identity_label.setWordWrap(True)
+        self._runtime_identity_label.setToolTip(
+            "PA Agent 不会自动热加载代码。这里的时间就是当前桌面窗口实际加载代码的时间；"
+            "代码更新后必须重启桌面 GUI。"
+        )
+        outer_layout.addWidget(self._runtime_identity_label)
+
+        self._campaign_status_label = QLabel("10 分钟模拟盘：尚未读取")
+        self._campaign_status_label.setObjectName("mutedLabel")
+        self._campaign_status_label.setWordWrap(True)
+        outer_layout.addWidget(self._campaign_status_label)
+
         status_row = QHBoxLayout()
         self._workbench_read_model_status_label = QLabel("只读层：未接入")
         self._workbench_read_model_status_label.setObjectName("mutedLabel")
@@ -925,6 +976,11 @@ class MainWindow(QMainWindow):
             )
             route_text = f"OKX {environment} {instrument or '未配置品种'}"
             boundary = "同源可执行" if compatible else "行情/执行不一致，已阻断"
+            risk_text = (
+                f"GUI 配置：资金上限 {route.risk_capital_cap_usdt} USDT"
+                f" / 单笔风险 {route.risk_percent * 100}%"
+                f" / 杠杆上限 {route.maximum_leverage}×"
+            )
         else:
             route = execution.longbridge
             environment = (
@@ -937,11 +993,13 @@ class MainWindow(QMainWindow):
                 f"Longbridge {environment} {instrument or '未配置品种'}"
             )
             boundary = "价格品种一致" if compatible else "价格品种不一致，已阻断"
+            risk_text = ""
         enabled = "启用" if execution.enabled else "停用"
         label.setText(
             f"交易：{enabled} · {analysis_source.upper()}/{analysis_symbol or '—'}"
             f" → {route_text} · 入场 {mode_labels.get(entry_mode, entry_mode)}"
             f" / 离场 {mode_labels.get(exit_mode, exit_mode)} · {boundary}"
+            + (f" · {risk_text}" if risk_text else "")
         )
         label.setToolTip(
             "\n".join(
@@ -957,6 +1015,7 @@ class MainWindow(QMainWindow):
                         f"主动离场：{mode_labels.get(exit_mode, exit_mode)}；"
                         f"ATR 倍数 {execution.exit_slippage_atr_multiple}"
                     ),
+                    f"风险定仓：{risk_text or '使用券商路由固定数量'}",
                     f"安全边界：{boundary}",
                 )
             )
@@ -982,6 +1041,38 @@ class MainWindow(QMainWindow):
             return f"{fact.value}[{certainty_labels[fact.certainty]}]"
 
         snapshot = model.capture()
+        campaign_label = getattr(self, "_campaign_status_label", None)
+        if campaign_label is not None:
+            campaign_label.setText(
+                "10 分钟 OKX 模拟盘："
+                f"{display(snapshot.campaign_state)} · "
+                f"{display(snapshot.campaign_progress)} · "
+                f"最近 {display(snapshot.campaign_last_result)} · "
+                f"实际冻结参数 {display(snapshot.campaign_risk_parameters)} · "
+                f"{display(snapshot.campaign_config_alignment)}"
+            )
+            alignment = snapshot.campaign_config_alignment
+            if (
+                alignment.certainty is FactCertainty.UNKNOWN
+                or alignment.value.startswith("不一致")
+            ):
+                campaign_label.setStyleSheet(
+                    "color: #ff5c5c; font-weight: 600;"
+                )
+            else:
+                campaign_label.setStyleSheet("")
+            campaign_label.setToolTip(
+                "\n".join(
+                    (
+                        f"状态来源：{snapshot.campaign_state.source}",
+                        f"读取时间：{snapshot.captured_at}",
+                        "“实际冻结参数”来自 Campaign 状态文件，"
+                        "不是当前可编辑 GUI 设置。",
+                        "GUI 保存的新配置要经过安全重启后"
+                        "才会进入下一轮 Campaign。",
+                    )
+                )
+            )
         label.setText(
             "只读："
             f"行情 {display(snapshot.connection)} "
@@ -1684,8 +1775,13 @@ class MainWindow(QMainWindow):
             self._last_frame_ready_bars = None
 
             self._ctx.data_source = new_source
-            if self._workbench_read_model is not None:
-                self._workbench_read_model.set_data_source(new_source)
+            workbench_read_model = getattr(
+                self,
+                "_workbench_read_model",
+                None,
+            )
+            if workbench_read_model is not None:
+                workbench_read_model.set_data_source(new_source)
             self._active_data_source_kind = kind
             committed = True
             self._sync_tv_exchange_visibility()
@@ -1771,8 +1867,13 @@ class MainWindow(QMainWindow):
                 except Exception as rollback_exc:  # noqa: BLE001
                     logger.debug("Failed to stop new RefreshLoop: %s", rollback_exc)
                 self._ctx.data_source = old_source
-                if self._workbench_read_model is not None:
-                    self._workbench_read_model.set_data_source(old_source)
+                workbench_read_model = getattr(
+                    self,
+                    "_workbench_read_model",
+                    None,
+                )
+                if workbench_read_model is not None:
+                    workbench_read_model.set_data_source(old_source)
                 self._active_data_source_kind = previous_kind
                 self._last_frame_ready_bars = previous_frame_bars
                 try:
@@ -4945,21 +5046,11 @@ class MainWindow(QMainWindow):
             self._apply_chart_display_settings()
 
     def _open_trading_dialog(self) -> None:
-        """Open functional broker configuration and lifecycle controls."""
-        from pa_agent.gui.trading_dialog import TradingDialog
-
-        service = getattr(self._ctx, "execution_service", None)
-        settings = getattr(self._ctx, "settings", None)
-        if service is None or settings is None:
-            QMessageBox.warning(self, "实盘交易", "实盘执行服务尚未初始化。")
-            return
-        dialog = TradingDialog(
-            settings=settings,
-            service=service,
-            event_bus=getattr(self._ctx, "event_bus", None),
-            parent=self,
-        )
-        dialog.exec()
+        """切到一级实盘工作区；保留旧方法名以兼容既有调用。"""
+        self._central.setCurrentIndex(self._trading_tab_index)
+        refresh = getattr(self._trading_workbench, "refresh_now", None)
+        if callable(refresh):
+            refresh()
         self._refresh_execution_configuration_status()
 
     def _apply_chart_display_settings(self) -> None:
