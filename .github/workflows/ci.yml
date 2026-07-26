@@ -15,10 +15,35 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: pip install -e ".[dev]"
 
       - name: Verify install
         run: python -c "import pa_agent; print('OK')"
+
+      # 18 条 --deselect 是 2026-07-26 时点的既有历史失败（清单与
+      # docs/CLAUDE_HANDOFF_20260726.md 第 10 节一致），修复一条就删一条；
+      # 除此之外任何失败都应让 CI 变红。
+      - name: Run unit tests
+        run: >-
+          python -m pytest tests/unit -q -p no:cacheprovider
+          --deselect tests/unit/test_coherence_checks.py::test_structural_inside_outside_mismatch_still_errors_in_strict
+          --deselect tests/unit/test_decision_continuity.py::test_audit_relation_flip_label
+          --deselect tests/unit/test_decision_continuity.py::test_bars_elapsed_between_parses_iso_t_separator
+          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_after_3_bars_unfilled_limit
+          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_on_cycle_change_unfilled_limit
+          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_on_direction_change_unfilled_limit
+          --deselect tests/unit/test_decision_nodes_judges.py::test_normalize_stage2_upgrades_9_0_for_planned_limit
+          --deselect tests/unit/test_decision_panel.py::test_panel_no_prediction_hidden
+          --deselect tests/unit/test_decision_panel.py::test_panel_unpredictable_renders_gray
+          --deselect tests/unit/test_decision_panel.py::test_panel_bullish_renders_green
+          --deselect tests/unit/test_decision_panel.py::test_panel_bearish_renders_red
+          --deselect tests/unit/test_decision_panel.py::test_panel_neutral_renders_yellow
+          --deselect tests/unit/test_decision_panel.py::test_panel_clear_hides_group
+          --deselect tests/unit/test_order_opportunity.py::test_play_order_alert_sound_uses_wav_on_windows
+          --deselect tests/unit/test_price_tick.py::test_stage2_normalizer_passes_breakout_price_check
+          --deselect tests/unit/test_provider_override_by_model.py::test_openclaw_cs_overrides_user_url_and_key
+          --deselect tests/unit/test_validation_lenient_fixes.py::test_lenient_validator_maps_openclaw_enum_slips
+          --deselect tests/unit/test_validation_lenient_fixes.py::test_lenient_validator_maps_action_and_limit_order_pending

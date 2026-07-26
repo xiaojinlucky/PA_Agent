@@ -168,19 +168,20 @@ class WorkerNewRiskAuthority:
 
 def _masked_exception(exc: BaseException) -> str:
     """Return an exception description that cannot expose common credentials."""
-    if isinstance(
-        exc,
-        (
-            _CommandRejected,
-            _CommandUncertain,
-            _ReconciliationNeedsAttention,
-        ),
-    ):
-        return f"{type(exc).__name__}: {exc}"
-    text = str(exc)
-    text = _SECRET_ASSIGNMENT.sub(lambda match: f"{match.group(1)}=<redacted>", text)
-    text = _LONG_TOKEN.sub("<redacted>", text)
-    return f"{type(exc).__name__}: {text}"
+    parts: list[str] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen and len(parts) < 3:
+        seen.add(id(current))
+        text = str(current)
+        text = _SECRET_ASSIGNMENT.sub(
+            lambda match: f"{match.group(1)}=<redacted>",
+            text,
+        )
+        text = _LONG_TOKEN.sub("<redacted>", text)
+        parts.append(f"{type(current).__name__}: {text}")
+        current = current.__cause__
+    return " <- ".join(parts)
 
 
 class ExecutionWorker:

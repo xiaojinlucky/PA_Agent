@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import urllib.error
 import urllib.request
 from unittest.mock import Mock, patch
 
@@ -15,6 +16,9 @@ from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
 from pa_agent.execution.okx_client import (
     OKX_FIXED_PROXY_URL,
     OKX_PENDING_ALGO_ORDER_TYPES,
+    OKX_READ_RECONNECT_DELAYS_SECONDS,
+    OKX_READ_TRANSPORT_ATTEMPTS,
+    OKX_REQUEST_TIMEOUT_SECONDS,
     HttpResponse,
     OkxRestClient,
     UrlLibTransport,
@@ -37,7 +41,10 @@ class FakeTransport:
                 "timeout": timeout,
             }
         )
-        return self.responses.pop(0)
+        response = self.responses.pop(0)
+        if isinstance(response, BaseException):
+            raise response
+        return response
 
 
 def _response(payload: dict, status: int = 200) -> HttpResponse:
@@ -89,6 +96,26 @@ def test_urllib_incomplete_read_is_normalized_as_read_only_transport_failure():
 
     assert caught.value.write_may_have_reached is False
     assert "IncompleteRead" in str(caught.value)
+    assert "/api/v5/account/bills" in str(caught.value)
+
+
+def test_urllib_transport_logs_only_endpoint_and_safe_nested_error_type():
+    opener = Mock()
+    opener.open.side_effect = urllib.error.URLError(TimeoutError())
+
+    with pytest.raises(BrokerTransportError) as caught:
+        UrlLibTransport(opener=opener).request(
+            "GET",
+            "https://www.okx.com/api/v5/account/bills?after=private-id",
+            headers={},
+            body=None,
+            timeout=10,
+        )
+
+    message = str(caught.value)
+    assert "GET /api/v5/account/bills" in message
+    assert "URLError:TimeoutError" in message
+    assert "private-id" not in message
 
 
 def test_urllib_transport_binds_fixed_proxy_even_when_no_proxy_is_wildcard(
@@ -208,7 +235,105 @@ def test_private_request_signature_uses_exact_path_query_and_compact_body():
     ).decode("ascii")
     assert call["headers"]["OK-ACCESS-SIGN"] == expected
     assert call["headers"]["OK-ACCESS-PASSPHRASE"] == "passphrase"
+    assert call["timeout"] == OKX_REQUEST_TIMEOUT_SECONDS
     assert call["headers"]["expTime"] == "1700000005000"
+
+
+def test_private_get_reconnects_with_fresh_signature(monkeypatch):
+    transport = FakeTransport(
+        [
+            BrokerTransportError(
+                "first tunnel failed",
+                write_may_have_reached=False,
+            ),
+            _response({"code": "0", "data": [{"totalEq": "1"}], "msg": ""}),
+        ]
+    )
+    times = iter(
+        [
+            1_700_000_000_000,
+            1_700_000_000_000,
+            1_700_000_001_000,
+            1_700_000_001_000,
+        ]
+    )
+    client = OkxRestClient(
+        OkxCredentials("api-key", "secret", "passphrase"),
+        transport=transport,
+        now_ms=lambda: next(times),
+    )
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "pa_agent.execution.okx_client.time.sleep",
+        delays.append,
+    )
+
+    assert client.balance() == [{"totalEq": "1"}]
+    assert len(transport.calls) == 2
+    assert delays == [OKX_READ_RECONNECT_DELAYS_SECONDS[0]]
+    assert (
+        transport.calls[0]["headers"]["OK-ACCESS-TIMESTAMP"]
+        != transport.calls[1]["headers"]["OK-ACCESS-TIMESTAMP"]
+    )
+    assert (
+        transport.calls[0]["headers"]["OK-ACCESS-SIGN"]
+        != transport.calls[1]["headers"]["OK-ACCESS-SIGN"]
+    )
+
+
+def test_get_stops_after_bounded_reconnects_and_raises_last_failure(
+    monkeypatch,
+):
+    transport = FakeTransport(
+        [
+            BrokerTransportError(
+                "first tunnel failed",
+                write_may_have_reached=False,
+            ),
+            BrokerTransportError(
+                "second tunnel failed",
+                write_may_have_reached=False,
+            ),
+            BrokerTransportError(
+                "third tunnel failed",
+                write_may_have_reached=False,
+            ),
+        ]
+    )
+    delays: list[float] = []
+    monkeypatch.setattr(
+        "pa_agent.execution.okx_client.time.sleep",
+        delays.append,
+    )
+
+    with pytest.raises(BrokerTransportError, match="third tunnel failed"):
+        _client(transport).balance()
+
+    assert len(transport.calls) == OKX_READ_TRANSPORT_ATTEMPTS
+    assert delays == list(OKX_READ_RECONNECT_DELAYS_SECONDS)
+
+
+def test_post_transport_failure_is_never_retried():
+    transport = FakeTransport(
+        [
+            BrokerTransportError(
+                "write outcome unknown",
+                write_may_have_reached=True,
+            ),
+            _response(
+                {
+                    "code": "0",
+                    "data": [{"ordId": "1", "sCode": "0"}],
+                    "msg": "",
+                }
+            ),
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError, match="write outcome unknown"):
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert len(transport.calls) == 1
 
 
 def test_simulated_header_is_explicit():

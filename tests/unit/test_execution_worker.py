@@ -33,6 +33,7 @@ from pa_agent.execution.worker_protocol import (
     WorkerState,
 )
 from pa_agent.execution.worker_store import WorkerStore
+from pa_agent.risk.runtime import RiskRuntimeBlocked
 
 
 class _MutableClock:
@@ -955,6 +956,29 @@ def test_exception_classification_and_masked_logging(tmp_path, caplog):
     assert store.get_command(refresh.id).failure_code == "RuntimeError"
     assert "abcdefghijklmnopqrstuvwxyz0123456789" not in caplog.text
     assert "<redacted>" in caplog.text
+
+
+def test_masked_logging_includes_safe_transport_cause(tmp_path, caplog):
+    worker, _store, service = _runtime(tmp_path)
+    caplog.set_level(logging.ERROR)
+    failure = RiskRuntimeBlocked(
+        "risk_runtime_BrokerTransportError",
+        "风险读取失败",
+    )
+    failure.__cause__ = BrokerTransportError(
+        "OKX GET /api/v5/account/bills 网络请求失败（SSLEOFError）",
+        write_may_have_reached=False,
+    )
+    service.failures["reconcile"] = failure
+    worker.start()
+    try:
+        pass
+    finally:
+        worker.close()
+
+    assert "RiskRuntimeBlocked: 风险读取失败" in caplog.text
+    assert "GET /api/v5/account/bills" in caplog.text
+    assert "SSLEOFError" in caplog.text
 
 
 def test_invalid_execution_record_fails_before_broker_write(tmp_path):

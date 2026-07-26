@@ -345,11 +345,15 @@ class MainWindow(QMainWindow):
         )
         self.setWindowTitle(
             f"PA Agent v{__version__} — Trading Terminal"
-            "（分析仅供参考，不构成投资建议）"
         )
         self.resize(1440, 900)
         self._ctx = ctx
         self._workbench_read_model = getattr(ctx, "workbench_read_model", None)
+        self._trading_workbench_read_model = getattr(
+            ctx,
+            "trading_workbench_read_model",
+            None,
+        ) or self._workbench_read_model
         self._worker: _AnalysisWorker | None = None
         self._analysis_worker_id: object | None = None
         self._prep_worker: Any = None
@@ -447,7 +451,8 @@ class MainWindow(QMainWindow):
                 settings=settings,
                 service=service,
                 event_bus=getattr(self._ctx, "event_bus", None),
-                read_model=self._workbench_read_model,
+                read_model=self._trading_workbench_read_model,
+                settings_path=getattr(self._ctx, "settings_path", None),
                 parent=self,
             )
             self._trading_workbench.configuration_saved.connect(
@@ -480,6 +485,10 @@ class MainWindow(QMainWindow):
         self._refresh_execution_configuration_status()
         self._status_bar.showMessage("就绪")
         self._refresh_ai_auth_ui_state()
+        self._central.currentChanged.connect(
+            self._sync_workspace_status_bar
+        )
+        self._sync_workspace_status_bar(self._central.currentIndex())
 
         # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
@@ -517,6 +526,10 @@ class MainWindow(QMainWindow):
         self._demo_exit_action.triggered.connect(self._exit_demo_mode)
         self._demo_exit_action.setEnabled(False)
         demo_menu.addAction(self._demo_exit_action)
+
+    def _sync_workspace_status_bar(self, index: int) -> None:
+        """交易工作台已有完整状态区，不再重复显示底部微小状态栏。"""
+        self._status_bar.setVisible(index != self._trading_tab_index)
 
     def _build_workbench(self) -> QWidget:
         """Build chart + AI sidebar workbench."""
@@ -975,7 +988,7 @@ class MainWindow(QMainWindow):
                 and analysis_symbol == source_symbol == instrument
             )
             route_text = f"OKX {environment} {instrument or '未配置品种'}"
-            boundary = "同源可执行" if compatible else "行情/执行不一致，已阻断"
+            boundary = "路由配置一致" if compatible else "行情/执行不一致，已阻断"
             risk_text = (
                 f"GUI 配置：资金上限 {route.risk_capital_cap_usdt} USDT"
                 f" / 单笔风险 {route.risk_percent * 100}%"
@@ -1040,7 +1053,25 @@ class MainWindow(QMainWindow):
         def display(fact: Any) -> str:
             return f"{fact.value}[{certainty_labels[fact.certainty]}]"
 
-        snapshot = model.capture()
+        try:
+            snapshot = model.capture()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Workbench read-model capture failed (%s)",
+                type(exc).__name__,
+            )
+            label.setText("只读：读取失败")
+            label.setToolTip(f"读取失败：{type(exc).__name__}")
+            campaign_label = getattr(self, "_campaign_status_label", None)
+            if campaign_label is not None:
+                campaign_label.setText("10 分钟 OKX 模拟盘：读取失败")
+                campaign_label.setStyleSheet(
+                    "color: #ff5c5c; font-weight: 600;"
+                )
+                campaign_label.setToolTip(
+                    f"读取失败：{type(exc).__name__}"
+                )
+            return
         campaign_label = getattr(self, "_campaign_status_label", None)
         if campaign_label is not None:
             campaign_label.setText(
@@ -1097,6 +1128,19 @@ class MainWindow(QMainWindow):
                 )
             )
         )
+
+    def _set_workbench_data_source(self, data_source: Any) -> None:
+        """把已提交的数据源切换同步给两套只读模型。"""
+        seen: set[int] = set()
+        for attribute in (
+            "_workbench_read_model",
+            "_trading_workbench_read_model",
+        ):
+            model = getattr(self, attribute, None)
+            if model is None or id(model) in seen:
+                continue
+            seen.add(id(model))
+            model.set_data_source(data_source)
 
     def _on_execution_error(self, message: str) -> None:
         label = getattr(self, "_execution_status_label", None)
@@ -1775,13 +1819,7 @@ class MainWindow(QMainWindow):
             self._last_frame_ready_bars = None
 
             self._ctx.data_source = new_source
-            workbench_read_model = getattr(
-                self,
-                "_workbench_read_model",
-                None,
-            )
-            if workbench_read_model is not None:
-                workbench_read_model.set_data_source(new_source)
+            MainWindow._set_workbench_data_source(self, new_source)
             self._active_data_source_kind = kind
             committed = True
             self._sync_tv_exchange_visibility()
@@ -1867,13 +1905,7 @@ class MainWindow(QMainWindow):
                 except Exception as rollback_exc:  # noqa: BLE001
                     logger.debug("Failed to stop new RefreshLoop: %s", rollback_exc)
                 self._ctx.data_source = old_source
-                workbench_read_model = getattr(
-                    self,
-                    "_workbench_read_model",
-                    None,
-                )
-                if workbench_read_model is not None:
-                    workbench_read_model.set_data_source(old_source)
+                MainWindow._set_workbench_data_source(self, old_source)
                 self._active_data_source_kind = previous_kind
                 self._last_frame_ready_bars = previous_frame_bars
                 try:

@@ -1,4 +1,4 @@
-param(
+﻿param(
     [Parameter(Mandatory = $true)]
     [string]$V2rayNRoot,
 
@@ -16,6 +16,279 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Invoke-CheckedIcacls {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FailureMessage
+    )
+
+    & icacls.exe @Arguments | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        throw "$FailureMessage（icacls 退出码 $LASTEXITCODE）。"
+    }
+}
+
+function Get-RuntimeTreeItems {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RuntimeDirectory
+    )
+
+    $runtimeRoot = Get-Item -LiteralPath $RuntimeDirectory -Force -ErrorAction Stop
+    $children = @(
+        Get-ChildItem `
+            -LiteralPath $RuntimeDirectory `
+            -Force `
+            -Recurse `
+            -ErrorAction Stop
+    )
+    return @($runtimeRoot) + @(
+        $children | Sort-Object {
+            $_.FullName.Split(
+                [System.IO.Path]::DirectorySeparatorChar
+            ).Count
+        }, FullName
+    )
+}
+
+function Assert-NotReparsePoint {
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.IO.FileSystemInfo]$Item
+    )
+
+    if (
+        ($Item.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0
+    ) {
+        throw "固定代理运行目录禁止使用重解析点：$($Item.FullName)"
+    }
+}
+
+function ConvertTo-SidValue {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Identity
+    )
+
+    try {
+        return (
+            New-Object System.Security.Principal.NTAccount($Identity)
+        ).Translate(
+            [System.Security.Principal.SecurityIdentifier]
+        ).Value
+    }
+    catch {
+        return (
+            New-Object System.Security.Principal.SecurityIdentifier($Identity)
+        ).Value
+    }
+}
+
+function Assert-RuntimeDirectorySecurity {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RuntimeDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$CurrentSid
+    )
+
+    $expectedSids = @($CurrentSid, "S-1-5-18") | Sort-Object
+    $runtimeRootPath = [System.IO.Path]::GetFullPath($RuntimeDirectory)
+    foreach ($item in Get-RuntimeTreeItems -RuntimeDirectory $RuntimeDirectory) {
+        Assert-NotReparsePoint -Item $item
+        if ($item.PSIsContainer) {
+            $acl = [System.IO.Directory]::GetAccessControl($item.FullName)
+        }
+        else {
+            $acl = [System.IO.File]::GetAccessControl($item.FullName)
+        }
+        $ownerSid = $acl.Owner
+        try {
+            $ownerSid = ConvertTo-SidValue -Identity $acl.Owner
+        }
+        catch {
+            throw "无法核验固定代理文件 Owner：$($item.FullName)"
+        }
+        if ($ownerSid -ne $CurrentSid) {
+            throw "固定代理文件 Owner 不是当前用户：$($item.FullName)"
+        }
+
+        $rules = @($acl.Access)
+        if (
+            $rules | Where-Object {
+                $_.AccessControlType -eq (
+                    [System.Security.AccessControl.AccessControlType]::Deny
+                )
+            }
+        ) {
+            throw "固定代理文件存在 Deny 权限：$($item.FullName)"
+        }
+        $allowRules = @(
+            $rules | Where-Object {
+                $_.AccessControlType -eq (
+                    [System.Security.AccessControl.AccessControlType]::Allow
+                )
+            }
+        )
+        $actualSids = @(
+            $allowRules | ForEach-Object {
+                $_.IdentityReference.Translate(
+                    [System.Security.Principal.SecurityIdentifier]
+                ).Value
+            }
+        ) | Sort-Object
+        if (
+            $allowRules.Count -ne 2 -or
+            (Compare-Object $expectedSids $actualSids)
+        ) {
+            throw "固定代理文件授权身份异常：$($item.FullName)"
+        }
+
+        $isRuntimeRoot = (
+            [System.IO.Path]::GetFullPath($item.FullName) -eq $runtimeRootPath
+        )
+        if ($isRuntimeRoot -and -not $acl.AreAccessRulesProtected) {
+            throw "固定代理运行目录仍允许继承外部 DACL。"
+        }
+        if (-not $isRuntimeRoot -and $acl.AreAccessRulesProtected) {
+            throw "固定代理子项仍使用受保护 DACL：$($item.FullName)"
+        }
+        foreach ($rule in $allowRules) {
+            if (
+                ($rule.FileSystemRights -band (
+                    [System.Security.AccessControl.FileSystemRights]::FullControl
+                )) -ne (
+                    [System.Security.AccessControl.FileSystemRights]::FullControl
+                )
+            ) {
+                throw "固定代理文件没有完整控制权限：$($item.FullName)"
+            }
+            if ($isRuntimeRoot -and $rule.IsInherited) {
+                throw "固定代理运行目录存在意外的继承权限。"
+            }
+            if (
+                $isRuntimeRoot -and
+                $rule.InheritanceFlags -ne (
+                    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit `
+                    -bor `
+                    [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                )
+            ) {
+                throw "固定代理运行目录权限没有向子项完整继承。"
+            }
+            if (
+                $isRuntimeRoot -and
+                $rule.PropagationFlags -ne (
+                    [System.Security.AccessControl.PropagationFlags]::None
+                )
+            ) {
+                throw "固定代理运行目录权限使用了异常传播方式。"
+            }
+            if (-not $isRuntimeRoot -and -not $rule.IsInherited) {
+                throw "固定代理子项没有继承运行目录权限：$($item.FullName)"
+            }
+        }
+    }
+}
+
+function Protect-RuntimeDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$RuntimeDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [System.Security.Principal.SecurityIdentifier]$CurrentSidObject
+    )
+
+    # 修改任何 DACL 之前先完整枚举一次；发现 Junction、符号链接等重解析点
+    # 立即终止，绝不沿着链接改到运行目录之外。
+    $initialItems = @(
+        Get-RuntimeTreeItems -RuntimeDirectory $RuntimeDirectory
+    )
+    foreach ($item in $initialItems) {
+        Assert-NotReparsePoint -Item $item
+    }
+
+    $currentSid = $CurrentSidObject.Value
+    $systemSid = New-Object `
+        System.Security.Principal.SecurityIdentifier("S-1-5-18")
+    Invoke-CheckedIcacls `
+        -Arguments @($RuntimeDirectory, "/reset") `
+        -FailureMessage "无法清除固定代理运行目录既有 DACL"
+    Invoke-CheckedIcacls `
+        -Arguments @(
+            $RuntimeDirectory,
+            "/setowner",
+            "*$currentSid"
+        ) `
+        -FailureMessage "无法设置固定代理运行目录 Owner"
+    Invoke-CheckedIcacls `
+        -Arguments @(
+            $RuntimeDirectory,
+            "/grant:r",
+            "*${currentSid}:(OI)(CI)F"
+        ) `
+        -FailureMessage "无法取得固定代理运行目录 DACL 控制权"
+
+    $rootAcl = New-Object `
+        System.Security.AccessControl.DirectorySecurity
+    $rootAcl.SetOwner($CurrentSidObject)
+    $rootAcl.SetAccessRuleProtection($true, $false)
+    foreach ($identitySid in @($CurrentSidObject, $systemSid)) {
+        $rootRule = New-Object `
+            System.Security.AccessControl.FileSystemAccessRule(
+                $identitySid,
+                [System.Security.AccessControl.FileSystemRights]::FullControl,
+                (
+                    [System.Security.AccessControl.InheritanceFlags]::ContainerInherit `
+                    -bor `
+                    [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+                ),
+                [System.Security.AccessControl.PropagationFlags]::None,
+                [System.Security.AccessControl.AccessControlType]::Allow
+            )
+        [void]$rootAcl.AddAccessRule($rootRule)
+    }
+    [System.IO.Directory]::SetAccessControl($RuntimeDirectory, $rootAcl)
+
+    # 必须逐项处理，不能启用“遇错继续”吞掉单个失败。父目录先于子项，
+    # 包括隐藏文件和隐藏目录，确保每个子项最终只继承根目录的两条权限。
+    foreach ($item in $initialItems | Select-Object -Skip 1) {
+        if ($item.PSIsContainer) {
+            $itemAcl = [System.IO.Directory]::GetAccessControl($item.FullName)
+        }
+        else {
+            $itemAcl = [System.IO.File]::GetAccessControl($item.FullName)
+        }
+        try {
+            $itemOwnerSid = ConvertTo-SidValue -Identity $itemAcl.Owner
+        }
+        catch {
+            $itemOwnerSid = $null
+        }
+        if ($itemOwnerSid -ne $currentSid) {
+            Invoke-CheckedIcacls `
+                -Arguments @(
+                    $item.FullName,
+                    "/setowner",
+                    "*$currentSid"
+                ) `
+                -FailureMessage "无法设置固定代理子项 Owner：$($item.FullName)"
+        }
+        Invoke-CheckedIcacls `
+            -Arguments @($item.FullName, "/reset") `
+            -FailureMessage "无法重置固定代理子项 DACL：$($item.FullName)"
+    }
+
+    Assert-RuntimeDirectorySecurity `
+        -RuntimeDirectory $RuntimeDirectory `
+        -CurrentSid $currentSid
+}
 
 if (-not $RuntimeDirectory) {
     $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -81,15 +354,12 @@ if ($null -ne $existingStartup) {
 }
 
 New-Item -ItemType Directory -Path $RuntimeDirectory -Force | Out-Null
-$currentIdentity = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
-& icacls.exe $RuntimeDirectory `
-    /inheritance:r `
-    /grant:r `
-    "${currentIdentity}:(OI)(CI)F" `
-    "SYSTEM:(OI)(CI)F" | Out-Null
-if ($LASTEXITCODE -ne 0) {
-    throw "无法把固定代理运行目录权限收紧到当前用户和 SYSTEM。"
-}
+$currentSidObject = (
+    [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+)
+Protect-RuntimeDirectory `
+    -RuntimeDirectory $RuntimeDirectory `
+    -CurrentSidObject $currentSidObject
 $runtimeCorePath = Join-Path $RuntimeDirectory "sing-box.exe"
 $runtimeConfigPath = Join-Path $RuntimeDirectory "config.json"
 $metadataPath = Join-Path $RuntimeDirectory "metadata.json"
@@ -103,11 +373,6 @@ $renderedConfig = $config | ConvertTo-Json -Depth 100
     $renderedConfig,
     $utf8NoBom
 )
-
-& $runtimeCorePath check -c $runtimeConfigPath
-if ($LASTEXITCODE -ne 0) {
-    throw "独立 sing-box 配置检查失败，退出码 $LASTEXITCODE。"
-}
 
 $metadata = [ordered]@{
     schema_version = 1
@@ -174,8 +439,22 @@ $supervisor = $supervisor.Replace(
 [System.IO.File]::WriteAllText(
     $supervisorPath,
     $supervisor,
-    $utf8NoBom
+    (New-Object System.Text.UTF8Encoding($true))
 )
+
+# 文件全部生成后重做一次目录和全部递归子项的安全边界。最终核验之后
+# 才允许执行复制进来的 sing-box，避免在不可信 ACL 下加载可执行文件。
+Protect-RuntimeDirectory `
+    -RuntimeDirectory $RuntimeDirectory `
+    -CurrentSidObject $currentSidObject
+Assert-RuntimeDirectorySecurity `
+    -RuntimeDirectory $RuntimeDirectory `
+    -CurrentSid $currentSidObject.Value
+
+& $runtimeCorePath check -c $runtimeConfigPath
+if ($LASTEXITCODE -ne 0) {
+    throw "独立 sing-box 配置检查失败，退出码 $LASTEXITCODE。"
+}
 
 $startupCommand = (
     "powershell.exe -NoProfile -NonInteractive -WindowStyle Hidden " +

@@ -31,6 +31,9 @@ OKX_PENDING_ALGO_ORDER_TYPES = (
 )
 OKX_FIXED_PROXY_URL = "http://127.0.0.1:10981"
 OKX_FIXED_PROXY_LABEL = "固定节点（身份未确认）"
+OKX_REQUEST_TIMEOUT_SECONDS = 20.0
+OKX_READ_TRANSPORT_ATTEMPTS = 3
+OKX_READ_RECONNECT_DELAYS_SECONDS = (1.0, 2.0)
 OKX_FIXED_PROXY_METADATA_PATH = (
     Path(__file__).resolve().parents[2]
     / "records"
@@ -130,6 +133,17 @@ class UrlLibTransport:
     def proxy_url(self) -> str:
         return self._proxy_url
 
+    @staticmethod
+    def _safe_failure_type(exc: BaseException) -> str:
+        """只暴露异常类型，不把代理、主机或请求内容写入日志。"""
+
+        cause = exc.reason if isinstance(exc, urllib.error.URLError) else exc
+        return (
+            type(exc).__name__
+            if cause is exc
+            else f"{type(exc).__name__}:{type(cause).__name__}"
+        )
+
     def request(
         self,
         method: str,
@@ -158,8 +172,10 @@ class UrlLibTransport:
             OSError,
             http.client.HTTPException,
         ) as exc:
+            endpoint = urllib.parse.urlsplit(url).path or "/"
             raise BrokerTransportError(
-                f"OKX 网络请求失败（{type(exc).__name__}）",
+                f"OKX {method.upper()} {endpoint} 网络请求失败"
+                f"（{self._safe_failure_type(exc)}）",
                 write_may_have_reached=method.upper() != "GET",
             ) from exc
 
@@ -211,7 +227,7 @@ class OkxRestClient:
         base_url: str = "https://www.okx.com",
         simulated: bool = False,
         transport: HttpTransport | None = None,
-        timeout: float = 10.0,
+        timeout: float = OKX_REQUEST_TIMEOUT_SECONDS,
         now_ms=None,
     ) -> None:
         self._credentials = credentials
@@ -275,37 +291,44 @@ class OkxRestClient:
         request_path = path + (f"?{query}" if query else "")
         body_text = self._compact_json(body)
         body_bytes = body_text.encode("utf-8") if body_text else None
-        headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-            "User-Agent": "PA_Agent/0.1",
-        }
-        if private:
-            timestamp = self._timestamp()
-            headers.update(
-                {
-                    "OK-ACCESS-KEY": self._credentials.api_key,
-                    "OK-ACCESS-PASSPHRASE": self._credentials.passphrase,
-                    "OK-ACCESS-TIMESTAMP": timestamp,
-                    "OK-ACCESS-SIGN": self._signature(
-                        timestamp,
-                        method,
-                        request_path,
-                        body_text,
-                    ),
-                    "expTime": str(self._corrected_now_ms() + 5_000),
-                }
-            )
-        if self._simulated:
-            headers["x-simulated-trading"] = "1"
-
-        response = self._transport.request(
-            method,
-            self._base_url + request_path,
-            headers=headers,
-            body=body_bytes,
-            timeout=self._timeout,
-        )
+        attempts = OKX_READ_TRANSPORT_ATTEMPTS if method == "GET" else 1
+        for attempt in range(attempts):
+            headers = {
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+                "User-Agent": "PA_Agent/0.1",
+            }
+            if private:
+                timestamp = self._timestamp()
+                headers.update(
+                    {
+                        "OK-ACCESS-KEY": self._credentials.api_key,
+                        "OK-ACCESS-PASSPHRASE": self._credentials.passphrase,
+                        "OK-ACCESS-TIMESTAMP": timestamp,
+                        "OK-ACCESS-SIGN": self._signature(
+                            timestamp,
+                            method,
+                            request_path,
+                            body_text,
+                        ),
+                        "expTime": str(self._corrected_now_ms() + 5_000),
+                    }
+                )
+            if self._simulated:
+                headers["x-simulated-trading"] = "1"
+            try:
+                response = self._transport.request(
+                    method,
+                    self._base_url + request_path,
+                    headers=headers,
+                    body=body_bytes,
+                    timeout=self._timeout,
+                )
+                break
+            except BrokerTransportError:
+                if attempt + 1 >= attempts:
+                    raise
+                time.sleep(OKX_READ_RECONNECT_DELAYS_SECONDS[attempt])
         try:
             payload = json.loads(response.body.decode("utf-8"))
         except (UnicodeError, json.JSONDecodeError) as exc:

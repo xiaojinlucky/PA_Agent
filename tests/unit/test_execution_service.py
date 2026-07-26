@@ -120,6 +120,7 @@ class FakeAdapter:
         self.cancel_error = None
         self.exit_error = None
         self.account_error = None
+        self.bills_error = None
         self.reconcile_write_unknown = False
         self.runtime_id = ""
         self.identity = "okx-account-a"
@@ -231,6 +232,34 @@ class FakeAdapter:
             account_profile=account_profile or "okx-live",
             equity=Decimal("1000"),
         )
+
+    def account_bills(self):
+        self.calls.append(("account_bills",))
+        if self.bills_error:
+            raise self.bills_error
+        return []
+
+
+class CountingRiskRuntime:
+    def __init__(self):
+        self.state = object()
+        self.calls = []
+
+    def get(self, route_key):
+        self.calls.append(("get", route_key))
+        return self.state
+
+    def refresh(self, **kwargs):
+        self.calls.append(("refresh", kwargs["account"]))
+        return self.state
+
+    def mark_failure(self, **kwargs):
+        self.calls.append(("mark_failure", kwargs["reason"]))
+        return type(
+            "BlockedState",
+            (),
+            {"kill_reason": kwargs["reason"]},
+        )()
 
 
 class FallbackFakeAdapter(FakeAdapter):
@@ -1007,8 +1036,9 @@ def test_monitor_once_refreshes_actual_selected_account(
     adapter.calls.clear()
 
     service._monitor_once()
+    service._monitor_once()
 
-    assert ("account_snapshot", "comprehensive") in adapter.calls
+    assert adapter.calls.count(("account_snapshot", "comprehensive")) == 2
 
 
 def test_monitor_once_refreshes_selected_account_without_active_execution(
@@ -1024,6 +1054,161 @@ def test_monitor_once_refreshes_selected_account_without_active_execution(
     assert len(snapshots) == 1
     assert snapshots[0].account_profile == "okx-live"
     assert ("account_snapshot", None) in adapter.calls
+
+
+def test_idle_monitor_throttles_complete_account_and_risk_refresh(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    risk_runtime = CountingRiskRuntime()
+    service._risk_runtime = risk_runtime
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+
+    first = service.monitor_once()
+    now[0] = 2.0
+    second = service.monitor_once()
+    now[0] = 59.0
+    third = service.monitor_once()
+    now[0] = 60.0
+    fourth = service.monitor_once()
+
+    assert [len(result[1]) for result in (first, second, third, fourth)] == [
+        1,
+        0,
+        0,
+        1,
+    ]
+    assert adapter.calls.count(("account_snapshot", None)) == 2
+    assert adapter.calls.count(("account_bills",)) == 2
+    assert [call[0] for call in risk_runtime.calls].count("refresh") == 2
+
+
+def test_idle_monitor_throttles_failed_account_refresh_attempts(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+    adapter.account_error = BrokerTransportError(
+        "proxy unavailable",
+        write_may_have_reached=False,
+    )
+
+    with pytest.raises(BrokerTransportError):
+        service.monitor_once()
+    adapter.account_error = None
+    now[0] = 1.0
+    assert service.monitor_once()[1] == []
+    now[0] = 60.0
+    assert len(service.monitor_once()[1]) == 1
+    assert adapter.calls.count(("account_snapshot", None)) == 2
+
+
+def test_idle_monitor_throttles_failed_full_risk_refresh_attempts(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    service._risk_runtime = CountingRiskRuntime()
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+    adapter.bills_error = BrokerTransportError(
+        "proxy unavailable",
+        write_may_have_reached=False,
+    )
+
+    with pytest.raises(RiskRuntimeBlocked):
+        service.monitor_once()
+    adapter.bills_error = None
+    now[0] = 2.0
+    assert service.monitor_once()[1] == []
+    now[0] = 60.0
+    assert len(service.monitor_once()[1]) == 1
+    assert adapter.calls.count(("account_bills",)) == 2
+
+
+def test_idle_monitor_refreshes_immediately_when_route_changes(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+
+    assert len(service.monitor_once()[1]) == 1
+    service._settings.execution.selected_broker = "longbridge"
+    service._settings.execution.longbridge.source_symbol = "GLD.US"
+    service._settings.execution.longbridge.instrument = "GLD.US"
+    service._settings.execution.longbridge.quantity = "1"
+    now[0] = 2.0
+
+    assert len(service.monitor_once()[1]) == 1
+    assert adapter.calls.count(("account_snapshot", None)) == 2
+
+
+def test_settings_reload_resets_idle_account_refresh_cadence(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+
+    assert len(service.monitor_once()[1]) == 1
+    now[0] = 2.0
+    assert service.monitor_once()[1] == []
+    service.reload_settings(service._settings)
+
+    assert len(service.monitor_once()[1]) == 1
+
+
+def test_explicit_account_refresh_forces_full_risk_read(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    risk_runtime = CountingRiskRuntime()
+    service._risk_runtime = risk_runtime
+    now = [0.0]
+    service._monotonic_clock = lambda: now[0]
+
+    service.monitor_once()
+    now[0] = 1.0
+    service.refresh_account()
+
+    assert adapter.calls.count(("account_bills",)) == 2
+    assert [call[0] for call in risk_runtime.calls].count("refresh") == 2
+
+
+def test_okx_account_snapshot_failure_persists_risk_stop(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, _record = _service(tmp_path, monkeypatch, adapter)
+    risk_runtime = CountingRiskRuntime()
+    service._risk_runtime = risk_runtime
+    adapter.account_error = BrokerTransportError(
+        "proxy unavailable",
+        write_may_have_reached=False,
+    )
+
+    with pytest.raises(BrokerTransportError):
+        service.refresh_account()
+
+    assert (
+        "mark_failure",
+        "risk_runtime_BrokerTransportError",
+    ) in risk_runtime.calls
 
 
 def test_unknown_reconcile_write_disarms_entire_session(tmp_path, monkeypatch):

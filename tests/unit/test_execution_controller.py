@@ -927,6 +927,7 @@ def test_gui_and_campaign_cannot_import_broker_writer_service():
         project_root / "pa_agent" / "app_context.py",
         project_root / "pa_agent" / "gui" / "main_window.py",
         project_root / "pa_agent" / "gui" / "trading_dialog.py",
+        project_root / "pa_agent" / "gui" / "trading_workbench.py",
         project_root / "pa_agent" / "okx_demo_campaign.py",
     ]
     forbidden = (

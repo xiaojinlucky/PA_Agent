@@ -17,7 +17,7 @@ from typing import Any
 
 from pa_agent.config.paths import PROJECT_ROOT
 from pa_agent.execution.models import AccountSnapshot, ExecutionRecord
-from pa_agent.execution.worker_protocol import WorkerHeartbeat
+from pa_agent.execution.worker_protocol import WorkerHeartbeat, WorkerState
 
 _HEARTBEAT_STALE_SECONDS = 10
 _RECONCILE_STALE_SECONDS = 30
@@ -59,6 +59,8 @@ class WorkbenchReadSnapshot:
     reconcile: ReadFact
     account: ReadFact
     risk_stop: ReadFact
+    route_alignment: ReadFact
+    risk_gate: ReadFact
     active_execution_count: ReadFact
     latest_execution_state: ReadFact
     campaign_state: ReadFact
@@ -85,6 +87,8 @@ class WorkbenchReadModel:
         worker_store: Any,
         clock: Callable[[], datetime] | None = None,
         campaign_state_path: Path = _DEFAULT_CAMPAIGN_STATE_PATH,
+        account_route: tuple[str, str] | None = None,
+        control_route: tuple[str, str] | None = None,
     ) -> None:
         self._settings = settings
         self._data_source = data_source
@@ -92,9 +96,31 @@ class WorkbenchReadModel:
         self._worker_store = worker_store
         self._clock = clock or (lambda: datetime.now(UTC))
         self._campaign_state_path = Path(campaign_state_path)
+        self._account_route = (
+            self._normalise_account_route(
+                account_route,
+                field_name="account_route",
+            )
+            if account_route is not None
+            else None
+        )
+        self._control_route = (
+            self._normalise_account_route(
+                control_route,
+                field_name="control_route",
+            )
+            if control_route is not None
+            else None
+        )
 
     @classmethod
-    def from_context(cls, context: Any) -> WorkbenchReadModel:
+    def from_context(
+        cls,
+        context: Any,
+        *,
+        account_route: tuple[str, str] | None = None,
+        control_route: tuple[str, str] | None = None,
+    ) -> WorkbenchReadModel:
         """从 AppContext 取出已有存储；不会新建另一套账本。"""
         execution_service = context.execution_service
         return cls(
@@ -102,6 +128,8 @@ class WorkbenchReadModel:
             data_source=context.data_source,
             execution_store=execution_service.execution_store,
             worker_store=execution_service.worker_store,
+            account_route=account_route,
+            control_route=control_route,
         )
 
     def set_data_source(self, data_source: Any) -> None:
@@ -124,7 +152,15 @@ class WorkbenchReadModel:
             captured_at,
         )
 
-        broker, account_profile = self._selected_account_route()
+        selected_route = self._selected_account_route()
+        account_route = self._account_route or selected_route
+        control_route = self._control_route or selected_route
+        broker, account_profile = account_route
+        route_alignment = self._route_alignment_fact(
+            account_route,
+            control_route,
+            captured_at,
+        )
         account_snapshot = None
         if broker and account_profile:
             account_snapshot = self._execution_store.latest_account_snapshot(
@@ -137,14 +173,27 @@ class WorkbenchReadModel:
             account_snapshot,
             captured_at,
         )
+        risk_broker, risk_environment, risk_account = (
+            self._risk_route_identity(account_route)
+        )
         risk_runtime_state = self._risk_runtime_state(
-            broker,
-            "demo" if account_profile == "okx-demo" else "live",
-            "okx" if broker == "okx" else account_profile,
+            risk_broker,
+            risk_environment,
+            risk_account,
         )
         risk_stop = self._risk_stop_fact(
             risk_runtime_state,
             captured_at,
+        )
+        risk_gate = self._risk_gate_fact(
+            risk_runtime_state=risk_runtime_state,
+            risk_stop=risk_stop,
+            heartbeat=heartbeat,
+            heartbeat_fact=heartbeat_fact,
+            reconcile=reconcile,
+            account=account,
+            route_alignment=route_alignment,
+            observed_at=captured_at,
         )
 
         active_executions = tuple(self._execution_store.list_active())
@@ -178,6 +227,8 @@ class WorkbenchReadModel:
             reconcile=reconcile,
             account=account,
             risk_stop=risk_stop,
+            route_alignment=route_alignment,
+            risk_gate=risk_gate,
             active_execution_count=active_execution_count,
             latest_execution_state=latest_execution_state,
             campaign_state=campaign_state,
@@ -237,10 +288,96 @@ class WorkbenchReadModel:
         environment: str,
         account: str,
     ) -> Any | None:
+        if not broker or not environment or not account:
+            return None
         getter = getattr(self._worker_store, "get_risk_runtime_state", None)
         if not callable(getter):
             return None
         return getter(f"{broker}:{environment}:{account}")
+
+    @staticmethod
+    def _normalise_account_route(
+        route: tuple[str, str],
+        *,
+        field_name: str,
+    ) -> tuple[str, str]:
+        if not isinstance(route, tuple) or len(route) != 2:
+            raise TypeError(f"{field_name} 必须是 (broker, account_profile) 元组")
+        broker = str(route[0] or "").strip().lower()
+        account_profile = str(route[1] or "").strip().lower()
+        valid_profiles = {
+            "okx": {"okx-demo", "okx-live"},
+            "longbridge": {"paper", "comprehensive", "intraday"},
+        }
+        if (
+            broker not in valid_profiles
+            or account_profile not in valid_profiles[broker]
+        ):
+            raise ValueError(
+                f"{field_name} 不是受支持的账户路由："
+                f"{broker or '空'}/{account_profile or '空'}"
+            )
+        return broker, account_profile
+
+    @staticmethod
+    def _risk_route_identity(
+        account_route: tuple[str, str],
+    ) -> tuple[str, str, str]:
+        broker, account_profile = account_route
+        if broker == "okx" and account_profile in {"okx-demo", "okx-live"}:
+            environment = "demo" if account_profile == "okx-demo" else "live"
+            return broker, environment, "okx"
+        if broker == "longbridge" and account_profile in {
+            "paper",
+            "comprehensive",
+            "intraday",
+        }:
+            environment = "demo" if account_profile == "paper" else "live"
+            return broker, environment, account_profile
+        return "", "", ""
+
+    @staticmethod
+    def _route_alignment_fact(
+        account_route: tuple[str, str],
+        control_route: tuple[str, str],
+        observed_at: str,
+    ) -> ReadFact:
+        account_label = WorkbenchReadModel._account_route_label(account_route)
+        control_label = WorkbenchReadModel._account_route_label(control_route)
+        source = "read-model account_route + execution control route"
+        if not all(account_route) or not all(control_route):
+            return ReadFact(
+                value=(
+                    "路由不匹配："
+                    f"页面 {account_label}，控制器 {control_label}"
+                ),
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+        if account_route != control_route:
+            return ReadFact(
+                value=(
+                    "路由不匹配："
+                    f"页面 {account_label}，控制器 {control_label}"
+                ),
+                certainty=FactCertainty.CONFIRMED,
+                source=source,
+                observed_at=observed_at,
+            )
+        return ReadFact(
+            value=f"路由匹配（{account_label}）",
+            certainty=FactCertainty.CONFIRMED,
+            source=source,
+            observed_at=observed_at,
+        )
+
+    @staticmethod
+    def _account_route_label(route: tuple[str, str]) -> str:
+        broker, account_profile = route
+        if not broker or not account_profile:
+            return "未配置"
+        return f"{broker}/{account_profile}"
 
     @staticmethod
     def _risk_stop_fact(state: Any | None, observed_at: str) -> ReadFact:
@@ -283,6 +420,73 @@ class WorkbenchReadModel:
             value=f"允许新增风险{drawdown_text}",
             certainty=FactCertainty.CONFIRMED,
             source="records/execution_control.sqlite3 / risk_runtime_state",
+            observed_at=observed_at,
+        )
+
+    @staticmethod
+    def _risk_gate_fact(
+        *,
+        risk_runtime_state: Any | None,
+        risk_stop: ReadFact,
+        heartbeat: WorkerHeartbeat | None,
+        heartbeat_fact: ReadFact,
+        reconcile: ReadFact,
+        account: ReadFact,
+        route_alignment: ReadFact,
+        observed_at: str,
+    ) -> ReadFact:
+        source = (
+            "risk_runtime_state + worker_heartbeats + "
+            "last_successful_reconcile_at + account_snapshots + route_alignment"
+        )
+
+        if bool(getattr(risk_runtime_state, "kill_active", False)):
+            return ReadFact(
+                value=risk_stop.value,
+                certainty=FactCertainty.CONFIRMED,
+                source=source,
+                observed_at=observed_at,
+            )
+
+        def unavailable(reason: str) -> ReadFact:
+            return ReadFact(
+                value=f"新增风险不可用：{reason}",
+                certainty=FactCertainty.UNKNOWN,
+                source=source,
+                observed_at=observed_at,
+            )
+
+        if risk_runtime_state is None:
+            return unavailable("尚无可信风险基线")
+        if (
+            route_alignment.certainty is not FactCertainty.CONFIRMED
+            or not route_alignment.value.startswith("路由匹配")
+        ):
+            return unavailable("页面账户与实际控制器路由不一致")
+        if heartbeat is None:
+            return unavailable("未观察到交易后台心跳")
+        if heartbeat.state not in {
+            WorkerState.RUNNING,
+            WorkerState.RECONCILING,
+        }:
+            state_label = {
+                WorkerState.STARTING: "启动中",
+                WorkerState.NEEDS_ATTENTION: "需要人工处理",
+                WorkerState.STOPPING: "正在停止",
+            }.get(heartbeat.state, heartbeat.state.value)
+            return unavailable(f"交易后台状态为{state_label}")
+        if heartbeat_fact.value != "新鲜":
+            return unavailable("交易后台心跳陈旧")
+        if reconcile.certainty is not FactCertainty.CONFIRMED:
+            return unavailable("交易后台尚未完成首次对账")
+        if reconcile.value != "新鲜":
+            return unavailable("交易后台最近成功对账已陈旧")
+        if account.certainty is not FactCertainty.CONFIRMED:
+            return unavailable(account.value)
+        return ReadFact(
+            value="允许新增风险",
+            certainty=FactCertainty.CONFIRMED,
+            source=source,
             observed_at=observed_at,
         )
 
@@ -628,26 +832,13 @@ class WorkbenchReadModel:
         last_result = str(payload.get("last_plan_result") or "").strip()
         last_action = str(payload.get("last_supervisor_action") or "").strip()
         last_error = str(payload.get("last_error") or "").strip()
-        result_labels = {
-            "blocked:no_order": "PA 本轮判断不下单",
-            (
-                "blocked:risk:leverage:"
-                "user_max_leverage_capacity_insufficient"
-            ): "风险目标需要超过用户设置的最大杠杆，本轮不下单",
-            "execution:ready": "已生成执行计划",
-        }
-        readable_result = result_labels.get(last_result)
-        if readable_result is None:
-            if last_result.startswith("blocked:risk:"):
-                readable_result = "风险检查未通过，本轮不下单"
-            elif last_result.startswith("blocked:"):
-                readable_result = "本轮未生成订单"
-            elif last_result.startswith("execution:"):
-                readable_result = "执行计划正在处理"
-            else:
-                readable_result = last_result
+        readable_result = self._campaign_result_text(
+            last_result=last_result,
+            last_action=last_action,
+            has_error=bool(last_error),
+        )
         campaign_last_result = ReadFact(
-            value=last_error or readable_result or last_action or "尚无结果",
+            value=readable_result,
             certainty=status_certainty,
             source=source,
             observed_at=observed_at,
@@ -667,6 +858,56 @@ class WorkbenchReadModel:
             campaign_risk_parameters,
             campaign_config_alignment,
         )
+
+    @staticmethod
+    def _campaign_result_text(
+        *,
+        last_result: str,
+        last_action: str,
+        has_error: bool,
+    ) -> str:
+        """把持久状态码转成主界面文案，原始异常只留在技术日志。"""
+        exact_labels = {
+            "blocked:no_order": "PA 本轮判断不下单",
+            (
+                "blocked:risk:leverage:"
+                "user_max_leverage_capacity_insufficient"
+            ): "风险目标需要超过最大杠杆，本轮不下单",
+            "execution:ready": "已生成执行计划，等待确认",
+            "execution:submitting": "执行请求已排队，等待交易后台",
+            "execution:entry_pending": "入场单已提交，等待成交",
+            "execution:partially_filled": "入场单部分成交",
+            "execution:protecting": "成交完成，正在建立保护",
+            "execution:open": "持仓与保护已确认",
+            "execution:exit_pending": "离场请求已提交，等待成交",
+            "execution:closed": "本轮执行已关闭",
+            "execution:canceled": "本轮执行已撤销",
+            "execution:blocked": "执行被门禁阻断，订单未发出",
+            "execution:rejected": "券商已明确拒绝请求",
+            "execution:unknown": "执行结果待只读对账",
+            "execution:error": "执行失败，查看技术详情",
+            "failed:network_error": "模型或网络暂时不可用，本轮已跳过",
+        }
+        readable = exact_labels.get(last_result)
+        if readable is not None:
+            return readable
+        if last_result.startswith("failed:"):
+            return "PA 分析失败，本轮未生成订单"
+        if last_result.startswith("blocked:risk:"):
+            return "风险检查未通过，本轮不下单"
+        if last_result.startswith("blocked:submit:"):
+            return "提交前门禁已阻断，订单未发出"
+        if last_result.startswith("blocked:"):
+            return "本轮未生成订单"
+        if last_result.startswith("script:hold:"):
+            return "已有持仓正在受控管理"
+        if last_result.startswith("execution:"):
+            return "执行计划正在处理"
+        if last_result:
+            return "本轮结果待核对"
+        if has_error:
+            return "本轮处理失败，查看技术详情"
+        return "监督流程已更新" if last_action else "尚无结果"
 
     def _campaign_risk_facts(
         self,

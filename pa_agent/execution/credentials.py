@@ -12,9 +12,17 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from pa_agent.execution.errors import CredentialError
+from pa_agent.util.logging import update_api_key
 
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _TRUE_VALUES = frozenset({"1", "true", "yes", "on"})
+
+
+def _register_secret_masks(*secrets: str) -> None:
+    """把券商认证机密注册进日志掩码器；日志中识别账户一律用非机密的 account_identity 指纹。"""
+    for secret in secrets:
+        if secret:
+            update_api_key(secret)
 
 
 @dataclass(frozen=True)
@@ -197,6 +205,11 @@ def load_longbridge_account_credentials(
                 profile=profile,
                 credentials=credentials,
             )
+            _register_secret_masks(
+                credentials.app_key,
+                credentials.app_secret,
+                credentials.access_token,
+            )
             return replace(credentials, account_identity=identity)
     expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise CredentialError(f"未找到 {profile} 账户的完整 Longbridge 凭据（需要 {expected}）")
@@ -254,6 +267,11 @@ def load_okx_credentials(
     for prefix in prefixes:
         credentials = _okx_credentials_for_prefix(values, prefix=prefix)
         if credentials is not None:
+            _register_secret_masks(
+                credentials.api_key,
+                credentials.secret_key,
+                credentials.passphrase,
+            )
             return credentials
     expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise CredentialError(

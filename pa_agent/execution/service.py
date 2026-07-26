@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from contextlib import contextmanager
@@ -70,6 +71,7 @@ _NEW_RISK = "new_risk"
 _RISK_REDUCING = "risk_reducing"
 _OKX_DEMO_CAMPAIGN_API_BASE_URL = "https://www.okx.com"
 _OKX_DEMO_CAMPAIGN_INSTRUMENT = "XAU-USDT-SWAP"
+_IDLE_ACCOUNT_REFRESH_INTERVAL_SECONDS = 60.0
 _RiskKind = Literal["new_risk", "risk_reducing"]
 
 
@@ -137,6 +139,13 @@ class ExecutionService:
         self._runtime_id = str(uuid.uuid4())
         self._stop_event = threading.Event()
         self._monitor_thread: threading.Thread | None = None
+        self._monotonic_clock = time.monotonic
+        self._idle_account_next_refresh: dict[
+            tuple[str, str, str, str], float
+        ] = {}
+        self._idle_account_refresh_in_progress: set[
+            tuple[str, str, str, str]
+        ] = set()
 
     @property
     def store(self) -> ExecutionStore:
@@ -235,6 +244,8 @@ class ExecutionService:
             if settings is not None:
                 self._settings = settings
             self._adapters.clear()
+            self._idle_account_next_refresh.clear()
+            self._idle_account_refresh_in_progress.clear()
             self.disarm(revoke_external=revoke_new_risk)
 
     def _emit_armed(self) -> None:
@@ -1771,6 +1782,7 @@ class ExecutionService:
                 account_profile=account_profile,
                 broker_metadata=broker_metadata,
                 execution=execution if execution_id else None,
+                raise_on_risk_failure=True,
             )
 
     def refresh_account_route(
@@ -1779,7 +1791,7 @@ class ExecutionService:
         broker: str,
         environment: str,
         account: str,
-        raise_on_risk_failure: bool = False,
+        raise_on_risk_failure: bool = True,
     ) -> AccountSnapshot:
         """Read the fixed OKX Demo campaign route without changing settings."""
         with self._lock:
@@ -1909,11 +1921,24 @@ class ExecutionService:
             or execution.state != ExecutionState.READY
         ):
             self._verify_account_identity(adapter, execution)
-        snapshot = adapter.account_snapshot(
-            plan,
-            account_profile=account_profile,
-            broker_metadata=broker_metadata,
-        )
+        try:
+            snapshot = adapter.account_snapshot(
+                plan,
+                account_profile=account_profile,
+                broker_metadata=broker_metadata,
+            )
+        except Exception as exc:
+            if self._risk_runtime is not None and plan.broker == "okx":
+                self._risk_runtime.mark_failure(
+                    broker=plan.broker,
+                    environment=plan.environment,
+                    account=plan.requested_account,
+                    reason=(
+                        "risk_runtime_"
+                        f"{self._risk_failure_code(exc)}"
+                    ),
+                )
+            raise
         self._store.save_account_snapshot(snapshot)
         self._emit_account(snapshot)
         self._refresh_risk_runtime(
@@ -2089,6 +2114,31 @@ class ExecutionService:
             except Exception as exc:  # noqa: BLE001
                 self._emit_error(f"交易监控轮询失败：{exc}")
 
+    def _begin_idle_account_refresh(
+        self,
+        route: tuple[str, str, str, str],
+    ) -> bool:
+        with self._lock:
+            if route in self._idle_account_refresh_in_progress:
+                return False
+            if float(self._monotonic_clock()) < (
+                self._idle_account_next_refresh.get(route, 0.0)
+            ):
+                return False
+            self._idle_account_refresh_in_progress.add(route)
+            return True
+
+    def _finish_idle_account_refresh(
+        self,
+        route: tuple[str, str, str, str],
+    ) -> None:
+        with self._lock:
+            self._idle_account_refresh_in_progress.discard(route)
+            self._idle_account_next_refresh[route] = (
+                float(self._monotonic_clock())
+                + _IDLE_ACCOUNT_REFRESH_INTERVAL_SECONDS
+            )
+
     def monitor_once(
         self,
     ) -> tuple[list[ExecutionRecord], list[AccountSnapshot]]:
@@ -2116,8 +2166,14 @@ class ExecutionService:
             )
             for record in active_records
         }
-        if target_key not in active_keys:
-            snapshots.append(self.refresh_account())
+        if (
+            target_key not in active_keys
+            and self._begin_idle_account_refresh(target_key)
+        ):
+            try:
+                snapshots.append(self.refresh_account())
+            finally:
+                self._finish_idle_account_refresh(target_key)
         return updates, snapshots
 
     def _monitor_once(self) -> None:

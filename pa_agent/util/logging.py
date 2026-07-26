@@ -52,13 +52,14 @@ _LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s: %(message)s"
 _THIRD_PARTY_LOGGERS = ("urllib3", "openai", "httpx")
 
 # tvdatafeed opens a websocket every refresh tick and logs at DEBUG — keep quiet
+# 注意：这里绝不能放 "root"——Python 3.9+ 中 logging.getLogger("root") 就是根日志器本身，
+# 放进来等于把全应用日志压到 WARNING（历史 bug：日志文件长期只剩 ERROR 的根因）。
 _QUIET_LOGGER_NAMES = (
     "urllib3",
     "openai",
     "httpx",
     "tvDatafeed",
     "tvDatafeed.main",
-    "root",  # tvdatafeed uses logging.getLogger("root") for websocket
     "websocket",
 )
 

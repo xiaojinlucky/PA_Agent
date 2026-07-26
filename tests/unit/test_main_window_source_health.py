@@ -108,7 +108,7 @@ def test_execution_status_shows_okx_demo_order_modes_and_atr(qtbot) -> None:
     window = MainWindow(AppContext(settings=settings, data_source=source))
     qtbot.addWidget(window)
 
-    assert "同源可执行" in window._execution_status_label.text()
+    assert "路由配置一致" in window._execution_status_label.text()
     assert "入场 限价+ATR / 离场 限价+ATR" in window._execution_status_label.text()
     assert (
         "GUI 配置：资金上限 0 USDT / 单笔风险 10.00% / 杠杆上限 20×"
@@ -128,3 +128,42 @@ def test_live_trading_is_built_as_a_top_level_workspace() -> None:
     assert "TradingDialog" not in inspect.getsource(
         MainWindow._open_trading_dialog
     )
+
+
+def test_trading_workspace_hides_redundant_status_bar(qtbot) -> None:
+    settings = Settings()
+    source = MagicMock()
+    source._connected = False
+    source.list_symbols.return_value = []
+    source.supported_timeframes.return_value = ["15m"]
+    window = MainWindow(AppContext(settings=settings, data_source=source))
+    qtbot.addWidget(window)
+
+    assert window._status_bar.isHidden() is False
+    window._central.setCurrentIndex(window._trading_tab_index)
+    assert window._status_bar.isHidden() is True
+    window._central.setCurrentIndex(0)
+    assert window._status_bar.isHidden() is False
+
+
+def test_read_model_capture_failure_does_not_abort_main_window(qtbot) -> None:
+    settings = Settings()
+    source = MagicMock()
+    source._connected = False
+    source.list_symbols.return_value = []
+    source.supported_timeframes.return_value = ["15m"]
+    read_model = MagicMock()
+    read_model.capture.side_effect = RuntimeError("broken snapshot")
+
+    window = MainWindow(
+        AppContext(
+            settings=settings,
+            data_source=source,
+            workbench_read_model=read_model,
+        )
+    )
+    qtbot.addWidget(window)
+
+    assert window._workbench_read_model_status_label.text() == "只读：读取失败"
+    assert window._campaign_status_label.text() == "10 分钟 OKX 模拟盘：读取失败"
+    assert "RuntimeError" in window._workbench_read_model_status_label.toolTip()
