@@ -59,3 +59,24 @@ def test_naive_local_to_utc_uses_host_offset():
     assert utc.tzinfo == timezone.utc
     assert utc.hour == 12
     assert utc.minute == 30
+
+
+def test_format_epoch_renders_exchange_local_time_when_tz_given():
+    # 2024-06-15 12:30 UTC == 美东 08:30（夏令时 EDT）== 北京 20:30
+    assert (
+        format_epoch_for_display(
+            1_718_454_600, short=True, tz_name="America/New_York"
+        )
+        == "2024-06-15 08:30"
+    )
+    assert (
+        format_epoch_for_display(
+            1_718_454_600_000, short=True, tz_name="Asia/Shanghai"
+        )
+        == "2024-06-15 20:30"
+    )
+
+
+def test_format_epoch_rejects_unknown_timezone():
+    with pytest.raises(Exception):
+        format_epoch_for_display(1_718_454_600, tz_name="Not/AZone")

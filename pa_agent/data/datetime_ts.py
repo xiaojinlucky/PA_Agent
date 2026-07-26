@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import calendar
 import time as _time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 
 _EPOCH = datetime(1970, 1, 1)
 
@@ -11,9 +11,9 @@ _EPOCH = datetime(1970, 1, 1)
 def naive_local_to_utc(dt: datetime) -> datetime:
     """Interpret naive *dt* as local wall time and convert to UTC."""
     if dt.tzinfo is not None:
-        return dt.astimezone(timezone.utc)
+        return dt.astimezone(UTC)
     local_offset = timedelta(seconds=-_time.timezone)
-    return dt.replace(tzinfo=timezone(local_offset)).astimezone(timezone.utc)
+    return dt.replace(tzinfo=timezone(local_offset)).astimezone(UTC)
 
 
 def datetime_to_ts_ms(dt: object) -> int:
@@ -64,10 +64,25 @@ def ts_open_to_ms(ts_open: float) -> float:
     return ts
 
 
-def format_epoch_for_display(ts_open: float, *, short: bool = False) -> str:
-    """Format bar open epoch without applying the host local timezone offset."""
+def format_epoch_for_display(
+    ts_open: float,
+    *,
+    short: bool = False,
+    tz_name: str | None = None,
+) -> str:
+    """Format bar open epoch without applying the host local timezone offset.
+
+    默认按 UTC 墙钟渲染（历史行为）；传入 IANA 时区名（如
+    ``America/New_York``）时按该交易所本地时间渲染，供多市场 K 线表
+    给大模型展示与市场制度一致的时间。未知时区必须报错，不得静默回退。
+    """
     sec = float(ts_open)
     if sec > 1e12:
         sec /= 1000.0
     fmt = "%Y-%m-%d %H:%M" if short else "%Y-%m-%d %H:%M:%S"
+    if tz_name:
+        from zoneinfo import ZoneInfo
+
+        moment = datetime.fromtimestamp(sec, tz=UTC)
+        return moment.astimezone(ZoneInfo(tz_name)).strftime(fmt)
     return (_EPOCH + timedelta(seconds=sec)).strftime(fmt)

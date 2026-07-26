@@ -190,7 +190,7 @@ def test_longbridge_limit_is_rejected_before_switch_starts(
 ) -> None:
     old_source = _OldSource()
     harness = _SwitchHarness(old_source)
-    harness._ctx.settings.general.analysis_bar_count = 946
+    harness._ctx.settings.general.analysis_bar_count = 3001
     created = False
 
     def _create(_kind: str) -> _WorkingSource:
@@ -200,7 +200,7 @@ def test_longbridge_limit_is_rejected_before_switch_starts(
 
     monkeypatch.setattr("pa_agent.data.factory.create_data_source", _create)
 
-    with pytest.raises(ValueError, match="最多支持 945 根"):
+    with pytest.raises(ValueError, match="最多支持 3000 根"):
         harness._switch_data_source("longbridge")
 
     assert created is False

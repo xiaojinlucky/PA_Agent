@@ -8,7 +8,11 @@ import math
 import os
 import re
 import threading
+import time
+from collections import deque
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
@@ -19,11 +23,13 @@ from zoneinfo import ZoneInfo
 from pa_agent.data.bar_close_wait import timeframe_to_seconds
 from pa_agent.data.base import (
     DataSource,
+    DataSourceError,
     DataSourceTransientError,
     KlineBar,
     normalize_kline_bar,
 )
 from pa_agent.data.datetime_ts import datetime_to_ts_ms
+from pa_agent.data.market_calendar import MarketCalendarError, is_trading_minute
 
 logger = logging.getLogger(__name__)
 
@@ -60,15 +66,42 @@ _PRESET_SYMBOLS: tuple[str, ...] = (
 _SYMBOL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._!-]*\.[A-Za-z]{2,4}$")
 _ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_CANDLESTICKS = 1000
+_MAX_TOTAL_CANDLESTICKS = 5000
+_QUOTE_RATE_LIMIT_PER_SECOND = 10
+_SDK_CALL_TIMEOUT_SECONDS = 15.0
 _SUPPORTED_MARKET_SUFFIXES = frozenset({"US", "HK", "SH", "SZ"})
 _MARKET_TIMEZONES = {
     "US": ZoneInfo("America/New_York"),
     "HK": ZoneInfo("Asia/Hong_Kong"),
     "CN": ZoneInfo("Asia/Shanghai"),
 }
-# RefreshLoop 会在分析窗口外额外请求 50 根指标预热和 5 根缓冲。
-LONGBRIDGE_MAX_ANALYSIS_BARS = 945
+# RefreshLoop 会在分析窗口外额外请求 50 根指标预热和 5 根缓冲；
+# 超过 1000 根的部分由 history_candlesticks_by_offset 分页补齐。
+LONGBRIDGE_MAX_ANALYSIS_BARS = 3000
 LONGBRIDGE_TOKEN_EXPIRING_THRESHOLD = timedelta(days=7)
+
+
+class _QuoteRateLimiter:
+    """长桥行情 SDK 频控：官方限制每秒最多 10 次调用。"""
+
+    def __init__(
+        self, max_calls_per_second: int = _QUOTE_RATE_LIMIT_PER_SECOND
+    ) -> None:
+        self._max_calls = max_calls_per_second
+        self._calls: deque[float] = deque()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                while self._calls and now - self._calls[0] >= 1.0:
+                    self._calls.popleft()
+                if len(self._calls) < self._max_calls:
+                    self._calls.append(now)
+                    return
+                wait_seconds = 1.0 - (now - self._calls[0])
+            time.sleep(max(wait_seconds, 0.01))
 
 LongbridgeTokenStatus = Literal["valid", "expiring", "expired", "unknown"]
 
@@ -266,6 +299,28 @@ class LongbridgeSource(DataSource):
         self._market_timezone: ZoneInfo | None = None
         self._weekly_last_trading_day_cache: dict[tuple[str, date], date] = {}
         self._token_expiry = LongbridgeTokenExpiry("unknown", None)
+        self._rate_limiter = _QuoteRateLimiter()
+        self._sdk_executor: ThreadPoolExecutor | None = None
+
+    def _call_quote_sdk(self, label: str, fn: Any, *args: Any) -> Any:
+        """频控 + 超时保护后执行一次行情 SDK 调用。
+
+        长桥 SDK 存在偶发同步调用卡顿（上游 issue #380）；
+        超时后不重试、明确失败，由上层决定下一步。
+        """
+        executor = self._sdk_executor
+        if executor is None:
+            raise DataSourceTransientError("Longbridge 未连接")
+        self._rate_limiter.acquire()
+        future = executor.submit(fn, *args)
+        try:
+            return future.result(timeout=_SDK_CALL_TIMEOUT_SECONDS)
+        except FutureTimeoutError as exc:
+            future.cancel()
+            raise DataSourceTransientError(
+                f"Longbridge {label}超过 {_SDK_CALL_TIMEOUT_SECONDS:.0f} 秒未响应"
+                "（SDK 卡顿保护，已放弃本次调用）"
+            ) from exc
 
     @property
     def token_expiry(self) -> LongbridgeTokenExpiry:
@@ -304,6 +359,11 @@ class LongbridgeSource(DataSource):
                 "未安装 Longbridge SDK，请执行：pip install longbridge"
             ) from exc
 
+        if self._sdk_executor is not None:
+            self._sdk_executor.shutdown(wait=False, cancel_futures=True)
+        self._sdk_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="lb-quote"
+        )
         try:
             config = sdk.Config.from_apikey(
                 credentials.app_key,
@@ -311,12 +371,14 @@ class LongbridgeSource(DataSource):
                 credentials.access_token,
                 enable_print_quote_packages=False,
             )
-            quote_context = sdk.QuoteContext(config)
+            quote_context = self._call_quote_sdk("连接", sdk.QuoteContext, config)
             session_closes: dict[str, datetime_time] = {}
             session_windows: dict[
                 str, tuple[tuple[datetime_time, datetime_time], ...]
             ] = {}
-            for market_session in quote_context.trading_session():
+            for market_session in self._call_quote_sdk(
+                "交易时段读取", quote_context.trading_session
+            ):
                 intraday_sessions = [
                     session
                     for session in market_session.trade_sessions
@@ -341,6 +403,9 @@ class LongbridgeSource(DataSource):
                     session_closes[market_name] = max(end for _, end in windows)
             # SDK 的 CN Intraday 尾点可能是最后一根分钟线的起始时间（如 14:57），
             # 日线/周线是否收盘必须按沪深常规收盘 15:00 判断。
+        except DataSourceTransientError:
+            self._connected = False
+            raise
         except Exception as exc:
             self._connected = False
             raise DataSourceTransientError(
@@ -365,6 +430,9 @@ class LongbridgeSource(DataSource):
             self._market_name = ""
             self._market_timezone = None
             self._weekly_last_trading_day_cache = {}
+            if self._sdk_executor is not None:
+                self._sdk_executor.shutdown(wait=False, cancel_futures=True)
+                self._sdk_executor = None
         logger.info("LongbridgeSource disconnected")
 
     def list_symbols(self) -> list[str]:
@@ -383,7 +451,11 @@ class LongbridgeSource(DataSource):
             raise DataSourceTransientError("Longbridge 未连接")
         try:
             with self._snapshot_lock:
-                static_rows = self._quote_context.static_info([normalized])
+                static_rows = self._call_quote_sdk(
+                    "品种校验", self._quote_context.static_info, [normalized]
+                )
+        except DataSourceTransientError:
+            raise
         except Exception as exc:
             raise DataSourceTransientError(
                 f"Longbridge 无法验证品种（网络或行情权限异常，{type(exc).__name__}）"
@@ -432,9 +504,15 @@ class LongbridgeSource(DataSource):
         week_end = week_start + timedelta(days=6)
         try:
             with self._snapshot_lock:
-                calendar = self._quote_context.trading_days(
-                    self._market, week_start, week_end
+                calendar = self._call_quote_sdk(
+                    "交易日历读取",
+                    self._quote_context.trading_days,
+                    self._market,
+                    week_start,
+                    week_end,
                 )
+        except DataSourceTransientError:
+            raise
         except Exception as exc:
             raise DataSourceTransientError(
                 f"Longbridge 交易日历读取失败（{type(exc).__name__}）"
@@ -446,19 +524,24 @@ class LongbridgeSource(DataSource):
         self._weekly_last_trading_day_cache[cache_key] = last_day
         return last_day
 
-    def _head_bar_is_forming(self, timestamp: datetime, duration_s: int | None) -> bool:
+    def _head_bar_is_forming(
+        self,
+        timestamp: datetime,
+        duration_s: int | None,
+        timeframe: str,
+    ) -> bool:
         if self._market is None or self._market_timezone is None:
             raise DataSourceTransientError("Longbridge 未订阅市场")
         market_open = _timestamp_in_market_timezone(timestamp, self._market_timezone)
         market_now = _now_in_market_timezone(self._market_timezone)
         session_close = self._regular_session_closes[self._market_name]
 
-        if self._timeframe == "1d":
+        if timeframe == "1d":
             close_at = datetime.combine(
                 market_open.date(), session_close, self._market_timezone
             )
             return market_now < close_at
-        if self._timeframe == "1w":
+        if timeframe == "1w":
             week_start = market_open.date() - timedelta(days=market_open.weekday())
             last_trading_day = self._last_trading_day_of_week(week_start)
             close_at = datetime.combine(
@@ -491,36 +574,109 @@ class LongbridgeSource(DataSource):
         localized = _timestamp_in_market_timezone(timestamp, self._market_timezone)
         return datetime_to_ts_ms(localized)
 
-    def latest_snapshot(self, n: int) -> list[KlineBar]:
+    def _fetch_rows(self, timeframe: str, n: int) -> list[Any]:
+        """最近 1000 根用 candlesticks；更早历史用 by_offset 分页回溯。"""
+        period = getattr(self._sdk.Period, _TF_MAP[timeframe])
+        try:
+            rows = list(
+                self._call_quote_sdk(
+                    "K 线拉取",
+                    self._quote_context.candlesticks,
+                    self._symbol,
+                    period,
+                    int(min(n, _MAX_CANDLESTICKS)),
+                    self._sdk.AdjustType.NoAdjust,
+                    self._sdk.TradeSessions.Intraday,
+                )
+                or []
+            )
+            seen_timestamps = {row.timestamp for row in rows}
+            while rows and len(rows) < n:
+                oldest = min(rows, key=lambda row: row.timestamp)
+                older_rows = self._call_quote_sdk(
+                    "历史 K 线分页",
+                    self._quote_context.history_candlesticks_by_offset,
+                    self._symbol,
+                    period,
+                    self._sdk.AdjustType.NoAdjust,
+                    False,
+                    int(min(n - len(rows) + 1, _MAX_CANDLESTICKS)),
+                    oldest.timestamp,
+                )
+                fresh = [
+                    row
+                    for row in (older_rows or [])
+                    if row.timestamp not in seen_timestamps
+                ]
+                if not fresh:
+                    break
+                rows.extend(fresh)
+                seen_timestamps.update(row.timestamp for row in fresh)
+        except DataSourceTransientError:
+            raise
+        except Exception as exc:
+            raise DataSourceTransientError(
+                f"Longbridge K 线拉取失败（{type(exc).__name__}）"
+            ) from exc
+        return rows
+
+    def _assert_no_intraday_gaps(
+        self, closed_ts_ascending_ms: list[int], timeframe: str
+    ) -> None:
+        """校验交易时段内不缺根（上游已知 5m 类缺根 issue #890）。
+
+        相邻已收盘 K 线之间若存在"应有开盘时刻落在连续交易时段内却没有
+        对应 K 线"，判定为数据缺口并拒绝分析；午休、收盘、周末与节假日
+        的间隔按交易日历判定为合法。只校验 1 小时及以下周期——更高周期
+        的棒边界与固定步长网格不对齐，无法用算术枚举。
+        """
+        duration_s = timeframe_to_seconds(timeframe)
+        if duration_s is None or duration_s > 3600:
+            return
+        step_ms = duration_s * 1000
+        for previous_ts, next_ts in zip(
+            closed_ts_ascending_ms, closed_ts_ascending_ms[1:], strict=False
+        ):
+            for slot_ms in range(previous_ts + step_ms, next_ts, step_ms):
+                try:
+                    slot_is_trading = is_trading_minute(self._market_name, slot_ms)
+                except MarketCalendarError as exc:
+                    raise DataSourceTransientError(
+                        f"Longbridge 缺口校验无法取得交易日历（{exc}）"
+                    ) from exc
+                if slot_is_trading:
+                    missing_at = datetime.fromtimestamp(
+                        slot_ms / 1000, tz=UTC
+                    ).isoformat()
+                    raise DataSourceError(
+                        f"Longbridge {self._symbol} {timeframe} 在交易时段内"
+                        f"缺根（{missing_at} 应有 K 线未返回，参考上游 issue "
+                        "#890），拒绝用不完整数据分析"
+                    )
+
+    def _snapshot_for(self, timeframe: str, n: int) -> list[KlineBar]:
         if not self._connected or self._quote_context is None or self._sdk is None:
             raise DataSourceTransientError("Longbridge 未连接")
         if not self._symbol or not self._timeframe:
             raise DataSourceTransientError("Longbridge 未订阅品种/周期")
+        if timeframe not in _TF_MAP:
+            raise ValueError(
+                f"Longbridge 不支持周期 {timeframe!r}；可用周期：{list(_TF_MAP)}"
+            )
         if n < 1:
             return []
-        if n > _MAX_CANDLESTICKS:
+        if n > _MAX_TOTAL_CANDLESTICKS:
             raise DataSourceTransientError(
-                "Longbridge 最近 K 线接口单次最多返回 1000 根；"
-                "PA_Agent 的分析 K 线数量请设为不超过 945"
+                f"Longbridge 单次快照上限 {_MAX_TOTAL_CANDLESTICKS} 根"
+                f"（含分页），请求 {n} 根被拒绝"
             )
 
         with self._snapshot_lock:
-            try:
-                rows = self._quote_context.candlesticks(
-                    self._symbol,
-                    getattr(self._sdk.Period, _TF_MAP[self._timeframe]),
-                    int(n),
-                    self._sdk.AdjustType.NoAdjust,
-                    self._sdk.TradeSessions.Intraday,
-                )
-            except Exception as exc:
-                raise DataSourceTransientError(
-                    f"Longbridge K 线拉取失败（{type(exc).__name__}）"
-                ) from exc
+            rows = self._fetch_rows(timeframe, n)
 
         if not rows:
             raise DataSourceTransientError(
-                f"Longbridge 未返回 K 线：{self._symbol} {self._timeframe}"
+                f"Longbridge 未返回 K 线：{self._symbol} {timeframe}"
             )
 
         ordered = sorted(
@@ -528,8 +684,10 @@ class LongbridgeSource(DataSource):
             key=lambda row: self._timestamp_to_market_epoch_ms(row.timestamp),
             reverse=True,
         )
-        duration_s = timeframe_to_seconds(self._timeframe)
-        head_is_forming = self._head_bar_is_forming(ordered[0].timestamp, duration_s)
+        duration_s = timeframe_to_seconds(timeframe)
+        head_is_forming = self._head_bar_is_forming(
+            ordered[0].timestamp, duration_s, timeframe
+        )
         bars: list[KlineBar] = []
         closed_seq = 1
         for i, row in enumerate(ordered[:n]):
@@ -553,4 +711,17 @@ class LongbridgeSource(DataSource):
                     )
                 )
             )
+        closed_ts_ascending = sorted(
+            int(bar.ts_open) for bar in bars if bar.closed
+        )
+        self._assert_no_intraday_gaps(closed_ts_ascending, timeframe)
         return bars
+
+    def latest_snapshot(self, n: int) -> list[KlineBar]:
+        return self._snapshot_for(self._timeframe, n)
+
+    def latest_snapshot_for_timeframe(
+        self, timeframe: str, n: int
+    ) -> list[KlineBar]:
+        """按指定周期返回最近 K 线；供 1h/4h 高周期薄背景使用。"""
+        return self._snapshot_for(timeframe, n)

@@ -68,7 +68,10 @@ def test_default_symbols_per_kind():
 
 
 def test_longbridge_analysis_limit_reserves_refresh_warmup():
-    assert max_analysis_bars_for_kind("longbridge") == 945
+    # 长桥历史 K 线已支持 by_offset 分页；分析上限 3000 + 预热 55 根
+    # 仍须落在单次快照硬上限 5000 之内。
+    assert max_analysis_bars_for_kind("longbridge") == 3000
+    assert max_analysis_bars_for_kind("longbridge") + 55 <= 5000
     assert max_analysis_bars_for_kind("okx") == 245
     assert max_analysis_bars_for_kind("mt5") == 5_000
 

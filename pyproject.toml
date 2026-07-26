@@ -30,6 +30,8 @@ dependencies = [
     "tushare>=1.4",
     "cursor-sdk>=0.1.0",
     "longbridge>=4.3.2",
+    "exchange_calendars>=4.5",
+    "requests>=2.31",
 ]
 
 [project.optional-dependencies]
@@ -40,6 +42,8 @@ dev = [
     "ruff>=0.5",
     "black>=24.4",
 ]
+yfinance = ["yfinance>=0.2"]
+plot = ["matplotlib>=3.8"]
 
 [project.scripts]
 pa-agent = "pa_agent.main:main"
@@ -58,7 +62,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
-ignore = ["E501"]
+# RUF001/002/003 对中文全角标点是纯误报，逐条压制会淹没真实问题
+ignore = ["E501", "RUF001", "RUF002", "RUF003"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

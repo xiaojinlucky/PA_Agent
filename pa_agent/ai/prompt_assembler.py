@@ -9,15 +9,20 @@ from pathlib import Path
 from typing import Any
 
 from pa_agent.ai.decision_stance import build_decision_stance_guidance, normalize_stance
-from pa_agent.ai.pattern_routing import (
-    STAGE1_DETECTED_PATTERNS_GUIDE,
-    STAGE1_PATTERN_BRIEFS_BLOCK,
-)
 from pa_agent.ai.kline_features import bar_candle_direction_label, compute_kline_geometry_features
 from pa_agent.ai.market_features import (
     compute_simple_market_features,
     inject_market_features_section,
     render_simple_market_features,
+)
+from pa_agent.ai.market_rules import (
+    market_rules_block,
+    timezone_label_for_symbol,
+    timezone_name_for_symbol,
+)
+from pa_agent.ai.pattern_routing import (
+    STAGE1_DETECTED_PATTERNS_GUIDE,
+    STAGE1_PATTERN_BRIEFS_BLOCK,
 )
 from pa_agent.data.base import KlineFrame
 from pa_agent.data.datetime_ts import format_epoch_for_display
@@ -966,13 +971,34 @@ class PromptAssembler:
         self._txt_cache[filename] = content
         return content
 
+    def _market_rules_section(self, symbol: str) -> str:
+        """按品种所属市场路由制度规则块；未归类市场返回空串（维持原行为）。
+
+        规则块只进用户回合，不进 system prompt——system 必须保持字节一致
+        才能命中 DeepSeek 的 KV 前缀缓存。
+        """
+        block = market_rules_block(symbol, prompt_dir=self._prompt_dir)
+        if not block:
+            return ""
+        return (
+            "## 市场制度规则（按品种所属市场自动路由；"
+            "制度约束用于风险与可执行性判断，不替代 PA 结构分析）\n\n"
+            f"{block}"
+        )
+
     # ── K-line table rendering ────────────────────────────────────────────────
 
     @staticmethod
     def _render_kline_table(frame: KlineFrame, limit: int | None = None) -> str:
-        """Render the K-line data as a text table (newest bar first)."""
+        """Render the K-line data as a text table (newest bar first).
+
+        时间列按品种所属市场的交易所时区渲染并在表头标注；
+        未归类符号（如 MT5 品种）保持历史 UTC 口径。
+        """
+        tz_name = timezone_name_for_symbol(frame.symbol)
+        tz_label = timezone_label_for_symbol(frame.symbol)
         lines = [
-            "序号 | 时间                | 开盘价    | 最高价    | 最低价    | 收盘价    | 阳阴 | 成交量    | EMA20     | ATR14",
+            f"序号 | 时间（{tz_label}）      | 开盘价    | 最高价    | 最低价    | 收盘价    | 阳阴 | 成交量    | EMA20     | ATR14",
             "-----+--------------------+----------+----------+----------+----------+------+----------+-----------+----------",
         ]
         bars = frame.bars[:limit] if limit is not None else frame.bars
@@ -982,7 +1008,7 @@ class PromptAssembler:
             ema_str = f"{ema:.4f}" if not math.isnan(ema) else "N/A"
             atr_str = f"{atr:.4f}" if not math.isnan(atr) else "N/A"
             yang_yin = bar_candle_direction_label(bar)
-            dt = format_epoch_for_display(bar.ts_open, short=True)
+            dt = format_epoch_for_display(bar.ts_open, short=True, tz_name=tz_name)
             lines.append(
                 f"{bar.seq:<4} | {dt:<19} | {bar.open:<9.4f} | {bar.high:<9.4f} | "
                 f"{bar.low:<9.4f} | {bar.close:<9.4f} | {yang_yin:<4} | {bar.volume:<9.0f} | "
@@ -1227,9 +1253,9 @@ class PromptAssembler:
         """
         try:
             from pa_agent.ai.decision_nodes import (
+                judge_always_in,
                 judge_data_sufficiency,
                 judge_direction,
-                judge_always_in,
             )
             from pa_agent.ai.trend_context import (
                 build_trend_context,
@@ -1325,6 +1351,7 @@ class PromptAssembler:
                 f"**长程背景**（当前仅 {n_bars} 根，不足 41 根，与近期窗口重叠；"
                 f"以程序预填 §2.2 为准）：\n"
             )
+        market_rules_section = self._market_rules_section(frame.symbol)
         return (
             "## 阶段一任务\n\n"
             "你现在只执行阶段一：市场诊断与闸门判断。不要评估具体下单、止损、止盈或仓位。\n\n"
@@ -1334,6 +1361,7 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars}\n"
             f"（K线序号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
+            f"{market_rules_section + chr(10) + chr(10) if market_rules_section else ''}"
             f"{higher_timeframe_block + chr(10) + chr(10) if higher_timeframe_block else ''}"
             f"## ⚠️ 分析窗口分层规则（与程序 §2.2/§2.3/§2.4 预填一致，必须遵守）\n\n"
             f"你收到全部 {n_bars} 根 K 线数据；下列分层与 `市场诊断框架.txt`、程序三窗口摘要**同一标准**：\n\n"
@@ -1391,6 +1419,7 @@ class PromptAssembler:
             "stage2_decision": previous_record.stage2_decision or {},
             "strategy_files_used": previous_record.strategy_files_used or [],
         }
+        market_rules_section = self._market_rules_section(frame.symbol)
         return (
             "## 阶段一增量任务\n\n"
             "你现在只执行阶段一：基于上一轮已完成分析和新增 K 线，更新市场诊断与闸门判断。\n"
@@ -1414,7 +1443,10 @@ class PromptAssembler:
             f"品种:{frame.symbol} 周期:{frame.timeframe} K线数量:{n_bars} 新增已收盘K线:{new_count}\n"
             f"（K线序号：1=最新已收盘，最大 K{n_bars}；"
             f"每个决策节点的 bar_range 由你自行选择子区间，勿超出 K{n_bars}-K1）\n\n"
-            "## 上一轮已完成分析（仅作为延续上下文）\n\n"
+            + (
+                f"{market_rules_section}\n\n" if market_rules_section else ""
+            )
+            + "## 上一轮已完成分析（仅作为延续上下文）\n\n"
             f"```json\n{json.dumps(previous_summary, ensure_ascii=False, indent=2)}\n```\n\n"
             f"## 新增 K线数据(共{new_count}根，序号1=最新已收盘；含阳阴列)\n\n"
             f"{new_kline_table}\n\n"
@@ -1769,6 +1801,10 @@ class PromptAssembler:
             if omit_kline_block
             else "本消息下方附有完整 K 线表与几何特征。\n\n"
         )
+        # 前缀链模式下市场规则块已在上方阶段一用户消息中，不重复注入。
+        market_rules_section = (
+            "" if omit_kline_block else self._market_rules_section(frame.symbol)
+        )
         return (
             f"{_STAGE2_API_TASK_RULE}\n\n"
             "## 阶段二任务\n\n"
@@ -1780,6 +1816,7 @@ class PromptAssembler:
             f"## 阶段一诊断结果\n\n```json\n"
             f"{compact_s1}"
             f"\n```\n\n"
+            f"{market_rules_section + chr(10) + chr(10) if market_rules_section else ''}"
             f"{kline_block}"
             f"{prev_pred_block + chr(10) if prev_pred_block else ''}"
             f"请根据以上诊断和K线数据,按《二元决策.txt》§3–§11、§14 输出 JSON 决策结果"

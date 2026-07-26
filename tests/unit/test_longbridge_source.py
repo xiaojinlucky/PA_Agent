@@ -19,11 +19,11 @@ from pa_agent.data.base import DataSourceTransientError
 from pa_agent.data.longbridge_source import (
     LONGBRIDGE_TOKEN_EXPIRING_THRESHOLD,
     LongbridgeSource,
+    _timestamp_in_market_timezone,
     classify_longbridge_token_expiry,
     inspect_longbridge_token_expiry,
     load_longbridge_credentials,
     normalize_longbridge_symbol,
-    _timestamp_in_market_timezone,
 )
 
 _CREDENTIAL_KEYS = (
@@ -596,6 +596,7 @@ def test_intraday_head_bar_is_capped_at_regular_market_close(
     is_forming = source._head_bar_is_forming(
         datetime(2026, 7, 15, 15, 0, tzinfo=ZoneInfo("America/New_York")),
         int(timeframe[:-1]) * 60 * 60,
+        timeframe,
     )
 
     assert is_forming is False
@@ -638,6 +639,7 @@ def test_intraday_head_bar_is_capped_at_each_session_boundary(
     is_forming = source._head_bar_is_forming(
         datetime.combine(date(2026, 7, 15), bar_open, timezone),
         int(timeframe[:-1]) * 60 * 60,
+        timeframe,
     )
 
     assert is_forming is False
@@ -702,7 +704,206 @@ def test_empty_snapshot_and_disconnect(
     assert source._quote_context is None
 
 
-def test_snapshot_rejects_more_than_official_limit(
+def _closed_us_5m_rows(*minute_offsets: int) -> list[SimpleNamespace]:
+    """2025-06-04（周三）美股盘中 13:30 UTC 起的 5m K 线，按分钟偏移生成。"""
+    base = datetime(2025, 6, 4, 13, 30, tzinfo=UTC)
+    return [
+        SimpleNamespace(
+            timestamp=base + timedelta(minutes=offset),
+            open=Decimal("100.0"),
+            high=Decimal("101.0"),
+            low=Decimal("99.0"),
+            close=Decimal("100.5"),
+            volume=10,
+            turnover=Decimal("1005.0"),
+        )
+        for offset in minute_offsets
+    ]
+
+
+def test_paged_history_merges_older_rows_without_duplicates(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    recent = _closed_us_5m_rows(10, 15)
+    older = _closed_us_5m_rows(0, 5)
+    sdk, calls = _fake_sdk(recent)
+
+    class PagedContext(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def history_candlesticks_by_offset(
+            self, *args: object
+        ) -> list[SimpleNamespace]:
+            calls["history_by_offset"] = args
+            return list(older) + [recent[0]]
+
+    sdk.QuoteContext = PagedContext
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2
+    )
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    bars = source.latest_snapshot(4)
+
+    assert len(bars) == 4
+    assert [bar.ts_open for bar in bars] == sorted(
+        (row.timestamp.timestamp() * 1000 for row in recent + older),
+        reverse=True,
+    )
+    history_args = calls["history_by_offset"]
+    assert history_args[3] is False
+    assert history_args[5] == recent[0].timestamp
+
+
+def test_gap_inside_trading_session_is_rejected(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from pa_agent.data.base import DataSourceError
+
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    # 缺 13:35（美东 09:35，交易时段内）：属于 #890 类缺根，必须拒绝。
+    sdk, _ = _fake_sdk(_closed_us_5m_rows(0, 10))
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    with pytest.raises(DataSourceError, match="交易时段内缺根"):
+        source.latest_snapshot(2)
+
+
+def test_cn_lunch_break_gap_is_legitimate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    # 2025-06-05（周四）上交所：11:25 是上午最后一根 5m，13:00 是下午第一根。
+    morning_last = datetime(2025, 6, 5, 3, 25, tzinfo=UTC)
+    afternoon_first = datetime(2025, 6, 5, 5, 0, tzinfo=UTC)
+    rows = [
+        SimpleNamespace(
+            timestamp=timestamp,
+            open=Decimal("100.0"),
+            high=Decimal("101.0"),
+            low=Decimal("99.0"),
+            close=Decimal("100.5"),
+            volume=10,
+            turnover=Decimal("1005.0"),
+        )
+        for timestamp in (morning_last, afternoon_first)
+    ]
+    sdk, _ = _fake_sdk(rows)
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 5, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("600519.SH", "5m")
+
+    bars = source.latest_snapshot(2)
+
+    assert len(bars) == 2
+    assert all(bar.closed for bar in bars)
+
+
+def test_latest_snapshot_for_timeframe_uses_requested_period(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    hourly = datetime(2025, 6, 4, 14, 30, tzinfo=UTC)
+    rows = [
+        SimpleNamespace(
+            timestamp=hourly,
+            open=Decimal("100.0"),
+            high=Decimal("101.0"),
+            low=Decimal("99.0"),
+            close=Decimal("100.5"),
+            volume=10,
+            turnover=Decimal("1005.0"),
+        )
+    ]
+    sdk, calls = _fake_sdk(rows)
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    bars = source.latest_snapshot_for_timeframe("1h", 1)
+
+    assert len(bars) == 1
+    assert calls["candlesticks"][1] == "period-1h"
+    # 订阅的主周期保持不变
+    assert source._timeframe == "5m"
+
+
+def test_rate_limiter_delays_over_limit_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pa_agent.data import longbridge_source as module
+
+    limiter = module._QuoteRateLimiter(max_calls_per_second=2)
+    clock = {"now": 100.0}
+    sleeps: list[float] = []
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+
+    def _fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["now"] += seconds
+
+    monkeypatch.setattr(module.time, "sleep", _fake_sleep)
+
+    limiter.acquire()
+    limiter.acquire()
+    limiter.acquire()
+
+    assert sleeps
+    assert abs(sum(sleeps) - 1.0) < 0.05
+
+
+def test_sdk_call_timeout_guard_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    import time as real_time
+
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk([])
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._SDK_CALL_TIMEOUT_SECONDS", 0.05
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+
+    with pytest.raises(DataSourceTransientError, match="SDK 卡顿保护"):
+        source._call_quote_sdk("测试", real_time.sleep, 0.5)
+
+
+def test_snapshot_rejects_more_than_paged_hard_limit(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _clear_credentials(monkeypatch)
@@ -714,5 +915,5 @@ def test_snapshot_rejects_more_than_official_limit(
     source.connect()
     source.subscribe("AAPL.US", "5m")
 
-    with pytest.raises(DataSourceTransientError, match="最多返回 1000 根"):
-        source.latest_snapshot(1001)
+    with pytest.raises(DataSourceTransientError, match="单次快照上限 5000"):
+        source.latest_snapshot(5001)
