@@ -175,6 +175,12 @@ def _number(value: object, *, decimals: int = 2) -> str:
 
 
 def _local_time(value: object) -> str:
+    """带时区的运行时间统一显示为北京时间（产品验收语义）。
+
+    显式固定 Asia/Shanghai 而不是取本机时区：产品语义是"UTC 运行
+    时间转换为北京时间"，同时保证测试在任意时区环境（如 UTC 的 CI
+    runner）结果一致。
+    """
     text = str(value or "").strip()
     try:
         parsed = datetime.fromisoformat(text)
@@ -182,7 +188,9 @@ def _local_time(value: object) -> str:
         return text[11:19] if len(text) >= 19 else text
     if parsed.tzinfo is None or parsed.utcoffset() is None:
         return parsed.strftime("%H:%M:%S")
-    return parsed.astimezone().strftime("%H:%M:%S")
+    from zoneinfo import ZoneInfo
+
+    return parsed.astimezone(ZoneInfo("Asia/Shanghai")).strftime("%H:%M:%S")
 
 
 def _direction(record: ExecutionRecord) -> str:

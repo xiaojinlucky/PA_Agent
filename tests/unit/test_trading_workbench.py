@@ -329,8 +329,13 @@ def test_backend_event_codes_are_not_exposed_in_primary_timeline():
     assert _event_label("new_backend_event") == "执行状态已更新"
 
 
-def test_utc_runtime_timestamp_is_shown_in_local_time():
+def test_utc_runtime_timestamp_is_shown_in_beijing_time():
+    """产品语义：带时区的 UTC 运行时间显式转换为北京时间（Asia/Shanghai），
+    不随本机/CI runner 时区变化。"""
     assert _local_time("2026-07-24T19:21:54+00:00") == "03:21:54"
+    assert _local_time("2026-07-24T19:21:54-04:00") == "07:21:54"
+    # 无时区信息按原样显示，不猜测
+    assert _local_time("2026-07-24T19:21:54") == "19:21:54"
 
 
 def test_old_campaign_execution_is_not_shown_as_latest_current_decision(qtbot):
