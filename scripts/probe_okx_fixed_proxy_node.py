@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -41,6 +42,23 @@ def _probe_port(value: str) -> int:
             "probe-port 不得占用正式固定代理端口 10981"
         )
     return port
+
+
+def _idle_seconds(value: str) -> int:
+    seconds = int(value)
+    if not 45 <= seconds <= 600:
+        raise argparse.ArgumentTypeError(
+            "idle-seconds 必须在 45 到 600 之间，"
+            "必须超过 AnyTLS 30 秒空闲检查间隔才有耐久意义"
+        )
+    return seconds
+
+
+def _idle_cycles(value: str) -> int:
+    cycles = int(value)
+    if not 0 <= cycles <= 10:
+        raise argparse.ArgumentTypeError("idle-cycles 必须在 0 到 10 之间")
+    return cycles
 
 
 def _atomic_write_bytes(path: Path, content: bytes) -> None:
@@ -131,6 +149,94 @@ def _process_path(process_id: int) -> Path:
     return Path(path).resolve()
 
 
+def _runtime_supervisor_pids(runtime_directory: Path) -> set[int]:
+    supervisor_path = (runtime_directory / "run-hidden.ps1").resolve()
+    encoded_path = base64.b64encode(
+        str(supervisor_path).encode("utf-8")
+    ).decode("ascii")
+    command = (
+        "$target = [Text.Encoding]::UTF8.GetString("
+        f"[Convert]::FromBase64String('{encoded_path}')); "
+        "Get-CimInstance Win32_Process | Where-Object { "
+        "$_.ProcessId -ne $PID -and $_.CommandLine -and "
+        "$_.CommandLine.IndexOf("
+        "$target, [StringComparison]::OrdinalIgnoreCase"
+        ") -ge 0 } | ForEach-Object { $_.ProcessId }"
+    )
+    completed = subprocess.run(
+        [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError("无法核验固定代理守护进程")
+    return {
+        int(line.strip())
+        for line in completed.stdout.splitlines()
+        if line.strip().isdigit()
+    }
+
+
+def _stop_runtime_proxy_fail_closed(
+    *,
+    runtime_directory: Path,
+    runtime_core_path: Path,
+    known_process_ids: set[int],
+) -> None:
+    """停止守护与正式代理；旧配置无法恢复时端口必须下线。"""
+
+    errors: list[str] = []
+    try:
+        supervisor_ids = _runtime_supervisor_pids(runtime_directory)
+    except Exception as exc:
+        supervisor_ids = set()
+        errors.append(f"supervisor_query:{type(exc).__name__}")
+    for process_id in supervisor_ids:
+        try:
+            os.kill(process_id, signal.SIGTERM)
+        except OSError as exc:
+            errors.append(f"supervisor_stop:{type(exc).__name__}")
+
+    process_ids = set(known_process_ids)
+    try:
+        process_ids.update(_listener_pids(_ACTIVE_PROXY_PORT))
+    except Exception as exc:
+        errors.append(f"listener_query:{type(exc).__name__}")
+    for process_id in process_ids:
+        try:
+            is_runtime_core = (
+                process_id in known_process_ids
+                or _process_path(process_id) == runtime_core_path
+            )
+            if is_runtime_core:
+                os.kill(process_id, signal.SIGTERM)
+        except Exception as exc:
+            errors.append(f"proxy_stop:{type(exc).__name__}")
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            listeners = _listener_pids(_ACTIVE_PROXY_PORT)
+        except Exception as exc:
+            errors.append(f"offline_verify:{type(exc).__name__}")
+            break
+        if not listeners:
+            return
+        time.sleep(0.1)
+    raise RuntimeError(
+        "旧配置恢复失败后无法证明 10981 已下线"
+        + (f"：{','.join(errors)}" if errors else "")
+    )
+
+
 def _profile(database_path: Path, profile_id: str) -> dict[str, Any]:
     connection = sqlite3.connect(
         f"file:{database_path}?mode=ro",
@@ -205,6 +311,11 @@ def _candidate_config(
             {
                 "type": "anytls",
                 "password": str(profile["Password"]),
+                "idle_session_check_interval": "30s",
+                "idle_session_timeout": "5m",
+                "min_idle_session": 1,
+                "tcp_keep_alive": "30s",
+                "tcp_keep_alive_interval": "30s",
                 "tls": {
                     "enabled": True,
                     "server_name": str(
@@ -299,12 +410,76 @@ def _wait_for_listener(port: int, process: subprocess.Popen[bytes]) -> None:
     raise TimeoutError("独立测试端口未在 12 秒内监听")
 
 
+def _read_full_risk_route(client: OkxRestClient) -> dict[str, int | bool]:
+    """按生产风险刷新顺序读完所有 OKX 端点。"""
+
+    balance_rows = len(client.balance())
+    position_rows = len(client.positions())
+    instrument_rows = len(client.instruments("SWAP"))
+    client.sync_server_time()
+    account_config = client.account_config()
+    account_config_ok = all(
+        str(account_config.get(field) or "").strip()
+        for field in ("uid", "mainUid", "type")
+    )
+    if not account_config_ok:
+        raise RuntimeError("OKX Demo 账户身份字段不完整")
+    bill_rows = len(client.account_bills())
+    return {
+        "balance_rows": balance_rows,
+        "position_rows": position_rows,
+        "instrument_rows": instrument_rows,
+        "account_config_ok": account_config_ok,
+        "bill_rows": bill_rows,
+    }
+
+
+def _endurance_verification(
+    client: OkxRestClient,
+    *,
+    idle_cycles: int,
+    idle_seconds: int,
+    verify_risk_bills: bool,
+) -> dict[str, Any]:
+    """空闲耐久闸门：每轮先真实空闲，再按生产节奏完整读取。
+
+    紧密连续探测无法暴露 AnyTLS/TLS 会话在空闲后失效的问题；
+    这里的空闲时长必须超过 30 秒会话检查间隔，模拟 Worker 60 秒
+    自然扫描的真实节奏。
+    """
+
+    successes = 0
+    errors: list[str] = []
+    for cycle in range(idle_cycles):
+        time.sleep(idle_seconds)
+        try:
+            client.sync_server_time()
+            if verify_risk_bills:
+                _read_full_risk_route(client)
+            else:
+                client.balance()
+        except Exception as exc:
+            errors.append(f"cycle{cycle + 1}:{type(exc).__name__}")
+        else:
+            successes += 1
+    return {
+        "endurance_cycles": idle_cycles,
+        "endurance_idle_seconds": idle_seconds,
+        "endurance_successes": successes,
+        "endurance_ok": successes == idle_cycles,
+        "endurance_errors": errors,
+    }
+
+
 def _probe(
     *,
     core_path: Path,
     config_path: Path,
     proxy_port: int,
     attempts: int,
+    verify_risk_bills: bool = False,
+    idle_cycles: int = 0,
+    idle_seconds: int = 75,
 ) -> dict[str, Any]:
     _assert_port_available(proxy_port)
     completed = subprocess.run(
@@ -340,7 +515,7 @@ def _probe(
             egress_ip = str(
                 json.loads(ip_response.body.decode("utf-8"))["ip"]
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         client = OkxRestClient(
             load_okx_credentials("demo"),
@@ -351,14 +526,21 @@ def _probe(
         public_successes = 0
         private_successes = 0
         public_latencies: list[int] = []
-        balance_rows = 0
+        full_risk_evidence: dict[str, int | bool] = {
+            "balance_rows": 0,
+            "position_rows": 0,
+            "instrument_rows": 0,
+            "account_config_ok": False,
+            "bill_rows": 0,
+        }
+        risk_bill_successes = 0
         api_codes: list[str] = []
         errors: list[str] = []
         for attempt in range(attempts):
             started = time.monotonic()
             try:
                 client.sync_server_time()
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(type(exc).__name__)
                 continue
             public_successes += 1
@@ -366,15 +548,49 @@ def _probe(
                 round((time.monotonic() - started) * 1000)
             )
             try:
-                balance_rows = len(client.balance())
+                if verify_risk_bills:
+                    full_risk_evidence = _read_full_risk_route(client)
+                else:
+                    full_risk_evidence["balance_rows"] = len(
+                        client.balance()
+                    )
             except BrokerApiError as exc:
                 api_codes.append(exc.code)
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 errors.append(type(exc).__name__)
             else:
                 private_successes += 1
+                if verify_risk_bills:
+                    risk_bill_successes += 1
             if attempt + 1 < attempts:
                 time.sleep(1)
+        tight_rounds_ok = (
+            public_successes == attempts
+            and private_successes == attempts
+            and (
+                not verify_risk_bills
+                or risk_bill_successes == attempts
+            )
+        )
+        if idle_cycles > 0 and tight_rounds_ok:
+            endurance = _endurance_verification(
+                client,
+                idle_cycles=idle_cycles,
+                idle_seconds=idle_seconds,
+                verify_risk_bills=verify_risk_bills,
+            )
+        else:
+            endurance = {
+                "endurance_cycles": idle_cycles,
+                "endurance_idle_seconds": idle_seconds,
+                "endurance_successes": 0,
+                "endurance_ok": idle_cycles == 0,
+                "endurance_errors": (
+                    ["skipped_tight_rounds_failed"]
+                    if idle_cycles > 0
+                    else []
+                ),
+            }
         return {
             "public_ok": public_successes == attempts,
             "private_read_ok": private_successes == attempts,
@@ -387,11 +603,18 @@ def _probe(
                 if public_latencies
                 else None
             ),
-            "balance_rows": balance_rows,
+            **full_risk_evidence,
+            "risk_bills_required": verify_risk_bills,
+            "risk_bills_ok": (
+                not verify_risk_bills
+                or risk_bill_successes == attempts
+            ),
+            "risk_bill_successes": risk_bill_successes,
+            **endurance,
             "api_codes": sorted(set(api_codes)),
             "errors": errors,
         }
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return {
             "public_ok": False,
             "private_read_ok": False,
@@ -413,6 +636,9 @@ def _probe_existing_proxy(
     *,
     proxy_port: int,
     attempts: int,
+    verify_risk_bills: bool = False,
+    idle_cycles: int = 0,
+    idle_seconds: int = 75,
 ) -> dict[str, Any]:
     transport = UrlLibTransport(
         proxy_url=f"http://127.0.0.1:{proxy_port}"
@@ -424,20 +650,65 @@ def _probe_existing_proxy(
         timeout=10,
     )
     successes = 0
+    risk_bill_successes = 0
+    full_risk_evidence: dict[str, int | bool] = {
+        "balance_rows": 0,
+        "position_rows": 0,
+        "instrument_rows": 0,
+        "account_config_ok": False,
+        "bill_rows": 0,
+    }
     errors: list[str] = []
     for attempt in range(attempts):
         try:
             client.sync_server_time()
-            client.balance()
-        except Exception as exc:  # noqa: BLE001
+            if verify_risk_bills:
+                full_risk_evidence = _read_full_risk_route(client)
+            else:
+                full_risk_evidence["balance_rows"] = len(
+                    client.balance()
+                )
+        except Exception as exc:
             errors.append(type(exc).__name__)
         else:
             successes += 1
+            if verify_risk_bills:
+                risk_bill_successes += 1
         if attempt + 1 < attempts:
             time.sleep(1)
+    tight_rounds_ok = successes == attempts and (
+        not verify_risk_bills or risk_bill_successes == attempts
+    )
+    if idle_cycles > 0 and tight_rounds_ok:
+        endurance = _endurance_verification(
+            client,
+            idle_cycles=idle_cycles,
+            idle_seconds=idle_seconds,
+            verify_risk_bills=verify_risk_bills,
+        )
+    else:
+        endurance = {
+            "endurance_cycles": idle_cycles,
+            "endurance_idle_seconds": idle_seconds,
+            "endurance_successes": 0,
+            "endurance_ok": idle_cycles == 0,
+            "endurance_errors": (
+                ["skipped_tight_rounds_failed"]
+                if idle_cycles > 0
+                else []
+            ),
+        }
     return {
         "private_read_ok": successes == attempts,
         "private_read_successes": successes,
+        **full_risk_evidence,
+        "risk_bills_required": verify_risk_bills,
+        "risk_bills_ok": (
+            not verify_risk_bills
+            or risk_bill_successes == attempts
+        ),
+        "risk_bill_successes": risk_bill_successes,
+        **endurance,
         "errors": errors,
     }
 
@@ -468,6 +739,8 @@ def _activate(
     active_config: dict[str, Any],
     metadata: dict[str, Any],
     attempts: int,
+    idle_cycles: int = 0,
+    idle_seconds: int = 75,
 ) -> dict[str, Any]:
     active_path = runtime_directory / "config.json"
     runtime_core_path = (runtime_directory / "sing-box.exe").resolve()
@@ -484,6 +757,7 @@ def _activate(
         if metadata_path.is_file()
         else None
     )
+    reloaded_process_id: int | None = None
     _atomic_write_json(active_path, active_config)
     try:
         os.kill(previous_process_id, signal.SIGTERM)
@@ -494,28 +768,93 @@ def _activate(
         verification = _probe_existing_proxy(
             proxy_port=_ACTIVE_PROXY_PORT,
             attempts=attempts,
+            verify_risk_bills=True,
+            idle_cycles=idle_cycles,
+            idle_seconds=idle_seconds,
         )
-        if not verification["private_read_ok"]:
-            raise RuntimeError("新固定代理的私有只读复核失败")
+        if (
+            not verification["private_read_ok"]
+            or not verification["risk_bills_ok"]
+            or not verification["endurance_ok"]
+        ):
+            raise RuntimeError(
+                "新固定代理的余额、完整账单分页或空闲耐久复核失败："
+                + json.dumps(verification, ensure_ascii=False)
+            )
         _atomic_write_json(metadata_path, metadata)
     except Exception:
-        _atomic_write_bytes(active_path, previous_config)
-        if previous_metadata is not None:
-            _atomic_write_bytes(metadata_path, previous_metadata)
-        else:
-            metadata_path.unlink(missing_ok=True)
-        current_process_ids = _listener_pids(_ACTIVE_PROXY_PORT)
-        for process_id in current_process_ids:
-            if _process_path(process_id) == runtime_core_path:
-                os.kill(process_id, signal.SIGTERM)
-        _wait_for_reloaded_proxy(
-            runtime_core_path=runtime_core_path,
-            previous_process_id=(
-                next(iter(current_process_ids))
-                if current_process_ids
-                else previous_process_id
-            ),
-        )
+        rollback_error: Exception | None = None
+        current_process_ids: set[int] = set()
+        rollback_restored = False
+        try:
+            _atomic_write_bytes(active_path, previous_config)
+            if previous_metadata is not None:
+                _atomic_write_bytes(metadata_path, previous_metadata)
+            else:
+                metadata_path.unlink(missing_ok=True)
+            rollback_restored = True
+        except Exception as exc:
+            rollback_error = exc
+        finally:
+            known_candidate_ids = (
+                {reloaded_process_id}
+                if reloaded_process_id is not None
+                else set()
+            )
+            try:
+                current_process_ids = _listener_pids(
+                    _ACTIVE_PROXY_PORT
+                )
+            except Exception:
+                current_process_ids = set()
+            for process_id in known_candidate_ids | current_process_ids:
+                try:
+                    if (
+                        process_id in known_candidate_ids
+                        or _process_path(process_id) == runtime_core_path
+                    ):
+                        os.kill(process_id, signal.SIGTERM)
+                except Exception:
+                    continue
+
+        if not rollback_restored:
+            try:
+                _stop_runtime_proxy_fail_closed(
+                    runtime_directory=runtime_directory,
+                    runtime_core_path=runtime_core_path,
+                    known_process_ids=(
+                        {reloaded_process_id}
+                        if reloaded_process_id is not None
+                        else set()
+                    ),
+                )
+            except Exception as shutdown_error:
+                raise RuntimeError(
+                    "新代理验证失败、旧配置恢复失败，"
+                    "且无法证明 10981 已下线"
+                ) from shutdown_error
+            raise RuntimeError(
+                "新代理验证失败，旧配置恢复失败；10981 已下线"
+            ) from rollback_error
+
+        try:
+            _wait_for_reloaded_proxy(
+                runtime_core_path=runtime_core_path,
+                previous_process_id=(
+                    reloaded_process_id
+                    if reloaded_process_id is not None
+                    else previous_process_id
+                ),
+            )
+        except Exception as restore_start_error:
+            _stop_runtime_proxy_fail_closed(
+                runtime_directory=runtime_directory,
+                runtime_core_path=runtime_core_path,
+                known_process_ids=current_process_ids,
+            )
+            raise RuntimeError(
+                "旧配置已恢复，但旧代理未能重新启动；10981 已下线"
+            ) from restore_start_error
         raise
     return {
         **verification,
@@ -530,8 +869,37 @@ def main() -> int:
     parser.add_argument("--probe-port", type=_probe_port, default=10982)
     parser.add_argument("--attempts", type=_positive_attempts, default=3)
     parser.add_argument("--runtime-directory", type=Path, required=True)
+    parser.add_argument(
+        "--verify-risk-bills",
+        action="store_true",
+        help="额外完整读取 OKX Demo 账单分页",
+    )
+    parser.add_argument(
+        "--idle-seconds",
+        type=_idle_seconds,
+        default=75,
+        help="每个耐久周期的真实空闲秒数，必须超过 AnyTLS 30 秒空闲检查",
+    )
+    parser.add_argument(
+        "--idle-cycles",
+        type=_idle_cycles,
+        default=2,
+        help="空闲耐久周期数；激活时至少 1，0 仅用于快速连通性排查",
+    )
+    parser.add_argument(
+        "--template-config",
+        type=Path,
+        default=None,
+        help=(
+            "sing-box 模板配置；默认使用运行目录现有 config.json。"
+            "v2rayN 主核心切到 xray 后，其 binConfigs 模板不再是 "
+            "sing-box 格式，不能默认依赖"
+        ),
+    )
     parser.add_argument("--activate", action="store_true")
     args = parser.parse_args()
+    if args.activate and args.idle_cycles < 1:
+        parser.error("激活必须至少通过 1 个空闲耐久周期，不能只靠紧密探测")
 
     root = args.v2rayn_root.resolve()
     runtime_directory = args.runtime_directory.resolve()
@@ -540,7 +908,17 @@ def main() -> int:
         root / "guiConfigs" / "guiNDB.db",
         args.profile_id,
     )
-    template_path = root / "binConfigs" / "config.json"
+    template_path = (
+        args.template_config.resolve()
+        if args.template_config is not None
+        else runtime_directory / "config.json"
+    )
+    if not template_path.is_file():
+        raise RuntimeError(
+            "sing-box 模板不存在："
+            f"{template_path}；请用 --template-config 显式指定一个 "
+            "sing-box 格式配置"
+        )
     template = json.loads(template_path.read_text(encoding="utf-8-sig"))
     candidate = _candidate_config(
         template,
@@ -555,6 +933,11 @@ def main() -> int:
             config_path=probe_path,
             proxy_port=args.probe_port,
             attempts=args.attempts,
+            verify_risk_bills=(
+                args.verify_risk_bills or args.activate
+            ),
+            idle_cycles=args.idle_cycles,
+            idle_seconds=args.idle_seconds,
         )
     finally:
         probe_path.unlink(missing_ok=True)
@@ -568,8 +951,14 @@ def main() -> int:
         "activated": False,
     }
     if args.activate:
-        if not result.get("private_read_ok"):
-            raise RuntimeError("私有只读接口未成功，禁止激活该节点")
+        if (
+            not result.get("private_read_ok")
+            or not result.get("risk_bills_ok")
+            or not result.get("endurance_ok")
+        ):
+            raise RuntimeError(
+                "余额、完整账单分页或空闲耐久未通过，禁止激活该节点"
+            )
         active_config = copy.deepcopy(candidate)
         active_config["inbounds"][0].update(
             {
@@ -583,6 +972,7 @@ def main() -> int:
             "profile_id": args.profile_id,
             "listen_host": "127.0.0.1",
             "listen_port": 10981,
+            "template_source": str(template_path),
             "source_config_sha256": hashlib.sha256(
                 template_path.read_bytes()
             ).hexdigest(),
@@ -591,11 +981,16 @@ def main() -> int:
                 time.localtime(),
             ),
         }
+        # 候选阶段已通过完整空闲耐久；切换后复核只保留 1 个空闲周期，
+        # 缩短探针与 Worker 自然扫描并发打同一 API key 限频的窗口。
+        # 切换后的权威耐久判据是 Worker 随后的连续自然扫描。
         activation = _activate(
             runtime_directory=runtime_directory,
             active_config=active_config,
             metadata=metadata,
             attempts=args.attempts,
+            idle_cycles=min(args.idle_cycles, 1),
+            idle_seconds=args.idle_seconds,
         )
         summary["activation_verification"] = activation
         summary["activated"] = True
