@@ -16,3 +16,12 @@
 10. `D:\Desktop\PA_Agent.lnk` 是用户桌面运行入口，必须指向本仓库 `.venv\Scripts\pa-agent.exe`。GUI 进程不会自动加载磁盘新代码；任何后端或 GUI 修改交付时，界面必须显示仓库路径、本次代码加载时间、Worker/Campaign 状态和真实风险参数，让用户能判断当前窗口实际加载了什么。
 11. 后端新增或修改用户可配置的交易行为时，必须在同一阶段补齐 GUI 控件、只读状态或明确阻断提示，并覆盖配置保存/重载与前后端同值测试；只有后端代码可用、桌面 GUI 看不到或改了不生效，不算完成。
 12. Qt 自动测试必须在测试模块收集前设置 `QT_QPA_PLATFORM=offscreen`，不得在用户桌面创建 `pytest-qt-qapp` 测试窗口；同一导入前阶段必须移除 OKX/Longbridge 环境变量，并把共享凭据文件路径改到测试专用空目录，确保测试模块导入和测试启动的子进程都不能读取真实券商凭据。正式 `config/settings.json` 也必须逐测试隔离并校验不变。
+
+## GUI 设计强制流程
+
+1. 任何新页面、重大改版、布局变化、组件层级变化、交互变化或新增用户配置，必须先调用项目级 `$frontend-design` Skill，并以 `D:\Desktop\Quant\前端设计\DESIGN.md`、当前代码、真实接口、`CONTEXT.md`、`lessons.md` 和最新 PRD 为真值；旧截图和旧 PRD 只能作为历史输入。
+2. 禁止任何副标题和注释性小字：不得出现 eyebrow、tagline、标题下解释、灰色辅助小字、括号注释、营销口号、重复说明或小号页脚。字段标签、单位、时间、状态、错误和风险阻断原因可以保留，但必须用正常可读字号与清晰对比度呈现。
+3. 写生产代码前必须完成：页面功能/字段/状态/交互合同、Product Design 三种高保真方向、用户审美确认、网页版 ChatGPT 的完整 PRD、脱敏材料与 PRD 的 Stitch 设计、GPT-Image-2 或可用 ImageGen 界面的至少三轮精修，以及项目级 `$design-taste-frontend` 的真实视觉审计。工具未实际调用时不得声称已经完成对应阶段。
+4. PA_Agent 是 `PyQt6 + QWidget + QSS + pyqtgraph` 原生桌面程序。Stitch 和图片生成稿只提供视觉、布局与状态参考；必须人工转换为 Qt 原生实现。禁止为使用 GSAP 引入 WebView、JavaScript 运行时或第二套前端；必要动效只用 Qt 原生动画，并在风险阻断、陈旧数据、错误和执行复核状态停止装饰性动效。
+5. 视觉实现必须接通真实 `WorkbenchReadModel`、`ExecutionController`、设置持久化与状态响应；只改静态外观、使用假按钮、写死数值或让 GUI 与后端实际语义不同均不算完成。
+6. 视觉截图夹具只允许 Fake Service、Fake ReadModel、内存或临时 SQLite。禁止调用 `AppContext.bootstrap()`、默认生产路径的 `ExecutionController`、Worker、Campaign、真实行情或券商网络；最终桌面可见验收仍由用户从 `D:\Desktop\PA_Agent.lnk` 启动并提供截图。

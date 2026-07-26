@@ -27,6 +27,7 @@
 6. **总权益与 USDT 权益分工不变。** 账户总权益只用于资金流、高水位和 50% 回撤；USDT 权益只用于定仓。
 7. **不新增买入、卖出、加仓按钮。** 常规交易由脚本执行；主界面只允许显示当前状态，以及在真实可达状态下显示撤销未成交入场或主动离场。
 8. **不在主界面暴露手动会话开关。** 原“桌面手动会话”移入默认收起的技术详情，自动 Campaign 不依赖它。
+9. **禁止副标题和注释性小字。** 不得出现 eyebrow、tagline、标题下解释、灰色辅助小字、括号注释、营销口号、重复说明或小号页脚。仅保留操作和安全判断必需的字段标签、单位、时间、状态、错误及风险阻断原因，并以正常可读字号和清晰对比度呈现。
 
 ## 4. 信息架构
 
@@ -48,7 +49,7 @@
 上半区显示最新 PA 决策：
 
 - 方向：做多 / 做空 / 不下单 / 等待
-- 置信度（有真实证据时才显示）
+- 置信度
 - 用户能看懂的原因
 - 合约张数
 - 入场、止损、止盈
@@ -71,8 +72,8 @@
 
 账户卡片显示：
 
-- 账户总权益（回撤口径）
-- USDT 权益（定仓口径）
+- 回撤总权益
+- 定仓 USDT 权益
 - 可用 USDT
 - 未实现盈亏
 - 当前仓位
@@ -151,7 +152,7 @@
 - 边框：`#252B36`
 - 主文字：`#E7ECF4`
 - 次文字：`#9AA3B2`
-- 弱文字：`#646D7C`
+- 非文字边界与禁用装饰：`#646D7C`
 - 正常：`#18B26B`
 - 警告：`#E6A23C`
 - 阻断：`#F05252`
@@ -161,7 +162,7 @@
 - 页面标题：22 px
 - 模块标题：15 px
 - 正文：13 px
-- 辅助文字：12 px，禁止更小
+- 字段标签、单位、时间、状态、错误和风险阻断原因：至少 13 px，不得作为灰色小字或标题下说明呈现
 - 间距：4 / 8 / 12 / 16 / 24 px
 - 表格行高：32 px
 - 普通按钮最小高：36 px
@@ -193,10 +194,10 @@
 
 Create a high-fidelity desktop trading operations workspace for “PA Agent”, implemented later in PyQt6. This is the existing top-level tab called “实盘交易”; do not add a left navigation rail. The interface is for OKX Demo only and must help a user answer within five seconds: whether automation is healthy, why the latest cycle traded or did not trade, and whether any position is fully protected.
 
-Use a restrained professional dark trading-terminal design. Background #090B10, panels #10131A, raised panels #151922, borders #252B36, primary text #E7ECF4, secondary #9AA3B2, muted #646D7C, healthy #18B26B, warning #E6A23C, blocked #F05252, primary action #2F8DFF. Use Microsoft YaHei UI for Chinese text and JetBrains Mono or Consolas for numbers. Avoid gradients, glow, glassmorphism, large shadows, tiny fonts, and decorative charts.
+Use a restrained professional dark trading-terminal design. Background #090B10, panels #10131A, raised panels #151922, borders #252B36, primary text #E7ECF4, and secondary text #9AA3B2. Use #646D7C only for non-text boundaries or disabled decoration. Healthy #18B26B, warning #E6A23C, blocked #F05252, primary action #2F8DFF. Use Microsoft YaHei UI for Chinese text and JetBrains Mono or Consolas for numbers. Avoid gradients, glow, glassmorphism, large shadows, tiny fonts, and decorative charts. Do not create subtitles, eyebrow labels, taglines, title helper text, grey explanatory microcopy, parenthetical annotations, marketing slogans, repeated descriptions, or tiny footer notes. Required labels, units, timestamps, statuses, errors, and risk-blocking reasons must remain at normal readable size and contrast.
 
 Layout:
-1. A fixed top header with “实盘交易”, a concise subtitle, and “刷新显示”.
+1. A fixed top header with only “实盘交易” and “刷新显示”; do not add a subtitle or explanatory microcopy.
 2. A fixed health strip for OKX 模拟盘, 自动交易, 交易服务, 风险闸门, 账户核对, and 更新时间. Unknown data must visibly say 状态未知 and must never look green.
 3. A 70/30 horizontal workspace. The central column contains a latest PA decision card, an OKX Demo execution lifecycle table, contextual safety actions, and a human-readable event timeline. The right column contains account/risk facts, current running parameters, editable next-start parameters, and collapsed technical details.
 4. Never show buy, sell, or add-position buttons. Normal trade execution is scripted. Only show “撤销未成交入场” when an entry order is actually cancellable and “主动离场” when a real position is safely eligible for exit.
@@ -226,14 +227,16 @@ Generate four coherent desktop states at both 1920×1080 and 1440×900: A) healt
 14. 风险未知时不显示绿色。
 15. 止盈档数来自真实计划，不写死为三档。
 16. 技术 ID、原始状态码和手动会话只在技术详情中。
-17. 所有正文不小于 12 px，普通按钮不低于 36 px。
+17. 所有正文及操作/安全必需信息不小于 13 px，普通按钮不低于 36 px。
 18. 1440×900 和 1920×1080 截图均无重叠、截断或横向滚动。
 19. GUI 配置保存、重载和 Campaign 当前冻结值测试通过。
 20. 离线测试不得访问真实 OKX/Longbridge 凭据或在桌面弹出 Qt 测试窗口。
+21. 全部四种状态中不存在副标题、eyebrow/tagline、标题下解释、灰色辅助小字、括号注释、营销口号、重复说明或小号页脚；必需的字段标签、单位、时间、状态、错误与风险阻断原因均使用正常可读字号和清晰对比度。
 
 ## 10. 2026-07-25 实施状态
 
 - 已完成：网页版 GPT 审核、本地语义修正、Stitch 四状态生成、PyQt6 主工作台落地、配置编辑态、风险阻断态、保护状态、技术详情收纳、1440×900 / 1920×1080 真图复核。
 - 已完成：双 Agent 对抗审查发现的旧快照闭锁、陈旧账本标识、盈亏口径、失败码收纳和固定张数超限提示均已修正；工作台定向 `22` 通过、`0` 失败，受影响范围 `516` 通过、`0` 失败；目标 Ruff、`compileall`、`git diff --check` 通过。
+- 2026-07-26 新增硬规则：禁止所有副标题和注释性小字。规则、Skill 与本 PRD 已更新；现有 GUI 尚未按这条新规则重新设计和验收，不能沿用上一轮截图声称本项通过。
 - 未完成：当前运行 GUI 尚未重新加载本次磁盘代码。
 - 硬阻断：当前公网 IP `188.253.121.195` 不在 OKX API 白名单，Campaign 已停止，06:43:44 之后的真实仓位和保护单无法确认。必须先恢复私有只读权限，再完成仓位/挂单/算法单硬门；只有确认安全后才能决定是否重启 Worker 或 Campaign。
