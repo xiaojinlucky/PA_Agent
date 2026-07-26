@@ -237,6 +237,52 @@ Generate four coherent desktop states at both 1920×1080 and 1440×900: A) healt
 
 - 已完成：网页版 GPT 审核、本地语义修正、Stitch 四状态生成、PyQt6 主工作台落地、配置编辑态、风险阻断态、保护状态、技术详情收纳、1440×900 / 1920×1080 真图复核。
 - 已完成：双 Agent 对抗审查发现的旧快照闭锁、陈旧账本标识、盈亏口径、失败码收纳和固定张数超限提示均已修正；工作台定向 `22` 通过、`0` 失败，受影响范围 `516` 通过、`0` 失败；目标 Ruff、`compileall`、`git diff --check` 通过。
-- 2026-07-26 新增硬规则：禁止所有副标题和注释性小字。规则、Skill 与本 PRD 已更新；现有 GUI 尚未按这条新规则重新设计和验收，不能沿用上一轮截图声称本项通过。
-- 未完成：当前运行 GUI 尚未重新加载本次磁盘代码。
-- 硬阻断：当前公网 IP `188.253.121.195` 不在 OKX API 白名单，Campaign 已停止，06:43:44 之后的真实仓位和保护单无法确认。必须先恢复私有只读权限，再完成仓位/挂单/算法单硬门；只有确认安全后才能决定是否重启 Worker 或 Campaign。
+- 2026-07-26 新增硬规则：禁止所有副标题和注释性小字。规则、Skill 与本 PRD 已更新；2026-07-26 日间已按该规则完成工作台重构与四状态离屏真图人工复核（见 §11.4），最终桌面可见验收仍由用户从 `D:\Desktop\PA_Agent.lnk` 启动核对。
+- 未完成：当前运行 GUI 尚未重新加载本次磁盘代码（需用户重开桌面入口）。
+- 历史硬阻断（已解决）：07-26 上午的 OKX 白名单/固定代理阻断已于当晚通过换节点解决，Campaign 已恢复常驻运行；当前运行态以根目录 `CONTEXT.md` 为准。
+
+## 11. 2026-07-26 视觉方向与实施合同
+
+本节取代上一节中关于“当前视觉已经验收”的表述。旧截图只保留为历史证据，不用于验收本轮界面。
+
+### 11.1 视觉探索
+
+Product Design 生成并比较了三套高保真方向：
+
+1. 门禁主导：六项状态和写入阻断最醒目，适合五秒内判断能否操作。
+2. 执行链路：执行流水与事件因果最强，适合排查一笔交易为什么失败。
+3. 证据分层：状态、来源、新鲜度、决策、流水和账户事实层级最平衡。
+
+最终采用第三套“证据分层”，吸收第一套清楚的六项状态判断，以及第二套按因果顺序组织的事件时间线。不得照搬参考图中的巨型“观望 62%”、整排禁用按钮、括号说明和灰色微文案。
+
+视觉原图与比较记录位于：
+
+- `scratch/visual/product-design-direction-1-gate-first.png`
+- `scratch/visual/product-design-direction-2-execution-chain.png`
+- `scratch/visual/product-design-direction-3-evidence-layers.png`
+- `scratch/visual/product-design-directions-20260726.md`
+- `scratch/visual/pa-trading-direction-a-gate-first-v1.png`
+- `scratch/visual/pa-trading-direction-a-gate-first-v2.png`
+
+### 11.2 Stitch 记录
+
+- 项目：`2898475897385439253`
+- 本轮设计系统：`assets/15995812927483392573`
+- 名称：`PA Trading Workbench — Longbridge Control`
+- 设计系统已创建并包含本 PRD 的布局、字体、颜色、状态和禁用微文案规则。
+- 屏幕生成请求发生 Stitch 服务端连接错误；按工具约束不重复提交。随后复查项目屏幕列表，没有发现本轮新屏幕，因此不把 Stitch 生成说成成功，也不让该外部故障阻塞 PyQt6 实现。
+
+### 11.3 固定页面边界
+
+实盘交易页是固定的 `OKX Demo / XAU-USDT-SWAP / 10m` 观察与控制页面：
+
+- 账户和风险事实固定读取 `okx / okx-demo`，不跟随全局券商选择串线。
+- 实际控制器路由必须单独核对；全局路由不是 OKX Demo 时，页面保持只读并显示“路由不匹配”。
+- “允许新增风险”必须同时满足：持久风险停止未启用、Worker 正在运行、心跳新鲜、最近成功对账新鲜、账户快照已确认且新鲜、控制路由匹配。
+- 任一事实缺失或陈旧都显示具体阻断原因，不允许用历史绿色状态代替当前放行。
+- GUI 只调用 `ExecutionController`；耐久入队、Worker、`ExecutionService` 和券商适配器边界不变。
+
+### 11.4 当前实施状态（2026-07-26 末次更新）
+
+- 已完成：三方向视觉探索、两轮 ImageGen 修订、人工验图、方向选择、Stitch 专用设计系统、前后端对象图与风险边界审计；专用 OKX Demo 读模型、主窗口接线、交易工作台重构、设置路径注入和边界测试（`tests/integration/test_trading_workbench_worker_boundary.py`）；四状态多尺寸离屏真图（2026-07-26 11:12–11:17 生成并人工检查，见 `scratch/visual/runtime/`）。
+- 未完成：严格口径下"选定方向后三轮连续精修"的第三轮独立证据；后续市场切换/自选列表等 P1 前端改版需按 GUI 强制设计流程另行走完整链路。

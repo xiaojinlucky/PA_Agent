@@ -2,6 +2,30 @@
 
 > **历史快照（截至 2026-07-22；不代表当前状态）**：本文件记录当时的发布、测试和运行验证。当前代码与 Git 基线以根目录 `CONTEXT.md`、`docs/CODEX_HANDOFF.md` 和最新 GitHub `main` 为准；本文件中的历史 SHA、测试数字和运行态只在各自时间点成立。
 
+## 2026-07-26 深夜 固定代理换节点恢复 + P1 多市场后端（Claude 会话）
+
+- 根因与决策：好猫 US1/日本2（AnyTLS）在空闲后持续 `SSLEOFError`（当日日志 142 次），客户端重试无法消除；按 handoff 建议走"换协议/供应商节点 + 空闲耐久闸门"。快速出口扫描 12 个候选：桔子云 OKX 日本 1（VMess，出口 `216.38.169.153`）与 OKX 美国 1 已在 OKX API 白名单；SakuraCat Hysteria2 全部传输层失败（QUIC 不可用）；其余候选 `50110`。
+- 耐久闸门固化：`scripts/probe_okx_fixed_proxy_node.py` 新增 `--idle-seconds`（45–600，必须超过 AnyTLS 30 秒空闲检查）与 `--idle-cycles`（0–10，激活强制 ≥1），候选与激活后复核都要求空闲后完整风险路线（含 1010 行账单分页）全过；紧密轮全过才进入耐久，失败明确 `skipped_tight_rounds_failed`。sing-box 模板默认改为运行目录 `config.json` 并新增 `--template-config`（用户当晚把 v2rayN 主核心切到 xray，其 `binConfigs/config.json` 已不是 sing-box 格式，这是第一次激活尝试失败的根因之一）。切换后 10981 复核只保留 1 个空闲周期，避免探针与 Worker 自然扫描并发打同一 API key 限频（第二次失败根因，回滚逻辑当场验证有效：自动恢复旧配置、守护进程拉起、无残留）。
+- 激活证据（22:41–22:52）：候选 10982 紧密 3/3（每轮 balance/positions/143 instruments/account_config/1010 bills 全过）+ 空闲 90 秒 ×3/3；切换 10981 后紧密 3/3 + 空闲 90 秒 1/1，新 sing-box PID `8588`，metadata `桔子云 / OKX 日本 1`。切换后日志零 `SSLEOFError`。
+- 自然扫描闸门（22:48–23:06）：只读观察器记录 `last_bill_scan_at` 连续推进 ≥9 次（约 2 分钟/次，后加速到 ~70 秒），`kill_activated_at` 冻结在 22:42:01（切换瞬间旧进程被杀的最后一次误伤），高水位与账户身份不变。
+- 专用恢复（23:09）：命令 `0e525d57-f198-46d2-b13f-9df4f40c0ac6` `succeeded / clear_drawdown_stop_completed`；恢复前核验活动 execution 0、PENDING/RUNNING 0、租约 0、无未解决 UNCERTAIN、两库 `integrity_check=ok`。恢复后 `kill_active=0`，高水位保持 `78303.57015174496` 未重锚，身份摘要不变。
+- Campaign 3 根自然 K 线（23:10–23:32）：`ab245e48-218a-4fac-8445-10c9893e868e` restart 语义恢复，冻结 `20000/10%/20x/risk_budget`，继承 `last_completed_bar_ms=1784989200000`（停机期间的中间 K 线不补跑、不冒充）。23:00 根：两阶段真实完成（Codex gpt-5.6-luna，42.4s/51.2s），Stage2 给出计划型做多，被杠杆容量硬闸门阻断 `blocked:risk:leverage:user_max_leverage_capacity_insufficient`（未截断、未强制成交）；23:10 根：自然 `blocked:no_order`（27.6s/31.2s）；23:20 根：再次真实信号被杠杆闸门阻断。3 完成 / 0 失败，进程持续 active。
+- fail-closed 现场证据（不做人为断网实验的理由）：当日自然故障期（13:05–22:36）风险运行态全程保持 `kill_active=1`、无一次回退直连或系统代理（传输层硬绑定 10981，代码与测试双重保证）；22:42 切换瞬间的 `ConnectionResetError` 立即重新触发 kill，也证明故障→闭锁路径实时有效。以上为真实运行证据，优于合成断网实验，后者会无谓打断刚恢复的红线运行。
+- 独立只读交叉审计（23:17，子 Agent）：无 CRITICAL——高水位/身份逐字符一致（身份同时经券商 `account_config` 实时重算比对）、kill 解除仅那一条授权命令、执行账本 `blocked 3 / canceled 22 / closed 11` 与基线一致零新增、券商侧全品种持仓 0/普通挂单 0/八类算法单全 0、`AlphaMaster` 未读未写。
+- P1 多市场后端（同晚落地，均带测试）：共享合同层 `Quant/shared/market_contracts`（39 通过）；`LongbridgeSource` 分页/频控/卡顿保护/缺根校验/`latest_snapshot_for_timeframe`（长桥源与日历、市场规则、注入、时区相关定向套件合计 `142` 通过、`0` 失败：78+25+58 去重后按最终一次全绿运行为准）；`market_calendar`（XNYS/XHKG/XSHG+半日市）；市场规则块 ×4 按符号路由注入用户回合（system 字节不变，前缀缓存安全）；K 线表时间列按交易所时区渲染并标注。`pyproject` 新增 `exchange_calendars>=4.5`。全量 unit 早跑一次：历史 18 失败 + 2 个因 945→3000 上限变化的旧契约测试（已按新分页语义更新为全过）；最终全量数字以收口一节为准。
+- 已知硬阻塞：长桥 access token 服务端 `401004 token invalid`（本地 exp 预检通过），P1 三标的真实两阶段验收（`scratch/p1_multimarket_acceptance.py`）等用户重签 token 后执行。
+
+## 2026-07-25 实盘交易工作台 Stitch 视觉重构
+
+- 设计输入：用户现状截图、长桥界面参考、现有 PyQt6/执行链代码、网页版 GPT 视觉审核和 UI/UX Pro Max 公开设计系统原则。最终本地 PRD 为 `docs/prd/04_PA_Agent_Stitch视觉重构PRD.md`。
+- Stitch：通过用户本机已登录 Chrome 打开 `AI Price Action Terminal` 项目并成功提交本地修正后的 PRD；生成了健康空仓、配置编辑、持仓保护和风险阻断四种桌面状态。生成稿仍包含与现有一级页签重复的左导航，因此只采纳健康状态带、账户/风险右栏、配置编辑态、保护卡片和阻断态，不照搬重复导航。
+- GUI：实盘交易继续使用现有一级页签；主视图区分最新 PA 决策、执行生命周期和人话事件；右栏明确分成当前运行参数与下次启动参数。新增配置未保存横幅、取消编辑、真实保护数量核对、临时风险读取故障专用重新检查，以及默认收起的仓库路径、代码加载时间、原始状态/ID/错误码和手动会话。
+- 安全交互：不显示买入、卖出或加仓；“执行待确认计划”只保留在折叠技术详情；撤销未成交入场和主动离场按 execution 状态动态出现；账户快照不可信时主动离场隐藏。只有 `risk_runtime_BrokerApiError / BrokerTransportError / IncompleteRead / 50004` 可显示“重新检查账户状态”，回撤、身份变化和账本完整性停止不显示这个操作。
+- 真图复核：`scratch/main_window_trading_1440x900.png`、`scratch/trading_workbench_1440x900.png`、`scratch/trading_workbench_1920x1080.png`、`scratch/trading_workbench_fixed_1440x900.png` 均由项目 PyQt6 在 `QT_QPA_PLATFORM=offscreen` 下渲染并人工打开检查；没有操作用户桌面和鼠标，没有创建 `pytest-qt-qapp` 窗口。
+- 自动验证：最终交易执行、风险、Campaign、设置和 GUI 受影响范围共 `516` 通过、`0` 失败，pytest 退出码 0；工作台最终定向范围 `22` 通过、`0` 失败。目标文件 Ruff `E4/E7/E9/F/I/UP/B/C4`、`compileall`、`git diff --check` 均通过。
+- 最终对抗审查修正：快照读取失败会废弃旧账户/执行数据并闭锁全部操作；陈旧 execution 在主卡片和表格明确标成“本地账本记录，待券商核对”；`realized_pnl` 明确为券商口径且未扣费用；Worker 原始失败码只进入技术详情；固定张数的损失或最低保证金超限会在编辑态即时标红。两位只读审查者的 P1/P2 发现均已用回归测试覆盖；同一审查者复核修正后全部 `PASS`，无新增 P0/P1。
+- 当前运行阻断：08:55 当前公网 IP `188.253.121.195` 被 OKX 以 `50110` 拒绝。Worker 仍有心跳但需人工处理，Campaign 已停止，06:43:44 之后无新的私有账户真值。旧账本中的 `56862` 张空单和 OCO 只能视为陈旧证据；公开行情越过旧止损价只支持“可能已由服务器端 OCO 止损”的推断，不支持“已平仓”结论。白名单恢复前没有重启 Campaign、没有恢复风险、没有写券商。
+
 ## 2026-07-24 Demo-S 真实回归与运行反馈修复
 
 - 受控记录使用真实 OKX 5m→10m 已收盘快照、真实 ATR14、实时 USDT 权益/合约规格/最大可开数和真实 SupervisorGate；仍由 `ExecutionController → ExecutionWorker → ExecutionService → OkxAdapter` 执行，未直接写券商、未启用 Live。
@@ -391,3 +415,109 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 当前受影响套件最终复跑：338 通过、0 失败。最终全量单元测试收集 1445 项：1425 通过、20 失败；20 项仍全部属于既有严格/宽松校验、预测、决策面板、连续性、数据源切换、OpenClaw 与音效契约，没有为全绿放宽交易逻辑。全量集成测试：19 通过、8 失败、3 跳过；8 项为 AkShare 真实联网、旧预测、旧决策面板和旧 `no_order` 严格校验范围。全部本轮 Python 文件 Ruff `E9/F`、`compileall pa_agent tests` 与 `git diff --check` 通过。
 - 20×/25×/45× 的真实方向容量分别观测为 `120000/55000/28000`，证明 OKX Demo 容量对杠杆并不单调。最新自然计划所需 `441374/436449` 张均超过真实容量，因此仍硬阻断，不截断。错误证据会保存首个下降点，例如 `20x=120000 → 25x=55000`。
 - 2026-07-24 16:57（北京时间）OKX 账单端点再次返回 `50004`，风险运行态已按设计置为 `kill_active=true / risk_runtime_50004`。17:09 后 `last_bill_scan_at` 已连续前进，证明端点恢复；持久停写仍正确保持，Campaign/Worker 继续运行，活动 execution/命令/租约、仓位和挂单均为 0。只有用户明确授权 CLEAR 后才允许由唯一 Worker 重锚恢复新增风险，不能因接口恢复自动清除。
+
+## 2026-07-24 WO-RUN-06-PROD-01 固定资本生产切换
+
+### 生产备份、迁移与风险基线
+
+- 使用 SQLite 原生 backup 创建切换前控制库副本：`scratch/production-backups/execution-control-v4-before-fixed-cap-cutover-20260724-201323.sqlite3`，大小 `90112` 字节，SHA-256 `2ad8a9f73e865ac66bdffe14f7187946b3af437aba6c6414fad9fdfa7da96e47`，`PRAGMA integrity_check=ok`、schema v4；备份时含 37 条命令、1 条处置和 1 条风险状态。
+- Worker 持有同一单例锁后才允许迁移和风险基线回填。生产 `v4_cutover_baseline` 标记为 `backfilled=true`、`baseline_origin=existing_v4_risk_runtime_state_snapshot`、`historical_maximum_claimed=false`；它是切换基线，不冒充历史最高净值。
+- 最终 Worker 的 WinSW PID 为 `5672`、实际 Worker PID 为 `55264`；`started_at=2026-07-24 20:56:15`（北京时间），晚于最终 `okx_adapter.py` 修改时间，心跳和 `last_successful_reconcile` 持续前进。
+- 临时读取故障只通过专用命令恢复：`3afac66d-1e0e-483d-86e9-4b1f892adbb2` 和最终重启后的 `d702f99d-e3e9-4355-96b7-d9133928d829` 均为 `succeeded`。两次均先完成新的完整风险读取，只清 `risk_runtime_BrokerTransportError`，高水位始终保持 `78303.57015174496`，未调用普通 drawdown CLEAR 重锚。
+
+### 固定资本与真实 Demo-S
+
+- 现行策略设置为风险资本上限 `20000 USDT`、单笔最坏止损风险 `10%`、最大杠杆 `20x`。定仓有效资本为 `min(20000, 最新 USDT eq)`；`totalEq` 只用于外部资金流、高水位和 50% 回撤。
+- execution `957e4d70-c6bd-509a-95d6-3cfcc48718d9` 的入场前证据为：USDT eq `77702.87537394238`、totalEq `77636.82793065166`、有效资本 `20000`、风险预算 `2000`、目标数量 `80116`、方向最大容量 `120000`。
+- 入场订单 `3771294118783832064` 全部成交 `80116`，均价 `4060.9`；原生 OCO `3771295355141189632`、`3771295918218113024` 各保护 `40058`，止损 `4048.1`，止盈分别为 `4078.7/4088.9`。
+- 主动离场时，第一张保护撤销后单笔详情返回 `51603 / Order does not exist`，旧进程把 execution 卡在 `exit_pending/needs_attention`；券商一度出现 `80116` 全仓无保护。修复后 Worker 使用客户算法订单号、待处理单和 `effective/canceled/order_failed` 历史复核，且在最终离场 POST 前紧贴写入点再次核对真实仓位、普通单和八类算法单。
+- 离场订单 `3771323397642997760` 全部成交 `80116`，均价 `4061.4953754555893957`；execution 最终 `CLOSED`、剩余 `0`、`needs_attention=false`，记录已实现盈亏 `47.6991`。真实券商收口为仓位 `0`、普通挂单 `0`、八类算法单 `0`。
+
+### 最终门禁与恢复运行
+
+- OKX 适配器：`94` 通过、`0` 失败。执行、OKX 与风险范围：`430` 通过、`0` 失败。
+- 完整单元测试收集 `1497` 项：`1477` 通过、`20` 失败。20 项与切换前失败节点完全相同，属于既有严格/宽松校验、预测、决策面板、连续性、数据源切换、OpenClaw、价格跳动与音效范围；本工单没有新增失败。
+- 最终改动范围 Ruff `E4/E7/E9/F/I`、`compileall`、`git diff --check` 通过；独立对抗审查最终为 `PASS`。
+- 新 Campaign `677c70df-aa5d-442a-9809-1896b7dc2994` 已恢复 `active`，固定配置为 `OKX Demo / XAU-USDT-SWAP / 10m / min_trade_confidence=20 / extreme_aggressive / entry+exit limit_with_slippage 0.50×ATR14`，继承 `last_completed_bar_ms=1784884200000`。Live 双硬门保持关闭，本节不构成 Live 交易或策略盈利证明。
+
+## 2026-07-24 桌面 GUI 与后台同源、Qt 测试弹窗隔离
+
+### 根因与用户入口
+
+- `D:\Desktop\PA_Agent.lnk` 已解析确认指向当前仓库 `D:\Desktop\Quant\PA_Agent\.venv\Scripts\pa-agent.exe`，工作目录也在同一仓库；不存在另一套 Demo 代码。此前的差异来自旧 GUI 仍保留 15:23 加载的代码，而 WinSW Worker/Campaign 已在 20:56 后加载新代码，GUI 不支持热更新。
+- 最终磁盘源码会在主窗口显示版本、仓库绝对路径、本次 GUI 代码加载时间、10 分钟 Campaign 状态与进度；交易窗口分开显示“桌面手动会话”和“自动 Campaign”，并直接展示风险资本上限、单笔风险比例、最大允许杠杆。持久 GUI 行情配置已对齐为 `OKX / XAU-USDT-SWAP / 10m`。
+- 在用户随后禁止 Agent 继续操控桌面和鼠标前，21:36 版曾从正式快捷方式完成一次可见核验；但 `main_window.py/read_models.py` 在 21:50–21:51 仍有最终修正，该窗口没有加载最终代码。22:15 只读进程检查确认桌面 GUI 已不再运行。最终 GUI 可见验收保持 `pending`，必须由用户自行从同一快捷方式启动并提供截图后才能改为通过；Agent 不再进行任何窗口自动化。
+
+### 弹窗隔离与离线验证
+
+- 截图中的窗口标题 `pytest-qt-qapp`、输入内容 `test` 来自自动化 Qt 测试，不是 PA 生产弹窗。`tests/conftest.py` 现于测试模块收集前设置 `QT_QPA_PLATFORM=offscreen`，同时把正式 `config/settings.json` 和券商共享环境路径替换到每个测试自己的临时目录，并移除进程中的 OKX/Longbridge 写入开关与凭据。需要认证语义的 AI 设置测试显式使用测试 Key，不重新读取真实券商配置。
+- GUI、Campaign 只读状态、数据源切换和测试隔离定向套件：`39` 通过、`0` 失败。完整单元测试收集 `1503` 项：`1485` 通过、`18` 失败；相较切换前 `1497` 项中的 `1477` 通过、`20` 失败，新增用例全部通过，并修复 2 个既有数据源切换失败。剩余 18 项仍是既有 PA 严格/宽松校验、旧预测面板、连续性、OpenClaw、价格跳动与音效范围，没有本轮新增失败。
+- 本轮文件 Ruff `E4/E7/E9/F` 与除主窗口外的导入顺序检查、`compileall pa_agent tests`、`git diff --check` 均通过。`main_window.py` 仍有 6 个本轮未触碰的局部导入排序告警，未为追求表面全绿批量格式化无关代码。
+
+### 运行态反馈
+
+- Campaign 连续完成前 7 根已收盘 10m K 线分析：`7` 成功、`0` 失败，最近均为自然 `blocked:no_order`，所以没有创建交易命令或强制制造成交。第 7 轮结束后 OKX Demo 仓位、普通挂单和八类算法单均为 0，风险闸门正常，Worker 持续成功对账。
+- 21:44 一次 OKX K 线 `URLError` 按设计触发 `risk_runtime_BrokerTransportError`。私有只读接口恢复后，专用命令 `5287e042-fe20-43bf-9614-b6f53ccbc6f9` 先刷新完整风险数据再成功解除该临时故障；普通 CLEAR 未使用，高水位保持 `78303.57015174496`、未重锚，也没有生成订单。下一轮成功后 Campaign 的旧网络错误已清空。
+
+## 2026-07-24 GUI/Campaign 真值与测试凭据隔离复审
+
+### 四项阻断修复
+
+- 测试模块收集前即设置无界面 Qt、移除 OKX/Longbridge 环境变量，并把共享凭据路径指向测试专用空目录；导入期断言和测试子进程均验证无法回到真实 `Quant\env`。
+- Campaign 状态与配置指纹一起冻结并耐久保存实际使用的风险资本上限、风险比例和最大杠杆。GUI 分开显示可编辑的“GUI 配置”和后台“实际冻结参数”；不一致、旧状态缺字段或状态不新鲜时标红且不冒充已生效。
+- `active / stopping / needs_attention / completed` 及未知状态统一接受时间新鲜度检查；状态陈旧、未来或无效时，进度、最近结果和冻结参数的可信度同步降为未知。
+- GUI 保存先构造完整候选设置并成功落盘，之后才更新共享内存和重载服务；模拟磁盘失败时，磁盘、内存和服务均保持旧配置。
+
+### 离线门禁
+
+- GUI、Campaign、凭据隔离、设置保存和数据源定向回归：`188` 通过、`0` 失败。
+- 完整单元测试：`1493` 通过、`18` 失败。18 项与修复前相同，属于既有 PA 严格/宽松校验、决策面板、连续性、OpenClaw、价格跳动和音效范围；本节没有新增失败。
+- 本节改动范围 Ruff `E4/E7/E9/F/I`、主窗口 Ruff `E4/E7/E9/F`、`compileall pa_agent tests` 与 `git diff --check` 均通过。
+- 运行中的 Campaign 是上述字段加入前启动的旧进程；在完成空仓、空挂单、无活动执行/命令、合法租约和 Worker 健康的实时硬门检查并做最短安全重启前，文档与 GUI 均不得声称当前进程已加载新冻结参数。最终桌面可见验收仍须用户自行从 `D:\Desktop\PA_Agent.lnk` 启动并提供截图，Agent 不操作桌面或鼠标。
+
+### 22:38 实时阻断
+
+- Campaign 最后在 22:01:33 确认正常，已完成 8 轮、失败 0、最近 `blocked:no_order`、无进行中轮次；22:16 已找不到进程，因此退出发生在 22:01:33–22:16 之间。状态文件没有退出错误，不能把时间上吻合的 IP 故障说成已证实退出原因。Worker PID `55264` 仍在，但 22:09 后 OKX 持续返回 `50110`：当前公网 IP `154.40.63.187` 不在该 API Key 白名单。
+- Worker 当前为 `needs_attention / BrokerApiError`，风险运行态为 `kill_active=true / risk_runtime_BrokerTransportError`，`NEW_RISK` 租约为 0；两个 SQLite 库完整性检查均为 `ok`，本地没有活动 execution。
+- 最后一份精确到秒的券商空现场证据为 21:32:53：仓位 0、普通挂单 0、八类算法单 0。IP 白名单阻断期间无法取得更新证据，因此不能把该旧快照当作当前事实，也不能启动 Campaign。恢复顺序固定为：用户恢复已授权公网 IP → 私有只读硬门 → 专用临时风险停止恢复（不重锚高水位）→ Campaign 最短重启并继承最后完成 K 线 → 再做 GUI 截图验收。
+
+### 23:28 白名单恢复与真实 Demo 反馈
+
+- 用户加入当前公网 IP 后，OKX Demo 私有只读恢复。仓位、普通挂单和八类算法单均为 0，活动 execution 和待处理命令为 0；专用恢复命令 `3cc99df4-8463-47da-8984-a587b2fa5490` 成功，高水位保持 `78303.57015174496`、未重锚。
+- Campaign 通过正式 `python -m pa_agent.okx_demo_campaign run` 入口恢复，进程树 `51428 → 22204`，沿用 Campaign ID 和 `last_completed_bar_ms`，状态新增并冻结 `20000 / 0.10 / 20`。22:00–23:00 停机期间的中间轮次没有补跑，也未伪报完成。
+- 恢复后的 23:10 K 线产生真实 PA 多单 execution `25ca0e71-0cfd-573a-94ef-b04be6edbaa1`，固定风险预算 `2000 USDT`、数量 `82630`，经 Controller→Worker 提交 OKX Demo 限价单 `3771656369780903938`。270 秒内成交 0 后按规则撤单，没有切市价；最终 `canceled / remaining=0 / attention=false`。
+- 23:27:32 最终券商回查：非零仓位 0、普通挂单 0、八类算法单全 0。Campaign `active`、累计 9 成功/0 失败、最近 `execution:canceled`；Worker PID `55264` 心跳和成功对账新鲜、kill=0、未解决 uncertain=0。
+- 四项 GUI/Campaign 安全阻断的独立对抗复审结论为 `PASS`。桌面可见验收仍未完成，必须由用户自行启动 `D:\Desktop\PA_Agent.lnk` 并提供截图。
+
+## 2026-07-25 OKX 实盘工作台与常驻临时故障恢复
+
+### GUI 与配置语义
+
+- 主窗口新增“分析工作台 / 实盘交易”一级页签，旧“实盘交易”菜单改为直接切换工作台，不再打开后端字段堆叠的大配置弹窗。
+- 实盘工作台只在主视图展示用户需要的事实：OKX Demo、Campaign/Worker、风险停止、最新 PA 决策、生命周期、账户资金、当前生效配置和下次启动配置。API 地址、账户身份摘要、命令 ID、execution ID 和原始错误码默认收进技术详情。
+- 风险预算模式固定为“资金上限 + 风险比例 + 最大杠杆 → 唯一张数”；固定张数模式固定为“张数 + 最大杠杆 → 反算最坏损失和风险比例”。两种模式互斥，容量不足或超过风险上限直接阻断，不自动缩小张数。
+- 离屏人工检查文件：`scratch/trading_workbench_1440x900.png`、`scratch/trading_workbench_1920x1080.png`、`scratch/trading_workbench_fixed_1440x900.png`。三张均无重叠、截断或横向拥挤；正式桌面可见验收仍由用户自行从 `D:\Desktop\PA_Agent.lnk` 重启并截图。
+
+### 真实运行证据
+
+- 02:54 前硬门：非零仓位 0、普通挂单 0、八类算法单全部 0、活动 execution 0、未解决写命令 0；Worker `7aad2cb0-f474-4a26-9e8b-49f9e78e5490` 心跳和成功对账新鲜。
+- 临时 `risk_runtime_BrokerTransportError` 由命令 `4cc7e044-5f99-4241-a9f8-928d7b8e4870` 完成专用复核恢复。恢复后 `kill_active=0`，`adjusted_high_water_usd=78303.57015174496`，没有重锚。
+- 新 Campaign `73451990-ce0f-490d-be94-bc3522d86699`、进程树 `52720 → 26936` 已真实加载自动恢复代码；首根自然 10m K 线先完成专用恢复，再得到 PA `blocked:no_order`，没有强制制造订单，Campaign 保持 `active`。
+- 第二根自然 10m K 线产生真实空单 execution `aa90ddfe-08e7-5fa8-a91f-49da9170dec8`：固定有效资本 `20000 USDT`、授权风险预算 `2000 USDT`、数量 `113724` 张，OKX Demo 实际均价 `4059.4012750167071155`，20x 净空持仓 `-113724`。两张原生 OCO `3772100057026174976 / 3772100521721503744` 各覆盖 `56862` 张，止损 `4064.8`，止盈 `4057.5 / 4050.2`；保护总量等于持仓，普通挂单 0、其他算法单 0、execution=`open`、`needs_attention=false`。这是真实自然 PA 反馈，不是 canary；后续终态仍由常驻 Worker/Campaign 继续监控。
+- 旧进程竞态生成的 execution `6cb04c25-9d30-597c-be8a-1900850d5c62` 被 Worker 提交前风险闸门确定阻断为 `BLOCKED`；命令 `74d09a47-c92a-4da1-bed8-301ef55bc8c5` 为 `FAILED`，无券商订单号。该失败发生后、02:54 新 Campaign 启动前的只读真值为仓位 0、普通挂单 0、八类算法单全部 0；不能把这个历史空仓快照误当成 03:05 自然空单之后的当前状态。
+
+### 工程门禁
+
+- 交易、风险、Worker、Campaign 与新工作台定向回归：`469` 通过、`0` 失败；临时恢复、确定性提交阻断和重启继承用例定向回归：`99` 通过、`0` 失败。
+- 完整单元测试收集 `1550` 项：`1532` 通过、`18` 失败。18 项仍是既有一致性/连续性、旧预测面板、音效、价格跳动、OpenClaw 和宽松枚举映射范围，本阶段没有新增失败。
+- 新工作台、Campaign、风险运行态及其测试 Ruff `E/F/I/UP/B/C4`、`compileall pa_agent tests` 与 `git diff --check` 通过。仓库其余本轮涉及的既有大文件仍有历史行长、导入顺序、RUF/SIM/中文标点和宽异常捕获问题，因此 PRD 第 16 条按严格口径仍未完全通过。
+
+### 03:31 最终对抗复审修正
+
+- 最终受影响范围回归：`319` 通过、`0` 失败。最终只读对抗复审结论为 `P0 / P1 / P2 全 PASS`，未发现残余阻断。
+- 固定张数现在由不可变计划携带 `sizing_mode / fixed_quantity / risk_used / contract_notional / worst_case_loss_per_contract`。Worker 写前用同一模式重算并逐项比较；单张风险变化但最终张数仍相同也会在券商预检和 POST 前阻断。真实本地全链 `Controller → Worker → ExecutionService → OkxAdapter → Fake OKX POST` 已证明固定 `2` 张只形成一次 `2` 张入场 POST；固定模式杠杆授权只绑定资金上限、模式、固定张数和最大杠杆，不使用隐藏风险比例。
+- 临时风险恢复把本根 K 线和唯一命令 ID 写入 Campaign 状态。超时或重启后只等待原命令；若进程崩溃在入队与命令 ID 落盘之间，本根直接跳过而不创建第二条命令。`ERROR / UNKNOWN / needs_attention` execution 不允许被普通重启路径当作安全终态跨过。
+- 工作台只列出并操作 `OKX / demo` 执行；陈旧账户快照显示为未知而不显示旧金额，未知风险不标绿。风险预算与预计实际最坏损失分开显示；固定模式新增只读反算，保证金字段明确为“按最大杠杆估算的最低保证金”。未知英文错误、UUID 和后端事件码不再进入主表。
+- 完整主窗口离屏图 `scratch/main_window_trading_1440x900.png` 与固定模式图 `scratch/trading_workbench_fixed_1440x900.png` 已重新生成并人工查看；一级页签、菜单、状态栏、北京时间、只读反算和完整页面滚动均正常，无横向重叠。
+- 03:24 只读运行证据：自然空单第一档 `56862` 张已止盈，剩余 `56862` 张由同量 `reduceOnly` 原生 OCO 完整保护；普通挂单和其余算法单为 0，Campaign 同向持有且未重复加仓，风险停止为 0。执行账本的价格差盈利与 OKX 净已实现盈亏口径不一致，尚未核清费用/资金费前不得把前者称为净利润。
+- 当前 Campaign 在最终“耐久恢复命令 ID”和“固定张数完整写前快照”修正前已经启动。因为仍有真实受保护仓位，本轮没有重启服务或 Campaign；磁盘最终代码只会在下次空仓硬门通过后的安全重启中加载。
