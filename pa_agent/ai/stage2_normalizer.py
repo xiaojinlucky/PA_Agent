@@ -503,6 +503,19 @@ def _unwrap_flat_stage2_decision(out: dict[str, Any]) -> bool:
         order_type = _order_type_from_decision_scalar(raw) or "不下单"
         decision: dict[str, Any] = {"order_type": order_type}
         decision.update(hoisted)
+        if order_type == "不下单":
+            # 模型的决策主张只有这个标量（wait/reject 等）；游离在顶层被
+            # 拾取的价位字段属于格式噪音而非结构化主张，构造程序字典时
+            # 显式置空是格式修复，不是清洗结构化矛盾主张（PR3.1 只约束
+            # 模型自己填好的 decision 字典）。
+            for field in (
+                "order_direction",
+                "entry_price",
+                "take_profit_price",
+                "take_profit_price_2",
+                "stop_loss_price",
+            ):
+                decision[field] = None
         out["decision"] = decision
         logger.debug(
             "Unwrapped scalar decision %r -> order_type=%s with %d hoisted fields",
@@ -767,25 +780,6 @@ def _coerce_decision_no_order(out: dict[str, Any]) -> bool:
 
     _clear_decision_to_no_order(decision)
     logger.debug("Coerced decision to 不下单 (%s)", ", ".join(triggers))
-    return True
-
-
-def _coerce_breakout_without_basis(out: dict[str, Any]) -> bool:
-    """Breakout orders require entry_basis_*; fall back to limit when missing."""
-    decision = out.get("decision")
-    if not isinstance(decision, dict):
-        return False
-    if decision.get("order_type") != "突破单":
-        return False
-    if decision.get("entry_basis_bar") and decision.get("entry_basis_extreme"):
-        return False
-    decision["order_type"] = "限价单"
-    decision["entry_basis_bar"] = None
-    decision["entry_basis_extreme"] = None
-    decision["entry_rule"] = None
-    logger.debug(
-        "breakout order missing entry_basis_*; coerced to 限价单"
-    )
     return True
 
 
@@ -1230,34 +1224,19 @@ def _normalize_next_bar_prediction(prediction: dict[str, Any]) -> None:
 
         prediction["probabilities"] = normalized
 
-        # 5. direction = argmax (R3.3) — respect model choice on ties
+        # 5. direction = argmax（R3.3）：确定性不变量，平局按规范序
+        #    ("bullish","bearish","neutral") 取首个最大值。不保留模型的
+        #    平局偏好——方向必须可由概率分布唯一重算，保证归一化幂等且可审计。
         order = ("bullish", "bearish", "neutral")
         max_value = max(normalized[k] for k in order)
-        tied_winners = [k for k in order if normalized[k] == max_value]
+        expected = next(k for k in order if normalized[k] == max_value)
         model_direction = str(prediction.get("direction") or "").strip().lower()
-
-        if len(tied_winners) > 1:
-            # Tie: preserve model's choice if it's one of the winners
-            if model_direction in tied_winners:
-                pass  # keep model's semantic choice
-            else:
-                # Model direction not in tied set — override with first winner
-                logger.warning(
-                    "next_bar_prediction direction=%r not in tied winners %s "
-                    "(probs=%s); overriding to %r",
-                    model_direction, tied_winners, normalized, tied_winners[0],
-                )
-                prediction["direction"] = tied_winners[0]
-        else:
-            # Clear winner
-            expected = tied_winners[0]
-            if model_direction != expected:
-                logger.debug(
-                    "next_bar_prediction direction %r -> %r (argmax of %s)",
-                    model_direction, expected, normalized,
-                )
-                prediction["direction"] = expected
-            # else: model direction matches argmax, no change needed
+        if model_direction != expected:
+            logger.debug(
+                "next_bar_prediction direction %r -> %r (argmax of %s)",
+                model_direction, expected, normalized,
+            )
+            prediction["direction"] = expected
     # else: unparseable probabilities with unpredictable=False — leave for validator
 
     # 6. Strip extra keys not allowed by the schema (additionalProperties: false).
@@ -1594,9 +1573,9 @@ def normalize_stage2(
             DecisionNodeEngine.apply_stage2(out, kline_frame, stage1_json)
         except Exception as exc:  # noqa: BLE001
             logger.warning("DecisionNodeEngine.apply_stage2 failed: %s", exc)
-    if _coerce_breakout_without_basis(out):
-        logger.debug("Coerced breakout-without-basis to 限价单 after DecisionNodeEngine")
-
+    # 突破单缺失 entry_basis_* 不再静默降级为限价单：改写订单类型属于决策
+    # 伪造。留给 schema 的突破单分支拒绝（category c，missing_fields 指明
+    # 缺失依据），由带反馈的重试要求模型补全挂单依据。
     normalize_stage2_traces(
         out,
         normalization_mode=normalization_mode,
@@ -1604,9 +1583,12 @@ def normalize_stage2(
     )
     decision = out.get("decision")
     if isinstance(decision, dict) and decision.get("order_type") == "不下单":
-        # A no-order decision must satisfy the schema "then" branch:
-        # all price fields + direction must be null.
-        for field in _NO_ORDER_PRICE_FIELDS:
+        # 提示词明确告知模型：不下单时 entry/tp/tp2/sl/order_direction 必须全空。
+        # 这些字段带值属于模型的矛盾主张（PR3.1），必须留给 schema 拒绝并
+        # 走带反馈的重试，禁止在这里静默清空洗白。
+        # 未向模型宣告的辅助字段（basis/entry_rule/estimated_win_rate）仍做
+        # 规范化置空，避免惩罚模型未被告知的规则。
+        for field in ("entry_basis_bar", "entry_basis_extreme", "entry_rule"):
             decision[field] = None
         decision["estimated_win_rate"] = None
         # trade_confidence / trade_confidence_reasoning are required (non-nullable)

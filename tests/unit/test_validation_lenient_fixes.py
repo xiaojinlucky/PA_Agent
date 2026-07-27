@@ -56,6 +56,7 @@ def test_lenient_validator_accepts_pending_answer_synonym() -> None:
     obj["decision"]["order_direction"] = None
     obj["decision"]["entry_price"] = None
     obj["decision"]["take_profit_price"] = None
+    obj["decision"]["take_profit_price_2"] = None
     obj["decision"]["stop_loss_price"] = None
     obj["decision_trace"].append(
         {

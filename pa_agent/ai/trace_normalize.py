@@ -791,6 +791,13 @@ def _repair_gate_result(obj: dict[str, Any]) -> None:
     gate = obj.get("gate_trace")
     if not isinstance(gate, list) or not gate:
         return
+    # 截断修复注入的 AUTO 桩表示原始输出没有真实闸门记录；
+    # 此时 unknown 是诚实结论，绝不允许翻转为 proceed（伪造闸门通过）。
+    if any(
+        isinstance(item, dict) and str(item.get("node_id", "")) == "AUTO"
+        for item in gate
+    ):
+        return
     # Check for valid blocking conditions
     node_12_block = any(
         isinstance(item, dict)

@@ -1255,10 +1255,12 @@ def test_repair_misplaced_decision_fields_from_diagnosis_summary() -> None:
     assert "estimated_win_rate_reasoning" not in out["diagnosis_summary"]
 
 
-def test_coerce_breakout_without_basis_to_limit() -> None:
-    from pa_agent.ai.stage2_normalizer import _coerce_breakout_without_basis
+def test_breakout_without_basis_is_not_coerced_to_limit() -> None:
+    """突破单缺 entry_basis_* 不得静默降级为限价单（决策伪造）。
 
-    out = {
+    归一化保持订单类型不变，由 schema 突破单分支拒绝并触发带反馈重试。
+    """
+    payload = {
         "decision": {
             "order_type": "突破单",
             "entry_basis_bar": None,
@@ -1266,6 +1268,5 @@ def test_coerce_breakout_without_basis_to_limit() -> None:
             "entry_rule": "K1 high + 1 tick",
         }
     }
-    assert _coerce_breakout_without_basis(out) is True
-    assert out["decision"]["order_type"] == "限价单"
-    assert out["decision"]["entry_rule"] is None
+    out = normalize_stage2(payload, skip_next_bar=True)
+    assert out["decision"]["order_type"] == "突破单"

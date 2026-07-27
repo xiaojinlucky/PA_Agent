@@ -227,8 +227,10 @@ class ValidationSettings(BaseModel):
     stage2_coherence_checks: bool = False
     trace_semantic_checks: bool = False
     strict_bar_by_bar_features: bool = False
-    #: Allow Stage 1 truncated JSON tail repair before failing syntax validation.
-    disable_truncation_repair: bool = False
+    #: Stage 1 截断 JSON 尾部注入修复默认关闭（Let it crash）：截断输出按
+    #: 语法失败进入带反馈的重试，只有显式配置 False 才允许注入修复；
+    #: 注入修复也只能给出 gate_result=unknown，绝不伪造 proceed。
+    disable_truncation_repair: bool = True
     #: Re-call API with structured feedback when validation fails (format errors).
     retry_enabled: bool = True
     retry_max: int = Field(default=3, ge=0, le=5)

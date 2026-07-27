@@ -558,3 +558,79 @@ def test_planned_limit_allows_k1_wick_touch_entry() -> None:
         decision, _frame(), bar_analysis=bar_analysis
     )
     assert not errors, errors
+
+
+def test_price_grounding_rejects_hallucinated_level() -> None:
+    """价位远超真实 OHLC 包络 → 反幻觉拒绝（PR 反幻觉层）。"""
+    from pa_agent.util.trade_metrics import validate_price_grounding
+
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 4527.4,
+        "take_profit_price": 4529.5,
+        "take_profit_price_2": 4531.0,
+        "stop_loss_price": 4524.9,
+    }
+    errors = validate_price_grounding(decision, _frame())
+    assert errors
+    assert any("entry_price" in e for e in errors)
+    assert any("OHLC 包络" in e for e in errors)
+
+
+def test_price_grounding_accepts_prices_inside_envelope() -> None:
+    from pa_agent.util.trade_metrics import validate_price_grounding
+
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 101.0,
+        "take_profit_price": 104.0,
+        "take_profit_price_2": 106.0,
+        "stop_loss_price": 100.0,
+    }
+    assert validate_price_grounding(decision, _frame()) == []
+
+
+def test_price_grounding_allows_breakout_within_atr_margin() -> None:
+    """合法突破挂单允许高出包络一个 ATR 容差，不得误杀。"""
+    from pa_agent.util.trade_metrics import validate_price_grounding
+
+    frame = _frame()
+    envelope_high = max(float(b.high) for b in frame.bars if b.closed)
+    atr_values = [
+        float(v)
+        for v in frame.indicators.atr14
+        if v == v and float(v) > 0
+    ]
+    assert atr_values, "fixture frame 必须带有效 ATR"
+    just_above = envelope_high + atr_values[0] * 0.5
+    decision = {
+        "order_type": "突破单",
+        "order_direction": "做多",
+        "entry_price": just_above,
+        "take_profit_price": None,
+        "take_profit_price_2": None,
+        "stop_loss_price": None,
+    }
+    assert validate_price_grounding(decision, frame) == []
+    far_above = envelope_high + atr_values[0] * 5
+    decision["entry_price"] = far_above
+    assert validate_price_grounding(decision, frame)
+
+
+def test_price_grounding_wired_into_order_metrics() -> None:
+    """validate_order_trade_metrics 传入 kline_frame 时必须执行包络校验。"""
+    decision = {
+        "order_type": "限价单",
+        "order_direction": "做多",
+        "entry_price": 4527.4,
+        "take_profit_price": 4533.0,
+        "take_profit_price_2": 4540.0,
+        "stop_loss_price": 4524.0,
+        "estimated_win_rate": 60,
+    }
+    errors = validate_order_trade_metrics(
+        decision, decision_stance="extreme_aggressive", kline_frame=_frame()
+    )
+    assert any("OHLC 包络" in e for e in errors)
