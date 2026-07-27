@@ -125,3 +125,47 @@ def session_state(market: str, at_utc_ms: int) -> MarketSessionState:
 def is_trading_minute(market: str, at_utc_ms: int) -> bool:
     """指定 UTC 毫秒时刻是否处于连续交易时段（午休不算）。"""
     return session_state(market, at_utc_ms).phase is SessionPhase.OPEN
+
+
+#: 开盘时段与尾盘各自的窗口长度（分钟）。日内结构在这两段与中段差异显著。
+_EDGE_WINDOW_MINUTES = 60
+
+
+@dataclass(frozen=True)
+class IntradayPhase:
+    """K 线所处的日内阶段，仅作背景描述。"""
+
+    label: str
+    is_half_day: bool
+    minutes_from_open: int | None
+    minutes_to_close: int | None
+
+
+def intraday_phase(market: str, at_utc_ms: int) -> IntradayPhase:
+    """把会话状态细分为开盘时段/午盘/尾盘/午休/闭市。
+
+    半日市的收盘时间本就更早，尾盘窗口随之自动前移，不需要特判。
+    连续交易时段短于两个窗口之和时（如半日市），优先判开盘时段，
+    避免同一根 K 线既算开盘又算尾盘。
+    """
+    state = session_state(market, at_utc_ms)
+    if state.phase is SessionPhase.CLOSED:
+        return IntradayPhase("闭市", False, None, None)
+    if state.phase is SessionPhase.BREAK:
+        return IntradayPhase("午休", state.is_half_day, None, None)
+
+    calendar = _calendar_for_market(market)
+    minute = _timestamp(at_utc_ms)
+    session = calendar.minute_to_session(minute)
+    open_ms = _to_utc_ms(calendar.session_open(session))
+    close_ms = _to_utc_ms(calendar.session_close(session))
+    from_open = max(0, (at_utc_ms - open_ms) // 60000)
+    to_close = max(0, (close_ms - at_utc_ms) // 60000)
+
+    if from_open < _EDGE_WINDOW_MINUTES:
+        label = "开盘时段"
+    elif to_close <= _EDGE_WINDOW_MINUTES:
+        label = "尾盘"
+    else:
+        label = "午盘"
+    return IntradayPhase(label, state.is_half_day, int(from_open), int(to_close))

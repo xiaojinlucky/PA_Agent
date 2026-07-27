@@ -138,6 +138,77 @@ def _structure_label(frame: KlineFrame, *, window: int = 20) -> str:
     return "过渡/混合"
 
 
+#: 连续多少根未触及 EMA20 即视为趋势极强（原始资料的 20GB）。
+_GAP_BAR_THRESHOLD = 20
+
+
+def _gap_bar_streak(frame: KlineFrame) -> int:
+    """从最新已收盘 K 线往回数，连续多少根完全没触及 EMA20。
+
+    触及 = 该根的 [low, high] 区间覆盖到当根 EMA20。缺 EMA 或价格
+    非有限值时立即停止计数，不猜测。
+    """
+    ema_series = frame.indicators.ema20 if frame.indicators else ()
+    streak = 0
+    for index, bar in enumerate(frame.bars):
+        if index >= len(ema_series):
+            break
+        ema = _finite(ema_series[index])
+        high = _finite(bar.high)
+        low = _finite(bar.low)
+        if ema is None or high is None or low is None:
+            break
+        if min(low, high) <= ema <= max(low, high):
+            break
+        streak += 1
+    return streak
+
+
+def _nearest_levels(
+    frame: KlineFrame, *, window: int = 40
+) -> tuple[tuple[float, int] | None, tuple[float, int] | None]:
+    """返回最新收盘价上方最近阻力与下方最近支撑（价格，来自第几根）。
+
+    只用真实 swing 极点：某根的高点高于左右相邻两根即为 swing high，
+    低点低于左右相邻两根即为 swing low。找不到就返回 None，不编造价位。
+    """
+    bars = tuple(frame.bars[:window])
+    if len(bars) < 3:
+        return None, None
+    close = _finite(bars[0].close)
+    if close is None:
+        return None, None
+
+    resistance: tuple[float, int] | None = None
+    support: tuple[float, int] | None = None
+    for i in range(1, len(bars) - 1):
+        bar, newer, older = bars[i], bars[i - 1], bars[i + 1]
+        high = _finite(bar.high)
+        low = _finite(bar.low)
+        newer_high, newer_low = _finite(newer.high), _finite(newer.low)
+        older_high, older_low = _finite(older.high), _finite(older.low)
+        if None in (high, low, newer_high, newer_low, older_high, older_low):
+            continue
+        seq = int(getattr(bar, "seq", i + 1) or i + 1)
+        if high > newer_high and high > older_high and high > close:
+            if resistance is None or high < resistance[0]:
+                resistance = (high, seq)
+        if low < newer_low and low < older_low and low < close:
+            if support is None or low > support[0]:
+                support = (low, seq)
+    return resistance, support
+
+
+def _levels_label(frame: KlineFrame) -> str:
+    resistance, support = _nearest_levels(frame)
+    parts: list[str] = []
+    if resistance is not None:
+        parts.append(f"上方最近阻力 {resistance[0]:.6g}（K{resistance[1]}）")
+    if support is not None:
+        parts.append(f"下方最近支撑 {support[0]:.6g}（K{support[1]}）")
+    return "；".join(parts) if parts else "窗口内无明确 swing 极点"
+
+
 def _render_frame_line(frame: KlineFrame, *, role: str) -> str:
     if not frame.bars:
         return f"- {role} {frame.timeframe}: 无已收盘数据"
@@ -151,13 +222,18 @@ def _render_frame_line(frame: KlineFrame, *, role: str) -> str:
     )
     structure = _structure_label(frame)
     position = _recent_position_label(frame)
-    return (
+    line = (
         f"- {role} {frame.timeframe}: 标签={_direction_label(frame)}；"
         f"最新已收盘={ts}；收盘={close if close is not None else '—'}；"
         f"EMA20={ema if ema is not None else '—'}（收盘在其{close_side}）；"
         f"ATR14={atr if atr is not None else '—'}；"
-        f"结构={structure}；位置={position}"
+        f"结构={structure}；位置={position}；"
+        f"关键位置={_levels_label(frame)}"
     )
+    streak = _gap_bar_streak(frame)
+    if streak >= _GAP_BAR_THRESHOLD:
+        line += f"；20GB=连续 {streak} 根未触及 EMA20（趋势极强，回撤到 EMA 前不宜逆势）"
+    return line
 
 
 def render_higher_timeframe_context(

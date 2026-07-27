@@ -17,6 +17,7 @@ from pa_agent.ai.market_features import (
 )
 from pa_agent.ai.market_rules import (
     market_rules_block,
+    session_context_line,
     timezone_label_for_symbol,
     timezone_name_for_symbol,
 )
@@ -25,7 +26,7 @@ from pa_agent.ai.pattern_routing import (
     STAGE1_PATTERN_BRIEFS_BLOCK,
 )
 from pa_agent.data.base import KlineFrame
-from pa_agent.data.datetime_ts import format_epoch_for_display
+from pa_agent.data.datetime_ts import format_epoch_for_display, ts_open_to_ms
 from pa_agent.records.schema import AnalysisRecord
 
 logger = logging.getLogger(__name__)
@@ -971,20 +972,27 @@ class PromptAssembler:
         self._txt_cache[filename] = content
         return content
 
-    def _market_rules_section(self, symbol: str) -> str:
-        """按品种所属市场路由制度规则块；未归类市场返回空串（维持原行为）。
+    def _market_rules_section(self, frame: KlineFrame) -> str:
+        """按品种所属市场路由制度规则块，并附当前 K 线所处的日内时段。
 
-        规则块只进用户回合，不进 system prompt——system 必须保持字节一致
-        才能命中 DeepSeek 的 KV 前缀缓存。
+        两者都只进用户回合，不进 system prompt——system 必须保持字节一致
+        才能命中 DeepSeek 的 KV 前缀缓存。时段随每根 K 线变化，更不能进 system。
         """
+        symbol = frame.symbol
         block = market_rules_block(symbol, prompt_dir=self._prompt_dir)
         if not block:
             return ""
-        return (
+        section = (
             "## 市场制度规则（按品种所属市场自动路由；"
             "制度约束用于风险与可执行性判断，不替代 PA 结构分析）\n\n"
             f"{block}"
         )
+        newest = frame.bars[0] if frame.bars else None
+        if newest is not None:
+            session_line = session_context_line(symbol, ts_open_to_ms(newest.ts_open))
+            if session_line:
+                section += f"\n\n{session_line}"
+        return section
 
     # ── K-line table rendering ────────────────────────────────────────────────
 
@@ -1351,7 +1359,7 @@ class PromptAssembler:
                 f"**长程背景**（当前仅 {n_bars} 根，不足 41 根，与近期窗口重叠；"
                 f"以程序预填 §2.2 为准）：\n"
             )
-        market_rules_section = self._market_rules_section(frame.symbol)
+        market_rules_section = self._market_rules_section(frame)
         return (
             "## 阶段一任务\n\n"
             "你现在只执行阶段一：市场诊断与闸门判断。不要评估具体下单、止损、止盈或仓位。\n\n"
@@ -1419,7 +1427,7 @@ class PromptAssembler:
             "stage2_decision": previous_record.stage2_decision or {},
             "strategy_files_used": previous_record.strategy_files_used or [],
         }
-        market_rules_section = self._market_rules_section(frame.symbol)
+        market_rules_section = self._market_rules_section(frame)
         return (
             "## 阶段一增量任务\n\n"
             "你现在只执行阶段一：基于上一轮已完成分析和新增 K 线，更新市场诊断与闸门判断。\n"
@@ -1803,7 +1811,7 @@ class PromptAssembler:
         )
         # 前缀链模式下市场规则块已在上方阶段一用户消息中，不重复注入。
         market_rules_section = (
-            "" if omit_kline_block else self._market_rules_section(frame.symbol)
+            "" if omit_kline_block else self._market_rules_section(frame)
         )
         return (
             f"{_STAGE2_API_TASK_RULE}\n\n"

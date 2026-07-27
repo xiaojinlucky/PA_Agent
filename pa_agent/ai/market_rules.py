@@ -76,6 +76,50 @@ def timezone_label_for_symbol(symbol: str) -> str:
     return _MARKET_TIMEZONE_LABELS[market]
 
 
+#: market_rules 的市场键 → market_calendar 的日历键。加密不参与日内时段。
+_CALENDAR_MARKET_KEYS: dict[str, str] = {
+    "CN": "CN",
+    "HK": "HK",
+    "US": "US",
+}
+
+
+def session_context_line(symbol: str, bar_open_utc_ms: object) -> str | None:
+    """返回 K 线所处日内时段的薄标签；不适用时返回 None。
+
+    仅股票市场有开盘/午盘/尾盘语义；加密 24 小时连续交易、未归类符号
+    （如 MT5 的 XAUUSD）一律不加，保持原有行为一字不变。
+    标签只作背景，不承载任何硬性交易限制。
+    """
+    market = market_for_symbol(symbol)
+    calendar_key = _CALENDAR_MARKET_KEYS.get(market or "")
+    if calendar_key is None:
+        return None
+    try:
+        at_ms = int(float(bar_open_utc_ms))
+    except (TypeError, ValueError):
+        return None
+    if at_ms <= 0:
+        return None
+
+    from pa_agent.data.market_calendar import MarketCalendarError, intraday_phase
+
+    try:
+        phase = intraday_phase(calendar_key, at_ms)
+    except MarketCalendarError as exc:
+        logger.info("符号 %s 无法判定日内时段，跳过时段标签：%s", symbol, exc)
+        return None
+
+    parts = [f"当前 K 线时段：{phase.label}"]
+    if phase.is_half_day:
+        parts.append("半日市")
+    if phase.minutes_from_open is not None:
+        parts.append(f"距开盘 {phase.minutes_from_open} 分钟")
+    if phase.minutes_to_close is not None:
+        parts.append(f"距收盘 {phase.minutes_to_close} 分钟")
+    return "；".join(parts) + "（仅作背景，不构成交易限制）"
+
+
 def market_rules_block(symbol: str, *, prompt_dir: Path) -> str | None:
     """加载符号所属市场的规则块正文；市场未归类时返回 None。
 

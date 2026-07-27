@@ -108,3 +108,65 @@ def test_stage2_prefix_chain_mode_skips_duplicate_rules(
 def test_system_prompt_stays_market_free(assembler: PromptAssembler):
     system_prompt = assembler._build_shared_system_prompt_inner()
     assert "市场制度规则块" not in system_prompt
+
+
+def _frame_at(symbol: str, utc_iso: str, *, n: int = 3):
+    """构造最新已收盘 K 线开盘时刻为 utc_iso 的分析帧。"""
+    from datetime import UTC, datetime
+
+    base_ms = int(datetime.fromisoformat(utc_iso).replace(tzinfo=UTC).timestamp() * 1000)
+    frame = _frame(symbol, n=n)
+    bars = tuple(
+        KlineBar(
+            seq=bar.seq,
+            ts_open=float(base_ms - i * 600_000),
+            open=bar.open,
+            high=bar.high,
+            low=bar.low,
+            close=bar.close,
+            volume=bar.volume,
+            amount=bar.amount,
+            closed=bar.closed,
+        )
+        for i, bar in enumerate(frame.bars)
+    )
+    return KlineFrame(
+        symbol=frame.symbol,
+        timeframe=frame.timeframe,
+        bars=bars,
+        indicators=frame.indicators,
+        snapshot_ts_local_ms=frame.snapshot_ts_local_ms,
+    )
+
+
+def test_stage1_injects_session_phase_for_stocks(assembler: PromptAssembler):
+    # 2025-06-04 周三 13:45 UTC = 美东 09:45，开盘后 15 分钟
+    prompt = assembler._build_stage1_user_prompt(
+        _frame_at("AAPL.US", "2025-06-04T13:45:00")
+    )
+    assert "当前 K 线时段：开盘时段" in prompt
+    assert "仅作背景，不构成交易限制" in prompt
+
+
+def test_stage1_session_phase_tracks_close_of_session(assembler: PromptAssembler):
+    # 2025-06-05 周四 06:40 UTC = 北京 14:40，A 股尾盘
+    prompt = assembler._build_stage1_user_prompt(
+        _frame_at("600519.SH", "2025-06-05T06:40:00")
+    )
+    assert "当前 K 线时段：尾盘" in prompt
+
+
+def test_stage1_no_session_phase_for_crypto_or_unmapped(assembler: PromptAssembler):
+    crypto = assembler._build_stage1_user_prompt(
+        _frame_at("XAU-USDT-SWAP", "2025-06-04T13:45:00")
+    )
+    assert "当前 K 线时段" not in crypto
+    unmapped = assembler._build_stage1_user_prompt(
+        _frame_at("XAUUSD", "2025-06-04T13:45:00")
+    )
+    assert "当前 K 线时段" not in unmapped
+
+
+def test_system_prompt_never_carries_session_phase(assembler: PromptAssembler):
+    """时段随每根 K 线变化，绝不能进 system prompt（会击穿前缀缓存）。"""
+    assert "当前 K 线时段" not in assembler._build_shared_system_prompt_inner()
