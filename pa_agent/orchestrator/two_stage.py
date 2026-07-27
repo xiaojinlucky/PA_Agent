@@ -180,6 +180,62 @@ def _enrich_stage1_validation_message(err: ValidationError, reply: Any) -> str:
     return f"{err.message}。{detail}" if detail else err.message
 
 
+def _claim_validation_code(err: ValidationError) -> str | None:
+    from pa_agent.ai.claim_validation import extract_claim_validation_code
+
+    return extract_claim_validation_code(err.invalid_fields)
+
+
+def _validation_exception(
+    err: ValidationError,
+    *,
+    stage: str,
+    message: str,
+    attempts: int,
+) -> dict[str, Any]:
+    claim_code = _claim_validation_code(err)
+    exception_type = (
+        "provider_error"
+        if err.category == "e"
+        else "claim_validation"
+        if claim_code
+        else "validation_error"
+    )
+    payload: dict[str, Any] = {
+        "type": exception_type,
+        "stage": stage,
+        "category": err.category,
+        "message": message,
+        "missing_fields": err.missing_fields,
+        "invalid_fields": err.invalid_fields,
+        "raw_text": err.raw_text,
+        "parse_position": err.parse_position,
+        "validation_attempts": attempts,
+    }
+    if claim_code:
+        payload["code"] = claim_code
+    return payload
+
+
+def _save_validation_partial(
+    writer: Any,
+    record: AnalysisRecord,
+    *,
+    stage: str,
+    category: str,
+    claim_code: str | None,
+) -> None:
+    reason = (
+        f"{stage}_claim_validation_{claim_code}"
+        if claim_code
+        else f"{stage}_{category}"
+    )
+    if claim_code:
+        writer.save_partial_durable(record, reason)
+    else:
+        writer.save_partial(record, reason)
+
+
 def _emit_buffered_stream(
     text: str,
     on_token: Callable[[str], None] | None,
@@ -199,6 +255,7 @@ def _build_empty_record(
     settings: Optional["Settings"],
     *,
     htf_text: str = "",
+    campaign_id: str | None = None,
 ) -> AnalysisRecord:
     """Build a partial AnalysisRecord with meta populated from the frame."""
     ts_ms = now_local_ms()
@@ -252,6 +309,7 @@ def _build_empty_record(
         bar_count=len(frame.bars),
         ai_provider=ai_provider,
         decision_stance=decision_stance,
+        campaign_id=campaign_id,
     )
 
     atr14 = None
@@ -269,6 +327,7 @@ def _build_empty_record(
         kline_data=kline_data,
         htf_text=htf_text,
         analysis_atr14=atr14,
+        analysis_price_tick=frame.price_tick,
         stage1_messages=[],
         stage1_response=None,
         stage1_diagnosis=None,
@@ -374,6 +433,7 @@ class TwoStageOrchestrator:
         previous_record: AnalysisRecord | None = None,
         incremental_new_bar_count: int | None = None,
         higher_timeframe_text: str = "",
+        campaign_id: str | None = None,
     ) -> AnalysisRecord:
         """Run the two-stage analysis pipeline and return an AnalysisRecord.
 
@@ -401,6 +461,7 @@ class TwoStageOrchestrator:
             frame,
             self._settings,
             htf_text=higher_timeframe_text,
+            campaign_id=campaign_id,
         )
 
         # ── Step 2: Pre-Stage-1 cancel check ─────────────────────────────────
@@ -594,6 +655,7 @@ class TwoStageOrchestrator:
         if isinstance(result_s1, ValidationError):
             err = result_s1
             err_message = _enrich_stage1_validation_message(err, reply_s1)
+            claim_code = _claim_validation_code(err)
             logger.warning(
                 "Stage 1 validation failed: category=%s message=%s",
                 err.category,
@@ -604,20 +666,21 @@ class TwoStageOrchestrator:
                     "stage1_messages": messages_s1,
                     "stage1_response": reply_s1.raw,
                     "usage_total": _accumulate_usage_calls(record.usage_total, s1_usage_calls),
-                    "exception": {
-                        "type": "provider_error" if err.category == "e" else "validation_error",
-                        "stage": "stage1",
-                        "category": err.category,
-                        "message": err_message,
-                        "missing_fields": err.missing_fields,
-                        "invalid_fields": err.invalid_fields,
-                        "raw_text": err.raw_text,
-                        "parse_position": err.parse_position,
-                        "validation_attempts": vr_s1.attempts,
-                    },
+                    "exception": _validation_exception(
+                        err,
+                        stage="stage1",
+                        message=err_message,
+                        attempts=vr_s1.attempts,
+                    ),
                 }
             )
-            self._pending_writer.save_partial(record, f"stage1_{err.category}")
+            _save_validation_partial(
+                self._pending_writer,
+                record,
+                stage="stage1",
+                category=err.category,
+                claim_code=claim_code,
+            )
             on_event(OrchestratorEvent.Stage1Failed)
             return record
 
@@ -904,6 +967,7 @@ class TwoStageOrchestrator:
         if isinstance(result_s2, ValidationError):
             err = result_s2
             err_message = _enrich_stage2_validation_message(err, reply_s2)
+            claim_code = _claim_validation_code(err)
             logger.warning(
                 "Stage 2 validation failed: category=%s message=%s",
                 err.category,
@@ -925,20 +989,21 @@ class TwoStageOrchestrator:
                         _accumulate_usage_calls(record.usage_total, s1_usage_calls),
                         s2_usage_calls,
                     ),
-                    "exception": {
-                        "type": "provider_error" if err.category == "e" else "validation_error",
-                        "stage": "stage2",
-                        "category": err.category,
-                        "message": err_message,
-                        "missing_fields": err.missing_fields,
-                        "invalid_fields": err.invalid_fields,
-                        "raw_text": err.raw_text,
-                        "parse_position": err.parse_position,
-                        "validation_attempts": vr_s2.attempts,
-                    },
+                    "exception": _validation_exception(
+                        err,
+                        stage="stage2",
+                        message=err_message,
+                        attempts=vr_s2.attempts,
+                    ),
                 }
             )
-            self._pending_writer.save_partial(record, f"stage2_{err.category}")
+            _save_validation_partial(
+                self._pending_writer,
+                record,
+                stage="stage2",
+                category=err.category,
+                claim_code=claim_code,
+            )
             on_event(OrchestratorEvent.Stage2Failed)
             return record
 

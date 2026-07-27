@@ -99,8 +99,9 @@ def test_free_chat_after_analysis(qtbot, tmp_path, monkeypatch):
     window._ctx.settings.general.analysis_bar_count = 20
     window._last_frame_ready_bars = make_newest_first_bars(
         50,
+        base_price=2036.0,
         with_forming=True,
-        trend_step=5.0,
+        trend_step=2.0,
     )
 
     window._on_submit_analysis()

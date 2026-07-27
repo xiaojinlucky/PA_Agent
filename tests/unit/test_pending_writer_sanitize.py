@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 
-
-from pa_agent.records.pending_writer import PendingWriter
+from pa_agent.orchestrator.free_chat import _derive_record_id
+from pa_agent.records.pending_writer import (
+    PendingWriter,
+    _build_basename,
+    _build_legacy_basename,
+)
 from pa_agent.util.mask_secret import mask_secret
-
 
 # ---------------------------------------------------------------------------
 # _sanitize static method
@@ -168,3 +172,144 @@ class TestSavePartialSanitizes:
         data = json.loads(path.read_text(encoding="utf-8"))
         assert data["_partial_reason"] == "stage2_c"
         assert data["exception"]["partial_reason"] == "stage2_c"
+
+    def test_claim_failure_partial_is_durable_and_reloadable(self, tmp_path):
+        from pa_agent.records.analysis_history import load_record
+
+        record = _make_record("sk-test").model_copy(
+            update={
+                "exception": {
+                    "type": "claim_validation",
+                    "stage": "stage2",
+                    "category": "c",
+                    "code": "price_out_of_range",
+                    "message": "bad price",
+                    "invalid_fields": [
+                        "claim_validation:price_out_of_range:"
+                        "decision.entry_price:bad price"
+                    ],
+                }
+            }
+        )
+        writer = PendingWriter(pending_dir=tmp_path)
+        path = writer.save_partial_durable(
+            record,
+            reason="stage2_claim_validation_price_out_of_range",
+        )
+
+        reloaded = load_record(path)
+        assert reloaded is not None
+        assert reloaded.exception is not None
+        assert reloaded.exception["code"] == "price_out_of_range"
+        assert (
+            reloaded.exception["partial_reason"]
+            == "stage2_claim_validation_price_out_of_range"
+        )
+
+    def test_generic_partial_remains_unavailable_as_history_baseline(
+        self,
+        tmp_path,
+    ):
+        from pa_agent.records.analysis_history import load_record
+
+        record = _make_record("sk-test")
+        writer = PendingWriter(pending_dir=tmp_path)
+        path = writer.save_partial(record, reason="timeout")
+
+        assert load_record(path) is None
+
+    def test_campaign_id_separates_same_second_record_names(
+        self,
+        tmp_path,
+    ):
+        record = _make_record("sk-test")
+        campaign_record = record.model_copy(
+            update={
+                "meta": record.meta.model_copy(
+                    update={
+                        "campaign_id": (
+                            "11111111-1111-4111-8111-111111111111"
+                        )
+                    }
+                )
+            }
+        )
+        writer = PendingWriter(pending_dir=tmp_path)
+
+        assert writer.full_path(record) != writer.full_path(campaign_record)
+
+    def test_millisecond_separates_same_second_record_names(self, tmp_path):
+        record = _make_record("sk-test")
+        next_millisecond = record.model_copy(
+            update={
+                "meta": record.meta.model_copy(
+                    update={
+                        "timestamp_local_ms": (
+                            record.meta.timestamp_local_ms + 1
+                        )
+                    }
+                )
+            }
+        )
+        writer = PendingWriter(pending_dir=tmp_path)
+
+        assert writer.full_path(record) != writer.full_path(next_millisecond)
+
+    def test_record_names_use_minutes_instead_of_month(
+        self,
+        monkeypatch,
+    ):
+        record = _make_record("sk-test")
+        monkeypatch.setattr(
+            "pa_agent.records.pending_writer._ms_to_local_datetime",
+            lambda _: datetime(2026, 7, 27, 19, 43, 26),
+        )
+
+        assert _build_basename(record) == (
+            "2026-07-27_19-43-26-000_XAUUSD_1h"
+        )
+
+    def test_free_chat_sidecar_uses_exact_record_basename(self, tmp_path):
+        record = _make_record("sk-test")
+        record = record.model_copy(
+            update={
+                "meta": record.meta.model_copy(
+                    update={
+                        "campaign_id": (
+                            "11111111-1111-4111-8111-111111111111"
+                        )
+                    }
+                )
+            }
+        )
+        writer = PendingWriter(pending_dir=tmp_path)
+
+        assert _derive_record_id(record) == writer.full_path(record).stem
+
+    def test_old_buggy_month_record_keeps_legacy_sidecar_id(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        record = _make_record("sk-test")
+        record = record.model_copy(
+            update={
+                "meta": record.meta.model_copy(
+                    update={
+                        "timestamp_local_ms": (
+                            record.meta.timestamp_local_ms + 123
+                        )
+                    }
+                )
+            }
+        )
+        monkeypatch.setattr(
+            "pa_agent.records.pending_writer._ms_to_local_datetime",
+            lambda _: datetime(2026, 7, 27, 19, 43, 26),
+        )
+        writer = PendingWriter(pending_dir=tmp_path)
+        legacy_id = "2026-07-27_19-07-26_XAUUSD_1h"
+        (tmp_path / f"{legacy_id}.json").write_text("{}", encoding="utf-8")
+
+        assert _build_legacy_basename(record) == legacy_id
+        assert writer.record_id(record) == legacy_id

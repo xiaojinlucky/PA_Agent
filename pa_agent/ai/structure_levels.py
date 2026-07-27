@@ -2,11 +2,11 @@
 from __future__ import annotations
 
 import logging
-import math
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from pa_agent.util.price_tick import infer_price_tick_from_frame
+from pa_agent.ai.claim_validation import declared_price_tick
 
 logger = logging.getLogger(__name__)
 
@@ -16,12 +16,16 @@ _SWING_LOOKBACK_BARS = 40
 _NUMBER = re.compile(r"\d+(?:\.\d+)?")
 
 
-def _price_text(value: float, tick: float | None) -> str:
-    if tick is None or tick <= 0:
+def _price_text(value: float, tick: Decimal | float | None) -> str:
+    try:
+        tick_decimal = Decimal(str(tick))
+    except (InvalidOperation, TypeError, ValueError):
+        tick_decimal = Decimal(0)
+    if not tick_decimal.is_finite() or tick_decimal <= 0:
         text = f"{value:.6f}".rstrip("0").rstrip(".")
         return "0" if text in ("", "-0") else text
-    decimals = max(0, min(6, int(round(-math.log10(tick))) if tick < 1 else 0))
-    text = f"{value:.{decimals}f}".rstrip("0").rstrip(".")
+    decimals = max(0, min(12, -tick_decimal.normalize().as_tuple().exponent))
+    text = f"{Decimal(str(value)):.{decimals}f}".rstrip("0").rstrip(".")
     return "0" if text in ("", "-0") else text
 
 
@@ -164,7 +168,7 @@ def _merge_level_texts(
     kept: list[str],
     swing_prices: list[float],
     *,
-    tick: float | None,
+    tick: Decimal | float | None,
     max_levels: int,
     kind: str,
 ) -> list[str]:
@@ -256,8 +260,8 @@ def refresh_stage1_support_resistance(
     if close <= 0:
         return False
 
-    tick = infer_price_tick_from_frame(kline_frame)
-    tolerance = (tick or 0.0) * 0.5
+    declared_tick = declared_price_tick(kline_frame)
+    tolerance = float(declared_tick or 0) * 0.5
 
     old_sup = list(stage1.get("support_levels") or [])
     old_res = list(stage1.get("resistance_levels") or [])
@@ -269,10 +273,18 @@ def refresh_stage1_support_resistance(
     swing_res = _swing_resistance_prices(tuple(bars), close, max_levels=max_levels)
 
     new_sup = _merge_level_texts(
-        kept_sup, swing_sup, tick=tick, max_levels=max_levels, kind="support"
+        kept_sup,
+        swing_sup,
+        tick=declared_tick,
+        max_levels=max_levels,
+        kind="support",
     )
     new_res = _merge_level_texts(
-        kept_res, swing_res, tick=tick, max_levels=max_levels, kind="resistance"
+        kept_res,
+        swing_res,
+        tick=declared_tick,
+        max_levels=max_levels,
+        kind="resistance",
     )
 
     changed = new_sup != old_sup or new_res != old_res

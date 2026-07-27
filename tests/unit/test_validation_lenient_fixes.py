@@ -140,9 +140,9 @@ def test_lenient_validator_maps_openclaw_enum_slips() -> None:
     obj = _stage2_trade_obj(
         order_type="突破单",
         order_direction="bearish",
-        entry_price=99.99,
+        entry_price=99.9,
         take_profit_price=95.0,
-        stop_loss_price=104.01,
+        stop_loss_price=104.0,
         entry_basis_bar="K1",
         entry_basis_extreme="low",
         entry_rule="K1低点下方1跳动",

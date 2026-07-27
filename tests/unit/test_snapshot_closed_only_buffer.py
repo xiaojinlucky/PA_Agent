@@ -1,6 +1,8 @@
 """Tests for build_analysis_frame when the buffer has no forming bar."""
 from __future__ import annotations
 
+import pytest
+
 from pa_agent.data.base import KlineBar
 from pa_agent.data.snapshot import build_analysis_frame, build_live_frame
 
@@ -127,3 +129,63 @@ def test_snapshot_rebase_preserves_turnover_and_pct_change() -> None:
     assert analysis.bars[0].pct_chg == 1.25
     assert live.bars[0].amount == 1050.0
     assert live.bars[0].pct_chg == 1.25
+
+
+def test_snapshot_inherits_authoritative_tick_from_raw_bars() -> None:
+    import time
+
+    now_ms = int(time.time() * 1000)
+    bars = [
+        KlineBar(
+            seq=1,
+            ts_open=float(now_ms - 60_000),
+            open=10.0,
+            high=10.25,
+            low=9.75,
+            close=10.0,
+            volume=1.0,
+            closed=True,
+            price_tick="0.25",
+        )
+    ]
+
+    frame = build_analysis_frame(
+        bars,
+        1,
+        "TEST",
+        "15m",
+        now_ms=now_ms,
+    )
+
+    assert frame is not None
+    assert frame.price_tick == "0.25"
+    assert frame.bars[0].price_tick == "0.25"
+
+
+def test_snapshot_rejects_conflicting_explicit_and_embedded_tick() -> None:
+    import time
+
+    now_ms = int(time.time() * 1000)
+    bars = [
+        KlineBar(
+            seq=1,
+            ts_open=float(now_ms - 60_000),
+            open=10.0,
+            high=10.25,
+            low=9.75,
+            close=10.0,
+            volume=1.0,
+            closed=True,
+            price_tick="0.25",
+        )
+    ]
+
+    with pytest.raises(ValueError, match="不一致"):
+        build_analysis_frame(
+            bars,
+            1,
+            "TEST",
+            "15m",
+            now_ms=now_ms,
+            price_tick="0.1",
+        )

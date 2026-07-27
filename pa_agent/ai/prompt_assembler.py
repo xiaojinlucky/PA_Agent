@@ -478,7 +478,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 
 **交易者方程（10.3）规则：**
 - 必须使用 **decision 中已填写的 entry_price / stop_loss_price / take_profit_price** 做数值计算（**take_profit_price_2 不参与 §10.3**），**禁止**用 K 线收盘、信号棒极点间距或「计划中的 1.8 点/3 点」代替三价
-- **突破单须先定 entry 再定 stop/target**：按下方「极值±1跳动」公式写入 `entry_price` 后，再用这三价做 10.3；程序校验前会把错误的突破 entry **校正**为极值±跳动。校正后若盈亏比/方程仍不达标，**10.3 必须判否**且 `order_type=不下单`
+- **突破单须先定 entry 再定 stop/target**：按下方「极值±1跳动」公式写入 `entry_price` 后，再用这三价做 10.3；程序**不会校正任何价位**，entry 与真实 K 线、真实最小跳动不一致时会直接拒绝整轮。若盈亏比/方程不达标，**10.3 必须判否**且 `order_type=不下单`
 - `decision_trace[10.3].reason` 中的入场/止损/目标数字必须与 `decision` 三价一致（勿用未写入 decision 的中间价）
 - 做多：风险点数 = entry − stop，回报点数 = take_profit_price − entry；做空：风险 = stop − entry，回报 = entry − take_profit_price
 - 盈亏比 = 回报 ÷ 风险（程序与界面只认此公式；reasoning 中写的 RR 必须与三价一致，否则校验失败）
@@ -555,7 +555,7 @@ JSON 字符串内不要用英文双引号强调，改用「」或不用引号。
 - **非计划型 / 已触发限价**：仍用完整 K1 high/low 对照（K1 已走过 entry 则 stale）。
 - 若 K1.close 已在 entry 错误一侧（买单 close 低于 entry、卖单 close 高于 entry）→ reprice 或 `不下单`。
 
-**突破单 entry_price 硬规则（程序会按 K 线表小数位推断最小跳动并校验）：**
+**突破单 entry_price 硬规则（只使用下方运行时注入的交易所真实最小跳动；程序禁止从 K 线小数位猜测，也不会替你改价）：**
 - order_type="突破单" 时，必须填写 decision.entry_basis_bar、decision.entry_basis_extreme、decision.entry_rule。
 - 做多突破单：entry_basis_extreme 必须为 "high"。从 K 线表读出 entry_basis_bar 的 **high**，设 `entry_price = high + 1×最小跳动`（**必须严格大于 high，禁止等于 high**）。示例：K1 high=4556.595、跳动=0.001 → entry_price=4556.596。
 - 做空突破单：entry_basis_extreme 必须为 "low"。从 K 线表读出 entry_basis_bar 的 **low**，设 `entry_price = low − 1×最小跳动`（**必须严格低于 low**；禁止用 K 线中部、收盘价或高于 low 的价位）。示例：K2 low=10.67、跳动=0.01 → entry_price=10.66。

@@ -126,3 +126,16 @@ def test_merge_sorts_resistance_near_to_far() -> None:
         kind="resistance",
     )
     assert merged == ["4178.69", "4200", "4221"]
+
+
+def test_merge_preserves_non_power_of_ten_tick_precision() -> None:
+    from pa_agent.ai.structure_levels import _merge_level_texts
+
+    merged = _merge_level_texts(
+        [],
+        [4178.25],
+        tick=0.25,
+        max_levels=1,
+        kind="resistance",
+    )
+    assert merged == ["4178.25"]

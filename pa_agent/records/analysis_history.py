@@ -41,6 +41,18 @@ def load_record(path: Path) -> AnalysisRecord | None:
     """Load one AnalysisRecord, returning None for unreadable legacy files."""
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
+        partial_reason = raw.get("_partial_reason")
+        if partial_reason is not None:
+            exception = raw.get("exception")
+            if (
+                not isinstance(exception, dict)
+                or exception.get("type") != "claim_validation"
+                or exception.get("partial_reason") != partial_reason
+            ):
+                return None
+            # 只允许耐久声明校验记录移除这一个审计标记。其他 partial
+            # 继续保持历史上的“不可作为分析基线加载”语义。
+            raw.pop("_partial_reason")
         return AnalysisRecord.model_validate(raw)
     except Exception:
         return None

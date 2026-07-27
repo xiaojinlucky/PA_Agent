@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -37,10 +38,15 @@ def test_mt5_higher_timeframe_read_keeps_main_subscription() -> None:
     with (
         patch("MetaTrader5.TIMEFRAME_H1", 60),
         patch("MetaTrader5.symbol_select"),
+        patch(
+            "MetaTrader5.symbol_info",
+            return_value=SimpleNamespace(trade_tick_size=0.01),
+        ),
         patch("MetaTrader5.copy_rates_from_pos", return_value=_rates()) as fetch,
     ):
         bars = source.latest_snapshot_for_timeframe("1h", 2)
 
     assert len(bars) == 2
+    assert all(bar.price_tick == "0.01" for bar in bars)
     assert source._timeframe == "15m"
     fetch.assert_called_once_with("XAUUSD", 60, 0, 3)

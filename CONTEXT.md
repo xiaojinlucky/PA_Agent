@@ -5,16 +5,16 @@
 ## 在做什么
 
 - WO-H 已由 `0a0c5a8`、`2e95a05`、`0486002` 完成并推送：时段标签、高周期关键位置、20GB 标记、成交量影子自动采集/评分和多市场前端设计包均已落地；成交量仍不进入提示词或交易判断。
-- 最近完成的主线是 WO-C2 Campaign 对账监控耐久化。`pa_agent/okx_demo_campaign.py` 已改为先读 execution 耐久终态，只有普通活动态才等待新对账；临时超时或 Worker 短暂 attention 不再杀死 Campaign，也不覆盖刚完成 K 线的结果。
-- 2026-07-27 16:31 北京时间从正式 `run` 入口恢复原 Campaign；专用恢复命令完成新的账户与账单读取后合法解除白名单内的临时风险停止，高水位未重锚。
-- 下一张开发工单是 WO-F 完整 Claim Validation；之后进入 `WO-POS-05` 多段仓位生命周期。多市场前端可并行继续方向 B 的高保真设计，但生产 PyQt6 等后端合同稳定后再落地。
+- 最近完成的主线是 WO-F Claim Validation 完整闭环：Stage1 支撑/阻力、Stage2 入场/止损/两档止盈、K 线引用和行情源声明的真实 `price_tick` 均已接入硬校验；校验只拒绝，不修正或补写模型声明。
+- 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
+- 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
+- 下一张开发工单是 `WO-POS-05` 多段仓位生命周期。WO-D 仍被长桥 `401004` 阻塞；WO-E 仍停在用户确认视觉方向之前。
 
 ## 上次停在哪
 
-- WO-C2 基线为 `HEAD=0486002`、工作区干净。最终三套件为 1886 项通过、0 失败；定向 Campaign 套件 86 项通过、0 失败。
-- 多 Agent 两轮对抗审查发现的终态 `needs_attention`、后置监控覆盖新 K 线结果、收口重试和人工中断耐久状态问题均已修正，最终复审 PASS。
-- 现场首根新 K 线 16:20–16:30 已完成，`analyses_completed` 由 16 增至 17，真实结果 `blocked:no_order`；Campaign 保持 `active`，没有新增 execution、订单或仓位。
-- 16:33 后只读现场：Worker 心跳与成功对账新鲜，风险停止为 0，活动 execution/命令、未解决 UNCERTAIN 和 NEW_RISK 租约均为 0；OKX Demo 空仓、空普通单、八类算法单全空。
+- WO-F 开工基线为 `HEAD=4e13c7f`。最终 unit/property/integration 三套件为 1926 项通过、7 项跳过、0 失败；GUI E2E 为 4 项通过、0 失败。
+- 19:10–19:20 与 19:20–19:30 两根目标 10m K 线均自然完成为 `blocked:no_order`，对应记录复跑声明校验均为 0 issues。20:01 安全重载后，20:00–20:10 K 线于 20:11:35 完成相同结果；新文件名 `2026-07-27_20-10-17-632_...json` 的分钟正确，四次声明复验均为 0 issues。
+- 最终硬门中两库 `integrity_check=ok`，Worker 心跳与成功对账新鲜，风险停止为 0；活动 execution/命令、未解决 UNCERTAIN、有效 NEW_RISK 租约、仓位、普通挂单和八类算法单均为 0。Campaign 保持 `active`，高水位 `78303.57015174496` 未改变。
 - 长桥 access token 仍被服务端以 `401004 token invalid` 拒绝。AAPL.US、700.HK、600519.SH 的真实两阶段验收继续阻塞；不得改凭据或绕过认证。
 
 ## 近期关键决定
@@ -29,5 +29,6 @@
 - 交易安全真值保持不变：高水位 `78303.57015174496`，账户身份摘要 `ba9b744dc78ae3fc203980e62b854b0a0e3d44c9c6d5e446de910bea74ef1def`。
 - `CLOSED/BLOCKED/CANCELED/REJECTED` 是无需新对账的安全终态；`BLOCKED/REJECTED` 可因确定未写入而带 `needs_attention=true`，不能误判为未知券商写入。`UNKNOWN/ERROR`、非终态 `needs_attention` 和记录丢失仍硬阻断。
 - 对账临时故障写稳定 `blocked:reconcile:*` 证据；若本根已有 `blocked:no_order` 等结果，只更新监控错误，不覆盖该结果。收口阶段在剩余窗口内重试临时对账，真实不安全状态耐久写 `needs_attention`。
-- WO-F 当前只有部分反幻觉校验落地，原工单要求的全部价位、K 线引用、真实最小报价单位和耐久 `blocked:claim_validation` 语义仍未完成，禁止继续标成整张工单完成。
+- WO-F 价格包络默认使用已收盘 OHLC 外扩 `1.0×ATR14`，价格精度只认行情源声明的 `price_tick`；K 线引用必须真实存在。缺 OHLC、ATR、真实 tick 或声明越界均失败关闭，不猜值、不静默修正。
+- 新记录文件名使用真实分钟、毫秒和 Campaign ID；历史秒级记录曾把分钟误写为月份，legacy 查找明确保留该旧格式，避免历史自由追问 sidecar 断链。
 - 总控与历史证据继续以 `docs/WORKORDER_MASTER_20260727.md`、`docs/VALIDATION_EVIDENCE.md` 和本页链接的归档为准。

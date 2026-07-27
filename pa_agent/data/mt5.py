@@ -12,6 +12,7 @@ Usage:
 from __future__ import annotations
 
 import logging
+from decimal import Decimal, InvalidOperation
 
 from pa_agent.data.base import (
     DataSource,
@@ -55,6 +56,7 @@ class MT5Source(DataSource):
         self._symbol: str = ""
         self._timeframe: str = ""
         self._connected: bool = False
+        self._price_tick: str | None = None
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -94,6 +96,7 @@ class MT5Source(DataSource):
             except Exception as exc:  # noqa: BLE001
                 logger.warning("MT5 shutdown error: %s", exc)
         self._connected = False
+        self._price_tick = None
         logger.info("MT5Source disconnected")
 
     # ── Discovery ─────────────────────────────────────────────────────────────
@@ -137,6 +140,8 @@ class MT5Source(DataSource):
                 f"Unsupported timeframe: {timeframe!r}. "
                 f"Use one of {list(_TF_MAP)}"
             )
+        if symbol != self._symbol:
+            self._price_tick = None
         self._symbol = symbol
         self._timeframe = timeframe
         # Tell MT5 to subscribe to this symbol's real-time data
@@ -151,7 +156,32 @@ class MT5Source(DataSource):
     def unsubscribe(self) -> None:
         self._symbol = ""
         self._timeframe = ""
+        self._price_tick = None
         logger.info("MT5Source unsubscribed")
+
+    def _declared_price_tick(self, mt5: object) -> str:
+        """读取券商为当前 MT5 品种声明的最小价格变化。"""
+        if self._price_tick is not None:
+            return self._price_tick
+        try:
+            symbol_info = mt5.symbol_info(self._symbol)
+        except Exception as exc:  # noqa: BLE001
+            raise DataSourceTransientError(
+                f"MT5 无法读取 {self._symbol} 的品种元数据"
+            ) from exc
+        raw_tick = getattr(symbol_info, "trade_tick_size", None)
+        try:
+            tick = Decimal(str(raw_tick))
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise DataSourceTransientError(
+                f"MT5 {self._symbol} 缺少有效 trade_tick_size"
+            ) from exc
+        if not tick.is_finite() or tick <= 0:
+            raise DataSourceTransientError(
+                f"MT5 {self._symbol} 缺少有效 trade_tick_size"
+            )
+        self._price_tick = format(tick, "f")
+        return self._price_tick
 
     def server_time_ms(self, symbol: str | None = None) -> int | None:
         """Broker/server time from the latest MT5 tick (milliseconds since epoch).
@@ -230,6 +260,7 @@ class MT5Source(DataSource):
             raise DataSourceTransientError(
                 f"MT5 timeframe constant {tf_name!r} not found"
             ) from exc
+        price_tick = self._declared_price_tick(mt5)
 
         # Ensure the symbol is selected/subscribed in MT5 for real-time data
         try:
@@ -283,6 +314,7 @@ class MT5Source(DataSource):
                         close=float(rate["close"]),
                         volume=vol,
                         closed=not is_forming,
+                        price_tick=price_tick,
                     )
                 )
             )

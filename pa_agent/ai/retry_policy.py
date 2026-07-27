@@ -20,6 +20,7 @@ _FORMAT_PREFIXES: tuple[str, ...] = (
 
 # Semantic errors that must NOT trigger retry (program should downgrade instead).
 _NO_RETRY_PREFIXES: tuple[str, ...] = (
+    "claim_validation:",
     "metrics:",
     "trace:§14",
     "s2:order_direction",

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import json
 
-from pa_agent.ai.json_validator import Ok
+from pa_agent.ai.json_validator import Ok, ValidationError
 from pa_agent.ai.stage2_normalizer import (
     _normalize_closed_enum,
     _normalize_stage2_bar_analysis_enums,
@@ -430,8 +430,8 @@ def test_normalize_stage2_with_prediction():
     assert pred["features_used"] == ["stage1_diagnosis"]
 
 
-def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
-    """Regression: wrong breakout entry snapped → RR/equation fail → 不下单."""
+def test_breakout_entry_is_not_snapped_or_silently_downgraded() -> None:
+    """错误突破价保留原样，交给最终校验硬拒绝。"""
     frame = KlineFrame(
         symbol="XAUUSD",
         timeframe="1h",
@@ -459,6 +459,7 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
         ),
         indicators=IndicatorBundle(ema20=(10.86, 10.86), atr14=(0.08, 0.08)),
         snapshot_ts_local_ms=1,
+        price_tick="0.01",
     )
     payload = {
         "decision": {
@@ -468,8 +469,8 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
             "entry_basis_bar": "K2",
             "entry_basis_extreme": "low",
             "entry_rule": "K2 low - 1 tick",
-            "take_profit_price": 10.50,
-            "take_profit_price_2": 10.30,
+            "take_profit_price": 10.60,
+            "take_profit_price_2": 10.59,
             "stop_loss_price": 10.84,
             "reasoning": "test",
             "diagnosis_confidence": 72,
@@ -493,7 +494,7 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
                 "node_id": "10.3",
                 "question": "交易者方程是否通过？",
                 "answer": "是",
-                "reason": "用10.72/10.84/10.50算RR约1.8",
+                "reason": "用10.72/10.84/10.60算RR=1",
                 "bar_range": "K2-K1",
             },
             {
@@ -511,14 +512,8 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
         kline_frame=frame,
         decision_stance="extreme_aggressive",
     )
-    assert out["decision"]["order_type"] == "不下单"
-    assert out["decision"]["entry_price"] is None
-    # Node 10.3 should have answer=否 (now may not be first after §9 node injection)
-    trace_103 = next((n for n in out["decision_trace"] if n.get("node_id") == "10.3"), None)
-    assert trace_103 is not None, "node 10.3 should be in decision_trace"
-    assert trace_103["answer"] == "否"
-    assert out["terminal"]["node_id"] == "10.3"
-    assert out["terminal"]["outcome"] == "reject"
+    assert out["decision"]["order_type"] == "突破单"
+    assert out["decision"]["entry_price"] == 10.72
 
     result = schema_test_validator().validate(
         "stage2",
@@ -526,7 +521,11 @@ def test_coerce_no_order_when_metrics_fail_after_breakout_entry_snap() -> None:
         decision_stance="extreme_aggressive",
         kline_frame=frame,
     )
-    assert isinstance(result, Ok)
+    assert isinstance(result, ValidationError)
+    assert any(
+        field.startswith("breakout_price:")
+        for field in result.invalid_fields
+    )
 
 
 def test_coerce_decision_when_103_no_but_prices_remain() -> None:

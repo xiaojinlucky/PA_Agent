@@ -39,6 +39,7 @@ def _frame_k1(*, high: float, low: float, close: float) -> KlineFrame:
         ),
         indicators=IndicatorBundle(ema20=(100.0, 100.0), atr14=(2.0, 2.0)),
         snapshot_ts_local_ms=1,
+        price_tick="0.1",
     )
 
 
@@ -76,6 +77,7 @@ def test_validator_coerces_stale_short_limit_to_no_order() -> None:
         order_direction="做空",
         entry_price=101.0,
         take_profit_price=98.0,
+        take_profit_price_2=96.0,
         stop_loss_price=103.0,
         estimated_win_rate=55,
         entry_basis_bar=None,

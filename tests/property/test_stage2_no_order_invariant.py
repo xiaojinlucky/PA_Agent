@@ -189,8 +189,8 @@ def test_breakout_order_requires_extreme_basis() -> None:
     assert "entry_basis_bar" in result.missing_fields
 
 
-def test_breakout_order_direction_extreme_mismatch_auto_corrected() -> None:
-    """Wrong entry_basis_extreme is aligned in normalize_stage2 before validation."""
+def test_breakout_order_direction_extreme_mismatch_is_rejected() -> None:
+    """Wrong entry_basis_extreme must not be silently rewritten."""
     decision = _base_decision(
         order_type="突破单",
         order_direction="做多",
@@ -201,12 +201,12 @@ def test_breakout_order_direction_extreme_mismatch_auto_corrected() -> None:
         estimated_win_rate=52,
         entry_basis_bar="K2",
         entry_basis_extreme="low",
-        entry_rule="模型误写 low，程序应改为 high",
+        entry_rule="模型误写 low，应直接拒绝",
     )
     obj = _base_stage2(decision)
     result = validator.validate("stage2", json.dumps(obj))
-    assert isinstance(result, Ok)
-    assert result.obj["decision"]["entry_basis_extreme"] == "high"
+    assert isinstance(result, ValidationError)
+    assert "decision.entry_basis_extreme" in result.invalid_fields
 
 
 @given(order_type=st.sampled_from(_ORDER_TYPES_WITH_TRADE))

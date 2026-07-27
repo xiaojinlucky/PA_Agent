@@ -20,6 +20,9 @@ class KlineBar:
     amount: float = 0.0   # turnover amount (成交额); 0 when unavailable
     pct_chg: float | None = None  # daily change % from API when available
     closed: bool = True   # False for the currently-forming bar
+    # 行情源声明的品种最小跳动。放在原始棒上，确保 GUI 在线程间复制
+    # list 后仍能由 snapshot 恢复元数据；禁止由 OHLC 小数位反推。
+    price_tick: str | None = None
 
 
 def normalize_kline_bar(bar: KlineBar) -> KlineBar:
@@ -48,6 +51,7 @@ def normalize_kline_bar(bar: KlineBar) -> KlineBar:
         amount=getattr(bar, "amount", 0.0),
         pct_chg=getattr(bar, "pct_chg", None),
         closed=bar.closed,
+        price_tick=getattr(bar, "price_tick", None),
     )
 
 
@@ -75,6 +79,9 @@ class KlineFrame:
     bars: tuple[KlineBar, ...]
     indicators: IndicatorBundle
     snapshot_ts_local_ms: int   # milliseconds since epoch, local time
+    # 行情源或交易所声明的真实最小跳动；缺失时声明校验必须显式阻断，
+    # 不能从 OHLC 的小数位反推。
+    price_tick: str | None = None
 
 
 # ── DataSource ABC ────────────────────────────────────────────────────────────

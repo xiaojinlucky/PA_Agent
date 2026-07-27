@@ -77,7 +77,6 @@ from pa_agent.execution.worker_protocol import (
 )
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.records.analysis_history import (
-    find_latest_successful_record,
     list_record_paths,
     load_record,
 )
@@ -1694,8 +1693,10 @@ def build_controlled_demo_s_record(
     return record, sizing
 
 
-def find_latest_natural_campaign_record() -> AnalysisRecord | None:
-    """只返回真实 OKX 5m→10m 自然分析，跳过所有受控或其他来源记录。"""
+def find_latest_natural_campaign_record(
+    campaign_id: str,
+) -> AnalysisRecord | None:
+    """只返回当前 Campaign 自己的真实自然分析，跳过受控或外部记录。"""
     for path in list_record_paths(RECORDS_PENDING_DIR):
         record = load_record(path)
         if record is None or record.exception is not None:
@@ -1703,6 +1704,7 @@ def find_latest_natural_campaign_record() -> AnalysisRecord | None:
         if (
             record.meta.symbol == CAMPAIGN_SYMBOL
             and record.meta.timeframe == CAMPAIGN_TIMEFRAME
+            and record.meta.campaign_id == campaign_id
             and record.meta.data_source == "okx"
             and record.meta.market_data_provenance
             == "okx_5m_utc_pair_aggregation"
@@ -1954,7 +1956,7 @@ def run_controlled_demo_s() -> dict[str, str]:
     state = CampaignStateStore().load()
     if state is None or state.status != "active":
         raise CampaignError("Demo-S 要求 10m Campaign 正在运行")
-    base_record = find_latest_natural_campaign_record()
+    base_record = find_latest_natural_campaign_record(state.campaign_id)
     if base_record is None:
         raise CampaignError("Demo-S 尚无真实 10m PA 记录")
     bar_ms = int(ts_open_to_ms(base_record.kline_data[0]["ts_open"]))
@@ -2221,17 +2223,57 @@ class OkxCampaignSource:
             simulated=True,
         )
         self._subscribed = False
+        self._price_tick: str | None = None
 
     def connect(self) -> None:
         return None
 
     def disconnect(self) -> None:
         self._subscribed = False
+        self._price_tick = None
 
     def subscribe(self, symbol: str, timeframe: str) -> None:
         if symbol != CAMPAIGN_INSTRUMENT or timeframe != CAMPAIGN_TIMEFRAME:
             raise CampaignError("OKX Demo 快速运行只允许自身执行产品的 10m K 线")
         self._subscribed = True
+
+    def price_tick(self) -> str:
+        """读取并缓存 OKX 公共品种元数据中的真实 tickSz。"""
+        if not self._subscribed:
+            raise CampaignError("OKX Demo 行情源尚未订阅")
+        if self._price_tick is not None:
+            return self._price_tick
+        try:
+            rows = self._client.public_instruments(
+                "SWAP",
+                instrument=CAMPAIGN_INSTRUMENT,
+            )
+        except (BrokerApiError, BrokerTransportError) as exc:
+            raise DataSourceTransientError(
+                f"OKX 品种 tickSz 暂时不可用: {exc}"
+            ) from exc
+        instrument = next(
+            (
+                row
+                for row in rows
+                if str(row.get("instId") or "").strip()
+                == CAMPAIGN_INSTRUMENT
+            ),
+            None,
+        )
+        if instrument is None:
+            raise CampaignError(
+                f"OKX 公共品种元数据缺少 {CAMPAIGN_INSTRUMENT}"
+            )
+        if str(instrument.get("state") or "").strip().lower() != "live":
+            raise CampaignError(
+                f"{CAMPAIGN_INSTRUMENT} 公共品种状态不是 live"
+            )
+        tick = _positive_decimal(instrument.get("tickSz"))
+        if tick <= 0:
+            raise CampaignError("OKX 黄金永续缺少有效 tickSz")
+        self._price_tick = format(tick, "f")
+        return self._price_tick
 
     def latest_snapshot(self, n: int) -> list[KlineBar]:
         return self.latest_snapshot_for_timeframe(CAMPAIGN_TIMEFRAME, n)
@@ -2638,24 +2680,103 @@ class OkxDemoCampaign:
         )
         return False
 
-    def _recover_record_for_bar(self, bar_ms: int):
-        record = find_latest_successful_record(
-            symbol=CAMPAIGN_SYMBOL,
-            timeframe=CAMPAIGN_TIMEFRAME,
+    def _recover_record_for_bar(
+        self,
+        bar_ms: int,
+    ) -> AnalysisRecord | None:
+        """只恢复当前 Campaign 自己为指定 K 线写下的耐久记录。"""
+        started_ms = int(self.state.started_at_utc.timestamp() * 1000)
+        owned_candidate: AnalysisRecord | None = None
+        ownerless_candidate_seen = False
+        for path in list_record_paths(RECORDS_PENDING_DIR):
+            record = load_record(path)
+            if record is None:
+                continue
+            if (
+                record.meta.symbol != CAMPAIGN_SYMBOL
+                or record.meta.timeframe != CAMPAIGN_TIMEFRAME
+                or record.meta.decision_stance != CAMPAIGN_STANCE
+                or record.meta.data_source != "okx"
+                or record.meta.market_data_provenance
+                != "okx_5m_utc_pair_aggregation"
+                or record.meta.timestamp_local_ms < started_ms
+                or not record.kline_data
+            ):
+                continue
+            exception = record.exception
+            is_claim = (
+                isinstance(exception, dict)
+                and str(exception.get("type") or "") == "claim_validation"
+            )
+            is_success = (
+                exception is None
+                and bool(record.stage1_diagnosis)
+                and bool(record.stage2_decision)
+            )
+            if not is_claim and not is_success:
+                continue
+            try:
+                record_bar_ms = int(
+                    ts_open_to_ms(record.kline_data[0]["ts_open"])
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if record_bar_ms != bar_ms:
+                continue
+
+            if record.meta.campaign_id is None:
+                ownerless_candidate_seen = True
+                continue
+            if record.meta.campaign_id != self.state.campaign_id:
+                continue
+            if owned_candidate is None:
+                owned_candidate = record
+        if owned_candidate is not None:
+            return owned_candidate
+        if ownerless_candidate_seen:
+            raise CampaignError(
+                "发现与 inflight K 线匹配但缺少 campaign_id 的旧耐久记录；"
+                "无法区分旧 Campaign 与交互式分析，已失败关闭，禁止重调模型"
+            )
+        return None
+
+    def _handle_claim_validation_record(
+        self,
+        record: AnalysisRecord,
+        bar_ms: int,
+    ) -> bool:
+        """把声明校验失败耐久收口为本根 blocked，并允许下一根继续。"""
+        exception = record.exception
+        if not isinstance(exception, dict):
+            return False
+        if str(exception.get("type") or "") != "claim_validation":
+            return False
+
+        from pa_agent.ai.claim_validation import (
+            extract_claim_validation_code,
         )
-        if record is None or record.meta.decision_stance != CAMPAIGN_STANCE:
-            return None
-        if record.meta.timestamp_local_ms < int(
-            self.state.started_at_utc.timestamp() * 1000
-        ):
-            return None
-        if not record.kline_data:
-            return None
-        try:
-            record_bar_ms = int(ts_open_to_ms(record.kline_data[0]["ts_open"]))
-        except (KeyError, TypeError, ValueError):
-            return None
-        return record if record_bar_ms == bar_ms else None
+
+        code = str(exception.get("code") or "").strip()
+        encoded_code = extract_claim_validation_code(
+            exception.get("invalid_fields") or []
+        )
+        if not code or code != encoded_code:
+            raise CampaignError("声明校验失败记录缺少一致的稳定错误码")
+
+        self._validate_record_context(record, bar_ms)
+        message = str(exception.get("message") or exception)
+        self._save_state(
+            inflight_bar_ms=None,
+            last_completed_bar_ms=bar_ms,
+            analyses_failed=self.state.analyses_failed + 1,
+            last_plan_result=f"blocked:claim_validation:{code}",
+            last_error=message,
+        )
+        logger.warning(
+            "PA 声明校验阻断本根 K 线，零执行写入；下一根继续: code=%s",
+            code,
+        )
+        return True
 
     def _execution_bar_ms(self, execution) -> int:
         return _campaign_execution_bar_ms(execution)
@@ -3004,23 +3125,18 @@ class OkxDemoCampaign:
             return hashlib.sha256(payload).hexdigest()
         raise CampaignError("无法为确定性执行脚本建立 PA 分析摘要")
 
-    @staticmethod
     def _validate_record_context(
+        self,
         record: AnalysisRecord,
         bar_ms: int,
     ) -> None:
         if (
             record.meta.symbol != CAMPAIGN_SYMBOL
             or record.meta.timeframe != CAMPAIGN_TIMEFRAME
+            or record.meta.campaign_id != self.state.campaign_id
             or record.meta.data_source != "okx"
             or record.meta.market_data_provenance
-            not in {
-                "okx_5m_utc_pair_aggregation",
-                (
-                    "okx_public_5m_utc_pair_aggregation_"
-                    "controlled_reproducible"
-                ),
-            }
+            != "okx_5m_utc_pair_aggregation"
         ):
             raise CampaignError("PA 耐久记录不属于当前 OKX 10m Campaign")
         if not record.kline_data or not isinstance(
@@ -3316,12 +3432,14 @@ class OkxDemoCampaign:
     def process_latest_closed_bar(self) -> bool:
         validate_campaign_settings(self.runtime.settings)
         fetch_count = int(self.runtime.settings.general.analysis_bar_count) + 50
+        price_tick = self.runtime.source.price_tick()
         bars = self.runtime.source.latest_snapshot(fetch_count)
         frame = build_analysis_frame(
             bars,
             int(self.runtime.settings.general.analysis_bar_count),
             CAMPAIGN_SYMBOL,
             CAMPAIGN_TIMEFRAME,
+            price_tick=price_tick,
         )
         if frame is None:
             raise DataSourceTransientError("XAU-USDT-SWAP 10m 已收盘聚合 K 线不足")
@@ -3335,6 +3453,38 @@ class OkxDemoCampaign:
             and bar_ms <= self.state.last_completed_bar_ms
         ):
             return False
+
+        inflight_bar_ms = self.state.inflight_bar_ms
+        if inflight_bar_ms is not None and inflight_bar_ms < bar_ms:
+            recovered_stale = self._recover_record_for_bar(inflight_bar_ms)
+            if recovered_stale is not None:
+                logger.info(
+                    "先收口上一根 K 线的耐久分析记录，再处理最新 K 线"
+                )
+                if not self._handle_claim_validation_record(
+                    recovered_stale,
+                    inflight_bar_ms,
+                ):
+                    self._validate_record_context(
+                        recovered_stale,
+                        inflight_bar_ms,
+                    )
+                    # 耐久记录可能写在上次计数保存之前或之后；没有逐根计数
+                    # 凭据时绝不猜测加一，与同根 reused 恢复保持 at-most-once。
+                    self._save_state(
+                        inflight_bar_ms=None,
+                        last_completed_bar_ms=inflight_bar_ms,
+                        last_plan_result="blocked:stale_recovered_analysis",
+                        last_error=(
+                            "恢复到的耐久分析对应旧 K 线；"
+                            "信号已过期，未创建执行计划"
+                        ),
+                    )
+                    logger.warning(
+                        "恢复到旧 K 线的成功分析，信号已过期，零执行写入"
+                    )
+                return True
+
         if not self._recover_transient_risk_stop_for_bar(bar_ms):
             return True
 
@@ -3342,6 +3492,8 @@ class OkxDemoCampaign:
             recovered = self._recover_record_for_bar(bar_ms)
             if recovered is not None:
                 logger.info("恢复同一根 K 线的耐久分析记录, 不重复调用模型")
+                if self._handle_claim_validation_record(recovered, bar_ms):
+                    return True
                 self._consume_record(recovered, bar_ms, reused=True)
                 return True
 
@@ -3364,6 +3516,7 @@ class OkxDemoCampaign:
                     higher_count,
                     CAMPAIGN_SYMBOL,
                     higher_timeframe,
+                    price_tick=price_tick,
                 )
                 if higher_frame is None:
                     raise DataSourceTransientError(
@@ -3391,9 +3544,12 @@ class OkxDemoCampaign:
             frame,
             CancelToken(),
             lambda event: events.append(event.name),
+            campaign_id=self.state.campaign_id,
             **submit_kwargs,
         )
         if record.exception is not None:
+            if self._handle_claim_validation_record(record, bar_ms):
+                return True
             exception_type = str(record.exception.get("type") or "unknown")
             message = str(record.exception.get("message") or record.exception)
             self._save_state(

@@ -16,8 +16,12 @@ from pa_agent.execution.errors import BrokerTransportError
 class _FakeOkxClient:
     def __init__(self) -> None:
         self.instrument_rows = [
-            {"instId": "XAU-USDT-SWAP", "state": "live"},
-            {"instId": "XAUT-USDT", "state": "live"},
+            {
+                "instId": "XAU-USDT-SWAP",
+                "state": "live",
+                "tickSz": "0.1",
+            },
+            {"instId": "XAUT-USDT", "state": "live", "tickSz": "0.01"},
         ]
         self.candle_rows = [
             ["3000", "100", "102", "99", "101", "10", "0", "1000", "0"],
@@ -72,10 +76,12 @@ def test_okx_source_validates_instrument_then_returns_newest_first_bars():
     bars = source.latest_snapshot(3)
 
     assert client.public_calls == [("SWAP", "XAU-USDT-SWAP")]
+    assert source.price_tick() == "0.1"
     assert client.candle_calls == [("XAU-USDT-SWAP", "30m", 3)]
     assert [bar.seq for bar in bars] == [0, 1, 2]
     assert [bar.closed for bar in bars] == [False, True, True]
     assert [bar.ts_open for bar in bars] == [3000.0, 2000.0, 1000.0]
+    assert all(bar.price_tick == "0.1" for bar in bars)
 
 
 def test_okx_source_reads_higher_timeframe_without_changing_main_subscription():
@@ -106,6 +112,7 @@ def test_okx_source_failed_switch_preserves_previous_subscription():
 
     assert source._symbol == "XAU-USDT-SWAP"
     assert source._timeframe == "30m"
+    assert source.price_tick() == "0.1"
 
 
 def test_okx_source_translates_transport_errors_without_exposing_credentials():

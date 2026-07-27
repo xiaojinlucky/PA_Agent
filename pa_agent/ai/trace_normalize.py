@@ -280,8 +280,7 @@ def fix_bar_range_string(text: str, *, default_max_seq: int | None = None) -> st
     if m:
         a, b = int(m.group(1)), int(m.group(2))
         if a == b:
-            capped = _cap_bar_seq(a, default_max_seq)
-            return f"K{capped}"
+            return f"K{a}"
         if a < b:
             logger.debug(
                 "bar_range=%r has reversed order (K%d before K%d); "
@@ -289,23 +288,15 @@ def fix_bar_range_string(text: str, *, default_max_seq: int | None = None) -> st
                 text, a, b, b, a,
             )
             a, b = b, a
-        a = _cap_bar_seq(a, default_max_seq)
-        b = _cap_bar_seq(b, default_max_seq)
         if a == b:
             return f"K{a}"
         return f"K{a}-K{b}"
 
     single = _SINGLE_BAR_RE.match(compact)
     if single:
-        return f"K{_cap_bar_seq(int(single.group(1)), default_max_seq)}"
+        return f"K{int(single.group(1))}"
 
     return raw
-
-
-def _cap_bar_seq(seq: int, max_seq: int | None) -> int:
-    if max_seq is not None and max_seq >= 1:
-        return max(1, min(seq, max_seq))
-    return seq
 
 
 def _branch_from_tail(per_node: dict[str, tuple[str, str]], tail: str) -> str | None:

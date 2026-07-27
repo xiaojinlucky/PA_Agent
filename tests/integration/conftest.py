@@ -63,7 +63,9 @@ SAMPLE_DECISION_TRACE = [
         "section": "\u4ea4\u6613\u8005\u65b9\u7a0b",
         "question": "\u4ea4\u6613\u8005\u65b9\u7a0b\u662f\u5426\u901a\u8fc7\uff1f",
         "answer": "\u662f",
-        "reason": "entry=2000 stop=1980 target=2050, RR about 2.5:1.",
+        "reason": (
+            "entry=2046.1 stop=2044.0 target=2051.0, RR about 2.3:1."
+        ),
         "skipped": False,
         "bar_range": "K1",
     },
@@ -119,10 +121,10 @@ VALID_STAGE2 = {
     "decision": {
         "order_direction": "\u505a\u591a",
         "order_type": "\u7a81\u7834\u5355",
-        "entry_price": 2010.5,
-        "take_profit_price": 2050.0,
-        "take_profit_price_2": 2090.0,
-        "stop_loss_price": 1995.0,
+        "entry_price": 2046.1,
+        "take_profit_price": 2051.0,
+        "take_profit_price_2": 2055.0,
+        "stop_loss_price": 2044.0,
         "entry_basis_bar": "K2",
         "entry_basis_extreme": "high",
         "entry_rule": "long breakout above K2 high by 1 tick",
@@ -136,7 +138,7 @@ VALID_STAGE2 = {
         "key_factors": ["factor1"],
         "watch_points": ["watch1"],
         "risk_assessment": "low risk",
-        "invalidation_condition": "break below 1980",
+        "invalidation_condition": "break below 2044.0",
     },
     "diagnosis_summary": {
         "cycle_position": "normal_channel",
@@ -182,7 +184,9 @@ def make_frame() -> KlineFrame:
             low=1990.0 + (n - 1 - i) * 2.0,
             close=2005.0 + (n - 1 - i) * 2.0,   # close rises: K20=close~2005, K1=close~2043
             volume=100.0,
-            closed=(i > 0),
+            # TwoStageOrchestrator receives an analysis frame, whose K1 must
+            # already be the newest closed bar rather than a forming candle.
+            closed=True,
         )
         for i in range(n)
     )
@@ -199,6 +203,7 @@ def make_frame() -> KlineFrame:
         bars=bars,
         snapshot_ts_local_ms=1700000000000,
         indicators=indicators,
+        price_tick="0.1",
     )
 
 

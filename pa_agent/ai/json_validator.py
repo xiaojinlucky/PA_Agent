@@ -588,6 +588,40 @@ class JsonValidator:
                 message="Top-level JSON value is not an object",
             )
 
+        # 原始声明必须先于任何归一化校验。否则非法 bar_from/bar_to 可能
+        # 先让归一化器抛异常，或越界价位/K 序号先被程序结构位洗成合法值，
+        # Campaign 就无法得到稳定 claim code 做 blocked 收口。
+        if kline_frame is not None:
+            from pa_agent.ai.claim_validation import validate_claims
+
+            claim_multiple = float(
+                getattr(
+                    self._validation,
+                    "claim_atr_tolerance_multiple",
+                    1.0,
+                )
+            )
+            raw_claim_fields = [
+                issue.as_invalid_field()
+                for issue in validate_claims(
+                    stage,
+                    obj,
+                    kline_frame,
+                    atr_tolerance_multiple=claim_multiple,
+                )
+            ]
+            if raw_claim_fields:
+                return ValidationError(
+                    category="c",
+                    stage=stage,
+                    raw_text=raw_text,
+                    invalid_fields=raw_claim_fields,
+                    message=(
+                        "0 schema error(s): "
+                        f"{raw_claim_fields[0]}"
+                    ),
+                )
+
         obj = self.normalize_parsed(
             stage,
             obj,
@@ -607,9 +641,9 @@ class JsonValidator:
             import jsonschema  # type: ignore[import]
         except ImportError:
             logger.warning("jsonschema not installed; skipping schema validation")
-            return Ok(obj=obj)
-
-        errors = list(jsonschema.Draft7Validator(schema).iter_errors(obj))
+            errors = []
+        else:
+            errors = list(jsonschema.Draft7Validator(schema).iter_errors(obj))
 
         # Classify errors
         missing: list[str] = []
@@ -627,6 +661,27 @@ class JsonValidator:
                     allowed[str(path)] = err.schema["enum"]
 
         # ── Explicit cross-field checks ───────────────────────────────────────
+        if kline_frame is not None:
+            from pa_agent.ai.claim_validation import validate_claims
+
+            claim_multiple = float(
+                getattr(
+                    self._validation,
+                    "claim_atr_tolerance_multiple",
+                    1.0,
+                )
+            )
+            claim_fields = [
+                issue.as_invalid_field()
+                for issue in validate_claims(
+                    stage,
+                    obj,
+                    kline_frame,
+                    atr_tolerance_multiple=claim_multiple,
+                )
+            ]
+            invalid.extend(claim_fields)
+
         if stage == "stage1":
             from pa_agent.ai.coherence_checks import auto_fix_bar_by_bar_types
 

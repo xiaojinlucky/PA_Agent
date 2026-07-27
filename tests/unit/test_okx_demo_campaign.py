@@ -160,6 +160,7 @@ def _frame(bar_ms: int) -> KlineFrame:
         bars=(bar,),
         indicators=indicators,
         snapshot_ts_local_ms=bar_ms,
+        price_tick="0.1",
     )
 
 
@@ -336,6 +337,9 @@ def test_demo_cleanup_timeout_is_a_hard_nonterminal_failure():
 
 
 class _FakeSource:
+    def price_tick(self):
+        return "0.1"
+
     def latest_snapshot(self, count):
         del count
         return [object()]
@@ -349,8 +353,8 @@ class _FakeOrchestrator:
         self.record = record
         self.calls = 0
 
-    def submit(self, frame, token, on_event):
-        del token, on_event
+    def submit(self, frame, token, on_event, *, campaign_id=None, **kwargs):
+        del token, on_event, kwargs
         self.calls += 1
         if not hasattr(self.record, "meta"):
             self.record.meta = SimpleNamespace(
@@ -359,7 +363,18 @@ class _FakeOrchestrator:
                 data_source="okx",
                 market_data_provenance="okx_5m_utc_pair_aggregation",
                 decision_stance=CAMPAIGN_STANCE,
+                campaign_id=campaign_id,
             )
+        elif hasattr(self.record.meta, "model_copy"):
+            self.record = self.record.model_copy(
+                update={
+                    "meta": self.record.meta.model_copy(
+                        update={"campaign_id": campaign_id}
+                    )
+                }
+            )
+        else:
+            self.record.meta.campaign_id = campaign_id
         if not hasattr(self.record, "kline_data"):
             self.record.kline_data = [
                 {
@@ -1546,12 +1561,14 @@ def test_demo_s_skips_newer_controlled_record_and_selects_natural_10m(
     monkeypatch,
     tmp_path,
 ):
+    campaign_id = "11111111-1111-4111-8111-111111111111"
     natural = _record(symbol=CAMPAIGN_SYMBOL).model_copy(deep=True)
     natural.meta = natural.meta.model_copy(
         update={
             "timeframe": CAMPAIGN_TIMEFRAME,
             "data_source": "okx",
             "market_data_provenance": "okx_5m_utc_pair_aggregation",
+            "campaign_id": campaign_id,
         }
     )
     natural.kline_data = [{"ts_open": 1_784_826_600_000, "closed": True}]
@@ -1569,14 +1586,24 @@ def test_demo_s_skips_newer_controlled_record_and_selects_natural_10m(
         "origin": "controlled_reproducible_demo_s",
         "decision": controlled.stage2_decision["decision"],
     }
+    foreign = natural.model_copy(deep=True)
+    foreign.meta = foreign.meta.model_copy(
+        update={
+            "timestamp_local_iso": "2026-07-24T01:31:00+08:00",
+            "timestamp_local_ms": 1_784_831_460_000,
+            "campaign_id": "22222222-2222-4222-8222-222222222222",
+        }
+    )
     writer = PendingWriter(tmp_path)
     writer.save_full_durable(natural)
     writer.save_full_durable(controlled)
+    writer.save_full_durable(foreign)
     monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
 
-    selected = find_latest_natural_campaign_record()
+    selected = find_latest_natural_campaign_record(campaign_id)
 
     assert selected is not None
+    assert selected.meta.campaign_id == campaign_id
     assert selected.meta.market_data_provenance == "okx_5m_utc_pair_aggregation"
 
 
@@ -1719,6 +1746,17 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
     class _MarketClient:
         def __init__(self):
             self.calls = []
+            self.instrument_calls = []
+
+        def public_instruments(self, inst_type, *, instrument=None):
+            self.instrument_calls.append((inst_type, instrument))
+            return [
+                {
+                    "instId": CAMPAIGN_INSTRUMENT,
+                    "state": "live",
+                    "tickSz": "0.1",
+                }
+            ]
 
         def candles(self, *, instrument, bar, limit):
             self.calls.append((instrument, bar, limit))
@@ -1787,6 +1825,8 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
     source = OkxCampaignSource(client)
     source.subscribe(CAMPAIGN_SYMBOL, CAMPAIGN_TIMEFRAME)
 
+    assert source.price_tick() == "0.1"
+    assert source.price_tick() == "0.1"
     bars = source.latest_snapshot(150)
     bars_1h = source.latest_snapshot_for_timeframe("1h", 150)
     bars_4h = source.latest_snapshot_for_timeframe("4h", 150)
@@ -1795,6 +1835,9 @@ def test_okx_campaign_source_uses_execution_instrument_prices():
         (CAMPAIGN_INSTRUMENT, "5m", 300),
         (CAMPAIGN_INSTRUMENT, "1H", 150),
         (CAMPAIGN_INSTRUMENT, "4H", 150),
+    ]
+    assert client.instrument_calls == [
+        ("SWAP", CAMPAIGN_INSTRUMENT),
     ]
     assert len(bars) == 1
     assert len(bars_1h) == 2
@@ -2145,6 +2188,9 @@ def test_new_bar_passes_thin_higher_timeframe_context(
             self.calls.append((CAMPAIGN_TIMEFRAME, count))
             return [object()]
 
+        def price_tick(self):
+            return "0.1"
+
         def latest_snapshot_for_timeframe(self, timeframe, count):
             self.calls.append((timeframe, count))
             return [object()]
@@ -2168,6 +2214,7 @@ def test_new_bar_passes_thin_higher_timeframe_context(
                     market_data_provenance=(
                         "okx_5m_utc_pair_aggregation"
                     ),
+                    campaign_id=kwargs["campaign_id"],
                 ),
                 kline_data=[
                     {
@@ -2940,6 +2987,400 @@ def test_transient_model_failure_skips_bar_without_stopping_campaign(
     assert service.submitted == []
 
 
+def test_claim_validation_blocks_one_bar_and_next_bar_continues(
+    monkeypatch,
+    tmp_path,
+):
+    first_bar_ms = 1_784_300_400_000
+    second_bar_ms = first_bar_ms + 10 * 60 * 1000
+    current_bar = {"ms": first_bar_ms}
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(current_bar["ms"]),
+    )
+
+    claim_record = SimpleNamespace(
+        exception={
+            "type": "claim_validation",
+            "stage": "stage2",
+            "code": "price_out_of_range",
+            "message": "TP2 超出真实包络",
+            "invalid_fields": [
+                "claim_validation:price_out_of_range:"
+                "decision.take_profit_price_2:bad price"
+            ],
+        }
+    )
+    next_record = SimpleNamespace(exception=None)
+
+    class _SequentialOrchestrator(_FakeOrchestrator):
+        def __init__(self):
+            super().__init__(claim_record)
+            self.records = [claim_record, next_record]
+
+        def submit(self, frame, token, on_event, **kwargs):
+            self.record = self.records[self.calls]
+            return super().submit(frame, token, on_event, **kwargs)
+
+    orchestrator = _SequentialOrchestrator()
+    service = _FakeExecutionService(
+        block=PlanBlocked("no_order", "PA 决策为不下单")
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(_runtime(orchestrator, service), store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert (
+        runner.state.last_plan_result
+        == "blocked:claim_validation:price_out_of_range"
+    )
+    assert runner.state.analyses_failed == 1
+    assert service.prepared == []
+    assert service.submitted == []
+
+    current_bar["ms"] = second_bar_ms
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 2
+    assert runner.state.last_completed_bar_ms == second_bar_ms
+    assert runner.state.last_plan_result == "blocked:no_order"
+    assert runner.state.analyses_failed == 1
+
+
+def test_inflight_claim_failure_recovers_durable_partial_without_model_call(
+    monkeypatch,
+    tmp_path,
+):
+    from pa_agent.orchestrator.two_stage import _build_empty_record
+
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+
+    settings = _settings()
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    started = datetime(2026, 7, 17, tzinfo=UTC)
+    state = _state(store, started).model_copy(
+        update={"inflight_bar_ms": bar_ms}
+    )
+    store.save(state)
+    record = _build_empty_record(
+        _frame(bar_ms),
+        settings,
+        campaign_id=state.campaign_id,
+    ).model_copy(
+        update={
+            "exception": {
+                "type": "claim_validation",
+                "stage": "stage1",
+                "category": "c",
+                "code": "bar_reference_out_of_range",
+                "message": "K999 超出当前帧",
+                "invalid_fields": [
+                    "claim_validation:bar_reference_out_of_range:"
+                    "gate_trace[0].bar_range:K999"
+                ],
+            }
+        }
+    )
+    writer = PendingWriter(tmp_path)
+    writer.save_partial_durable(
+        record,
+        "stage1_claim_validation_bar_reference_out_of_range",
+    )
+    ownerless = record.model_copy(
+        update={
+            "meta": record.meta.model_copy(
+                update={
+                    "timestamp_local_ms": record.meta.timestamp_local_ms + 1,
+                    "campaign_id": None,
+                }
+            )
+        }
+    )
+    writer.save_partial_durable(
+        ownerless,
+        "stage1_claim_validation_bar_reference_out_of_range",
+    )
+
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService()
+    runtime = _runtime(orchestrator, service)
+    runtime.settings = settings
+    runtime.writer = writer
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 0
+    assert runner.state.analyses_failed == 1
+    assert (
+        runner.state.last_plan_result
+        == "blocked:claim_validation:bar_reference_out_of_range"
+    )
+    assert service.prepared == []
+    assert service.submitted == []
+
+
+def test_stale_inflight_claim_is_closed_before_latest_bar_analysis(
+    monkeypatch,
+    tmp_path,
+):
+    from pa_agent.orchestrator.two_stage import _build_empty_record
+
+    old_bar_ms = 1_784_300_400_000
+    latest_bar_ms = old_bar_ms + 10 * 60 * 1000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(latest_bar_ms),
+    )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+
+    settings = _settings()
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(update={"inflight_bar_ms": old_bar_ms})
+    store.save(state)
+    record = _build_empty_record(
+        _frame(old_bar_ms),
+        settings,
+        campaign_id=state.campaign_id,
+    ).model_copy(
+        update={
+            "exception": {
+                "type": "claim_validation",
+                "stage": "stage1",
+                "category": "c",
+                "code": "bar_reference_out_of_range",
+                "message": "K999 超出当前帧",
+                "invalid_fields": [
+                    "claim_validation:bar_reference_out_of_range:"
+                    "gate_trace[0].bar_range:K999"
+                ],
+            }
+        }
+    )
+    writer = PendingWriter(tmp_path)
+    writer.save_partial_durable(
+        record,
+        "stage1_claim_validation_bar_reference_out_of_range",
+    )
+
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService(
+        block=PlanBlocked("no_order", "PA 决策为不下单")
+    )
+    runtime = _runtime(orchestrator, service)
+    runtime.settings = settings
+    runtime.writer = writer
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 0
+    assert runner.state.last_completed_bar_ms == old_bar_ms
+    assert (
+        runner.state.last_plan_result
+        == "blocked:claim_validation:bar_reference_out_of_range"
+    )
+
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 1
+    assert runner.state.last_completed_bar_ms == latest_bar_ms
+    assert runner.state.last_plan_result == "blocked:no_order"
+
+
+def test_stale_inflight_success_is_closed_without_execution_or_model_rerun(
+    monkeypatch,
+    tmp_path,
+):
+    old_bar_ms = 1_784_300_400_000
+    latest_bar_ms = old_bar_ms + 10 * 60 * 1000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(latest_bar_ms),
+    )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+
+    started = datetime(2026, 7, 17, tzinfo=UTC)
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, started).model_copy(
+        update={"inflight_bar_ms": old_bar_ms}
+    )
+    store.save(state)
+    base = _record(symbol=CAMPAIGN_SYMBOL)
+    durable_record = base.model_copy(
+        update={
+            "meta": base.meta.model_copy(
+                update={
+                    "timestamp_local_ms": int(
+                        (started + timedelta(minutes=1)).timestamp() * 1000
+                    ),
+                    "symbol": CAMPAIGN_SYMBOL,
+                    "timeframe": CAMPAIGN_TIMEFRAME,
+                    "data_source": "okx",
+                    "market_data_provenance": (
+                        "okx_5m_utc_pair_aggregation"
+                    ),
+                    "decision_stance": CAMPAIGN_STANCE,
+                    "campaign_id": state.campaign_id,
+                }
+            ),
+            "kline_data": [{"ts_open": old_bar_ms, "closed": True}],
+        }
+    )
+    writer = PendingWriter(tmp_path)
+    writer.save_full_durable(durable_record)
+
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService(
+        block=PlanBlocked("no_order", "PA 决策为不下单")
+    )
+    runtime = _runtime(orchestrator, service)
+    runtime.writer = writer
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 0
+    assert service.prepared == []
+    assert service.submitted == []
+    assert runner.state.last_completed_bar_ms == old_bar_ms
+    assert (
+        runner.state.last_plan_result
+        == "blocked:stale_recovered_analysis"
+    )
+    assert runner.state.analyses_completed == 0
+
+    assert runner.process_latest_closed_bar() is True
+    assert orchestrator.calls == 1
+    assert runner.state.last_completed_bar_ms == latest_bar_ms
+    assert runner.state.last_plan_result == "blocked:no_order"
+
+
+def test_campaign_fails_closed_on_ownerless_inflight_claim_record(
+    monkeypatch,
+    tmp_path,
+):
+    from pa_agent.orchestrator.two_stage import _build_empty_record
+
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+
+    settings = _settings()
+    interactive = _build_empty_record(
+        _frame(bar_ms),
+        settings,
+    ).model_copy(
+        update={
+            "exception": {
+                "type": "claim_validation",
+                "stage": "stage1",
+                "category": "c",
+                "code": "price_out_of_range",
+                "message": "交互式记录",
+                "invalid_fields": [
+                    "claim_validation:price_out_of_range:"
+                    "support_levels[0]:bad"
+                ],
+            }
+        }
+    )
+    PendingWriter(tmp_path).save_partial_durable(
+        interactive,
+        "stage1_claim_validation_price_out_of_range",
+    )
+
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(update={"inflight_bar_ms": bar_ms})
+    store.save(state)
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService(
+        block=PlanBlocked("no_order", "PA 决策为不下单")
+    )
+    runner = OkxDemoCampaign(
+        _runtime(orchestrator, service),
+        store,
+        state,
+    )
+
+    with pytest.raises(CampaignError, match="缺少 campaign_id"):
+        runner.process_latest_closed_bar()
+
+    assert orchestrator.calls == 0
+    assert service.prepared == []
+    assert runner.state.inflight_bar_ms == bar_ms
+
+
+def test_campaign_fails_closed_on_ownerless_inflight_success(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
+    started = datetime(2026, 7, 17, tzinfo=UTC)
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, started).model_copy(
+        update={"inflight_bar_ms": bar_ms}
+    )
+    store.save(state)
+    base = _record(symbol=CAMPAIGN_SYMBOL)
+    ownerless = base.model_copy(
+        update={
+            "meta": base.meta.model_copy(
+                update={
+                    "timestamp_local_ms": int(
+                        (started + timedelta(minutes=1)).timestamp() * 1000
+                    ),
+                    "symbol": CAMPAIGN_SYMBOL,
+                    "timeframe": CAMPAIGN_TIMEFRAME,
+                    "data_source": "okx",
+                    "market_data_provenance": (
+                        "okx_5m_utc_pair_aggregation"
+                    ),
+                    "decision_stance": CAMPAIGN_STANCE,
+                    "campaign_id": None,
+                }
+            ),
+            "kline_data": [{"ts_open": bar_ms, "closed": True}],
+        }
+    )
+    PendingWriter(tmp_path).save_full_durable(ownerless)
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    service = _FakeExecutionService()
+    runner = OkxDemoCampaign(
+        _runtime(orchestrator, service),
+        store,
+        state,
+    )
+
+    with pytest.raises(CampaignError, match="缺少 campaign_id"):
+        runner.process_latest_closed_bar()
+
+    assert orchestrator.calls == 0
+    assert service.prepared == []
+    assert runner.state.inflight_bar_ms == bar_ms
+
+
 def test_inflight_bar_reuses_durable_record(monkeypatch, tmp_path):
     monkeypatch.setattr(
         campaign_module,
@@ -2952,38 +3393,52 @@ def test_inflight_bar_reuses_durable_record(monkeypatch, tmp_path):
         "build_analysis_frame",
         lambda *args, **kwargs: _frame(bar_ms),
     )
+    monkeypatch.setattr(campaign_module, "RECORDS_PENDING_DIR", tmp_path)
     started = datetime(2026, 7, 17, tzinfo=UTC)
-    durable_record = SimpleNamespace(
-        exception=None,
-        meta=SimpleNamespace(
-            decision_stance=CAMPAIGN_STANCE,
-            timestamp_local_ms=int((started + timedelta(minutes=1)).timestamp() * 1000),
-            symbol=CAMPAIGN_SYMBOL,
-            timeframe=CAMPAIGN_TIMEFRAME,
-            data_source="okx",
-            market_data_provenance="okx_5m_utc_pair_aggregation",
-        ),
-        kline_data=[{"ts_open": bar_ms, "closed": True}],
-    )
-    monkeypatch.setattr(
-        campaign_module,
-        "find_latest_successful_record",
-        lambda **kwargs: durable_record,
-    )
     orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
     service = _FakeExecutionService()
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(store, started).model_copy(update={"inflight_bar_ms": bar_ms})
     store.save(state)
+    base = _record(symbol=CAMPAIGN_SYMBOL)
+    durable_record = base.model_copy(
+        update={
+            "meta": base.meta.model_copy(
+                update={
+                    "timestamp_local_ms": int(
+                        (started + timedelta(minutes=1)).timestamp() * 1000
+                    ),
+                    "symbol": CAMPAIGN_SYMBOL,
+                    "timeframe": CAMPAIGN_TIMEFRAME,
+                    "data_source": "okx",
+                    "market_data_provenance": (
+                        "okx_5m_utc_pair_aggregation"
+                    ),
+                    "decision_stance": CAMPAIGN_STANCE,
+                    "campaign_id": state.campaign_id,
+                }
+            ),
+            "kline_data": [{"ts_open": bar_ms, "closed": True}],
+        }
+    )
+    writer = PendingWriter(tmp_path)
+    writer.save_full_durable(durable_record)
+    runtime = _runtime(orchestrator, service)
+    runtime.writer = writer
     runner = OkxDemoCampaign(
-        _runtime(orchestrator, service),
+        runtime,
         store,
         state,
     )
 
     assert runner.process_latest_closed_bar() is True
     assert orchestrator.calls == 0
-    assert service.prepared == [durable_record]
+    assert len(service.prepared) == 1
+    prepared_record = service.prepared[0]
+    assert prepared_record.meta == durable_record.meta
+    assert prepared_record.kline_data == durable_record.kline_data
+    assert prepared_record.stage2_decision == durable_record.stage2_decision
+    assert "risk_sizing" in prepared_record.stage2_response
     assert service.submitted == ["execution-1"]
     assert runner.state.analyses_completed == 0
 

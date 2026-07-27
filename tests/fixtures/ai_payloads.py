@@ -52,7 +52,7 @@ VALID_STAGE2_NO_ORDER = {
             "answer": "否",
             "reason": "价格在区间中部",
             "skipped": False,
-            "bar_range": "K40-K1",
+            "bar_range": "K20-K1",
         },
     ],
     "terminal": {

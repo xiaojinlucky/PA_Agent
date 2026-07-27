@@ -39,6 +39,7 @@ def _frame(n: int = 5) -> KlineFrame:
             ema20=tuple([2000.0] * n),
             atr14=tuple([10.0] * n),
         ),
+        price_tick="0.1",
     )
 
 

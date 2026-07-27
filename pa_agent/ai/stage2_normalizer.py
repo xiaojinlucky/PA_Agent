@@ -7,8 +7,6 @@ from typing import Any
 
 from pa_agent.ai.trace_normalize import normalize_stage2_traces
 from pa_agent.util.price_tick import (
-    normalize_breakout_basis_extreme,
-    normalize_breakout_entry_price,
     parse_k_seq,
 )
 
@@ -523,10 +521,8 @@ def _unwrap_flat_stage2_decision(out: dict[str, Any]) -> bool:
         decision: dict[str, Any] = {"order_type": order_type}
         decision.update(hoisted)
         if order_type == "不下单":
-            # 模型的决策主张只有这个标量（wait/reject 等）；游离在顶层被
-            # 拾取的价位字段属于格式噪音而非结构化主张，构造程序字典时
-            # 显式置空是格式修复，不是清洗结构化矛盾主张（PR3.1 只约束
-            # 模型自己填好的 decision 字典）。
+            # 只补齐真正缺失的 schema 字段；模型明确给出的非空价位必须
+            # 原样保留，让 no-order invariant 拒绝，不能在这里洗掉矛盾。
             for field in (
                 "order_direction",
                 "entry_price",
@@ -534,7 +530,7 @@ def _unwrap_flat_stage2_decision(out: dict[str, Any]) -> bool:
                 "take_profit_price_2",
                 "stop_loss_price",
             ):
-                decision[field] = None
+                decision.setdefault(field, None)
         out["decision"] = decision
         logger.debug(
             "Unwrapped scalar decision %r -> order_type=%s with %d hoisted fields",
@@ -1561,20 +1557,6 @@ def normalize_stage2(
     _normalize_stage2_bar_analysis_enums(out, stage1_json=stage1_json)
     _coerce_decision_no_order(out)
     _repair_terminal_trade_node(out)
-    decision = out.get("decision")
-    if isinstance(decision, dict) and normalize_breakout_basis_extreme(decision):
-        logger.debug(
-            "breakout entry_basis_extreme aligned to %s for %s",
-            decision.get("entry_basis_extreme"),
-            decision.get("order_direction"),
-        )
-    if isinstance(decision, dict) and normalize_breakout_entry_price(
-        decision, kline_frame=kline_frame
-    ):
-        logger.debug(
-            "breakout entry_price adjusted to basis extreme ± 1 tick (basis=%s)",
-            decision.get("entry_basis_bar"),
-        )
     _coerce_decision_when_trade_metrics_fail(
         out,
         decision_stance=decision_stance,

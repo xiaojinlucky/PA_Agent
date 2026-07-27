@@ -151,6 +151,7 @@ class OkxSource(DataSource):
         self._connected = False
         self._symbol = ""
         self._timeframe = ""
+        self._price_tick: str | None = None
 
     def connect(self) -> None:
         # 公共行情无需登录；具体品种在 subscribe 时向 OKX 在线验证。
@@ -160,6 +161,7 @@ class OkxSource(DataSource):
         self._connected = False
         self._symbol = ""
         self._timeframe = ""
+        self._price_tick = None
 
     def list_symbols(self) -> list[str]:
         return list(_PRESET_INSTRUMENTS)
@@ -196,14 +198,26 @@ class OkxSource(DataSource):
         state = str(instrument.get("state") or "").strip().lower()
         if state != "live":
             raise ValueError(f"OKX 品种 {normalized} 当前状态不是 live（可正常交易）")
+        try:
+            price_tick = Decimal(str(instrument.get("tickSz") or ""))
+        except InvalidOperation as exc:
+            raise ValueError(f"OKX 品种 {normalized} 的 tickSz 无效") from exc
+        if not price_tick.is_finite() or price_tick <= 0:
+            raise ValueError(f"OKX 品种 {normalized} 的 tickSz 无效")
 
         # 在线验证全部通过后再切换，失败不会破坏旧订阅。
         self._symbol = normalized
         self._timeframe = timeframe
+        self._price_tick = format(price_tick, "f")
 
     def unsubscribe(self) -> None:
         self._symbol = ""
         self._timeframe = ""
+        self._price_tick = None
+
+    def price_tick(self) -> str | None:
+        """返回 OKX 公共品种元数据声明的真实最小跳动。"""
+        return self._price_tick
 
     def is_symbol_available(self, symbol: str) -> bool:
         try:
@@ -323,6 +337,7 @@ class OkxSource(DataSource):
                     volume=float(volume),
                     amount=float(amount),
                     closed=closed,
+                    price_tick=self._price_tick,
                 )
             )
         return bars

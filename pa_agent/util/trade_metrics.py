@@ -1,7 +1,6 @@
 """Risk/reward and estimated win-rate helpers for trading decisions."""
 from __future__ import annotations
 
-import math
 from typing import Any
 
 
@@ -221,65 +220,6 @@ def validate_limit_order_k1_freshness(
     return errors
 
 
-def validate_price_grounding(
-    decision: dict[str, Any],
-    kline_frame: Any,
-    *,
-    atr_tolerance_multiple: float = 1.0,
-) -> list[str]:
-    """反幻觉：入场价与止损价必须落在真实 OHLC 包络内。
-
-    包络 = 已收盘 K 线的 [min(low), max(high)]，外扩容差 =
-    max(ATR14 × 倍数, 3 × tick)——给合法的突破挂单留出真实波动
-    幅度内的余量。entry/stop 与当前市场直接互动，落在包络外说明
-    模型引用了不存在的价格水平，整个决策拒绝，不做任何修正。
-    止盈目标本就允许投射到历史区间之外，由 RR/几何校验经 entry
-    传递锚定，不在此检查。
-    """
-    if decision.get("order_type") not in ("限价单", "突破单", "市价单"):
-        return []
-    bars = getattr(kline_frame, "bars", None) if kline_frame is not None else None
-    closed = [bar for bar in (bars or []) if bool(getattr(bar, "closed", True))]
-    if not closed:
-        return []
-
-    envelope_low = min(float(bar.low) for bar in closed)
-    envelope_high = max(float(bar.high) for bar in closed)
-
-    from pa_agent.util.price_tick import infer_price_tick_from_frame
-
-    tick = infer_price_tick_from_frame(kline_frame) or 0.0
-    atr_value = 0.0
-    indicators = getattr(kline_frame, "indicators", None)
-    atr_series = getattr(indicators, "atr14", None) if indicators else None
-    if atr_series:
-        for value in atr_series:
-            candidate = float(value)
-            if math.isfinite(candidate) and candidate > 0:
-                atr_value = candidate
-                break
-    tolerance = max(atr_value * max(atr_tolerance_multiple, 0.0), tick * 3)
-    lower_bound = envelope_low - tolerance
-    upper_bound = envelope_high + tolerance
-
-    errors: list[str] = []
-    for field in ("entry_price", "stop_loss_price"):
-        raw = decision.get(field)
-        if raw is None:
-            continue
-        try:
-            price = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if not (lower_bound <= price <= upper_bound):
-            errors.append(
-                f"decision.{field}: {price:.6g} 落在真实 OHLC 包络 "
-                f"[{envelope_low:.6g}, {envelope_high:.6g}]±{tolerance:.6g} 之外；"
-                "价位必须来自真实 K 线可见的价格水平，否则 order_type=不下单"
-            )
-    return errors
-
-
 def validate_take_profit_2_geometry(
     decision: dict[str, Any],
 ) -> list[str]:
@@ -374,7 +314,6 @@ def validate_order_trade_metrics(
         )
 
     if kline_frame is not None:
-        errors.extend(validate_price_grounding(decision, kline_frame))
         errors.extend(
             validate_limit_order_k1_freshness(
                 decision, kline_frame, bar_analysis=bar_analysis

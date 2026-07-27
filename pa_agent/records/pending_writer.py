@@ -36,11 +36,34 @@ def _ms_to_local_datetime(ms: int) -> datetime:
 
 def _build_basename(record: AnalysisRecord) -> str:
     """Build the filename stem (without extension) for a record."""
-    dt = _ms_to_local_datetime(record.meta.timestamp_local_ms)
-    ts_str = dt.strftime("%Y-%m-%d_%H-%m-%S")
+    timestamp_ms = record.meta.timestamp_local_ms
+    dt = _ms_to_local_datetime(timestamp_ms)
+    ts_str = (
+        f"{dt.strftime('%Y-%m-%d_%H-%M-%S')}"
+        f"-{timestamp_ms % 1000:03d}"
+    )
     symbol = record.meta.symbol
     timeframe = record.meta.timeframe
-    return f"{ts_str}_{symbol}_{timeframe}"
+    campaign_suffix = (
+        f"_{record.meta.campaign_id}"
+        if record.meta.campaign_id is not None
+        else ""
+    )
+    return f"{ts_str}_{symbol}_{timeframe}{campaign_suffix}"
+
+
+def _build_legacy_basename(record: AnalysisRecord) -> str:
+    """返回 WO-F 前秒级、无 Campaign 后缀的历史文件名。
+
+    历史实现误把分钟写成月份（``%m``）。这里必须保留该格式，才能继续
+    找到已经落盘的旧主记录和自由追问 sidecar；新记录只使用
+    ``_build_basename`` 的正确分钟格式。
+    """
+    dt = _ms_to_local_datetime(record.meta.timestamp_local_ms)
+    return (
+        f"{dt.strftime('%Y-%m-%d_%H-%m-%S')}_"
+        f"{record.meta.symbol}_{record.meta.timeframe}"
+    )
 
 
 class PendingWriter:
@@ -97,6 +120,25 @@ class PendingWriter:
         """Return the canonical full-record path without writing it."""
         return self._pending_dir / f"{_build_basename(record)}.json"
 
+    def record_id(self, record: AnalysisRecord) -> str:
+        """解析主记录及自由追问 sidecar 共用的文件名 stem。
+
+        新记录使用毫秒级 canonical 名；打开旧秒级记录时，只要旧主文件或
+        sidecar 仍存在，就继续沿用旧名，避免历史追问断成新的孤立会话。
+        """
+        canonical = _build_basename(record)
+        if (self._pending_dir / f"{canonical}.json").is_file():
+            return canonical
+        legacy = _build_legacy_basename(record)
+        legacy_paths = (
+            self._pending_dir / f"{legacy}.json",
+            self._pending_dir / f"{legacy}.followups.jsonl",
+            self._pending_dir / f"{legacy}.conversation.json",
+        )
+        if any(path.is_file() for path in legacy_paths):
+            return legacy
+        return canonical
+
     def save_full_durable(self, record: AnalysisRecord) -> Path:
         """Atomically write, fsync and re-read a complete record.
 
@@ -145,6 +187,60 @@ class PendingWriter:
         self._write_json(path, data)
         try:
             from pa_agent.records.analysis_history import invalidate_latest_record_cache
+
+            invalidate_latest_record_cache()
+        except Exception:  # noqa: BLE001
+            pass
+        return path
+
+    def save_partial_durable(
+        self,
+        record: AnalysisRecord,
+        reason: str,
+    ) -> Path:
+        """原子持久化并回读验证一份必须可恢复的失败记录。
+
+        普通 UI 取消等历史路径仍可使用 ``save_partial`` 的尽力而为语义；
+        会影响 Campaign 幂等推进的声明校验失败必须走本方法。
+        """
+        path = self.full_path(record)
+        data = record.model_dump()
+        data["_partial_reason"] = reason
+        if isinstance(data.get("exception"), dict):
+            data["exception"] = {
+                **data["exception"],
+                "partial_reason": reason,
+            }
+        data = self._sanitize(data, self._api_key)
+        self._write_json_durable(path, data)
+        try:
+            persisted_raw = json.loads(path.read_text(encoding="utf-8"))
+            if persisted_raw.pop("_partial_reason", None) != reason:
+                raise ValueError("partial reason mismatch")
+            persisted = AnalysisRecord.model_validate(persisted_raw)
+        except Exception as exc:
+            raise OSError(
+                f"durable partial analysis record verification failed: {path}"
+            ) from exc
+        expected_exception = record.exception
+        if isinstance(expected_exception, dict):
+            expected_exception = {
+                **expected_exception,
+                "partial_reason": reason,
+            }
+        if (
+            persisted.meta.timestamp_local_ms != record.meta.timestamp_local_ms
+            or persisted.meta.symbol != record.meta.symbol
+            or persisted.meta.timeframe != record.meta.timeframe
+            or persisted.exception != expected_exception
+        ):
+            raise OSError(
+                f"durable partial analysis record content mismatch: {path}"
+            )
+        try:
+            from pa_agent.records.analysis_history import (
+                invalidate_latest_record_cache,
+            )
 
             invalidate_latest_record_cache()
         except Exception:  # noqa: BLE001

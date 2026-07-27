@@ -42,6 +42,16 @@ class RecordMeta(BaseModel):
     bar_count: int
     ai_provider: dict         # Sanitized provider config snapshot (no plaintext API key)
     decision_stance: str = "conservative"  # conservative | balanced | aggressive | extreme_aggressive
+    # 只有受控 Campaign 分析填写；交互式 GUI 保持 None。用于恢复时证明
+    # pending 记录确实属于当前 Campaign，不能只按标的/周期猜所有权。
+    campaign_id: str | None = None
+
+    @field_validator("campaign_id")
+    @classmethod
+    def _validate_campaign_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return str(UUID(str(value)))
 
 
 class AnalysisRecord(BaseModel):
@@ -54,6 +64,9 @@ class AnalysisRecord(BaseModel):
     htf_text: str
     # 最新已收盘主周期 K 线对应的 ATR14 快照；执行滑点由它乘以用户倍数得到。
     analysis_atr14: float | None = None
+    # 分析时行情源声明的真实最小价格跳动；用于证明价位精度校验没有
+    # 从 K 线小数位猜测。
+    analysis_price_tick: str | None = None
     stage1_messages: list[dict]
     stage1_response: Optional[dict]     # Raw response (includes reasoning_content)
     stage1_diagnosis: Optional[dict]

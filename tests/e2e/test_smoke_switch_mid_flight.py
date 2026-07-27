@@ -36,6 +36,7 @@ def _make_ctx_slow_stage2(tmp_path):
 
     # stage2 call blocks for up to 5 s, but respects the cancel token
     stage2_started = threading.Event()
+    cancel_observed = threading.Event()
 
     def slow_chat(messages, cancel_token=None, **kwargs):
         call_count = slow_chat._call_count
@@ -51,6 +52,7 @@ def _make_ctx_slow_stage2(tmp_path):
             while time.monotonic() < deadline:
                 if cancel_token is not None and cancel_token.is_set():
                     from pa_agent.ai.deepseek_client import CancelledError
+                    cancel_observed.set()
                     raise CancelledError("cancelled by token")
                 time.sleep(0.05)
             return _make_reply(VALID_STAGE2_ORDER)
@@ -79,17 +81,27 @@ def _make_ctx_slow_stage2(tmp_path):
     ctx.exp_reader = MagicMock()
     ctx.exp_reader.read_top5.return_value = []
 
-    return ctx, pending_writer, stage2_started
+    return ctx, pending_writer, stage2_started, cancel_observed
 
 
 @pytest.mark.e2e
-def test_switch_mid_flight_cancels_worker(qtbot, tmp_path):
+def test_switch_mid_flight_cancels_worker(qtbot, tmp_path, monkeypatch):
     """Switching symbol while stage2 is running cancels the worker."""
     from pa_agent.gui.main_window import MainWindow
 
-    ctx, _pending_writer, stage2_started = _make_ctx_slow_stage2(tmp_path)
+    (
+        ctx,
+        _pending_writer,
+        stage2_started,
+        cancel_observed,
+    ) = _make_ctx_slow_stage2(tmp_path)
 
     window = MainWindow(ctx)
+    monkeypatch.setattr(
+        window,
+        "_prompt_debug_report_for_bug_fix",
+        lambda *args, **kwargs: None,
+    )
     qtbot.addWidget(window)
     window.show()
 
@@ -109,13 +121,19 @@ def test_switch_mid_flight_cancels_worker(qtbot, tmp_path):
     worker = window._worker
     assert worker is not None, "Worker should have been created"
 
-    # Trigger symbol switch mid-flight
-    window._symbol_combo.setCurrentText("EURUSD")
+    # Trigger the same committed switch path used after the user confirms a
+    # typed symbol through 获取数据/提交分析. Typing alone intentionally only
+    # updates the alert label and must not change subscriptions.
+    window._on_symbol_or_tf_changed(
+        "EURUSD",
+        window._tf_combo.currentText(),
+    )
 
     # Worker should be cancelled and finish within a reasonable time
     # (the slow_chat loop checks cancel_token every 50 ms)
-    finished = worker.wait(6_000)  # 6 s timeout
+    finished = worker.wait(2_000)
     assert finished, "Worker did not finish after symbol switch"
+    assert cancel_observed.is_set(), "Stage 2 did not observe cancellation"
 
     # The current streaming conversation input should be disabled after switch.
     assert not window._stream_panel._input_edit.isEnabled()

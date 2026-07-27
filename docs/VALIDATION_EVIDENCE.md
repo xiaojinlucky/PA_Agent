@@ -561,3 +561,35 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 16:31 最终启动硬门：Worker 心跳和成功对账新鲜，两库完整，账户身份一致；活动 execution、PENDING/RUNNING 命令、未解决 UNCERTAIN、NEW_RISK 租约均为 0；OKX Demo 非零仓位、普通挂单和八类算法挂单均为 0。
 - 风险账本当时只保留白名单内的 `risk_runtime_BrokerTransportError` 临时停止。Campaign 从正式 `run` 入口恢复后，只创建一次耐久恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e`；Worker 完成新的账户、身份和账单读取后返回 `clear_drawdown_stop_completed`。高水位保持 `78303.57015174496`，没有重锚。
 - 首根新已收盘 10m K 线 16:20–16:30 完成，`analyses_completed` 从 16 增至 17，真实结果 `blocked:no_order`；没有新增 execution、订单、仓位或租约。Campaign 保持 `active`，Worker 和全局对账继续新鲜，风险停止为 0。
+
+## 2026-07-27 WO-F Claim Validation 完整闭环
+
+### 实现与拒绝语义
+
+- 新增 `pa_agent/ai/claim_validation.py`，同时校验原始模型声明与归一化后的 Stage1/Stage2 对象，防止越界价位或虚假 K 线引用在归一化过程中被洗掉。
+- Stage1 覆盖支撑与阻力，Stage2 覆盖入场、止损和两档止盈；价格范围使用已收盘 OHLC 包络外扩可配置 ATR14 容差，默认 `1.0×ATR14`。
+- 价格精度只认行情源写入 `KlineFrame.price_tick` 的真实最小跳动；缺失时返回 `price_tick_unavailable`，不按显示小数位猜测。
+- `bar_range`、`new_closed_bars`、`entry_basis_bar` 和文本中的 K 序号必须真实存在于当前已收盘 K 线集合。错误码按固定优先级稳定选择，并耐久写入分析记录。
+- 最终失败由 Campaign 映射为 `blocked:claim_validation:<code>`，完成本根后继续下一根；离线测试证明该路径不创建 execution、提交、撤单、离场或调杠杆写入。
+- Campaign 恢复只接管同一 `campaign_id` 的耐久记录；ownerless 文件不会被采用，崩溃前遗留的成功分析会明确关闭为 `blocked:stale_recovered_analysis`，不会在重启后执行陈旧信号。
+
+### 离线验证
+
+- `tests/unit`、`tests/property`、`tests/integration` 最终为 1926 项通过、7 项跳过、0 失败；其中 3 项因未提供 KKAI 模型密钥固定跳过，4 个 AkShare 联网冒烟测试因各自端点当轮不可达而条件跳过。
+- GUI E2E 为 4 项通过、0 失败。加固后的品种切换用例明确断言 Stage2 看到了取消令牌；有效订单夹具的文字价位与结构化入场、止损、止盈一致。
+- 改动 Python 文件 Ruff `E4,E7,E9,F,I,UP,B,C4` 相对 `HEAD` 没有新增诊断，减少 2 条旧诊断；`compileall pa_agent tests` 与 `git diff --check` 通过。
+- 两轮代码/测试对抗审查及最后增量复审均无 P0/P1。最后发现的历史文件名兼容与两个测试假绿点已修正并复跑。
+- 持久记录文件名此前把分钟误写为月份。新 canonical 文件名改用真实分钟、毫秒和 Campaign ID；legacy 查找保留旧 `%m` 格式，确保历史主记录和自由追问 sidecar 不断链。
+- 隐藏重定向进程里合并运行全部 `tests/` 时，Windows/Qt 的既有 `AxisItem` 析构竞态触发 access violation；工单要求的三套件与 GUI E2E 已在隔离进程分别完整运行并零失败，未把该运行器崩溃伪报成测试通过。
+
+### OKX Demo 实盘式运行验收
+
+- 2026-07-27 19:01–19:05 完成只读硬门：Worker、账户身份、风险态和数据库完整性均满足要求；活动 execution、活动命令、未解决 UNCERTAIN、有效 NEW_RISK 租约、仓位、普通挂单和八类算法挂单均为 0。
+- 19:07:06 从正式 `run` 入口恢复同一 Campaign `6cba8d3e-44e2-447e-b51f-1254aff2a425`。
+- 19:10–19:20 K 线于 19:21:37 完成，19:20–19:30 K 线于 19:31:31 完成；两根均为自然 `blocked:no_order`。对应记录复跑声明校验均为 0 issues。
+- 发现文件名分钟问题后，20:01 再次确认 Campaign 空闲、两库完整、Worker/账户/风险态健康且券商空仓空单，随后只停止旧进程树并从正式 `run` 入口恢复同一 Campaign，没有使用 `restart`、没有归档状态或改变冻结参数。
+- 重载后的 20:00–20:10 K 线于 20:11:35 完成，Campaign 统计变为 28 成功、2 失败，结果仍为 `blocked:no_order`。新记录 `2026-07-27_20-10-17-632_XAU-USDT-SWAP_10m_6cba8d3e-44e2-447e-b51f-1254aff2a425.json` 的分钟与 `timestamp_local_ms` 一致，`analysis_price_tick=0.1`、来源为 `okx_5m_utc_pair_aggregation`、K1 已收盘、共 100 根；原始/归一化 Stage1、Stage2 四次声明复验均为 0 issues。
+- 20:13 最终回查：Campaign 保持 `active`；两库 `integrity_check=ok`，Worker 心跳与成功对账新鲜；活动 execution、PENDING/RUNNING 命令、未解决 UNCERTAIN、有效 NEW_RISK 租约、非零仓位、普通挂单和八类算法挂单均为 0。账户身份仍为 `ba9b744dc78ae3fc203980e62b854b0a0e3d44c9c6d5e446de910bea74ef1def`，高水位仍为 `78303.57015174496`，风险停止为 0。
+- 新 Campaign 日志没有真实 ERROR/CRITICAL 等级行；仅重复出现已登记的 Windows `WinError 32` 日志轮转警告，没有第三类新异常。
+- 这次运行验收证明正式入口已加载 WO-F 且自然样本没有被误杀。自然样本没有产生非法声明，因此不能声称现场实际触发过 `blocked:claim_validation`；非法声明拒绝与继续下一根由离线集成和 Campaign 测试证明。
+- 全程仅使用 OKX Demo 模拟账户，不构成 OKX Live 实盘、策略盈利或 Longbridge 验收证明。长桥 `401004` 与 WO-E 视觉方向阻塞均未解除。

@@ -157,16 +157,15 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - 已有基座：`_symbol_combo`（main_window.py:653）、`_switch_data_source` 事务（:1738）、`last_symbols_by_source` 持久化、`EnhancedStatusBar`（gui/widgets/status_bar.py，未挂载）。
 - 验收：同一桌面窗口对 AAPL.US、700.HK、600519.SH 各完成一次真实两阶段分析（用户从 .lnk 启动后截图）。
 
-### WO-F Claim Validation 反幻觉层（roadmap P1 项）
+### WO-F Claim Validation 反幻觉层（2026-07-27 完成）
 
-**当前状态：部分完成，禁止标成整张工单完成。** 已落地截断/归一化严格化和 entry/stop 的 OHLC 包络校验，历史 property 失败也已裁决；但下面原规格中的 TP 与支撑阻力价位、K 线引用边界、真实品种 tick、稳定错误码和 `blocked:claim_validation:<code>` 后继续下一根仍未全部实现。完整接线会越过当前 WO-H 白名单并需要运行验收。
+**状态：已完成。** 本地实现、离线三套件、对抗审查和 OKX Demo 正式入口运行验收均已通过。
 
-**目标**：LLM 输出的每个价位必须落在真实 OHLC 范围内、引用的 K 线特征可回溯到具体 bar，否则拒绝输出（Let it crash，不静默修正）。
+**已落地**：新增 `pa_agent/ai/claim_validation.py`，同时检查原始模型声明与归一化后的结构化对象，防止非法声明被 normalizer 洗成合法结果。Stage1 校验 `support_levels`、`resistance_levels`；Stage2 校验 `entry_price`、`stop_loss_price`、`take_profit_price`、`take_profit_price_2`。价位必须落在已收盘 OHLC 包络外扩可配置 ATR14 容差内，且必须是行情源声明的真实 `price_tick` 整数倍；缺少真实 tick 时直接拒绝，不按显示小数位猜测。`bar_range`、`new_closed_bars`、`entry_basis_bar` 及文本中的 K 序号必须存在于当前已收盘 K 线集合。
 
-**实现要点**：新模块 `pa_agent/ai/claim_validation.py`；校验点挂在 Stage1/Stage2 JSON 归一化之后、执行计划构建之前（`orchestrator/two_stage.py` 与 `ai/json_validator.py` 的衔接处）；校验项：① `entry/stop/tp` 与 `support/resistance_levels` 必须在 `[min(low)-容差, max(high)+容差]` 内（容差 = 当前 ATR14 的可配置倍数，默认 1.0×，防止合法的突破位被误杀）；② `bar_range`/`new_closed_bars` 引用的 K 序号必须 ≤ 实际根数；③ 价位精度必须符合品种 tick size。失败 → 该轮分析标记 `blocked:claim_validation:<code>` 耐久记录并继续下一根（与现有 blocked 语义一致，不让 Campaign 退出）。
-**顺带**：清理 `tests/property` 6 个历史失败（它们正是 AI 输出校验语义级失败——先逐个读失败原因，判断是测试契约过期还是校验器缺陷，再决定改测试还是改校验器；不许为了绿而放宽校验）。
+**耐久闭环**：声明校验只拒绝，不修改模型输出。带反馈重试仍失败时，分析记录耐久保存 `exception.type=claim_validation` 和稳定错误码；Campaign 写入 `blocked:claim_validation:<code>` 后继续下一根，不创建 execution 或券商写命令。Campaign 恢复只认同一 `campaign_id` 的耐久记录，重启时不会接管 ownerless 文件，也不会执行崩溃前的陈旧成功分析。
 
-**验收标准**：新模块单测覆盖越界价/越界 bar 引用/合法突破位不误杀三类；property 6 项失败清零或每项有书面裁决（测试契约过期 → 更新测试并说明）；全量 unit 无新增失败。
+**验收结果**：unit/property/integration 1926 项通过、7 项跳过、0 失败；GUI E2E 4 项通过、0 失败。OKX Demo 正式 `run` 入口加载新代码后，两根目标 10m K 线均自然完成为 `blocked:no_order`，记录复跑声明校验为 0 issues。20:01 在完整空现场硬门后安全重载同一 Campaign；20:00–20:10 K 线于 20:11:35 完成相同结果，新文件名分钟与原始/归一化 Stage1、Stage2 四次声明复验均通过，Campaign 保持 active。
 
 > **2026-07-27 09:20 基线更新（重要）**：`tests/unit` + `tests/property` 全量 **零失败**，
 > 交接时的历史 18 项已全部裁决清零（3 个真实代码缺陷 + 其余为生产演进后测试滞后 / 夹具
@@ -269,7 +268,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 | WO-C | 硬门全过后重启，继承正确，≥1 根自然 K 线，无新 ERROR |
 | WO-D | 3 标的 complete、时区/规则块人工抽查过、acceptance_pass=true |
 | WO-E | 设计流程全走完+用户审美确认，零副标题，真实读写链接通，三标的桌面验收 |
-| WO-F | 三类校验单测过，property 6 项清零或书面裁决，unit 零新增失败 |
+| WO-F | Stage1/Stage2 受管价位、真实 K 线引用和行情源 tick 硬校验；稳定 `blocked:claim_validation:<code>` 耐久化并继续下一根；三套件零失败；OKX Demo 正式入口加载与自然样本无误杀验收通过 |
 | WO-G-3 | `CONTEXT.md` 保持一页，历史流水账完整归档且可还原 |
 | WO-H-3 | 每次完整或增量分析自动落成交量影子摘要，并可离线描述性评分；不进提示词、不生成信号、不宣称转正 |
 
@@ -339,7 +338,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   独立静态审查无 P0/P1，确认的 5 个 P2 已全部修正。三套件 1880 项、0 失败、0 错误、
   7 项跳过（3 固定 + 4 个 AkShare 条件跳过）；WO-F 因原规格未完整落地改回“部分完成”。
 - [ ] WO-D：**被长桥 token 401004 阻塞，等用户重签**
-- [ ] WO-F：只完成严格化、entry/stop grounding 和历史失败裁决；原规格其余部分仍待完成
+- [x] WO-F：全部受管价位、K 线引用、真实 tick、稳定错误码和 Campaign 继续下一根语义完成；离线回归、对抗审查与 OKX Demo 正式入口运行验收通过
 - [x] WO-G-1、WO-G-2、WO-G-3：历史测试失败裁决完成，`CONTEXT.md` 一页化完成
 - [x] WO-H 任务 1、2：提交 `0a0c5a8` 已推送
 - [x] WO-H 任务 3：成交量影子摘要、自动分析落盘、离线评分脚本和测试完成；未进提示词
@@ -348,6 +347,13 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
+- [x] 2026-07-27 20:01 WO-F 完整闭环：Stage1/Stage2 全部受管价位、真实 K 线引用和
+  行情源声明 tick 硬校验完成；最终失败耐久写 `blocked:claim_validation:<code>` 并继续
+  下一根，零 execution/券商写命令。unit/property/integration 1926 项通过、7 项跳过、
+  0 失败，GUI E2E 4 项通过、0 失败；两轮代码审查及最后增量复审无 P0/P1。OKX Demo
+  两根目标 10m K 线自然完成为 `blocked:no_order`，复跑声明校验 0 issues；随后通过空现场
+  硬门安全重载同一 Campaign。重载后 20:00–20:10 K 线于 20:11:35 完成 `blocked:no_order`；
+  新记录文件名分钟和四次声明复验均通过，账户身份、高水位和冻结风险参数未改变。
 
 ## 6. 用户侧待办（只有用户能做）
 

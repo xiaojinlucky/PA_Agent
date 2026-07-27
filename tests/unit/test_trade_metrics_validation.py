@@ -17,15 +17,51 @@ validator = schema_test_validator()
 
 
 def _frame() -> KlineFrame:
+    bars = [
+        KlineBar(
+            seq=1,
+            ts_open=10.0,
+            open=101.0,
+            high=104.0,
+            low=100.0,
+            close=101.0,
+            volume=1,
+            closed=True,
+        ),
+        KlineBar(
+            seq=2,
+            ts_open=9.0,
+            open=100.0,
+            high=102.0,
+            low=98.0,
+            close=101.0,
+            volume=1,
+            closed=True,
+        ),
+    ]
+    bars.extend(
+        KlineBar(
+            seq=seq,
+            ts_open=float(11 - seq),
+            open=100.0,
+            high=103.0,
+            low=97.0,
+            close=100.0,
+            volume=1,
+            closed=True,
+        )
+        for seq in range(3, 11)
+    )
     return KlineFrame(
         symbol="XAUUSD",
         timeframe="5m",
-        bars=(
-            KlineBar(seq=1, ts_open=1.0, open=101.0, high=104.0, low=100.0, close=103.0, volume=1, closed=True),
-            KlineBar(seq=2, ts_open=0.0, open=100.0, high=102.0, low=98.0, close=101.0, volume=1, closed=True),
+        bars=tuple(bars),
+        indicators=IndicatorBundle(
+            ema20=tuple(100.0 for _ in bars),
+            atr14=tuple(10.0 for _ in bars),
         ),
-        indicators=IndicatorBundle(ema20=(100.0, 100.0), atr14=(2.0, 2.0)),
         snapshot_ts_local_ms=1,
+        price_tick="0.1",
     )
 
 
@@ -258,8 +294,8 @@ def test_stage2_validator_coerces_bad_rr_to_no_order() -> None:
     assert result.obj["terminal"]["outcome"] == "reject"
 
 
-def test_stage2_validator_auto_fixes_breakout_entry_at_or_inside_basis_high() -> None:
-    """Entry at/below K2 high is bumped to high + 1 tick before breakout_price check."""
+def test_stage2_validator_rejects_breakout_entry_at_or_inside_basis_high() -> None:
+    """突破价不再被程序改写；等于/低于依据高点时直接拒绝。"""
     obj = _stage2_trade_obj(entry_price=101.5, take_profit_price=106.5, stop_loss_price=100.0)
     result = validator.validate(
         "stage2",
@@ -267,9 +303,11 @@ def test_stage2_validator_auto_fixes_breakout_entry_at_or_inside_basis_high() ->
         decision_stance="aggressive",
         kline_frame=_frame(),
     )
-    assert isinstance(result, Ok)
-    entry = result.obj["decision"]["entry_price"]
-    assert entry > 102.0
+    assert isinstance(result, ValidationError)
+    assert any(
+        field.startswith("breakout_price:")
+        for field in result.invalid_fields
+    )
 
 
 def test_stage2_validator_normalizes_stale_entry_bar_to_pending() -> None:
@@ -562,7 +600,7 @@ def test_planned_limit_allows_k1_wick_touch_entry() -> None:
 
 def test_price_grounding_rejects_hallucinated_level() -> None:
     """价位远超真实 OHLC 包络 → 反幻觉拒绝（PR 反幻觉层）。"""
-    from pa_agent.util.trade_metrics import validate_price_grounding
+    from pa_agent.ai.claim_validation import validate_claims
 
     decision = {
         "order_type": "限价单",
@@ -572,14 +610,16 @@ def test_price_grounding_rejects_hallucinated_level() -> None:
         "take_profit_price_2": 4531.0,
         "stop_loss_price": 4524.9,
     }
-    errors = validate_price_grounding(decision, _frame())
-    assert errors
-    assert any("entry_price" in e for e in errors)
-    assert any("OHLC 包络" in e for e in errors)
+    issues = validate_claims("stage2", {"decision": decision}, _frame())
+    assert any(
+        issue.code == "price_out_of_range"
+        and issue.path == "decision.entry_price"
+        for issue in issues
+    )
 
 
 def test_price_grounding_accepts_prices_inside_envelope() -> None:
-    from pa_agent.util.trade_metrics import validate_price_grounding
+    from pa_agent.ai.claim_validation import validate_claims
 
     decision = {
         "order_type": "限价单",
@@ -589,12 +629,12 @@ def test_price_grounding_accepts_prices_inside_envelope() -> None:
         "take_profit_price_2": 106.0,
         "stop_loss_price": 100.0,
     }
-    assert validate_price_grounding(decision, _frame()) == []
+    assert validate_claims("stage2", {"decision": decision}, _frame()) == []
 
 
 def test_price_grounding_allows_breakout_within_atr_margin() -> None:
     """合法突破挂单允许高出包络一个 ATR 容差，不得误杀。"""
-    from pa_agent.util.trade_metrics import validate_price_grounding
+    from pa_agent.ai.claim_validation import validate_claims
 
     frame = _frame()
     envelope_high = max(float(b.high) for b in frame.bars if b.closed)
@@ -613,24 +653,27 @@ def test_price_grounding_allows_breakout_within_atr_margin() -> None:
         "take_profit_price_2": None,
         "stop_loss_price": None,
     }
-    assert validate_price_grounding(decision, frame) == []
+    assert validate_claims("stage2", {"decision": decision}, frame) == []
     far_above = envelope_high + atr_values[0] * 5
     decision["entry_price"] = far_above
-    assert validate_price_grounding(decision, frame)
+    assert validate_claims("stage2", {"decision": decision}, frame)
 
 
-def test_price_grounding_wired_into_order_metrics() -> None:
-    """validate_order_trade_metrics 传入 kline_frame 时必须执行包络校验。"""
-    decision = {
-        "order_type": "限价单",
-        "order_direction": "做多",
-        "entry_price": 4527.4,
-        "take_profit_price": 4533.0,
-        "take_profit_price_2": 4540.0,
-        "stop_loss_price": 4524.0,
-        "estimated_win_rate": 60,
-    }
-    errors = validate_order_trade_metrics(
-        decision, decision_stance="extreme_aggressive", kline_frame=_frame()
+def test_claim_validation_is_wired_into_json_validator() -> None:
+    obj = _stage2_trade_obj(
+        entry_price=4527.4,
+        take_profit_price=4533.0,
+        take_profit_price_2=4540.0,
+        stop_loss_price=4524.0,
     )
-    assert any("OHLC 包络" in e for e in errors)
+    result = validator.validate(
+        "stage2",
+        json.dumps(obj),
+        decision_stance="extreme_aggressive",
+        kline_frame=_frame(),
+    )
+    assert isinstance(result, ValidationError)
+    assert any(
+        field.startswith("claim_validation:price_out_of_range:")
+        for field in result.invalid_fields
+    )

@@ -35,14 +35,9 @@ def _derive_record_id(record: AnalysisRecord) -> str:
 
     Uses the same logic as ``_build_basename`` in pending_writer.py.
     """
-    from datetime import datetime, timezone
+    from pa_agent.records.pending_writer import _build_basename
 
-    ms = record.meta.timestamp_local_ms
-    dt = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).astimezone()
-    ts_str = dt.strftime("%Y-%m-%d_%H-%m-%S")
-    symbol = record.meta.symbol
-    timeframe = record.meta.timeframe
-    return f"{ts_str}_{symbol}_{timeframe}"
+    return _build_basename(record)
 
 
 def _strip_reasoning(message: dict) -> dict:
@@ -106,8 +101,15 @@ class FreeChatSession:
         # ``reasoning_content``.
         self._history_full: list[dict] = []
 
-        # Derived record ID used as the JSONL sidecar basename.
-        self._record_id: str = _derive_record_id(base_record)
+        # Derived record ID used as the JSONL sidecar basename. 真实
+        # PendingWriter 会先解析旧秒级主记录；MagicMock/轻量测试替身仍走
+        # 纯函数 canonical 名，避免要求所有替身同步新增方法。
+        record_id_resolver = getattr(type(pending_writer), "record_id", None)
+        self._record_id = (
+            record_id_resolver(pending_writer, base_record)
+            if callable(record_id_resolver)
+            else _derive_record_id(base_record)
+        )
         self._native_thread_id = ""
         self._native_provider_adapter = ""
         self._native_model = ""

@@ -57,6 +57,7 @@ def _frame(bar_ms: int) -> KlineFrame:
         bars=(bar,),
         indicators=IndicatorBundle(ema20=(4000.0,), atr14=(10.0,)),
         snapshot_ts_local_ms=bar_ms,
+        price_tick="0.1",
     )
 
 
@@ -68,6 +69,9 @@ class _Source:
         del count
         return [object()]
 
+    def price_tick(self):
+        return "0.1"
+
     def disconnect(self):
         return None
 
@@ -77,7 +81,7 @@ class _ScriptedOrchestrator:
         self.writer = writer
         self.calls = 0
 
-    def submit(self, frame, token, on_event):
+    def submit(self, frame, token, on_event, *, campaign_id=None):
         del token, on_event
         self.calls += 1
         bar = frame.bars[0]
@@ -94,6 +98,7 @@ class _ScriptedOrchestrator:
                             "okx_5m_utc_pair_aggregation"
                         ),
                         "decision_stance": "extreme_aggressive",
+                        "campaign_id": campaign_id,
                     }
                 ),
                 "kline_data": [dataclasses.asdict(bar)],

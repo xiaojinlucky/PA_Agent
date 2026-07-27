@@ -227,6 +227,9 @@ class ValidationSettings(BaseModel):
     stage2_coherence_checks: bool = False
     trace_semantic_checks: bool = False
     strict_bar_by_bar_features: bool = False
+    #: 声明价位允许超出可见 OHLC 包络的 ATR14 倍数。默认 1×，既容纳
+    #: 合法突破，又不允许模型引用远离真实 K 线的虚构价位。
+    claim_atr_tolerance_multiple: float = Field(default=1.0, ge=0.0, le=10.0)
     #: Stage 1 截断 JSON 尾部注入修复默认关闭（Let it crash）：截断输出按
     #: 语法失败进入带反馈的重试，只有显式配置 False 才允许注入修复；
     #: 注入修复也只能给出 gate_result=unknown，绝不伪造 proceed。
