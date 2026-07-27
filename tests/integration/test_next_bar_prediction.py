@@ -11,17 +11,29 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from tests.fixtures.validators import schema_test_validator
 from pa_agent.ai.router import route_strategy_files
+from pa_agent.config.settings import Settings
 from pa_agent.orchestrator.two_stage import TwoStageOrchestrator
 from pa_agent.util.threading import CancelToken
+from tests.fixtures.validators import schema_test_validator
 
 from .conftest import (
     VALID_STAGE1,
     VALID_STAGE2,
-    make_reply,
     make_frame,
+    make_reply,
 )
+
+
+def _settings_with_next_bar_prediction() -> Settings:
+    """下根K线预期功能默认关闭（省 token），关闭时程序会剥离该字段。
+
+    验证"模型返回预测→记录保留预测"必须显式开启该开关，
+    否则测到的是功能关闭时的正确剥离行为。
+    """
+    settings = Settings()
+    settings.general.enable_next_bar_prediction = True
+    return settings
 
 _PREDICTION_BULLISH = {
     "direction": "bullish",
@@ -98,6 +110,7 @@ def test_orchestrator_passes_through_prediction(
         validator=validator,
         pending_writer=pending_writer,
         exp_reader=exp_reader,
+        settings=_settings_with_next_bar_prediction(),
     )
 
     record = orchestrator.submit(
@@ -166,6 +179,7 @@ def test_short_circuit_emits_unpredictable(
         validator=validator,
         pending_writer=pending_writer,
         exp_reader=exp_reader,
+        settings=_settings_with_next_bar_prediction(),
     )
 
     record = orchestrator.submit(
@@ -224,6 +238,7 @@ def test_save_full_round_trip(
         validator=validator,
         pending_writer=pending_writer,
         exp_reader=exp_reader,
+        settings=_settings_with_next_bar_prediction(),
     )
 
     orchestrator.submit(
@@ -233,7 +248,8 @@ def test_save_full_round_trip(
     )
 
     # Verify saved record has the prediction
-    saved = pending_writer.save_full.call_args[0][0]
+    # 编排器已改用 save_full_durable（耐久原子落盘）持久化最终记录
+    saved = pending_writer.save_full_durable.call_args[0][0]
     pred = saved.stage2_decision.get("next_bar_prediction")
     assert pred is not None
     assert pred["direction"] == "bullish"
@@ -242,13 +258,22 @@ def test_save_full_round_trip(
 def test_demo_mode_replays_legacy_record(
     frame, pending_writer, assembler, exp_reader
 ):
-    """Legacy record without prediction must not crash DecisionPanel (R10.1)."""
-    from pa_agent.gui.decision_panel import DecisionPanel
-    from PyQt6.QtWidgets import QApplication
+    """Legacy record without prediction must not crash the panels (R10.1).
+
+    预测组 UI 已迁至 FutureTrendPanel；旧记录（无 next_bar_prediction 键）
+    对两个面板都必须安全：DecisionPanel 正常渲染决策，FutureTrendPanel
+    隐藏预测模块。
+    """
     import sys
+
+    from PyQt6.QtWidgets import QApplication
+
+    from pa_agent.gui.decision_panel import DecisionPanel
+    from pa_agent.gui.future_trend_panel import FutureTrendPanel
 
     _app = QApplication.instance() or QApplication(sys.argv)
     panel = DecisionPanel()
+    trend_panel = FutureTrendPanel()
 
     # Legacy: no next_bar_prediction key
     legacy_s2 = json.loads(json.dumps(VALID_STAGE2))
@@ -257,7 +282,8 @@ def test_demo_mode_replays_legacy_record(
 
     # Must not raise
     panel.set_decision(legacy_s2)
-    assert not panel._prediction_group.isVisible()
+    trend_panel.set_prediction(legacy_s2)
+    assert not trend_panel._bar_group.isVisible()
 
 
 def test_cancel_no_prediction_required(
@@ -304,6 +330,7 @@ def test_network_error_no_prediction_required(
         validator=validator,
         pending_writer=pending_writer,
         exp_reader=exp_reader,
+        settings=_settings_with_next_bar_prediction(),
     )
 
     record = orchestrator.submit(frame=frame, cancel_token=CancelToken(), on_event=lambda e: None)
