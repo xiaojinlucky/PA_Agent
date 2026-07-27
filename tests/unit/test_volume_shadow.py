@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import cast
 
@@ -247,6 +248,49 @@ def test_record_volume_shadow_appends_readable_json_lines(tmp_path) -> None:
     assert len(lines) == 2
     assert json.loads(lines[0])["state"] == "expanding"
     assert json.loads(lines[1]) == json.loads(lines[0])
+
+
+def test_record_volume_shadow_uses_isolated_default_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out_dir = tmp_path / "volume_shadow"
+    monkeypatch.setenv("PA_AGENT_VOLUME_SHADOW_DIR", str(out_dir))
+
+    path = record_volume_shadow(_frame([150.0, *([100.0] * 20)]))
+
+    assert path == out_dir / "AAPL.US_10m.jsonl"
+    assert path.exists()
+
+
+def test_record_volume_shadow_serializes_concurrent_writers(tmp_path: Path) -> None:
+    frame = _frame([150.0, *([100.0] * 20)])
+
+    def write_once(_index: int) -> Path | None:
+        return record_volume_shadow(frame, out_dir=tmp_path)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        paths = list(pool.map(write_once, range(24)))
+
+    path = tmp_path / "AAPL.US_10m.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert paths == [path] * 24
+    assert len(lines) == 24
+    assert all(json.loads(line)["state"] == "expanding" for line in lines)
+
+
+def test_record_volume_shadow_recovers_interrupted_final_line(tmp_path: Path) -> None:
+    frame = _frame([150.0, *([100.0] * 20)])
+    path = record_volume_shadow(frame, out_dir=tmp_path)
+    assert path is not None
+    with path.open("ab") as handle:
+        handle.write(b'{"incomplete"')
+
+    record_volume_shadow(frame, out_dir=tmp_path)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert all(json.loads(line)["state"] == "expanding" for line in lines)
 
 
 def test_record_volume_shadow_does_not_create_output_for_invalid_frame(

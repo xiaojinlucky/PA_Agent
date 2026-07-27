@@ -1,11 +1,13 @@
 """Unit tests for PromptAssembler (task 7.3)."""
 from __future__ import annotations
 
-import pytest
+import logging
 from pathlib import Path
 
+import pytest
+
 from pa_agent.ai.prompt_assembler import PromptAssembler
-from pa_agent.data.base import KlineBar, KlineFrame, IndicatorBundle
+from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame
 
 
 def _make_frame(n: int = 5) -> KlineFrame:
@@ -113,6 +115,65 @@ def test_stage1_user_prompt_contains_required_fields(assembler: PromptAssembler)
     assert "程序结构辅助特征" in user
     assert "doji" in user
     assert "更高时间框架" not in user
+
+
+def test_stage1_records_volume_shadow_without_injecting_prompt(
+    assembler: PromptAssembler,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    shadow_dir = tmp_path / "volume_shadow"
+    monkeypatch.setenv("PA_AGENT_VOLUME_SHADOW_DIR", str(shadow_dir))
+
+    messages = assembler.build_stage1(_make_frame(8))
+
+    shadow_path = shadow_dir / "XAUUSD_1h.jsonl"
+    assert shadow_path.exists()
+    rendered_prompt = "\n".join(str(message["content"]) for message in messages)
+    assert "relative_volume" not in rendered_prompt
+    assert "baseline_volume" not in rendered_prompt
+    assert "latest_volume" not in rendered_prompt
+
+
+def test_stage1_reports_shadow_write_failure_without_stopping_analysis(
+    assembler: PromptAssembler,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    def fail_shadow_write(_frame: KlineFrame) -> None:
+        raise OSError("shadow disk unavailable")
+
+    monkeypatch.setattr(
+        "pa_agent.ai.prompt_assembler.record_volume_shadow",
+        fail_shadow_write,
+    )
+
+    with caplog.at_level(logging.ERROR):
+        messages = assembler.build_stage1(_make_frame())
+
+    assert [message["role"] for message in messages] == ["system", "user"]
+    assert "成交量影子记录失败" in caplog.text
+
+
+def test_stage1_does_not_record_shadow_when_prompt_construction_fails(
+    assembler: PromptAssembler,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    recorded_frames: list[KlineFrame] = []
+
+    def fail_prompt(*_args: object, **_kwargs: object) -> str:
+        raise RuntimeError("prompt construction failed")
+
+    monkeypatch.setattr(assembler, "_build_stage1_user_prompt", fail_prompt)
+    monkeypatch.setattr(
+        "pa_agent.ai.prompt_assembler.record_volume_shadow",
+        recorded_frames.append,
+    )
+
+    with pytest.raises(RuntimeError, match="prompt construction failed"):
+        assembler.build_stage1(_make_frame())
+
+    assert recorded_frames == []
 
 
 def test_stage2_user_prompt_includes_gate_trace(assembler: PromptAssembler):
@@ -436,6 +497,7 @@ def test_stage2_prompt_conservative_omits_balanced_only_hints(assembler: PromptA
 
 def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
     assembler: PromptAssembler,
+    monkeypatch: pytest.MonkeyPatch,
 ):
     """Incremental Stage 1 with full previous record uses 4-message continuation."""
     from pa_agent.records.schema import AnalysisRecord, RecordMeta
@@ -469,8 +531,14 @@ def test_incremental_stage1_prompt_includes_previous_record_and_new_bars(
         usage_total={},
     )
 
+    recorded_frames: list[KlineFrame] = []
+    monkeypatch.setattr(
+        "pa_agent.ai.prompt_assembler.record_volume_shadow",
+        recorded_frames.append,
+    )
     messages = assembler.build_incremental_stage1(frame, previous, 2)
 
+    assert recorded_frames == [frame]
     # 4-message continuation structure: system, user(prev S1), assistant(prev S1 reply), user(incremental)
     assert [m["role"] for m in messages] == ["system", "user", "assistant", "user"]
     # Message [1] is previous full Stage 1 user prompt, refreshed with market features
@@ -560,6 +628,7 @@ def test_incremental_stage1_raises_without_previous_messages(
 ):
     """Incremental Stage 1 raises ValueError when previous record lacks messages."""
     import pytest
+
     from pa_agent.records.schema import AnalysisRecord, RecordMeta
 
     frame = _make_frame(5)
@@ -595,6 +664,7 @@ def test_incremental_stage1_raises_without_previous_response(
 ):
     """Incremental Stage 1 raises ValueError when previous record lacks response content."""
     import pytest
+
     from pa_agent.records.schema import AnalysisRecord, RecordMeta
 
     frame = _make_frame(5)

@@ -43,18 +43,11 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 - 桌面 GUI 由用户自己从 `D:\Desktop\PA_Agent.lnk` 启动；Agent 不操作桌面和鼠标。
 - 测试必须 `QT_QPA_PLATFORM=offscreen` + 凭据隔离（conftest 已做）；pytest 用 `--basetemp` 指向临时目录 + `-p no:cacheprovider`。
 
-### 0.5 当前运行态基线（2026-07-27 00:30 前后，接手时必须重新核验）
+### 0.5 运行态证据口径
 
-- 固定代理：sing-box PID 8588，`records\okx_fixed_proxy\`，节点 **桔子云 OKX 日本 1**（VMess，出口 216.38.169.153 已在 OKX 白名单）。守护：run-hidden.ps1（隐藏 PowerShell，互斥体 `Local\PAAgentOkxFixedProxy`，10 秒轮询拉起）。
-- 风险态：`kill_active=0`（23:09 由授权命令 `0e525d57-f198-46d2-b13f-9df4f40c0ac6` 合法解除）。
-- Campaign：`ab245e48-218a-4fac-8445-10c9893e868e` active 常驻，已完成 3 根自然 K 线（杠杆阻断/no_order/杠杆阻断）。**它加载的是 23:10 的旧代码**（无市场规则块注入）。
-- Worker：PID 40980（13:32 启动），加载含 3 次 GET 重连的代码。
-- 运行态核验命令（只读）：
-  ```
-  .venv\Scripts\python.exe -m pa_agent.okx_demo_campaign status
-  # 风险态：sqlite3 只读连 records/execution_control.sqlite3 查 risk_runtime_state
-  # 日志：Get-Content logs\pa_agent.log -Tail 20
-  ```
+- 本文后文记录的 PID、Campaign ID、账户和订单状态都是带时间戳的历史证据，不能当成当前事实。
+- 最新已登记的只读现场见 `CONTEXT.md`：2026-07-27 北京时间约 13:00，Worker 健康、两库完整、风险停止为 0、券商侧空仓空挂单；Campaign 已于 10:30:55 因等待对账超时退出并漏过后续 K 线。
+- 当前 WO-H 接手任务明确禁止操作交易运行态，因此不重启、不恢复、不补跑，也不把旧现场冒充实时状态。后续若解除边界，仍须重新执行完整只读硬门。
 
 ---
 
@@ -71,10 +64,11 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 | P1 后端：市场规则块 ×4 + 路由 + 注入（用户回合）+ K 线表交易所时区 | `prompt_engineering/市场规则_*.txt`、`pa_agent/ai/market_rules.py`、`prompt_assembler.py`、`tests/unit/test_market_rules*.py` |
 | 共享合同层（符号/K线合同/日历/双协议） | `D:\Desktop\Quant\shared\market_contracts`（39 测试全过，已 editable 装入 venv） |
 | 文档同步 | `CONTEXT.md` 顶部、`docs/VALIDATION_EVIDENCE.md`、`docs/CLAUDE_HANDOFF_20260726.md` 横幅、PRD04 §10/§11.4 |
-| 最终三套件回归：1874 项、0 失败、0 错误、3 跳过 | 2026-07-27 WO-H 收口复核 |
+| 提交 `2e95a05` 前三套件回归：1874 项、0 失败、0 错误 | 2026-07-27 WO-H 收口复核；当次 3 项固定跳过，另有 1 个 AkShare 条件跳过 |
 
 **测试基线（验收时的对照）**：
-- `tests/unit` + `tests/property` + `tests/integration`：必须零失败；当前 1874 项、0 失败、0 错误、3 跳过。
+- `tests/unit` + `tests/property` + `tests/integration`：必须零失败；`2e95a05` 接手基线为 1874 项、0 失败、0 错误。
+- 固定跳过基线为 3 项；4 个已登记的 AkShare 联网冒烟测试在各自行情请求真实不可达时可条件跳过，必须在 JUnit 中逐项保留具体原因，不能新增普通 skip/xfail。
 - 旧 handoff 中的 unit 18 项、property 6 项和 integration 既有失败均已完成裁决，禁止继续当作豁免。
 - 改动文件 Ruff `E4,E7,E9,F,I,UP,B,C4` 全绿；`compileall` 过；`git diff --check` 过。
 
@@ -84,7 +78,7 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 
 ### WO-A 对抗审查（本阶段收口必需）
 
-**状态**：子 Agent 因额度限制未跑成；Claude 主循环顺序自查进行中（见进度账本）。若接手：按下面 4 视角逐一执行，每个视角产出"发现清单"，每个发现再用怀疑者姿态验证一遍（默认不成立，能实证才算）。
+**状态**：2026-07-27 早期四个子 Agent 因额度限制全部失败，后由 Claude 主循环完成一轮顺序自查。当前接手批次已用三名独立 Agent 覆盖下面四个静态视角：交易安全/范围、数据正确性、提示词缓存和文档诚实性。没有确认 P0/P1；5 个 P2（JSONL 并发与中断、完整路径记录时点、WO-D 摘要字段、CONTEXT 行数、跳过分类）已全部修正。运行态和外部制度事实因本轮边界未重新验证。
 
 **视角 1 交易安全/运行态**：攻击 `probe_okx_fixed_proxy_node.py` 激活流程失败路径（回滚失败、10981 被他进程接管、metadata 与实际配置不一致）；`_activate` 每个失败分支是否保证 10981 要么旧配置要么明确下线；耐久闸门可否被绕过（`--activate` 时 argparse 已强制 idle-cycles≥1，验证）；恢复命令是否可能重锚高水位；频控器/超时保护对 Worker 场景副作用（注意：Worker 不用 longbridge_source，无影响——验证这个论断）。
 
@@ -96,7 +90,9 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 
 **验收标准**：4 视角全部执行完；每个确认的 P0/P1 发现已修复并有回归测试；修复后受影响套件复跑全绿；结果回写本文档进度账本。
 
-### WO-B 确认式提交推送（用户已在等清单）
+### WO-B 确认式提交推送（历史批次已完成）
+
+**状态**：四个历史提交 `372cd26`、`aa1c91d`、`a5d2e19`、`b539cb5` 已进入当前主线。以下清单保留为审计记录，不再是当前待提交快照；当前提交仍须重新按确认式 Git 流程列出精确文件。
 
 **前置**：WO-A 完成。**执行者注意：提交推送必须先向用户列清单并得到明确"是"，一次一问。**
 
@@ -117,13 +113,13 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 ```
 零泄漏才可提交；staged 中不得出现数据库/日志/凭据/scratch/二进制大文件；staged 出现删除或重命名必须另获用户授权。
 
-**远程核验**：`origin=git@github.com:xiaojinlucky/PA_Agent.git`；**本仓库为用户明确要求的 PUBLIC 例外**（CONTEXT.md 有记录，不得改回 private）；不得误推 `upstream`（rosemarycox 上游）；推送前本地 HEAD 必须基于 origin/main 实时 SHA（当前基线 `03c23f7`+本地一提交 `4282f433`，ahead 1），推送 `main → origin/main` 后核对远端 SHA 与本地一致。钩子失败禁止 `--no-verify`。
+**远程核验（历史）**：`origin=git@github.com:xiaojinlucky/PA_Agent.git`；**本仓库为用户明确要求的 PUBLIC 例外**。当时的 `03c23f7`/`4282f433` 基线已经过期，仅用于还原该批次；任何新推送必须重新 fetch 并核对实时 SHA。不得误推 `upstream`，钩子失败禁止 `--no-verify`。
 
 **验收标准**：4 个 commit 逐个通过 gitleaks；push 后 `git rev-parse origin/main` == 本地 HEAD；向用户报告最终 SHA。
 
-### WO-C Campaign 空仓安全重启（加载 P1 提示词代码）
+### WO-C Campaign 空仓安全重启（历史动作完成，当前运行目标已退出）
 
-**目的**：现役 Campaign 用的是 23:10 旧代码；重启后 XAU-USDT-SWAP 的分析将开始注入加密市场规则块 + UTC 时区标注表头。
+**状态**：2026-07-27 07:43 的历史重启已完成并证明市场规则块和 UTC 表头生效；较新的 `CONTEXT.md` 记录该 Campaign 已于 10:30:55 退出。本轮禁止操作运行态，不能把历史完成写成当前 active。
 
 **硬门（全部满足才可动）**：活动 execution=0、PENDING/RUNNING 命令=0、`NEW_RISK` 租约=0、OKX Demo 仓位=0、普通挂单=0、八类算法单=0、Worker 心跳新鲜、两库 `integrity_check=ok`、`kill_active=0`。
 
@@ -135,7 +131,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **阻塞**：长桥 access token 服务端 `401004 token invalid`。**只有用户能在长桥后台重签 token 并更新 `D:\Desktop\Quant\env` 的 `LONGBRIDGE_*`/`LONGPORT_*` 三件套**。
 
-**解除后执行**：`.venv\Scripts\python.exe scratch\p1_multimarket_acceptance.py`（脚本已就绪：AAPL.US/700.HK/600519.SH 各一次真实两阶段分析，10m 主周期 + 1h/4h 高周期背景，记录写 `scratch/p1_acceptance_records`）。
+**解除后执行**：`.venv\Scripts\python.exe scratch\p1_multimarket_acceptance.py`。2026-07-27 接手审计已离线修正该本机脚本的事件名、成功判定、Longbridge 来源标记和异常释放；仍不得在 token 无效时运行或绕过认证。脚本对 AAPL.US/700.HK/600519.SH 各跑一次真实两阶段分析，10m 主周期 + 1h/4h 高周期背景，记录写 `scratch/p1_acceptance_records`。
 
 **验收标准**：3 个符号 `record_status=complete`、无 error；人工抽查 Stage1 输出里 K 线时间为交易所当地时间、市场规则块出现在提示词（记录文件里有完整 prompt）；`acceptance_pass: true`。
 
@@ -151,6 +147,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 ### WO-F Claim Validation 反幻觉层（roadmap P1 项）
 
+**当前状态：部分完成，禁止标成整张工单完成。** 已落地截断/归一化严格化和 entry/stop 的 OHLC 包络校验，历史 property 失败也已裁决；但下面原规格中的 TP 与支撑阻力价位、K 线引用边界、真实品种 tick、稳定错误码和 `blocked:claim_validation:<code>` 后继续下一根仍未全部实现。完整接线会越过当前 WO-H 白名单并需要运行验收。
+
 **目标**：LLM 输出的每个价位必须落在真实 OHLC 范围内、引用的 K 线特征可回溯到具体 bar，否则拒绝输出（Let it crash，不静默修正）。
 
 **实现要点**：新模块 `pa_agent/ai/claim_validation.py`；校验点挂在 Stage1/Stage2 JSON 归一化之后、执行计划构建之前（`orchestrator/two_stage.py` 与 `ai/json_validator.py` 的衔接处）；校验项：① `entry/stop/tp` 与 `support/resistance_levels` 必须在 `[min(low)-容差, max(high)+容差]` 内（容差 = 当前 ATR14 的可配置倍数，默认 1.0×，防止合法的突破位被误杀）；② `bar_range`/`new_closed_bars` 引用的 K 序号必须 ≤ 实际根数；③ 价位精度必须符合品种 tick size。失败 → 该轮分析标记 `blocked:claim_validation:<code>` 耐久记录并继续下一根（与现有 blocked 语义一致，不让 Campaign 退出）。
@@ -162,7 +160,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 > 交接时的历史 18 项已全部裁决清零（3 个真实代码缺陷 + 其余为生产演进后测试滞后 / 夹具
 > 与真实市场语义不符），过程未放宽任何生产语义。**后续验收闸门改为「全量必须零失败」**，
 > 不再有"历史 18 项"豁免。已推送 `origin/main = 20773d6`（3 commit，逐 commit gitleaks 零泄漏）。
-> 集成测试仍有 4 个 akshare 联网用例失败（外网依赖，非代码缺陷）。
+> 集成测试的历史失败已完成裁决；AkShare 联网冒烟用例在端点不可达时按已登记原因条件跳过，端点恢复时仍会真实运行。
 
 ### WO-H 时间/多周期/成交量因素接入（2026-07-27 研究裁决与执行）
 
@@ -185,12 +183,14 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 **执行状态**：
 - 任务 1 股票交易时段标签与任务 2 高周期关键位置、20GB 标记已由提交 `0a0c5a8`
   推送；全量基线 1823 项、0 失败、0 错误。
-- 任务 3 已完成三文件白名单内的可调用框架：成交量摘要、JSONL 追加记录、可提交的
-  离线评分核心、本地命令行入口和 51 项定向测试。成交量未进入提示词，也未接入自动分析调用链。
+- 任务 3 已完成成交量摘要、JSONL 追加记录、离线评分核心、本地命令行入口和测试。
+  接手审计发现原 `/goal` 要求“每次分析额外记录”，因此又在完整 Stage1 和增量 Stage1
+  构造点补上自动落盘，并为同一 JSONL 增加跨进程串行追加和中断半行恢复；测试写入
+  隔离到临时目录，成交量字段仍未进入提示词。
 - 当前评分只比较放量与缩量两组的后续相对振幅，属于描述性结果；摘要没有预测方向，
   因而不能计算 Wilson 方向准确率门，也不能据此批准成交量转正。
-- 本轮最终三套件为 1874 项、0 失败、0 错误、3 跳过；提示词、AI、执行、GUI 和脚本
-  目录没有本轮差异。
+- 提交 `2e95a05` 的三套件为 1874 项、0 失败、0 错误；当前补漏批次的最终数字以进度账本
+  最新一条为准。`prompt_engineering/`、执行、GUI 和脚本目录保持无差异。
 
 ### WO-G 遗留专项（优先级低）
 
@@ -231,10 +231,12 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
      ⑥`test_price_tick` + ⑤的夹具 —— 均缺 `take_profit_price_2`（TP2 现为下单必填），
      决策先被正确降级为不下单，导致测不到目标行为；补齐夹具字段。
 2. 集成 4 个既有失败（next_bar_prediction ×3、no_order_with_prices ×1）：同上裁决。
-3. `CONTEXT.md` 一页化：**已完成**。当前文件 32 行；旧流水账完整归档到
+3. `CONTEXT.md` 一页化：**已完成**。当前文件 34 行；旧流水账完整归档到
    `docs/archive/CONTEXT_full_history_through_20260727_wo_h.md`。
 4. `D:\Desktop\Quant\shared` 尚无 Git 版本管理：需用户拍板是否建仓（禁止擅自 git init）。
-5. 全仓 Ruff 历史债务（4963 项基线违规）：不在常规工单批量改。
+5. 全仓 Ruff 历史债务：`4963` 是旧历史数字，已不能当当前精确基线。2026-07-27 在明确排除
+   `pa_agent/execution`、`pa_agent/gui`、`scripts` 后重扫允许范围为 421 项，其中 269 项可机械
+   修复；完整仓库当前数仍未知。该专项不在常规工单批量改，尤其禁止直接全仓 `ruff --fix`。
 
 ---
 
@@ -242,7 +244,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **实现者自查**：改动文件 Ruff（`--select E4,E7,E9,F,I,UP,B,C4`）+ `compileall` + 定向 pytest 全绿。
 2. **对抗审查**：按 WO-A 的 4 视角模板（交易安全/数据正确性/提示词缓存/文档诚实）逐视角列发现；每个发现用"默认怀疑、能实证才算"的标准二次验证。
-3. **回归闸门**：全量 `tests/unit` + `tests/property` + `tests/integration` 必须零失败；当前数量不得低于 1874，跳过不得高于 3，数量变化必须有书面解释。
+3. **回归闸门**：全量 `tests/unit` + `tests/property` + `tests/integration` 必须零失败；数量不得低于 1874。固定跳过不得高于 3；4 个已登记的 AkShare 联网冒烟用例可在各自端点真实不可达时条件跳过，必须逐项保留具体原因。其他数量变化必须有书面解释。
 4. **运行态闸门**：任何触碰执行链/提示词的改动，交付前核验 Campaign/Worker/风险态三件套 + `pa_agent.log` 无新 ERROR 类别。
 5. **文档闸门**：CONTEXT.md 顶部与本文档进度账本同步更新；主张必须可被证据文件支撑。
 
@@ -257,7 +259,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 | WO-E | 设计流程全走完+用户审美确认，零副标题，真实读写链接通，三标的桌面验收 |
 | WO-F | 三类校验单测过，property 6 项清零或书面裁决，unit 零新增失败 |
 | WO-G-3 | `CONTEXT.md` 保持一页，历史流水账完整归档且可还原 |
-| WO-H-3 | 成交量仅做影子摘要和离线描述性评分，不进提示词、不接自动调用链、不宣称转正 |
+| WO-H-3 | 每次完整或增量分析自动落成交量影子摘要，并可离线描述性评分；不进提示词、不生成信号、不宣称转正 |
 
 ## 5. 进度账本（每个重要步骤后回写）
 
@@ -288,7 +290,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   新 Campaign `6cba8d3e` 继承 `last_completed_bar_ms` 正确、首根自然 K 线完成（no_order，0 失败）；
   **新代码生效实证**：最新耐久分析记录（records/pending/2026-07-27_07-07-36_...json）包含
   `市场制度规则块 · 加密货币`、`时间（UTC）` 表头与资金费率条款。
-- [x] 2026-07-27 08:25 WO-F Claim Validation 落地（Claude 主循环）：
+- [x] 2026-07-27 08:25 WO-F 第一批严格化与 entry/stop grounding 落地（Claude 主循环）：
   ①`ValidationSettings.disable_truncation_repair` 默认 False→True（截断输出默认按语法失败
   走带反馈重试；宽松修复只能产出 gate_result=unknown）；
   ②`trace_normalize._repair_gate_result` 增加 AUTO 桩守卫——截断注入的 unknown 绝不再被
@@ -315,15 +317,20 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   批次门禁：受影响套件全绿；全量 unit+property = 历史 18 项零新增；compileall/diff-check 过；
   范围 Ruff 有 16 项**既有**历史债（settings 旧签名引号 UP037×11、C420×1、旧 import 排序
   I001×4，均非本轮新增行），按"不顺手清理"纪律保留并如实记录。
-- [x] 2026-07-27 14:11 WO-H 任务 3、4 收口：成交量影子摘要、JSONL 记录、严格本地
-  后验评分核心和命令行入口完成，成交量零提示词与零自动调用链；`CONTEXT.md` 一页化并
+- [x] 2026-07-27 14:11 WO-H 任务 3、4 第一轮收口：成交量影子摘要、JSONL 记录、严格本地
+  后验评分核心和命令行入口完成，但当时尚未接自动调用链；`CONTEXT.md` 一页化并
   完整归档，多市场前端页面合同和三个方向完成。两轮多 Agent 对抗审查发现均已修复；
   三文件完整 Ruff、compileall、diff-check 通过，定向 51 项和三套件 1874 项均零失败。
+- [x] 2026-07-27 15:10 完成工单逐项复审与 WO-H-3 补漏：完整和增量 Stage1 均自动把
+  成交量摘要写入 `scratch/volume_shadow/`，测试写入隔离到临时目录，提示词没有成交量
+  字段；WO-D 本机验收脚本的成功判定、Longbridge 来源标记和资源释放已离线修正。三路
+  独立静态审查无 P0/P1，确认的 5 个 P2 已全部修正。三套件 1880 项、0 失败、0 错误、
+  7 项跳过（3 固定 + 4 个 AkShare 条件跳过）；WO-F 因原规格未完整落地改回“部分完成”。
 - [ ] WO-D：**被长桥 token 401004 阻塞，等用户重签**
-- [x] WO-F：Claim Validation 已落地并完成失败裁决
+- [ ] WO-F：只完成严格化、entry/stop grounding 和历史失败裁决；原规格其余部分仍待完成
 - [x] WO-G-1、WO-G-2、WO-G-3：历史测试失败裁决完成，`CONTEXT.md` 一页化完成
 - [x] WO-H 任务 1、2：提交 `0a0c5a8` 已推送
-- [x] WO-H 任务 3：成交量影子可调用框架、离线评分脚本和测试完成；未接自动调用链
+- [x] WO-H 任务 3：成交量影子摘要、自动分析落盘、离线评分脚本和测试完成；未进提示词
 - [x] WO-E 前置设计包：`docs/prd/05_多市场看盘前端设计包.md` 已完成
 - [ ] WO-E 生产实现：停在三个视觉方向待用户选择；PyQt6、Stitch 和桌面验收均未开始
 
@@ -331,6 +338,5 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. 本轮 WO-H 收口改动的提交确认（Codex 会发精确文件清单）。
-4. WO-E 的审美确认环节。
-5. `shared/` 是否建 Git 仓库的决定。
+3. WO-E 的审美确认环节：A/B/C 三选一，当前推荐 B“证据优先”。
+4. `shared/` 是否建 Git 仓库的决定。

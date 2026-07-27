@@ -521,3 +521,26 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 完整主窗口离屏图 `scratch/main_window_trading_1440x900.png` 与固定模式图 `scratch/trading_workbench_fixed_1440x900.png` 已重新生成并人工查看；一级页签、菜单、状态栏、北京时间、只读反算和完整页面滚动均正常，无横向重叠。
 - 03:24 只读运行证据：自然空单第一档 `56862` 张已止盈，剩余 `56862` 张由同量 `reduceOnly` 原生 OCO 完整保护；普通挂单和其余算法单为 0，Campaign 同向持有且未重复加仓，风险停止为 0。执行账本的价格差盈利与 OKX 净已实现盈亏口径不一致，尚未核清费用/资金费前不得把前者称为净利润。
 - 当前 Campaign 在最终“耐久恢复命令 ID”和“固定张数完整写前快照”修正前已经启动。因为仍有真实受保护仓位，本轮没有重启服务或 Campaign；磁盘最终代码只会在下次空仓硬门通过后的安全重启中加载。
+
+## 2026-07-27 WO-H 接手补漏与总工单诚实性复核
+
+### 成交量影子自动采集
+
+- 原 `/goal` 要求“每次分析额外落一份成交量摘要”，而提交 `2e95a05` 只提供可调用函数。接手批次已在完整 Stage1 和增量 Stage1 的消息构造点各调用一次 `record_volume_shadow(frame)`；调用发生在真实 Stage1 请求前，但返回值没有参与任何消息内容。
+- 生产默认输出为 `scratch/volume_shadow/<symbol>_<timeframe>.jsonl`。测试在收集期和每个用例中把 `PA_AGENT_VOLUME_SHADOW_DIR` 指向临时目录；全量测试后仓库内 `scratch/volume_shadow` 仍不存在。
+- 同一 JSONL 现在由跨进程文件锁串行写入，普通写错会回滚到原长度；若进程在半行中断，下一次持锁写入会先截回最后一个完整换行。并发写入和中断半行恢复均有单测。
+- 新增测试直接证明 JSONL 文件生成，同时完整消息中不存在 `relative_volume`、`baseline_volume`、`latest_volume`；完整分析和增量分析路径均被覆盖。`prompt_engineering/` 差异为空。
+
+### 离线评分与 WO-D 入口
+
+- `pa_agent/data/volume_shadow.py` 继续只做放量组与缩量组的后续相对振幅描述性比较。摘要没有预测方向，因此没有伪造 Wilson 方向准确率，也没有据均值差宣称统计显著或转正。
+- 本机 `scratch/p1_multimarket_acceptance.py` 原先把枚举类名误记为事件名，并读取不存在的 `RecordMeta.status/error_type`，导致成功记录也无法通过。接手批次已改为记录 `event.name`，用 `RecordSaved + exception is None + Stage1/Stage2 结果存在` 判定完成，明确把内存设置来源标为 `longbridge`，并用 `finally` 释放订阅和连接。
+- 该脚本通过目标 Ruff、`py_compile` 和成功/取消判定函数的离线对象检查；没有读取真实凭据或调用外部 API。真实 AAPL.US、700.HK、600519.SH 验收仍被长桥 `401004 token invalid` 硬阻塞。
+
+### 工程门禁与范围
+
+- `HEAD=2e95a05` 开工基线：1874 项、0 失败、0 错误；第一次运行因 AkShare 端点不可达出现 4 跳过，JUnit 明确记录 1 项条件联网跳过和 3 项缺少 KKAI Key 的固定跳过。
+- 补漏与 P2 修正后的最终三套件：1880 项、0 失败、0 错误、7 项跳过；其中 3 项因未提供 KKAI 模型密钥固定跳过，4 个 AkShare 联网冒烟测试因各自行情请求当轮不可达而条件跳过。
+- 改动文件 Ruff `E4,E7,E9,F,I,UP,B,C4`、`py_compile` 和 `git diff --check` 通过；`pa_agent/execution/`、`pa_agent/gui/`、`scripts/`、`records/`、`.github/` 差异为空，未操作交易运行态。
+- 三名独立 Agent 覆盖交易安全/范围、数据正确性、提示词缓存和文档诚实性四个视角；无 P0/P1。确认的 5 个 P2 已修正，并由定向测试及最终三套件回归复证。
+- 逐项代码审计确认 WO-F 仅完成部分严格化与 entry/stop OHLC grounding；原规格中的其余价位、K 线引用、真实 tick 和耐久阻断语义未全部实现，因此总工单已撤回“WO-F 完成”主张。

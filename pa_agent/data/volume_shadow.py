@@ -7,6 +7,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import time
 from dataclasses import dataclass
 from itertools import pairwise
@@ -14,6 +15,9 @@ from pathlib import Path
 from statistics import fmean, median
 from urllib.parse import quote
 
+from filelock import FileLock, Timeout
+
+from pa_agent.config.paths import PROJECT_ROOT
 from pa_agent.data.bar_close_wait import timeframe_to_seconds
 from pa_agent.data.base import KlineFrame
 from pa_agent.data.datetime_ts import ts_open_to_ms
@@ -24,6 +28,8 @@ _MIN_CLOSED_BARS = 6
 _EXPANDING_THRESHOLD = 1.5
 _CONTRACTING_THRESHOLD = 0.7
 _MIN_SCORE_SAMPLES = 10
+_OUTPUT_DIR_ENV = "PA_AGENT_VOLUME_SHADOW_DIR"
+_OUTPUT_LOCK_TIMEOUT_SECONDS = 2.0
 _REQUIRED_CSV_COLUMNS = {
     "symbol",
     "timeframe",
@@ -99,17 +105,82 @@ def summarize_volume(frame: KlineFrame) -> dict[str, object] | None:
     }
 
 
+def _truncate_incomplete_jsonl_tail(handle: int) -> None:
+    """丢弃上次进程中断留下的半行，保留最后一条完整 JSONL 记录。"""
+    size = os.fstat(handle).st_size
+    if size == 0:
+        return
+    os.lseek(handle, -1, os.SEEK_END)
+    if os.read(handle, 1) == b"\n":
+        return
+
+    cursor = size
+    complete_size = 0
+    while cursor > 0:
+        block_size = min(8192, cursor)
+        cursor -= block_size
+        os.lseek(handle, cursor, os.SEEK_SET)
+        block = os.read(handle, block_size)
+        newline_at = block.rfind(b"\n")
+        if newline_at >= 0:
+            complete_size = cursor + newline_at + 1
+            break
+    os.ftruncate(handle, complete_size)
+    os.fsync(handle)
+
+
+def _append_jsonl_line(path: Path, line: str) -> None:
+    """跨线程、跨进程串行追加一条完整 JSONL，并在普通写错时回滚半行。"""
+    lock = FileLock(f"{path}.lock", timeout=_OUTPUT_LOCK_TIMEOUT_SECONDS)
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        with lock:
+            handle = os.open(path, flags, 0o600)
+            try:
+                _truncate_incomplete_jsonl_tail(handle)
+                original_size = os.fstat(handle).st_size
+                payload = memoryview(f"{line}\n".encode())
+                try:
+                    while payload:
+                        written = os.write(handle, payload)
+                        if written <= 0:
+                            raise OSError("成交量影子 JSONL 未写入任何字节")
+                        payload = payload[written:]
+                    os.fsync(handle)
+                except Exception:
+                    os.ftruncate(handle, original_size)
+                    os.fsync(handle)
+                    raise
+            finally:
+                os.close(handle)
+    except Timeout as exc:
+        raise OSError("成交量影子 JSONL 写锁超时") from exc
+
+
 def record_volume_shadow(
     frame: KlineFrame,
     *,
-    out_dir: str | Path,
+    out_dir: str | Path | None = None,
 ) -> Path | None:
-    """把一条有效摘要追加为 UTF-8 JSONL；无有效摘要时不创建文件。"""
+    """把一条有效摘要追加为 UTF-8 JSONL；无有效摘要时不创建文件。
+
+    生产默认写入 ``scratch/volume_shadow``。测试或离线工具可通过显式
+    ``out_dir`` 或 ``PA_AGENT_VOLUME_SHADOW_DIR`` 把影子记录隔离到临时目录。
+    """
     summary = summarize_volume(frame)
     if summary is None:
         return None
 
-    directory = Path(out_dir).resolve()
+    configured_dir = out_dir
+    if configured_dir is None:
+        configured_dir = os.environ.get(_OUTPUT_DIR_ENV)
+    directory = Path(
+        configured_dir
+        if configured_dir is not None
+        else PROJECT_ROOT / "scratch" / "volume_shadow"
+    ).resolve()
     directory.mkdir(parents=True, exist_ok=True)
     symbol = quote(str(summary["symbol"]), safe="._-")
     timeframe = quote(str(summary["timeframe"]), safe="._-")
@@ -122,8 +193,7 @@ def record_volume_shadow(
         ensure_ascii=False,
         sort_keys=True,
     )
-    with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(f"{line}\n")
+    _append_jsonl_line(path, line)
     return path
 
 

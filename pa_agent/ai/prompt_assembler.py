@@ -27,6 +27,7 @@ from pa_agent.ai.pattern_routing import (
 )
 from pa_agent.data.base import KlineFrame
 from pa_agent.data.datetime_ts import format_epoch_for_display, ts_open_to_ms
+from pa_agent.data.volume_shadow import record_volume_shadow
 from pa_agent.records.schema import AnalysisRecord
 
 logger = logging.getLogger(__name__)
@@ -918,6 +919,14 @@ class PromptAssembler:
             return False
         return bool(getattr(cfg, "stage2_load_full_strategy_library", False))
 
+    @staticmethod
+    def _record_volume_shadow(frame: KlineFrame) -> None:
+        """记录分析帧的成交量事实，但绝不把它拼进提示词。"""
+        try:
+            record_volume_shadow(frame)
+        except (OSError, ValueError) as exc:
+            logger.error("成交量影子记录失败，本轮提示词保持不变：%s", exc)
+
     # ── Process-level system-prompt cache ────────────────────────────────────
     # DeepSeek KV Cache hits require the *prefix* of consecutive requests to
     # be byte-identical.  System prompts are fully static (persona + txt files)
@@ -1104,6 +1113,7 @@ class PromptAssembler:
             analysis_mode=analysis_mode,
             higher_timeframe_text=higher_timeframe_text,
         )
+        self._record_volume_shadow(frame)
 
         return [
             {"role": "system", "content": system_content},
@@ -1228,6 +1238,7 @@ class PromptAssembler:
             analysis_mode=analysis_mode,
             higher_timeframe_text=higher_timeframe_text,
         )
+        self._record_volume_shadow(frame)
 
         return [
             {"role": "system",    "content": system_content},

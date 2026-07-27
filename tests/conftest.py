@@ -55,8 +55,14 @@ _COLLECTION_BROKER_ENV = (
     / f"pa-agent-pytest-{os.getpid()}"
     / "broker.env"
 )
+_COLLECTION_VOLUME_SHADOW_DIR = (
+    Path(tempfile.gettempdir())
+    / f"pa-agent-pytest-{os.getpid()}"
+    / "volume_shadow"
+)
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 os.environ["_PA_AGENT_TEST_SHARED_ENV_PATH"] = str(_COLLECTION_BROKER_ENV)
+os.environ["PA_AGENT_VOLUME_SHADOW_DIR"] = str(_COLLECTION_VOLUME_SHADOW_DIR)
 for _broker_env_key in _BROKER_ENV_KEYS:
     os.environ.pop(_broker_env_key, None)
 
@@ -81,6 +87,10 @@ def _isolate_runtime_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv(
         "_PA_AGENT_TEST_SHARED_ENV_PATH",
         str(isolated_broker_env),
+    )
+    monkeypatch.setenv(
+        "PA_AGENT_VOLUME_SHADOW_DIR",
+        str(tmp_path / "runtime" / "volume_shadow"),
     )
     for key in _BROKER_ENV_KEYS:
         monkeypatch.delenv(key, raising=False)
