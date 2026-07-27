@@ -1,7 +1,7 @@
 """Tests for decision continuity (flip cooldown, neutral+AIS, guard)."""
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 
 from pa_agent.ai.decision_continuity import (
     apply_continuity_guard,
@@ -19,8 +19,16 @@ from pa_agent.data.base import KlineBar, KlineFrame, IndicatorBundle
 
 
 def _ms(iso: str) -> int:
-    # Treat local ISO as UTC in tests; only deltas matter.
-    dt = datetime.strptime(iso, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+    """把本地墙钟 ISO 转成 epoch 毫秒，语义与生产一致。
+
+    生产 `timestamp_local_iso` 是本机墙钟的 naive ISO，
+    `snapshot_ts_local_ms` 是真实 epoch 毫秒；
+    `_parse_local_iso_ms` 用 naive `.timestamp()`（按本机时区）换算。
+    测试若把同一串 ISO 当 UTC 处理，两侧换算不一致，在非 UTC 机器上
+    会凭空多出时区偏移。这里同样用 naive `.timestamp()`，
+    使断言在任意时区环境都成立。
+    """
+    dt = datetime.strptime(iso, "%Y-%m-%d %H:%M:%S")
     return int(dt.timestamp() * 1000)
 
 
@@ -234,8 +242,10 @@ def test_render_prompt_mentions_neutral_ais():
 
 
 def test_audit_relation_flip_label():
+    # 记录时间必须贴近 _frame() 的快照时刻（默认 2026-06-30 14:25:00）：
+    # 相差过久会先触发"挂单超时自动取消"，关系标签变成已失效而非反手。
     prev = {
-        "record_time": "2026-06-22 22:49:07",
+        "record_time": "2026-06-30 14:20:00",
         "order_direction": "做空",
         "order_type": "限价单",
         "entry_price": "4196.79",
@@ -270,9 +280,11 @@ def test_build_continuity_context_auto_cancels_after_3_bars_unfilled_limit():
                 "decision": {
                     "order_direction": "做多",
                     "order_type": "限价单",
-                    "entry_price": 5000.0,  # not touched by _frame() low
-                    "stop_loss_price": 4980.0,
-                    "take_profit_price": 5050.0,
+                    # 做多限价要"未触发"，入场价必须低于 _frame() 的最低价 4190；
+                    # 高于市价的买入限价按真实市场语义会立即成交。
+                    "entry_price": 4000.0,
+                    "stop_loss_price": 3980.0,
+                    "take_profit_price": 4050.0,
                 }
             },
         },
@@ -295,9 +307,9 @@ def test_build_continuity_context_auto_cancels_on_cycle_change_unfilled_limit():
                 "decision": {
                     "order_direction": "做多",
                     "order_type": "限价单",
-                    "entry_price": 5000.0,
-                    "stop_loss_price": 4980.0,
-                    "take_profit_price": 5050.0,
+                    "entry_price": 4000.0,
+                    "stop_loss_price": 3980.0,
+                    "take_profit_price": 4050.0,
                 }
             },
         },
@@ -319,9 +331,10 @@ def test_build_continuity_context_auto_cancels_on_direction_change_unfilled_limi
                 "decision": {
                     "order_direction": "做多",
                     "order_type": "限价单",
-                    "entry_price": 7459.05,
-                    "stop_loss_price": 7454.13,
-                    "take_profit_price": 7466.42,
+                    # 未触发的做多限价必须低于 _frame() 最低价 4190
+                    "entry_price": 4000.0,
+                    "stop_loss_price": 3995.0,
+                    "take_profit_price": 4010.0,
                 }
             },
         },

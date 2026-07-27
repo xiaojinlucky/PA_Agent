@@ -54,6 +54,9 @@ def test_play_order_alert_sound_uses_wav_on_windows(monkeypatch) -> None:
         SND_FILENAME = 1
         SND_ALIAS = 2
         SND_NODEFAULT = 4
+        # 实现使用异步播放避免阻塞 GUI 线程；夹具缺该常量会让
+        # 属性访问异常被吞、误跌到 MessageBeep 兜底。
+        SND_ASYNC = 8
         MB_ICONEXCLAMATION = 48
 
         @staticmethod

@@ -630,6 +630,8 @@ def test_normalize_stage2_upgrades_9_0_for_planned_limit() -> None:
             "order_direction": "做空",
             "entry_price": 101.0,
             "take_profit_price": 98.0,
+            # TP2 是下单必填项；缺失会让决策先被降级为不下单，测不到 §9.0P
+            "take_profit_price_2": 96.0,
             "stop_loss_price": 103.0,
             "reasoning": "test",
             "diagnosis_confidence": 60,
@@ -696,8 +698,12 @@ def test_normalize_stage2_upgrades_9_0_for_planned_limit() -> None:
         snapshot_ts_local_ms=1,
     )
     out = normalize_stage2(obj, kline_frame=frame, stage1_json=obj["diagnosis_summary"])
+    # §9.x 由 DecisionNodeEngine 按真实 K 线几何程序回填，模型的 §9.0=否
+    # 会被程序判定覆盖；计划型限价另有独立的 §9.0P 节点记录挂单依据。
     node_90 = next(n for n in out["decision_trace"] if n["node_id"] == "9.0")
     assert node_90["answer"] == "是"
+    node_90p = next(n for n in out["decision_trace"] if n["node_id"] == "9.0P")
+    assert node_90p["answer"] == "是"
 
 
 def test_11_2_override_preserves_limit_order_without_basis() -> None:

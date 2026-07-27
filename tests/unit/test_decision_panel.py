@@ -70,83 +70,8 @@ def _valid_no_order() -> dict:
 # ── Tests ────────────────────────────────────────────────────────────────────
 
 
-def test_panel_no_prediction_hidden(panel: DecisionPanel):
-    """Without next_bar_prediction, prediction group must be hidden (R6.6)."""
-    data = _valid_no_order()
-    panel.set_decision(data["decision"], diagnosis_summary=data.get("diagnosis_summary"))
-    assert not panel._prediction_group.isVisible()
-
-
-def test_panel_unpredictable_renders_gray(panel: DecisionPanel):
-    """unpredictable=true renders gray badge (R6.4)."""
-    data = _valid_no_order()
-    data["next_bar_prediction"] = {
-        "direction": None,
-        "probabilities": None,
-        "reasoning": "数据不足，无法预测方向",
-        "unpredictable": True,
-        "features_used": ["stage1_diagnosis"],
-    }
-    inner = {**data["decision"], "next_bar_prediction": data["next_bar_prediction"]}
-    panel.set_decision(inner, diagnosis_summary=data.get("diagnosis_summary"))
-    assert panel._prediction_group.isVisible()
-    assert "不可预测" in panel._prediction_direction_label.text()
-    assert "#8b949e" in panel._prediction_direction_label.styleSheet()
-
-
-def test_panel_bullish_renders_green(panel: DecisionPanel):
-    """Highest bullish probability uses green on the combined probs line (R6.2, R6.3)."""
-    data = _valid_no_order()
-    data["next_bar_prediction"] = {
-        "direction": "bullish",
-        "probabilities": {"bullish": 70, "bearish": 20, "neutral": 10},
-        "reasoning": "多头趋势明确，结构支持阳线",
-        "unpredictable": False,
-        "features_used": ["stage1_diagnosis"],
-    }
-    inner = {**data["decision"], "next_bar_prediction": data["next_bar_prediction"]}
-    panel.set_decision(inner, diagnosis_summary=data.get("diagnosis_summary"))
-    assert panel._prediction_group.isVisible()
-    line = panel._prediction_direction_label.text()
-    assert "阳 70%" in line
-    assert "阴 20%" in line
-    assert "中 10%" in line
-    assert "阴线" not in line
-    assert "#3fb950" in panel._prediction_direction_label.styleSheet()
-
-
-def test_panel_bearish_renders_red(panel: DecisionPanel):
-    """Highest bearish probability uses red on the combined probs line."""
-    data = _valid_no_order()
-    data["next_bar_prediction"] = {
-        "direction": "bearish",
-        "probabilities": {"bullish": 15, "bearish": 65, "neutral": 20},
-        "reasoning": "空头趋势持续，阴线概率最高",
-        "unpredictable": False,
-        "features_used": ["stage1_diagnosis"],
-    }
-    inner = {**data["decision"], "next_bar_prediction": data["next_bar_prediction"]}
-    panel.set_decision(inner, diagnosis_summary=data.get("diagnosis_summary"))
-    line = panel._prediction_direction_label.text()
-    assert "阴 65%" in line
-    assert "阴线" not in line
-    assert "#f85149" in panel._prediction_direction_label.styleSheet()
-
-
-def test_panel_neutral_renders_yellow(panel: DecisionPanel):
-    """Highest neutral probability uses yellow on the combined probs line."""
-    data = _valid_no_order()
-    data["next_bar_prediction"] = {
-        "direction": "neutral",
-        "probabilities": {"bullish": 20, "bearish": 25, "neutral": 55},
-        "reasoning": "震荡区间，方向不明，中性概率最高",
-        "unpredictable": False,
-        "features_used": ["stage1_diagnosis"],
-    }
-    inner = {**data["decision"], "next_bar_prediction": data["next_bar_prediction"]}
-    panel.set_decision(inner, diagnosis_summary=data.get("diagnosis_summary"))
-    assert "中 55%" in panel._prediction_direction_label.text()
-    assert "#e6b800" in panel._prediction_direction_label.styleSheet()
+# 预测组 UI 已整体迁至 FutureTrendPanel；渲染契约（隐藏/灰/绿/红/黄/clear）
+# 的测试同步迁至 tests/unit/test_future_trend_panel.py。
 
 
 def test_panel_bearish_range_trend_shows_biased_sideways(panel: DecisionPanel):
@@ -162,25 +87,6 @@ def test_panel_bearish_range_trend_shows_biased_sideways(panel: DecisionPanel):
     assert "震荡偏空" in panel._trend_label.text()
     assert "下跌交易区间" in panel._cycle_label.text()
     assert "#f85149" in panel._trend_label.styleSheet()
-
-
-def test_panel_clear_hides_group(panel: DecisionPanel):
-    """clear() must hide prediction group and clear text."""
-    data = _valid_no_order()
-    data["next_bar_prediction"] = {
-        "direction": "bullish",
-        "probabilities": {"bullish": 70, "bearish": 20, "neutral": 10},
-        "reasoning": "test",
-        "unpredictable": False,
-        "features_used": ["stage1_diagnosis"],
-    }
-    inner = {**data["decision"], "next_bar_prediction": data["next_bar_prediction"]}
-    panel.set_decision(inner, diagnosis_summary=data.get("diagnosis_summary"))
-    assert panel._prediction_group.isVisible()
-
-    panel.clear()
-    assert not panel._prediction_group.isVisible()
-    assert panel._prediction_reasoning_edit.toPlainText() == ""
 
 
 def test_panel_render_performance(panel: DecisionPanel):

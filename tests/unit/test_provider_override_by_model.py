@@ -147,28 +147,45 @@ def test_openclaw_wb_on_load_keeps_submodel_from_settings() -> None:
     assert s.provider.model == "openclaw_wb/deepseek-v4-flash"
 
 
-def test_openclaw_cs_overrides_user_url_and_key() -> None:
-    """When model is openclaw_cs*, user-filled base_url/api_key must be ignored."""
+def test_openclaw_cs_clears_base_url_and_keeps_user_key() -> None:
+    """Cursor 路由走 SDK 直连，不经网关：必须清空 base_url，保留用户 API Key。
+
+    历史版本曾用 QClaw 网关（写入 127.0.0.1 地址与网关 token），现已改为
+    Cursor SDK 直连，base_url 留空以免误导为 OpenAI 兼容端点。
+    """
     s = Settings()
     s.provider.model = "openclaw_cs"
     s.provider.base_url = "https://example.com/v1"
-    s.provider.api_key = "sk-user-input"
+    s.provider.api_key = "crsr_user_input"
 
-    with patch("pa_agent.ai.qclaw_connector.detect_qclaw", return_value=True), patch(
-        "pa_agent.ai.qclaw_connector.qclaw_provider_settings"
-    ) as resolve, patch("pa_agent.ai.qclaw_connector.qclaw_health_check_base", return_value=(True, "ok")):
-        resolved = MagicMock()
-        resolved.model = "openclaw_cs"
-        resolved.base_url = "http://127.0.0.1:51187/v1"
-        resolved.api_key = "tok-from-qclaw"
-        resolved.thinking = True
-        resolved.reasoning_effort = "max"
-        resolved.context_window = 2_000_000
-        resolve.return_value = resolved
+    err = apply_cursor_provider_to_settings(s, preferred_model="openclaw_cs")
 
-        err = apply_cursor_provider_to_settings(s, preferred_model="openclaw_cs")
-        assert err is None
+    assert err is None
+    assert s.provider.model == "openclaw_cs"
+    assert s.provider.base_url == ""
+    assert s.provider.api_key == "crsr_user_input"
 
-    assert s.provider.base_url == "http://127.0.0.1:51187/v1"
-    assert s.provider.api_key == "tok-from-qclaw"
+
+def test_openclaw_cs_requires_api_key() -> None:
+    """Cursor 路由缺 API Key 必须明确报错，不静默放行。"""
+    s = Settings()
+    s.provider.model = "openclaw_cs"
+    s.provider.api_key = ""
+
+    err = apply_cursor_provider_to_settings(s, preferred_model="openclaw_cs")
+
+    assert err is not None
+    assert "API Key" in err
+
+
+def test_openclaw_cs_preserves_pinned_submodel() -> None:
+    """openclaw_cs/<cursorModelId> 形式的子模型必须原样保留。"""
+    s = Settings()
+    s.provider.model = "openclaw_cs/composer-2.5"
+    s.provider.api_key = "crsr_key"
+
+    err = apply_cursor_provider_to_settings(s)
+
+    assert err is None
+    assert s.provider.model == "openclaw_cs/composer-2.5"
 
