@@ -495,20 +495,30 @@ def validate_bar_by_bar_vs_features(
         if not declared or not computed or declared == computed:
             continue
 
-        # AI bar_type and program bar_type are overlapping classifications,
-        # not mutually exclusive. Only flag genuine bull/bear contradictions.
-        _ALL_BAR_TYPES = _STRUCTURAL_TYPES | _THRESHOLD_SENSITIVE_TYPES
-        if declared in _ALL_BAR_TYPES and computed in _ALL_BAR_TYPES:
-            _opposites = (
-                ("trend_bull", "trend_bear"),
-                ("outside_bull", "outside_bear"),
+        # 阈值敏感类型（doji/trend/other）的边界依赖参数，模型与程序
+        # 分类重叠不算矛盾，只标记真正的多空对立。
+        _opposites = (
+            ("trend_bull", "trend_bear"),
+            ("outside_bull", "outside_bear"),
+        )
+        if (declared, computed) in _opposites or (computed, declared) in _opposites:
+            errors.append(
+                f"bar_by_bar_summary[{i}].bar_type={declared!r} contradicts "
+                f"program feature K{seq} bar_type={computed!r}"
             )
-            if (declared, computed) in _opposites or (computed, declared) in _opposites:
-                errors.append(
-                    f"bar_by_bar_summary[{i}].bar_type={declared!r} contradicts "
-                    f"program feature K{seq} bar_type={computed!r}"
-                )
             continue
+
+        # 结构型（inside/outside）是客观几何关系，且提示词已明确告知模型
+        # 判定优先级 inside/outside > doji/trend/flat/other。程序算出结构型
+        # 而模型报了别的类型（兼容对除外），属于违反明示规则的真实矛盾。
+        structural_involved = (
+            computed in _STRUCTURAL_TYPES or declared in _STRUCTURAL_TYPES
+        )
+        if structural_involved and (declared, computed) not in _COMPATIBLE_PAIRS:
+            errors.append(
+                f"bar_by_bar_summary[{i}].bar_type={declared!r} contradicts "
+                f"program feature K{seq} bar_type={computed!r}"
+            )
     return errors
 
 

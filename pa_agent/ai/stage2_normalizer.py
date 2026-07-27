@@ -411,6 +411,25 @@ def _normalize_stage2_enum_aliases(out: dict[str, Any]) -> bool:
             bar_analysis["always_in"] = mapped_ai
             logger.debug("always_in %r -> %r", raw_ai, mapped_ai)
             changed = True
+        # OpenClaw 常把 entry_bar 的 strength/freshness 写成英文滑写
+        # （pending、limit_order_pending 等）；本函数是枚举滑写统一入口，
+        # 与主流程的 bar_analysis 归一化幂等重复无害。
+        entry_bar = bar_analysis.get("entry_bar")
+        if isinstance(entry_bar, dict):
+            if _normalize_entry_bar_freshness(entry_bar):
+                changed = True
+            raw_strength = entry_bar.get("strength")
+            mapped_strength = _normalize_closed_enum(
+                raw_strength,
+                _ENTRY_BAR_STRENGTH_ENUM,
+                aliases=_ENTRY_BAR_STRENGTH_ALIASES,
+            )
+            if mapped_strength and mapped_strength != raw_strength:
+                entry_bar["strength"] = mapped_strength
+                logger.debug(
+                    "entry_bar.strength %r -> %r", raw_strength, mapped_strength
+                )
+                changed = True
 
     terminal = out.get("terminal")
     if isinstance(terminal, dict):
