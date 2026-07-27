@@ -544,3 +544,20 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 改动文件 Ruff `E4,E7,E9,F,I,UP,B,C4`、`py_compile` 和 `git diff --check` 通过；`pa_agent/execution/`、`pa_agent/gui/`、`scripts/`、`records/`、`.github/` 差异为空，未操作交易运行态。
 - 三名独立 Agent 覆盖交易安全/范围、数据正确性、提示词缓存和文档诚实性四个视角；无 P0/P1。确认的 5 个 P2 已修正，并由定向测试及最终三套件回归复证。
 - 逐项代码审计确认 WO-F 仅完成部分严格化与 entry/stop OHLC grounding；原规格中的其余价位、K 线引用、真实 tick 和耐久阻断语义未全部实现，因此总工单已撤回“WO-F 完成”主张。
+
+## 2026-07-27 WO-C2 Campaign 对账监控耐久化
+
+### 故障与代码验收
+
+- 现场状态证明原 Campaign 在 10:30:55 因“等待交易后台完成下一轮券商对账超时”进入 `needs_attention` 并退出。根因是历史 execution 不分状态统一强等下一轮全局对账，`TimeoutError` 又不属于 `run()` 的临时读取处理范围。
+- 修复后会先扫描全部 owned execution：安全终态和 `READY` 不等待；普通活动态对账超时或 Worker 单轮 attention 会在重读账本后耐久记录临时阻断并重试；`UNKNOWN/ERROR`、非终态 attention、记录丢失和非法状态仍硬阻断。
+- 后置监控不会覆盖刚完成 K 线的真实结果；收口阶段按剩余时间重试临时对账，真实不安全状态耐久落为 `needs_attention`。测试同时证明超时路径零提交、零撤单、零离场、零调杠杆。
+- Campaign 定向套件 86 项通过、0 失败；全量 unit、property、integration 三套件合计 1886 项通过、0 失败。`compileall pa_agent tests` 与 `git diff --check` 通过。
+- 完整 Ruff 在修改前后都报告同一 2 项既有债：`SIM105` 和非启用规则对应的 `RUF100`；排除这两个精确基线项后，改动文件 Ruff 通过。本轮没有顺手修改无关旧代码。
+- 两轮独立只读对抗审查发现并推动修复 5 个安全语义缺口：确定未写入的终态 attention、后置监控结果覆盖、临时 Worker attention、收口重试、人工中断耐久状态。最终代码审查与测试审查均为 PASS。
+
+### 真实运行验收
+
+- 16:31 最终启动硬门：Worker 心跳和成功对账新鲜，两库完整，账户身份一致；活动 execution、PENDING/RUNNING 命令、未解决 UNCERTAIN、NEW_RISK 租约均为 0；OKX Demo 非零仓位、普通挂单和八类算法挂单均为 0。
+- 风险账本当时只保留白名单内的 `risk_runtime_BrokerTransportError` 临时停止。Campaign 从正式 `run` 入口恢复后，只创建一次耐久恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e`；Worker 完成新的账户、身份和账单读取后返回 `clear_drawdown_stop_completed`。高水位保持 `78303.57015174496`，没有重锚。
+- 首根新已收盘 10m K 线 16:20–16:30 完成，`analyses_completed` 从 16 增至 17，真实结果 `blocked:no_order`；没有新增 execution、订单、仓位或租约。Campaign 保持 `active`，Worker 和全局对账继续新鲜，风险停止为 0。

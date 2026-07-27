@@ -117,15 +117,27 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **验收标准**：4 个 commit 逐个通过 gitleaks；push 后 `git rev-parse origin/main` == 本地 HEAD；向用户报告最终 SHA。
 
-### WO-C Campaign 空仓安全重启（历史动作完成，当前运行目标已退出）
+### WO-C Campaign 空仓安全重启（当前 active）
 
-**状态**：2026-07-27 07:43 的历史重启已完成并证明市场规则块和 UTC 表头生效；较新的 `CONTEXT.md` 记录该 Campaign 已于 10:30:55 退出。本轮禁止操作运行态，不能把历史完成写成当前 active。
+**状态**：2026-07-27 16:31 北京时间，原 Campaign 从正式 `run` 入口恢复并加载 WO-C2 修复，沿用 Campaign ID、完成水位和冻结风险参数。16:20–16:30 首根新 K 线已完成为 `blocked:no_order`，Campaign 持续 `active`。
 
-**硬门（全部满足才可动）**：活动 execution=0、PENDING/RUNNING 命令=0、`NEW_RISK` 租约=0、OKX Demo 仓位=0、普通挂单=0、八类算法单=0、Worker 心跳新鲜、两库 `integrity_check=ok`、`kill_active=0`。
+**硬门（全部满足才可动）**：活动 execution=0、PENDING/RUNNING 命令=0、未解决 UNCERTAIN=0、`NEW_RISK` 租约=0、OKX Demo 仓位=0、普通挂单=0、八类算法单=0、Worker 心跳/成功对账新鲜、两库 `integrity_check=ok`、账户身份一致。风险停止必须为 0；唯一例外是 `RECOVERABLE_TRANSIENT_RISK_STOP_REASONS` 中的临时读取停止，此时只允许 Campaign 针对新 K 线创建一次耐久的专用恢复命令，新账户/身份/账单读取完整前保持停写，禁止直接清除或重锚高水位。
 
-**步骤**：① 只读核验硬门；② 停当前 Campaign 进程（先 `taskkill /PID <pid>`，PID 用 `Get-CimInstance Win32_Process` 查 `okx_demo_campaign` 命令行）；③ `Start-Process .venv\Scripts\python.exe -ArgumentList "-m","pa_agent.okx_demo_campaign","restart" -WorkingDirectory <repo> -WindowStyle Hidden -RedirectStandardOutput logs\okx_demo_campaign_restart_<ts>_stdout.log -RedirectStandardError ...`；④ 核对新 status：继承 `last_completed_bar_ms`、冻结参数不变；⑤ 观察 ≥1 根自然 K 线完成。
+**恢复方式**：同配置、旧状态未完成且当前无进程时使用正式 `python -m pa_agent.okx_demo_campaign run` 继续原 Campaign；只有需要归档旧 Campaign 并开始新 24 小时窗口时才使用 `restart`。进程已存在时先重新核验全部硬门，再按最短维护窗口处理，禁止重复启动争抢 `CampaignProcessLock`。
 
-**验收标准**：新 Campaign active、继承正确、首根自然 K 线完成且 `pa_agent.log` 无新 ERROR 类别；Worker 不需要重启（其代码本轮未再改）。
+**验收标准**：Campaign active、继承正确、冻结参数不变、专用临时恢复有完整命令证据且高水位未重锚、首根自然 K 线完成；Worker 保持健康，券商现场继续由实时只读证据确认。
+
+### WO-C2 Campaign 对账监控耐久化（2026-07-27 完成）
+
+**根因**：旧 `_monitor_owned_executions()` 只要历史 `execution_ids` 非空，就先强制等待一个时间戳更晚的新对账；即使全部 execution 已是安全终态，30 秒无新时间戳也会抛 `TimeoutError`，越过 `run()` 并把 Campaign 写成 `needs_attention` 后退出。
+
+**实现**：
+- 扫描全部 owned execution；`CLOSED/BLOCKED/CANCELED/REJECTED` 和 `READY` 不等待新对账。`BLOCKED/REJECTED` 的 `needs_attention=true` 表示确定未写入或券商明确拒绝，不再误判为未知写入。
+- 普通活动态才等待对账；`TimeoutError` 或 Worker 单轮 attention 会先重读耐久账本，仍为普通活动态时记录 `blocked:reconcile:*`、跳过本轮轮询并重试，不创建或重试券商写入。
+- `UNKNOWN/ERROR`、非终态 `needs_attention`、记录丢失和非法状态继续硬阻断。监控错误不得覆盖本根既有 `blocked:no_order`、风险阻断等结果。
+- `close_out()` 在剩余窗口内重试临时对账；真实不安全状态耐久写 `needs_attention` 并返回失败，人工中断也不会停在假 `stopping`。
+
+**验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。真实恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e` 完成新的账户与账单读取，`kill_active` 由白名单临时停止合法恢复为 0，高水位保持 `78303.57015174496`；首根新 K 线完成且零新增 execution/订单/仓位。
 
 ### WO-D P1 三标的真实验收（被长桥 token 阻塞）
 
@@ -333,6 +345,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-H 任务 3：成交量影子摘要、自动分析落盘、离线评分脚本和测试完成；未进提示词
 - [x] WO-E 前置设计包：`docs/prd/05_多市场看盘前端设计包.md` 已完成
 - [ ] WO-E 生产实现：停在三个视觉方向待用户选择；PyQt6、Stitch 和桌面验收均未开始
+- [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
+  0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
+  经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
 
 ## 6. 用户侧待办（只有用户能做）
 

@@ -155,6 +155,18 @@ CAMPAIGN_CLOSEOUT_SECONDS = 15 * 60
 CAMPAIGN_STATE_PATH = RECORDS_PENDING_DIR.parent / "okx_demo_campaign.json"
 CAMPAIGN_LOCK_PATH = RECORDS_PENDING_DIR.parent / "okx_demo_campaign.lock"
 CAMPAIGN_HISTORY_DIR = RECORDS_PENDING_DIR.parent / "okx_demo_campaign_history"
+CAMPAIGN_RECONCILE_TIMEOUT_RESULT = "blocked:reconcile:timeout"
+CAMPAIGN_RECONCILE_WORKER_ATTENTION_RESULT = (
+    "blocked:reconcile:worker_needs_attention"
+)
+CAMPAIGN_SAFE_TERMINAL_STATES = frozenset(
+    {
+        ExecutionState.CLOSED,
+        ExecutionState.BLOCKED,
+        ExecutionState.CANCELED,
+        ExecutionState.REJECTED,
+    }
+)
 
 # 这不是策略信号，也不是日常运行器的一部分。它只用来把 Demo 的
 # 「市价入场 -> 成交回读 -> 原生保护 -> 受控离场」完整走一遍。
@@ -3482,7 +3494,10 @@ class OkxDemoCampaign:
                 self._monitor_owned_executions()
             except DataSourceTransientError as exc:
                 logger.warning("行情暂时不可用: %s", exc)
-                self._save_state(last_error=str(exc))
+                if not self.state.last_error.startswith(
+                    "blocked:reconcile:"
+                ):
+                    self._save_state(last_error=str(exc))
             remaining = (
                 self.state.expires_at_utc - _utc_now()
             ).total_seconds()
@@ -3491,39 +3506,159 @@ class OkxDemoCampaign:
             time.sleep(min(self.poll_seconds, remaining))
         return self.close_out()
 
-    def _monitor_owned_executions(self) -> None:
+    def _monitor_owned_executions(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         owned_ids = list(self.state.execution_ids)
         if not owned_ids:
             return
-        after = (
-            self.runtime.execution_service.latest_successful_reconcile_at()
-        )
-        poll_interval = float(
-            self.runtime.settings.execution.poll_interval_seconds
-        )
-        self.runtime.execution_service.wait_for_reconcile(
-            after=after,
-            timeout=max(30.0, poll_interval * 3 + 5),
-        )
+
+        def load_owned_executions():
+            executions = []
+            for execution_id in owned_ids:
+                execution = self.runtime.execution_service.get_execution(
+                    execution_id
+                )
+                if execution is None:
+                    message = (
+                        f"实验 execution {execution_id} 不存在于执行账本"
+                    )
+                    self._save_state(
+                        last_plan_result="blocked:execution:missing",
+                        last_error=message,
+                    )
+                    raise CampaignError(message)
+                state = getattr(execution, "state", None)
+                state_value = str(getattr(state, "value", state) or "missing")
+                if state in {ExecutionState.UNKNOWN, ExecutionState.ERROR}:
+                    message = (
+                        f"execution {execution_id} 状态 {state_value}，"
+                        "需要人工核对"
+                    )
+                    self._save_state(
+                        last_plan_result=f"execution:{state_value}",
+                        last_error=message,
+                    )
+                    raise CampaignError(message)
+                if not isinstance(state, ExecutionState):
+                    message = (
+                        f"execution {execution_id} 状态 {state_value} "
+                        "不在已核验状态集合"
+                    )
+                    self._save_state(
+                        last_plan_result="blocked:execution:invalid_state",
+                        last_error=message,
+                    )
+                    raise CampaignError(message)
+                if (
+                    state not in CAMPAIGN_SAFE_TERMINAL_STATES
+                    and bool(getattr(execution, "needs_attention", False))
+                ):
+                    message = (
+                        f"execution {execution_id} 需要人工核对，"
+                        "禁止自动进入下一根"
+                    )
+                    self._save_state(
+                        last_plan_result=(
+                            "blocked:execution:needs_attention"
+                        ),
+                        last_error=message,
+                    )
+                    raise CampaignError(message)
+                executions.append(execution)
+            return executions
+
+        owned_executions = load_owned_executions()
+        if any(
+            execution.state in ACTIVE_EXECUTION_STATES
+            for execution in owned_executions
+        ):
+            after = (
+                self.runtime.execution_service.latest_successful_reconcile_at()
+            )
+            poll_interval = float(
+                self.runtime.settings.execution.poll_interval_seconds
+            )
+            reconcile_timeout = max(30.0, poll_interval * 3 + 5)
+            if timeout_seconds is not None:
+                reconcile_timeout = min(
+                    reconcile_timeout,
+                    max(0.1, float(timeout_seconds)),
+                )
+            try:
+                self.runtime.execution_service.wait_for_reconcile(
+                    after=after,
+                    timeout=reconcile_timeout,
+                )
+            except (LiveTradingDisabled, TimeoutError) as exc:
+                # 超时边界上 Worker 可能已经把 execution 推进到安全终态；
+                # 先重读耐久账本，只有仍为普通活动态时才暂缓本轮 K 线。
+                owned_executions = load_owned_executions()
+                if any(
+                    execution.state in ACTIVE_EXECUTION_STATES
+                    for execution in owned_executions
+                ):
+                    message = (
+                        str(exc).strip()
+                        or "等待交易后台完成下一轮券商对账超时"
+                    )
+                    transient_result = (
+                        CAMPAIGN_RECONCILE_TIMEOUT_RESULT
+                        if isinstance(exc, TimeoutError)
+                        else CAMPAIGN_RECONCILE_WORKER_ATTENTION_RESULT
+                    )
+                    updates = {
+                        "last_error": f"{transient_result}: {message}",
+                    }
+                    if (
+                        not self.state.last_plan_result
+                        or self.state.last_plan_result.startswith(
+                            "execution:"
+                        )
+                        or self.state.last_plan_result.startswith(
+                            "blocked:reconcile:"
+                        )
+                    ):
+                        updates["last_plan_result"] = transient_result
+                    self._save_state(**updates)
+                    raise DataSourceTransientError(message) from exc
+            else:
+                owned_executions = load_owned_executions()
+
         last_execution_id = self.state.last_execution_id
         if not last_execution_id:
             return
-        execution = self.runtime.execution_service.get_execution(
-            last_execution_id
+        execution = next(
+            (
+                item
+                for item in owned_executions
+                if item.id == last_execution_id
+            ),
+            None,
         )
         if execution is None:
             raise CampaignError(
                 f"实验 execution {last_execution_id} 不存在于执行账本"
             )
         actual_result = f"execution:{execution.state.value}"
+        updates = {}
         if (
-            self.state.last_plan_result.startswith("execution:")
-            and self.state.last_plan_result != actual_result
-        ):
-            self._save_state(
-                last_plan_result=actual_result,
-                last_error="",
+            (
+                self.state.last_plan_result.startswith("execution:")
+                and self.state.last_plan_result != actual_result
             )
+            or self.state.last_plan_result.startswith("blocked:reconcile:")
+        ):
+            updates["last_plan_result"] = actual_result
+        if (
+            updates
+            or self.state.last_error.startswith("blocked:reconcile:")
+        ):
+            updates["last_error"] = ""
+        if updates:
+            self._save_state(**updates)
 
     def _owned_active_executions(self):
         owned_ids = set(self.state.execution_ids)
@@ -3539,8 +3674,27 @@ class OkxDemoCampaign:
         self._save_state(status="stopping")
         self._expire_owned_ready(reason="24 小时 OKX Demo 实验到期，未提交计划作废")
         cleanup_deadline = time.monotonic() + self.closeout_seconds
+        poll_interval = float(
+            self.runtime.settings.execution.poll_interval_seconds
+        )
         while time.monotonic() < cleanup_deadline:
-            self._monitor_owned_executions()
+            try:
+                self._monitor_owned_executions(
+                    timeout_seconds=cleanup_deadline - time.monotonic(),
+                )
+            except DataSourceTransientError as exc:
+                logger.warning("收口等待交易后台对账暂时失败: %s", exc)
+                remaining = max(0.0, cleanup_deadline - time.monotonic())
+                if remaining > 0:
+                    time.sleep(min(poll_interval, remaining))
+                continue
+            except CampaignError as exc:
+                self._save_state(
+                    status="needs_attention",
+                    last_error=str(exc),
+                )
+                logger.error("收口发现执行状态需要人工核对: %s", exc)
+                return False
             active = self._owned_active_executions()
             if not active:
                 if self.state.execution_ids:
@@ -3570,7 +3724,7 @@ class OkxDemoCampaign:
                         execution.id,
                         reason="24 小时 OKX Demo 实验到期",
                     )
-            time.sleep(float(self.runtime.settings.execution.poll_interval_seconds))
+            time.sleep(poll_interval)
 
         remaining = self._owned_active_executions()
         self._save_state(

@@ -4,20 +4,18 @@
 
 ## 在做什么
 
-- 当前主线是 WO-H 后半段。任务 1 的股票交易时段标签和任务 2 的高周期关键位置、20GB 标记已由提交 `0a0c5a8` 推送，禁止重做。
-- 任务 3 已完成成交量影子链：`PromptAssembler` 在完整分析和增量分析构造阶段各记录一次已收盘 K 线摘要到 `scratch/volume_shadow/`；`scratch/score_volume_shadow.py` 用本地 CSV 比较放量组与缩量组的后续相对振幅。摘要只落盘，不进入提示词。
-- 任务 4 已完成文档交付：本文件压缩为一页，旧流水账完整归档到 `docs/archive/CONTEXT_full_history_through_20260727_wo_h.md`；多市场前端设计包见 `docs/prd/05_多市场看盘前端设计包.md`。
-- 本轮不修改 `pa_agent/execution/`、`pa_agent/gui/`、`scripts/`，不操作交易运行态，不读写 AlphaMaster。
+- WO-H 已由 `0a0c5a8`、`2e95a05`、`0486002` 完成并推送：时段标签、高周期关键位置、20GB 标记、成交量影子自动采集/评分和多市场前端设计包均已落地；成交量仍不进入提示词或交易判断。
+- 最近完成的主线是 WO-C2 Campaign 对账监控耐久化。`pa_agent/okx_demo_campaign.py` 已改为先读 execution 耐久终态，只有普通活动态才等待新对账；临时超时或 Worker 短暂 attention 不再杀死 Campaign，也不覆盖刚完成 K 线的结果。
+- 2026-07-27 16:31 北京时间从正式 `run` 入口恢复原 Campaign；专用恢复命令完成新的账户与账单读取后合法解除白名单内的临时风险停止，高水位未重锚。
+- 下一张开发工单是 WO-F 完整 Claim Validation；之后进入 `WO-POS-05` 多段仓位生命周期。多市场前端可并行继续方向 B 的高保真设计，但生产 PyQt6 等后端合同稳定后再落地。
 
 ## 上次停在哪
 
-- 开工基线在 `HEAD=0a0c5a8` 上复核为 1823 项、0 失败、0 错误、7 跳过。
-- `HEAD=2e95a05` 的开工复核为 1874 项、0 失败、0 错误；当次固定跳过 3 项，另有 1 个 AkShare 条件跳过。
-- 补齐自动影子采集与并发保护后的三套件为 1880 项、0 失败、0 错误、7 项跳过（3 固定 + 4 个 AkShare 条件跳过）；新增 6 项覆盖自动落盘、提示词零字段、失败隔离、并发追加和中断恢复。
-- 评分脚本已用本地 JSONL 和 CSV 验证两条路径：样本够时输出两组样本数与平均后续振幅；数据不足时明确输出“样本不足，暂不给结论”。
-- 本轮只在 `pa_agent/data/`、`pa_agent/ai/`、`tests/` 和文档范围补齐漏项；`prompt_engineering/`、`pa_agent/execution/`、`pa_agent/gui/`、`scripts/` 保持无差异。
+- WO-C2 基线为 `HEAD=0486002`、工作区干净。最终三套件为 1886 项通过、0 失败；定向 Campaign 套件 86 项通过、0 失败。
+- 多 Agent 两轮对抗审查发现的终态 `needs_attention`、后置监控覆盖新 K 线结果、收口重试和人工中断耐久状态问题均已修正，最终复审 PASS。
+- 现场首根新 K 线 16:20–16:30 已完成，`analyses_completed` 由 16 增至 17，真实结果 `blocked:no_order`；Campaign 保持 `active`，没有新增 execution、订单或仓位。
+- 16:33 后只读现场：Worker 心跳与成功对账新鲜，风险停止为 0，活动 execution/命令、未解决 UNCERTAIN 和 NEW_RISK 租约均为 0；OKX Demo 空仓、空普通单、八类算法单全空。
 - 长桥 access token 仍被服务端以 `401004 token invalid` 拒绝。AAPL.US、700.HK、600519.SH 的真实两阶段验收继续阻塞；不得改凭据或绕过认证。
-- WO-D 本地验收脚本已修正成功判定、Longbridge 来源标记和异常释放；`scratch/score_volume_shadow.py` 与验收脚本均受 `.gitignore` 的 `scratch/` 规则保护，只作为本机入口。
 
 ## 近期关键决定
 
@@ -29,6 +27,7 @@
 - 自选列表只写本地 `GeneralSettings`，不写长桥云端 watchlist。
 - 市场时钟读取 `market_calendar.session_state` 的开市、午休、闭市、半日市与下一变化时间；加密显示连续交易，不伪造股票会话。
 - 交易安全真值保持不变：高水位 `78303.57015174496`，账户身份摘要 `ba9b744dc78ae3fc203980e62b854b0a0e3d44c9c6d5e446de910bea74ef1def`。
-- 2026-07-27 北京时间约 13:00 的只读现场：Worker 健康、两库完整、风险停止为 0、券商侧空仓空挂单；Campaign 已于 10:30:55 因等待对账超时退出并漏过后续 K 线。本轮按用户边界不重启、不恢复、不补跑。
+- `CLOSED/BLOCKED/CANCELED/REJECTED` 是无需新对账的安全终态；`BLOCKED/REJECTED` 可因确定未写入而带 `needs_attention=true`，不能误判为未知券商写入。`UNKNOWN/ERROR`、非终态 `needs_attention` 和记录丢失仍硬阻断。
+- 对账临时故障写稳定 `blocked:reconcile:*` 证据；若本根已有 `blocked:no_order` 等结果，只更新监控错误，不覆盖该结果。收口阶段在剩余窗口内重试临时对账，真实不安全状态耐久写 `needs_attention`。
 - WO-F 当前只有部分反幻觉校验落地，原工单要求的全部价位、K 线引用、真实最小报价单位和耐久 `blocked:claim_validation` 语义仍未完成，禁止继续标成整张工单完成。
 - 总控与历史证据继续以 `docs/WORKORDER_MASTER_20260727.md`、`docs/VALIDATION_EVIDENCE.md` 和本页链接的归档为准。

@@ -40,6 +40,8 @@ from pa_agent.okx_demo_campaign import (
     CAMPAIGN_INSTRUMENT,
     CAMPAIGN_MIN_CONFIDENCE,
     CAMPAIGN_OKX_API_BASE_URL,
+    CAMPAIGN_RECONCILE_TIMEOUT_RESULT,
+    CAMPAIGN_RECONCILE_WORKER_ATTENTION_RESULT,
     CAMPAIGN_STANCE,
     CAMPAIGN_SYMBOL,
     CAMPAIGN_TIMEFRAME,
@@ -3071,8 +3073,29 @@ def test_closeout_cancels_pending_entry_and_exits_open_position(
         active_batches=[
             [pending, opened, unrelated_demo, unrelated_live],
             [unrelated_demo, unrelated_live],
-        ]
+        ],
+        records={pending.id: pending, opened.id: opened},
     )
+    original_wait_for_reconcile = service.wait_for_reconcile
+    reconcile_attempts = 0
+
+    def _wait_after_one_timeout(*, after, timeout):
+        nonlocal reconcile_attempts
+        reconcile_attempts += 1
+        if reconcile_attempts == 1:
+            raise TimeoutError("等待交易后台完成下一轮券商对账超时")
+        if reconcile_attempts == 3:
+            service.store.records[pending.id] = SimpleNamespace(
+                id=pending.id,
+                state=ExecutionState.CANCELED,
+            )
+            service.store.records[opened.id] = SimpleNamespace(
+                id=opened.id,
+                state=ExecutionState.CLOSED,
+            )
+        return original_wait_for_reconcile(after=after, timeout=timeout)
+
+    service.wait_for_reconcile = _wait_after_one_timeout
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(
         store,
@@ -3096,6 +3119,7 @@ def test_closeout_cancels_pending_entry_and_exits_open_position(
     assert all(ids == [] for ids in service.reconciled_execution_ids)
     assert service.reconcile_commands == 0
     assert service.reconcile_waits > 0
+    assert reconcile_attempts == 3
     assert runner.state.status == "completed"
 
 
@@ -3123,12 +3147,32 @@ def test_closeout_without_executions_still_writes_final_account_snapshot(
     assert runner.state.status == "completed"
 
 
-def test_monitor_syncs_newer_terminal_execution_state_into_campaign(tmp_path):
+@pytest.mark.parametrize(
+    "terminal_state",
+    [
+        ExecutionState.CLOSED,
+        ExecutionState.BLOCKED,
+        ExecutionState.CANCELED,
+        ExecutionState.REJECTED,
+    ],
+)
+def test_monitor_syncs_terminal_execution_without_waiting_for_reconcile(
+    terminal_state,
+    tmp_path,
+):
     execution = SimpleNamespace(
-        id="demo-s-closed",
-        state=ExecutionState.CLOSED,
+        id=f"demo-s-{terminal_state.value}",
+        state=terminal_state,
+        needs_attention=terminal_state
+        in {ExecutionState.BLOCKED, ExecutionState.REJECTED},
     )
     service = _FakeExecutionService(records={execution.id: execution})
+
+    def _unexpected_wait(*, after, timeout):
+        del after, timeout
+        raise AssertionError("安全终态不应等待下一轮券商对账")
+
+    service.wait_for_reconcile = _unexpected_wait
     store = CampaignStateStore(tmp_path / "campaign.json")
     state = _state(
         store,
@@ -3150,8 +3194,342 @@ def test_monitor_syncs_newer_terminal_execution_state_into_campaign(tmp_path):
 
     runner._monitor_owned_executions()
 
+    assert runner.state.last_plan_result == f"execution:{terminal_state.value}"
+    assert runner.state.last_error == ""
+    assert service.reconcile_waits == 0
+
+
+def test_monitor_timeout_preserves_newer_bar_result(tmp_path):
+    active = SimpleNamespace(
+        id="open-after-no-order",
+        state=ExecutionState.OPEN,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(records={active.id: active})
+
+    original_wait = service.wait_for_reconcile
+    attempts = 0
+
+    def _timeout_then_recover(*, after, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("等待交易后台完成下一轮券商对账超时")
+        return original_wait(after=after, timeout=timeout)
+
+    service.wait_for_reconcile = _timeout_then_recover
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+            "last_plan_result": "blocked:no_order",
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    with pytest.raises(DataSourceTransientError):
+        runner._monitor_owned_executions()
+
+    assert runner.state.last_plan_result == "blocked:no_order"
+    assert runner.state.last_error.startswith(
+        f"{CAMPAIGN_RECONCILE_TIMEOUT_RESULT}:"
+    )
+
+    runner._monitor_owned_executions()
+
+    assert attempts == 2
+    assert runner.state.last_plan_result == "blocked:no_order"
+    assert runner.state.last_error == ""
+
+
+def test_monitor_accepts_terminal_state_reached_at_timeout_boundary(tmp_path):
+    active = SimpleNamespace(
+        id="closing-at-timeout",
+        state=ExecutionState.EXIT_PENDING,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(records={active.id: active})
+
+    def _close_then_timeout(*, after, timeout):
+        del after, timeout
+        service.store.records[active.id] = SimpleNamespace(
+            id=active.id,
+            state=ExecutionState.CLOSED,
+            needs_attention=False,
+        )
+        raise TimeoutError("等待交易后台完成下一轮券商对账超时")
+
+    service.wait_for_reconcile = _close_then_timeout
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+            "last_plan_result": "execution:exit_pending",
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    runner._monitor_owned_executions()
+
     assert runner.state.last_plan_result == "execution:closed"
     assert runner.state.last_error == ""
+
+
+def test_run_keeps_alive_and_writes_nothing_when_active_reconcile_times_out(
+    monkeypatch,
+    tmp_path,
+):
+    started = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    clock = {"now": started}
+    monkeypatch.setattr(campaign_module, "_utc_now", lambda: clock["now"])
+    active = SimpleNamespace(
+        id="open-timeout",
+        state=ExecutionState.OPEN,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(records={active.id: active})
+
+    def _timeout(*, after, timeout):
+        del after, timeout
+        service.reconcile_waits += 1
+        clock["now"] = runner.state.expires_at_utc
+        raise TimeoutError("等待交易后台完成下一轮券商对账超时")
+
+    service.wait_for_reconcile = _timeout
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, started).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+            "last_plan_result": "execution:open",
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    processed = []
+    monkeypatch.setattr(
+        runner,
+        "process_latest_closed_bar",
+        lambda: processed.append(True) or True,
+    )
+    monkeypatch.setattr(runner, "close_out", lambda: True)
+
+    assert runner.run() is True
+    assert runner.state.status == "active"
+    assert runner.state.last_plan_result == CAMPAIGN_RECONCILE_TIMEOUT_RESULT
+    assert runner.state.last_error.startswith(
+        f"{CAMPAIGN_RECONCILE_TIMEOUT_RESULT}:"
+    )
+    assert processed == []
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
+    assert service.leverage_parameters == []
+    assert service.refreshed == 0
+    assert service.arm_calls == []
+    assert service.reconcile_commands == 0
+
+
+def test_run_resumes_bar_processing_after_reconcile_recovers(
+    monkeypatch,
+    tmp_path,
+):
+    started = datetime(2026, 7, 17, 1, tzinfo=UTC)
+    clock = {"now": started}
+    monkeypatch.setattr(campaign_module, "_utc_now", lambda: clock["now"])
+    monkeypatch.setattr(
+        campaign_module.time,
+        "sleep",
+        lambda seconds: clock.__setitem__(
+            "now", clock["now"] + timedelta(seconds=seconds)
+        ),
+    )
+    active = SimpleNamespace(
+        id="open-recovers",
+        state=ExecutionState.OPEN,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(records={active.id: active})
+    original_wait = service.wait_for_reconcile
+    attempts = 0
+
+    def _wait_then_recover(*, after, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TimeoutError("等待交易后台完成下一轮券商对账超时")
+        return original_wait(after=after, timeout=timeout)
+
+    service.wait_for_reconcile = _wait_then_recover
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, started).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+            "last_plan_result": "execution:open",
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    processed = []
+
+    def _process_after_recovery():
+        processed.append(True)
+        service.store.records[active.id] = SimpleNamespace(
+            id=active.id,
+            state=ExecutionState.CLOSED,
+            needs_attention=False,
+        )
+        clock["now"] = runner.state.expires_at_utc
+        return True
+
+    monkeypatch.setattr(
+        runner,
+        "process_latest_closed_bar",
+        _process_after_recovery,
+    )
+    monkeypatch.setattr(runner, "close_out", lambda: True)
+
+    assert runner.run() is True
+    assert attempts == 2
+    assert processed == [True]
+    assert runner.state.last_plan_result == "execution:closed"
+    assert runner.state.last_error == ""
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
+    assert service.leverage_parameters == []
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "needs_attention", "expected_result"),
+    [
+        (ExecutionState.UNKNOWN, False, "execution:unknown"),
+        (ExecutionState.ERROR, False, "execution:error"),
+        (
+            ExecutionState.OPEN,
+            True,
+            "blocked:execution:needs_attention",
+        ),
+    ],
+)
+def test_monitor_hard_blocks_unsafe_execution_state(
+    execution_state,
+    needs_attention,
+    expected_result,
+    tmp_path,
+):
+    execution = SimpleNamespace(
+        id=f"unsafe-{execution_state.value}",
+        state=execution_state,
+        needs_attention=needs_attention,
+    )
+    safe_last = SimpleNamespace(
+        id="safe-last",
+        state=ExecutionState.CLOSED,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(
+        records={
+            execution.id: execution,
+            safe_last.id: safe_last,
+        }
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [execution.id, safe_last.id],
+            "last_execution_id": safe_last.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    with pytest.raises(CampaignError, match="需要人工核对"):
+        runner._monitor_owned_executions()
+
+    assert runner.state.last_plan_result == expected_result
+    assert service.reconcile_waits == 0
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
+
+
+def test_monitor_treats_worker_attention_as_transient_after_ledger_recheck(
+    tmp_path,
+):
+    active = SimpleNamespace(
+        id="worker-needs-attention",
+        state=ExecutionState.OPEN,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(records={active.id: active})
+
+    def _worker_attention(*, after, timeout):
+        del after, timeout
+        raise LiveTradingDisabled("交易后台需要人工处理")
+
+    service.wait_for_reconcile = _worker_attention
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    with pytest.raises(DataSourceTransientError, match="需要人工处理"):
+        runner._monitor_owned_executions()
+
+    assert (
+        runner.state.last_plan_result
+        == CAMPAIGN_RECONCILE_WORKER_ATTENTION_RESULT
+    )
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
 
 
 def test_closeout_timeout_is_not_reported_as_completed(tmp_path):
@@ -3173,3 +3551,47 @@ def test_closeout_timeout_is_not_reported_as_completed(tmp_path):
     assert runner.close_out() is False
     assert runner.state.status == "needs_attention"
     assert "仍有 1 条活动执行" in runner.state.last_error
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "needs_attention"),
+    [
+        (ExecutionState.UNKNOWN, False),
+        (ExecutionState.OPEN, True),
+    ],
+)
+def test_closeout_persists_needs_attention_for_unsafe_execution(
+    execution_state,
+    needs_attention,
+    tmp_path,
+):
+    unsafe = SimpleNamespace(
+        id=f"closeout-{execution_state.value}",
+        state=execution_state,
+        needs_attention=needs_attention,
+    )
+    service = _FakeExecutionService(records={unsafe.id: unsafe})
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [unsafe.id],
+            "last_execution_id": unsafe.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+        closeout_seconds=60,
+    )
+
+    assert runner.close_out() is False
+    assert runner.state.status == "needs_attention"
+    assert "需要人工核对" in runner.state.last_error
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
