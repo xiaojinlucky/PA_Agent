@@ -71,12 +71,11 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 | P1 后端：市场规则块 ×4 + 路由 + 注入（用户回合）+ K 线表交易所时区 | `prompt_engineering/市场规则_*.txt`、`pa_agent/ai/market_rules.py`、`prompt_assembler.py`、`tests/unit/test_market_rules*.py` |
 | 共享合同层（符号/K线合同/日历/双协议） | `D:\Desktop\Quant\shared\market_contracts`（39 测试全过，已 editable 装入 venv） |
 | 文档同步 | `CONTEXT.md` 顶部、`docs/VALIDATION_EVIDENCE.md`、`docs/CLAUDE_HANDOFF_20260726.md` 横幅、PRD04 §10/§11.4 |
-| 最终全量 unit：失败=历史 18 项精确一致，零新增 | `%TEMP%\final_unit_out.txt`（临时）；FAILED 清单已逐名比对 |
+| 最终三套件回归：1874 项、0 失败、0 错误、3 跳过 | 2026-07-27 WO-H 收口复核 |
 
 **测试基线（验收时的对照）**：
-- `tests/unit` 全量：仅允许历史 18 个失败（清单见 `docs/CLAUDE_HANDOFF_20260726.md` §10）。
-- `tests/integration`：8 个既有失败（4 个 akshare 联网 + `test_next_bar_prediction.py` 3 个 + `test_two_stage_no_order_with_prices.py` 1 个，均为 HEAD 既有，涉及模块本轮未改）。
-- `tests/property`：6 个历史失败（AI 输出校验语义级，见 WO-6）。
+- `tests/unit` + `tests/property` + `tests/integration`：必须零失败；当前 1874 项、0 失败、0 错误、3 跳过。
+- 旧 handoff 中的 unit 18 项、property 6 项和 integration 既有失败均已完成裁决，禁止继续当作豁免。
 - 改动文件 Ruff `E4,E7,E9,F,I,UP,B,C4` 全绿；`compileall` 过；`git diff --check` 过。
 
 ---
@@ -165,7 +164,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 > 不再有"历史 18 项"豁免。已推送 `origin/main = 20773d6`（3 commit，逐 commit gitleaks 零泄漏）。
 > 集成测试仍有 4 个 akshare 联网用例失败（外网依赖，非代码缺陷）。
 
-### WO-H 时间/多周期/成交量因素接入（2026-07-27 研究裁决，等用户确认方向后执行）
+### WO-H 时间/多周期/成交量因素接入（2026-07-27 研究裁决与执行）
 
 **依据**：用户两个 GPT 对话（TP1/TP2+RR 批判、实盘冻结决策+因素接入建议）+ 原始资料
 `E:\QQ文件\价格行为学资料\文件18-多时间周期分析.txt`（Brooks MTA：嵌套原理、HTF 设置+主周期
@@ -183,9 +182,19 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   **必须先影子运行**并用评测门禁（方向准确率 Wilson 下界>50%）证明增益才转正。
 - 横切纪律：新因素一律薄标签、进用户回合（保提示词缓存）、可程序校验、先影子后转正。
 
+**执行状态**：
+- 任务 1 股票交易时段标签与任务 2 高周期关键位置、20GB 标记已由提交 `0a0c5a8`
+  推送；全量基线 1823 项、0 失败、0 错误。
+- 任务 3 已完成三文件白名单内的可调用框架：成交量摘要、JSONL 追加记录、可提交的
+  离线评分核心、本地命令行入口和 51 项定向测试。成交量未进入提示词，也未接入自动分析调用链。
+- 当前评分只比较放量与缩量两组的后续相对振幅，属于描述性结果；摘要没有预测方向，
+  因而不能计算 Wilson 方向准确率门，也不能据此批准成交量转正。
+- 本轮最终三套件为 1874 项、0 失败、0 错误、3 跳过；提示词、AI、执行、GUI 和脚本
+  目录没有本轮差异。
+
 ### WO-G 遗留专项（优先级低）
 
-1. 历史 18 个 unit 失败逐项裁决（**进行中**，已裁决 11 项）：
+1. 历史 18 个 unit 失败逐项裁决（**已完成，全部清零**）：
    - **已修（6 项，UI 迁移）**：`test_decision_panel.py` 的预测组 6 个测试——预测 UI 已整体迁至
      `FutureTrendPanel`（`pa_agent/gui/future_trend_panel.py`），旧测试断言的 `_prediction_group`
      等成员已不存在。裁决：迁移测试而非恢复旧控件，新建 `tests/unit/test_future_trend_panel.py`
@@ -222,7 +231,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
      ⑥`test_price_tick` + ⑤的夹具 —— 均缺 `take_profit_price_2`（TP2 现为下单必填），
      决策先被正确降级为不下单，导致测不到目标行为；补齐夹具字段。
 2. 集成 4 个既有失败（next_bar_prediction ×3、no_order_with_prices ×1）：同上裁决。
-3. `CONTEXT.md` 一页化：旧流水账归档到 `docs/archive/`（roadmap 治理修订要求）。
+3. `CONTEXT.md` 一页化：**已完成**。当前文件 32 行；旧流水账完整归档到
+   `docs/archive/CONTEXT_full_history_through_20260727_wo_h.md`。
 4. `D:\Desktop\Quant\shared` 尚无 Git 版本管理：需用户拍板是否建仓（禁止擅自 git init）。
 5. 全仓 Ruff 历史债务（4963 项基线违规）：不在常规工单批量改。
 
@@ -232,7 +242,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **实现者自查**：改动文件 Ruff（`--select E4,E7,E9,F,I,UP,B,C4`）+ `compileall` + 定向 pytest 全绿。
 2. **对抗审查**：按 WO-A 的 4 视角模板（交易安全/数据正确性/提示词缓存/文档诚实）逐视角列发现；每个发现用"默认怀疑、能实证才算"的标准二次验证。
-3. **回归闸门**：全量 `tests/unit` 失败集合必须仍 == 历史 18 项（名单在 handoff §10）；任何新增失败必须修复或有书面裁决。
+3. **回归闸门**：全量 `tests/unit` + `tests/property` + `tests/integration` 必须零失败；当前数量不得低于 1874，跳过不得高于 3，数量变化必须有书面解释。
 4. **运行态闸门**：任何触碰执行链/提示词的改动，交付前核验 Campaign/Worker/风险态三件套 + `pa_agent.log` 无新 ERROR 类别。
 5. **文档闸门**：CONTEXT.md 顶部与本文档进度账本同步更新；主张必须可被证据文件支撑。
 
@@ -246,6 +256,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 | WO-D | 3 标的 complete、时区/规则块人工抽查过、acceptance_pass=true |
 | WO-E | 设计流程全走完+用户审美确认，零副标题，真实读写链接通，三标的桌面验收 |
 | WO-F | 三类校验单测过，property 6 项清零或书面裁决，unit 零新增失败 |
+| WO-G-3 | `CONTEXT.md` 保持一页，历史流水账完整归档且可还原 |
+| WO-H-3 | 成交量仅做影子摘要和离线描述性评分，不进提示词、不接自动调用链、不宣称转正 |
 
 ## 5. 进度账本（每个重要步骤后回写）
 
@@ -303,13 +315,22 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   批次门禁：受影响套件全绿；全量 unit+property = 历史 18 项零新增；compileall/diff-check 过；
   范围 Ruff 有 16 项**既有**历史债（settings 旧签名引号 UP037×11、C420×1、旧 import 排序
   I001×4，均非本轮新增行），按"不顺手清理"纪律保留并如实记录。
+- [x] 2026-07-27 14:11 WO-H 任务 3、4 收口：成交量影子摘要、JSONL 记录、严格本地
+  后验评分核心和命令行入口完成，成交量零提示词与零自动调用链；`CONTEXT.md` 一页化并
+  完整归档，多市场前端页面合同和三个方向完成。两轮多 Agent 对抗审查发现均已修复；
+  三文件完整 Ruff、compileall、diff-check 通过，定向 51 项和三套件 1874 项均零失败。
 - [ ] WO-D：**被长桥 token 401004 阻塞，等用户重签**
-- [ ] WO-E / WO-F / WO-G：未开始
+- [x] WO-F：Claim Validation 已落地并完成失败裁决
+- [x] WO-G-1、WO-G-2、WO-G-3：历史测试失败裁决完成，`CONTEXT.md` 一页化完成
+- [x] WO-H 任务 1、2：提交 `0a0c5a8` 已推送
+- [x] WO-H 任务 3：成交量影子可调用框架、离线评分脚本和测试完成；未接自动调用链
+- [x] WO-E 前置设计包：`docs/prd/05_多市场看盘前端设计包.md` 已完成
+- [ ] WO-E 生产实现：停在三个视觉方向待用户选择；PyQt6、Stitch 和桌面验收均未开始
 
 ## 6. 用户侧待办（只有用户能做）
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-B 的提交确认（Claude/接手者会发清单，回复"是"即执行）。
+3. 本轮 WO-H 收口改动的提交确认（Codex 会发精确文件清单）。
 4. WO-E 的审美确认环节。
 5. `shared/` 是否建 Git 仓库的决定。
