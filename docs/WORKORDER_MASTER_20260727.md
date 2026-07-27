@@ -159,9 +159,62 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **验收标准**：新模块单测覆盖越界价/越界 bar 引用/合法突破位不误杀三类；property 6 项失败清零或每项有书面裁决（测试契约过期 → 更新测试并说明）；全量 unit 无新增失败。
 
+### WO-H 时间/多周期/成交量因素接入（2026-07-27 研究裁决，等用户确认方向后执行）
+
+**依据**：用户两个 GPT 对话（TP1/TP2+RR 批判、实盘冻结决策+因素接入建议）+ 原始资料
+`E:\QQ文件\价格行为学资料\文件18-多时间周期分析.txt`（Brooks MTA：嵌套原理、HTF 设置+主周期
+决策、只看 2-3 周期、反对多周期共识与低周期拼触发）。RR 1:1 上限批判已被当前代码采纳
+（`max_risk_reward_ratio()` 返回 None，结构三价保持原样，仅保留 RR≥1 下限）。
+
+**裁决**：
+- 多周期：已按资料正统落地（10m 主 + 1h/4h 薄背景，长桥高周期接口本轮已补）。
+  **禁止**多周期投票/共识硬闸、禁止加 1m/5m 触发周期。增量方向：HTF 关键位置语义做实
+  （资料的设置优先级表）、20GB 趋势强度标记（可程序判定）。
+- 时间：加密只用连续市场语义（已在加密规则块）；股票品种增量 = 分析帧加
+  "session 阶段"薄标签（开盘/午盘/尾盘，由 market_calendar 判定），不做时段硬闸。
+- 成交量：Brooks 体系几乎不用（资料实证），仅股票市场有补充价值。若做：
+  relative_volume + expanding/contracting 轻摘要，只解释不信号不进闸门，
+  **必须先影子运行**并用评测门禁（方向准确率 Wilson 下界>50%）证明增益才转正。
+- 横切纪律：新因素一律薄标签、进用户回合（保提示词缓存）、可程序校验、先影子后转正。
+
 ### WO-G 遗留专项（优先级低）
 
-1. 历史 18 个 unit 失败：多为旧预测面板/音效/OpenClaw 枚举映射的过期契约——逐项裁决改测试或改代码，单独一批提交。
+1. 历史 18 个 unit 失败逐项裁决（**进行中**，已裁决 11 项）：
+   - **已修（6 项，UI 迁移）**：`test_decision_panel.py` 的预测组 6 个测试——预测 UI 已整体迁至
+     `FutureTrendPanel`（`pa_agent/gui/future_trend_panel.py`），旧测试断言的 `_prediction_group`
+     等成员已不存在。裁决：迁移测试而非恢复旧控件，新建 `tests/unit/test_future_trend_panel.py`
+     覆盖同样六条渲染契约（隐藏/灰/绿/红/黄/clear），旧文件删除对应用例并留迁移注释；
+     断言文案按现行格式（"阳线的概率为70%"）更新。
+   - **已修（5 项，decision_continuity）**：
+     `test_bars_elapsed_between_parses_iso_t_separator` 是**真时区不一致**——测试助手 `_ms`
+     把本地墙钟 ISO 当 UTC 构造，而生产 `_parse_local_iso_ms` 按本机时区解析（生产自洽正确：
+     `timestamp_local_iso` 是本机墙钟 naive、`snapshot_ts_local_ms` 是真 epoch）；修助手用
+     naive `.timestamp()`，任意时区环境都成立。其余 4 项是**夹具与真实市场语义不符**：
+     ①`test_audit_relation_flip_label` 的 prev 记录时间比帧快照早 8 天，必然先触发挂单超时
+     自动取消（标签变已失效）→ 记录时间贴近快照；②三个 auto-cancel 用例把"高于市价的买入
+     限价"当作未触发，但买入限价高于市价按真实市场语义会立即成交（生产 `low <= entry` 判定
+     正确）→ 入场价改到帧最低价之下。**均未放宽生产语义**。
+   - **已修（7 项，2026-07-27 08:5x 完成，历史 18 项全部清零）**：
+     ①`test_validation_lenient_fixes` OpenClaw 枚举 ×2 —— `_normalize_stage2_enum_aliases`
+     漏了 entry_bar 的 strength/freshness 滑写（pending / limit_order_pending），该函数
+     本就是枚举滑写统一入口，补上调用（与主流程幂等重复无害）。
+     ②`test_order_opportunity` 音效 —— 夹具 FakeWinsound 缺 `SND_ASYNC`，属性异常被吞后
+     误跌到 MessageBeep 兜底；补常量（生产用异步播放避免阻塞 GUI 线程，正确）。
+     ③`test_provider_override_by_model` OpenClaw CS —— Cursor 路由已从 QClaw 网关改为
+     **SDK 直连**（不用 base_url、要 `crsr_` key），旧测试仍断言网关行为；按现行语义重写为
+     3 个测试（清空 base_url 保留用户 key / 缺 key 明确报错 / 子模型原样保留）。
+     ④`test_coherence_checks` 结构型矛盾 —— 生产逻辑退化：只剩多空对立判定，
+     `_COMPATIBLE_PAIRS`（outside_* 与 trend_* 兼容）已成死代码。结构型 inside/outside 是
+     客观几何且提示词明示优先级高于 doji/trend，**恢复**结构型矛盾判定（仅 strict 模式，
+     生产默认关闭，不影响现役 Campaign）。
+     ⑤`test_decision_nodes_judges` §9.0 —— 真因同⑥（夹具缺 TP2）。**过程记录（诚实性）**：
+     曾一度只读 `_fix_background_limit_trace`（只插 §9.0P、不改 §9.0）就断定"生产改为保持
+     §9.0=否"，据此把断言改成 `== 否` —— **该结论错误**：§9.x 实际由 `DecisionNodeEngine`
+     按真实 K 线几何程序回填，会覆盖模型的 §9.0=否。全量回归当场暴露该误判，已改回原断言
+     `== 是` 并补充 §9.0P 断言。教训：判断"生产语义是否变更"必须追完所有写入方，
+     单看一个函数就下结论会把自己的误读写成契约。
+     ⑥`test_price_tick` + ⑤的夹具 —— 均缺 `take_profit_price_2`（TP2 现为下单必填），
+     决策先被正确降级为不下单，导致测不到目标行为；补齐夹具字段。
 2. 集成 4 个既有失败（next_bar_prediction ×3、no_order_with_prices ×1）：同上裁决。
 3. `CONTEXT.md` 一页化：旧流水账归档到 `docs/archive/`（roadmap 治理修订要求）。
 4. `D:\Desktop\Quant\shared` 尚无 Git 版本管理：需用户拍板是否建仓（禁止擅自 git init）。
