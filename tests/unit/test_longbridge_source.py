@@ -763,6 +763,43 @@ def test_paged_history_merges_older_rows_without_duplicates(
     assert history_args[5] == recent[0].timestamp
 
 
+def test_paged_history_stops_when_page_only_repeats_seen_rows(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    recent = _closed_us_5m_rows(0, 5)
+    sdk, _ = _fake_sdk(recent)
+    history_calls = 0
+
+    class DuplicateOnlyContext(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def history_candlesticks_by_offset(
+            self, *args: object
+        ) -> list[SimpleNamespace]:
+            nonlocal history_calls
+            history_calls += 1
+            return list(recent)
+
+    sdk.QuoteContext = DuplicateOnlyContext
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2
+    )
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    bars = source.latest_snapshot(4)
+
+    assert len(bars) == 2
+    assert history_calls == 1
+
+
 def test_gap_inside_trading_session_is_rejected(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -821,6 +858,73 @@ def test_cn_lunch_break_gap_is_legitimate(
 
     assert len(bars) == 2
     assert all(bar.closed for bar in bars)
+
+
+@pytest.mark.parametrize(
+    ("previous_open_utc", "next_open_utc"),
+    (
+        # 2025-03-09 切入夏令时：周一开盘由 14:30 UTC 提前至 13:30 UTC。
+        (
+            datetime(2025, 3, 7, 20, 55, tzinfo=UTC),
+            datetime(2025, 3, 10, 13, 30, tzinfo=UTC),
+        ),
+        # 2025-11-02 退出夏令时：周一开盘由 13:30 UTC 延后至 14:30 UTC。
+        (
+            datetime(2025, 10, 31, 19, 55, tzinfo=UTC),
+            datetime(2025, 11, 3, 14, 30, tzinfo=UTC),
+        ),
+    ),
+)
+def test_us_dst_weekend_gap_is_legitimate(
+    tmp_path: Path,
+    previous_open_utc: datetime,
+    next_open_utc: datetime,
+) -> None:
+    source = LongbridgeSource(env_file=tmp_path / "unused-env")
+    source._market_name = "US"
+    source._symbol = "AAPL.US"
+
+    source._assert_no_intraday_gaps(
+        [
+            int(previous_open_utc.timestamp() * 1000),
+            int(next_open_utc.timestamp() * 1000),
+        ],
+        "5m",
+    )
+
+
+def test_us_half_day_to_next_session_gap_is_legitimate(tmp_path: Path) -> None:
+    source = LongbridgeSource(env_file=tmp_path / "unused-env")
+    source._market_name = "US"
+    source._symbol = "AAPL.US"
+
+    source._assert_no_intraday_gaps(
+        [
+            # 2025-11-28 感恩节次日半日市，最后一根 5m 棒于 17:55 UTC 开盘。
+            int(datetime(2025, 11, 28, 17, 55, tzinfo=UTC).timestamp() * 1000),
+            # 下一交易日首根 5m 棒。
+            int(datetime(2025, 12, 1, 14, 30, tzinfo=UTC).timestamp() * 1000),
+        ],
+        "5m",
+    )
+
+
+def test_gap_check_skips_timeframes_above_one_hour(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    source = LongbridgeSource(env_file=tmp_path / "unused-env")
+    source._market_name = "US"
+    source._symbol = "AAPL.US"
+
+    def fail_if_calendar_is_queried(*_args: object) -> bool:
+        raise AssertionError("4h 缺口校验不应枚举交易分钟")
+
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source.is_trading_minute",
+        fail_if_calendar_is_queried,
+    )
+
+    source._assert_no_intraday_gaps([0, 86_400_000], "4h")
 
 
 def test_latest_snapshot_for_timeframe_uses_requested_period(

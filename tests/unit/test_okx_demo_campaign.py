@@ -1065,6 +1065,31 @@ def test_completed_campaign_cannot_restart_automatically(tmp_path):
         store.create_or_resume(now=datetime(2026, 7, 18, tzinfo=UTC))
 
 
+@pytest.mark.parametrize("status", ["stopping", "needs_attention"])
+def test_campaign_state_rejects_automatic_resume_after_closeout_started(
+    status,
+    tmp_path,
+):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(
+        state.model_copy(
+            update={
+                "status": status,
+                "last_error": "收口状态等待人工核对",
+            }
+        )
+    )
+
+    with pytest.raises(CampaignError, match="禁止自动恢复"):
+        store.create_or_resume(now=datetime(2026, 7, 17, 1, tzinfo=UTC))
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == status
+    assert persisted.last_error == "收口状态等待人工核对"
+
+
 def test_explicit_restart_archives_an_idle_campaign(monkeypatch, tmp_path):
     store = CampaignStateStore(tmp_path / "campaign.json")
     original = store.create_or_resume(now=datetime(2026, 7, 17, tzinfo=UTC))
@@ -3943,6 +3968,66 @@ def test_monitor_hard_blocks_unsafe_execution_state(
     assert service.exited == []
 
 
+@pytest.mark.parametrize(
+    ("record_state", "expected_result", "expected_message"),
+    [
+        (None, "blocked:execution:missing", "不存在于执行账本"),
+        (
+            "corrupted",
+            "blocked:execution:invalid_state",
+            "不在已核验状态集合",
+        ),
+    ],
+)
+def test_monitor_hard_blocks_missing_or_invalid_owned_execution(
+    record_state,
+    expected_result,
+    expected_message,
+    tmp_path,
+):
+    execution_id = "owned-ledger-invalid"
+    records = {}
+    if record_state is not None:
+        records[execution_id] = SimpleNamespace(
+            id=execution_id,
+            state=record_state,
+            needs_attention=False,
+        )
+    service = _FakeExecutionService(records=records)
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [execution_id],
+            "last_execution_id": execution_id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    with pytest.raises(CampaignError, match=expected_message):
+        runner._monitor_owned_executions()
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.last_plan_result == expected_result
+    assert persisted.last_error == runner.state.last_error
+    assert expected_message in persisted.last_error
+    assert service.reconcile_waits == 0
+    assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
+    assert service.leverage_parameters == []
+    assert service.refreshed == 0
+    assert service.arm_calls == []
+
+
 def test_monitor_treats_worker_attention_as_transient_after_ledger_recheck(
     tmp_path,
 ):
@@ -3983,6 +4068,638 @@ def test_monitor_treats_worker_attention_as_transient_after_ledger_recheck(
         == CAMPAIGN_RECONCILE_WORKER_ATTENTION_RESULT
     )
     assert service.submitted == []
+    assert service.canceled == []
+    assert service.exited == []
+
+
+def test_main_keyboard_interrupt_finishes_closeout_without_stale_stopping(
+    monkeypatch,
+    tmp_path,
+):
+    service = _FakeExecutionService(active_batches=[[]])
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    runtime = _runtime(
+        _FakeOrchestrator(SimpleNamespace(exception=None)),
+        service,
+    )
+    settings = _settings()
+    lock_state = {"held": False, "entries": 0, "exits": 0}
+
+    class _TrackingCampaignLock:
+        def __enter__(self):
+            assert lock_state["held"] is False
+            lock_state["held"] = True
+            lock_state["entries"] += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            assert lock_state["held"] is True
+            lock_state["held"] = False
+            lock_state["exits"] += 1
+            return False
+
+    def _interrupt(_runner):
+        raise KeyboardInterrupt
+
+    original_disarm = service.disarm
+
+    def _disarm_while_locked():
+        assert lock_state["held"] is True
+        original_disarm()
+
+    monkeypatch.setattr(service, "disarm", _disarm_while_locked)
+    monkeypatch.setattr(campaign_module, "CampaignStateStore", lambda: store)
+    monkeypatch.setattr(
+        campaign_module,
+        "ExecutionStore",
+        lambda **_kwargs: SimpleNamespace(get=lambda _execution_id: None),
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "CampaignProcessLock",
+        _TrackingCampaignLock,
+    )
+    monkeypatch.setattr(campaign_module, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(campaign_module, "configure_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda _settings: {},
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "build_runtime",
+        lambda *, base_settings: runtime,
+    )
+    monkeypatch.setattr(OkxDemoCampaign, "run", _interrupt)
+
+    assert campaign_module.main(["run"]) == 0
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "completed"
+    assert persisted.status != "stopping"
+    assert persisted.last_error == ""
+    assert service.disarm_calls == 1
+    assert service.refreshed == 1
+    assert lock_state == {"held": False, "entries": 1, "exits": 1}
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["stopping", "needs_attention", "completed"],
+)
+def test_main_preserves_non_active_state_when_resume_is_rejected(
+    status,
+    monkeypatch,
+    tmp_path,
+):
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    store.save(
+        state.model_copy(
+            update={
+                "status": status,
+                "last_error": "必须保留的原始错误",
+            }
+        )
+    )
+    settings = _settings()
+
+    class _NoopCampaignLock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            return False
+
+    monkeypatch.setattr(campaign_module, "CampaignStateStore", lambda: store)
+    monkeypatch.setattr(
+        campaign_module,
+        "ExecutionStore",
+        lambda **_kwargs: SimpleNamespace(get=lambda _execution_id: None),
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "CampaignProcessLock",
+        _NoopCampaignLock,
+    )
+    monkeypatch.setattr(campaign_module, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(campaign_module, "configure_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda _settings: {},
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "build_runtime",
+        lambda **_kwargs: pytest.fail(
+            "非 active 状态不得进入运行时构建"
+        ),
+    )
+
+    assert campaign_module.main(["run"]) == 2
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == status
+    assert persisted.last_error == "必须保留的原始错误"
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "interrupt_at"),
+    [
+        pytest.param(
+            ExecutionState.ENTRY_PENDING,
+            "cancel",
+            id="cancel-entry",
+        ),
+        pytest.param(
+            ExecutionState.OPEN,
+            "request_exit",
+            id="request-exit",
+        ),
+        pytest.param(
+            None,
+            "refresh_wait",
+            id="final-refresh-wait",
+        ),
+    ],
+)
+def test_main_does_not_repeat_closeout_after_interrupt_during_closeout(
+    execution_state,
+    interrupt_at,
+    monkeypatch,
+    tmp_path,
+):
+    execution = (
+        SimpleNamespace(
+            id=f"closeout-{interrupt_at}",
+            state=execution_state,
+            needs_attention=False,
+        )
+        if execution_state is not None
+        else None
+    )
+    active = [execution] if execution is not None else []
+    records = {execution.id: execution} if execution is not None else {}
+    service = _FakeExecutionService(
+        active_batches=[active],
+        records=records,
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    runtime = _runtime(
+        _FakeOrchestrator(SimpleNamespace(exception=None)),
+        service,
+    )
+    settings = _settings()
+    lock_state = {"held": False, "entries": 0, "exits": 0}
+    action_calls = []
+
+    class _TrackingCampaignLock:
+        def __enter__(self):
+            assert lock_state["held"] is False
+            lock_state["held"] = True
+            lock_state["entries"] += 1
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            del exc_type, exc, traceback
+            assert lock_state["held"] is True
+            lock_state["held"] = False
+            lock_state["exits"] += 1
+            return False
+
+    def _run_closeout(runner):
+        if execution is not None:
+            runner._save_state(
+                execution_ids=[execution.id],
+                last_execution_id=execution.id,
+            )
+        return runner.close_out()
+
+    def _interrupt_cancel(execution_id):
+        assert interrupt_at == "cancel"
+        assert lock_state["held"] is True
+        action_calls.append(("cancel", execution_id))
+        service.canceled.append(execution_id)
+        raise KeyboardInterrupt("测试收口中断")
+
+    def _interrupt_exit(execution_id, *, reason):
+        assert interrupt_at == "request_exit"
+        assert lock_state["held"] is True
+        action_calls.append(("request_exit", execution_id))
+        service.exited.append((execution_id, reason))
+        raise KeyboardInterrupt("测试收口中断")
+
+    def _interrupt_refresh_wait(command_id, *, timeout):
+        assert interrupt_at == "refresh_wait"
+        assert lock_state["held"] is True
+        action_calls.append(("refresh_wait", command_id))
+        assert timeout == 30.0
+        raise KeyboardInterrupt("测试收口中断")
+
+    monkeypatch.setattr(campaign_module, "CampaignStateStore", lambda: store)
+    monkeypatch.setattr(
+        campaign_module,
+        "ExecutionStore",
+        lambda **_kwargs: SimpleNamespace(get=lambda _execution_id: None),
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "CampaignProcessLock",
+        _TrackingCampaignLock,
+    )
+    monkeypatch.setattr(campaign_module, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(campaign_module, "configure_logging", lambda **_kwargs: None)
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda _settings: {},
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "build_runtime",
+        lambda *, base_settings: runtime,
+    )
+    monkeypatch.setattr(OkxDemoCampaign, "run", _run_closeout)
+    if interrupt_at == "cancel":
+        monkeypatch.setattr(service, "cancel_entry", _interrupt_cancel)
+    elif interrupt_at == "request_exit":
+        monkeypatch.setattr(service, "request_exit", _interrupt_exit)
+    else:
+        monkeypatch.setattr(
+            service,
+            "wait_for_command",
+            _interrupt_refresh_wait,
+        )
+
+    with pytest.raises(KeyboardInterrupt, match="测试收口中断"):
+        campaign_module.main(["run"])
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "needs_attention"
+    assert persisted.last_error == "测试收口中断"
+    assert len(action_calls) == 1
+    assert service.disarm_calls == 1
+    assert service.canceled == (
+        [execution.id] if interrupt_at == "cancel" else []
+    )
+    assert service.exited == (
+        [(execution.id, "24 小时 OKX Demo 实验到期")]
+        if interrupt_at == "request_exit"
+        else []
+    )
+    assert service.refreshed == (1 if interrupt_at == "refresh_wait" else 0)
+    assert lock_state == {"held": False, "entries": 1, "exits": 1}
+
+
+def test_closeout_write_failure_persists_needs_attention_without_retry(
+    monkeypatch,
+    tmp_path,
+):
+    active = SimpleNamespace(
+        id="closeout-cancel-failure",
+        state=ExecutionState.ENTRY_PENDING,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(
+        active_batches=[[active]],
+        records={active.id: active},
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [active.id],
+            "last_execution_id": active.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    cancel_calls = []
+
+    def _fail_cancel(execution_id):
+        cancel_calls.append(execution_id)
+        raise RuntimeError("撤单命令传输失败")
+
+    monkeypatch.setattr(service, "cancel_entry", _fail_cancel)
+
+    with pytest.raises(RuntimeError, match="撤单命令传输失败"):
+        runner.close_out()
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "needs_attention"
+    assert persisted.status != "completed"
+    assert persisted.last_error == "撤单命令传输失败"
+    assert cancel_calls == [active.id]
+    assert service.disarm_calls == 1
+    assert service.exited == []
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "action"),
+    [
+        pytest.param(
+            ExecutionState.ENTRY_PENDING,
+            "cancel",
+            id="cancel-entry",
+        ),
+        pytest.param(
+            ExecutionState.OPEN,
+            "request_exit",
+            id="request-exit",
+        ),
+    ],
+)
+@pytest.mark.parametrize(
+    ("command_result", "expected_error", "expected_message"),
+    [
+        pytest.param(
+            WorkerCommandStatus.FAILED,
+            CampaignError,
+            "测试命令失败",
+            id="failed",
+        ),
+        pytest.param(
+            WorkerCommandStatus.UNCERTAIN,
+            CampaignError,
+            "结果不明",
+            id="uncertain",
+        ),
+        pytest.param(
+            "timeout",
+            TimeoutError,
+            "测试等待超时",
+            id="timeout",
+        ),
+    ],
+)
+def test_closeout_does_not_repeat_failed_or_uncertain_worker_command(
+    execution_state,
+    action,
+    command_result,
+    expected_error,
+    expected_message,
+    monkeypatch,
+    tmp_path,
+):
+    execution = SimpleNamespace(
+        id=f"closeout-{action}",
+        state=execution_state,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(
+        active_batches=[[execution]],
+        records={execution.id: execution},
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [execution.id],
+            "last_execution_id": execution.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    action_calls = []
+
+    def _command():
+        status = (
+            WorkerCommandStatus.RUNNING
+            if command_result == "timeout"
+            else command_result
+        )
+        return service._command(
+            action,
+            status=status,
+            failure_code=(
+                "测试命令失败"
+                if command_result is WorkerCommandStatus.FAILED
+                else ""
+            ),
+        )
+
+    def _cancel(execution_id):
+        action_calls.append(("cancel", execution_id))
+        service.canceled.append(execution_id)
+        return _command()
+
+    def _request_exit(execution_id, *, reason):
+        action_calls.append(("request_exit", execution_id))
+        service.exited.append((execution_id, reason))
+        return _command()
+
+    if command_result == "timeout":
+        service.wait_error = TimeoutError("测试等待超时")
+    if action == "cancel":
+        monkeypatch.setattr(service, "cancel_entry", _cancel)
+    else:
+        monkeypatch.setattr(service, "request_exit", _request_exit)
+
+    with pytest.raises(expected_error, match=expected_message):
+        runner.close_out()
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "needs_attention"
+    assert len(action_calls) == 1
+    assert len(service.waited_command_ids) == 1
+    assert service.canceled == (
+        [execution.id] if action == "cancel" else []
+    )
+    assert service.exited == (
+        [(execution.id, "24 小时 OKX Demo 实验到期")]
+        if action == "request_exit"
+        else []
+    )
+    assert service.disarm_calls == 1
+
+
+@pytest.mark.parametrize(
+    ("execution_state", "action"),
+    [
+        pytest.param(
+            ExecutionState.ENTRY_PENDING,
+            "cancel",
+            id="cancel-entry",
+        ),
+        pytest.param(
+            ExecutionState.OPEN,
+            "request_exit",
+            id="request-exit",
+        ),
+    ],
+)
+def test_closeout_does_not_repeat_succeeded_command_while_state_is_unchanged(
+    execution_state,
+    action,
+    monkeypatch,
+    tmp_path,
+):
+    execution = SimpleNamespace(
+        id=f"unchanged-{action}",
+        state=execution_state,
+        needs_attention=False,
+    )
+    service = _FakeExecutionService(
+        active_batches=[[execution]],
+        records={execution.id: execution},
+    )
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(
+        store,
+        datetime(2026, 7, 17, tzinfo=UTC),
+    ).model_copy(
+        update={
+            "execution_ids": [execution.id],
+            "last_execution_id": execution.id,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+        closeout_seconds=1,
+    )
+    monotonic_values = iter((0.0, 0.0, 0.0, 0.5, 0.5, 2.0))
+    monkeypatch.setattr(
+        campaign_module.time,
+        "monotonic",
+        lambda: next(monotonic_values, 2.0),
+    )
+    monkeypatch.setattr(campaign_module.time, "sleep", lambda _seconds: None)
+
+    assert runner.close_out() is False
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "needs_attention"
+    assert service.canceled == (
+        [execution.id] if action == "cancel" else []
+    )
+    assert service.exited == (
+        [(execution.id, "24 小时 OKX Demo 实验到期")]
+        if action == "request_exit"
+        else []
+    )
+    assert len(service.waited_command_ids) == 1
+    assert service.disarm_calls == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            KeyboardInterrupt("收口再次被人工中断"),
+            id="keyboard-interrupt",
+        ),
+        pytest.param(
+            SystemExit("收口收到退出请求"),
+            id="system-exit",
+        ),
+    ],
+)
+def test_closeout_persists_base_exception_and_reraises(
+    failure,
+    monkeypatch,
+    tmp_path,
+):
+    service = _FakeExecutionService(active_batches=[[]])
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+
+    def _fail_expire(*, reason):
+        del reason
+        raise failure
+
+    monkeypatch.setattr(runner, "_expire_owned_ready", _fail_expire)
+
+    with pytest.raises(type(failure), match=str(failure)):
+        runner.close_out()
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "needs_attention"
+    assert persisted.last_error == str(failure)
+    assert service.disarm_calls == 1
+    assert service.canceled == []
+    assert service.exited == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(
+            KeyboardInterrupt("收口被人工中断"),
+            id="keyboard-interrupt",
+        ),
+        pytest.param(
+            SystemExit("收口收到退出请求"),
+            id="system-exit",
+        ),
+    ],
+)
+def test_closeout_state_write_failure_does_not_replace_original_signal(
+    failure,
+    monkeypatch,
+    tmp_path,
+):
+    service = _FakeExecutionService(active_batches=[[]])
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(_FakeOrchestrator(SimpleNamespace(exception=None)), service),
+        store,
+        state,
+    )
+    real_save = store.save
+
+    def _fail_expire(*, reason):
+        del reason
+        raise failure
+
+    def _fail_attention_save(candidate):
+        if candidate.status == "needs_attention":
+            raise CampaignError("测试状态文件写入失败")
+        real_save(candidate)
+
+    monkeypatch.setattr(runner, "_expire_owned_ready", _fail_expire)
+    monkeypatch.setattr(store, "save", _fail_attention_save)
+
+    with pytest.raises(type(failure), match=str(failure)):
+        runner.close_out()
+
+    persisted = store.load()
+    assert persisted is not None
+    assert persisted.status == "stopping"
+    assert runner.state.status == "needs_attention"
+    assert runner.state.last_error == str(failure)
+    assert service.disarm_calls == 1
     assert service.canceled == []
     assert service.exited == []
 

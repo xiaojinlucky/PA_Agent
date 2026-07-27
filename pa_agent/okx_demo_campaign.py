@@ -512,6 +512,11 @@ class CampaignStateStore:
                 raise CampaignError("现有实验状态与当前固定配置不一致, 禁止覆盖")
             if existing.status == "completed":
                 raise CampaignError("该 24 小时实验已经完成, 禁止自动重新计时")
+            if existing.status in {"stopping", "needs_attention"}:
+                raise CampaignError(
+                    f"现有实验状态为 {existing.status}，禁止自动恢复；"
+                    "请先完成人工核对，再使用显式 restart"
+                )
             existing_frozen = {
                 field: getattr(existing, field)
                 for field in frozen_risk
@@ -3826,69 +3831,113 @@ class OkxDemoCampaign:
         ]
 
     def close_out(self) -> bool:
-        self.runtime.execution_service.disarm()
-        self._save_state(status="stopping")
-        self._expire_owned_ready(reason="24 小时 OKX Demo 实验到期，未提交计划作废")
-        cleanup_deadline = time.monotonic() + self.closeout_seconds
-        poll_interval = float(
-            self.runtime.settings.execution.poll_interval_seconds
-        )
-        while time.monotonic() < cleanup_deadline:
+        try:
+            self.runtime.execution_service.disarm()
+            self._save_state(status="stopping")
+            self._expire_owned_ready(
+                reason="24 小时 OKX Demo 实验到期，未提交计划作废"
+            )
+            cleanup_deadline = time.monotonic() + self.closeout_seconds
+            poll_interval = float(
+                self.runtime.settings.execution.poll_interval_seconds
+            )
+            completed_closeout_actions: set[tuple[str, str]] = set()
+            while time.monotonic() < cleanup_deadline:
+                try:
+                    self._monitor_owned_executions(
+                        timeout_seconds=cleanup_deadline - time.monotonic(),
+                    )
+                except DataSourceTransientError as exc:
+                    logger.warning("收口等待交易后台对账暂时失败: %s", exc)
+                    remaining = max(
+                        0.0, cleanup_deadline - time.monotonic()
+                    )
+                    if remaining > 0:
+                        time.sleep(min(poll_interval, remaining))
+                    continue
+                except CampaignError as exc:
+                    self._save_state(
+                        status="needs_attention",
+                        last_error=str(exc),
+                    )
+                    logger.error("收口发现执行状态需要人工核对: %s", exc)
+                    return False
+                active = self._owned_active_executions()
+                if not active:
+                    if self.state.execution_ids:
+                        command = (
+                            self.runtime.execution_service.refresh_account(
+                                self.state.execution_ids[-1]
+                            )
+                        )
+                    else:
+                        command = (
+                            self.runtime.execution_service.refresh_account()
+                        )
+                    self._wait_for_worker_command(
+                        command.id,
+                        action="最终账户快照",
+                    )
+                    self._save_state(status="completed", last_error="")
+                    logger.info("OKX Demo 实验已完成, 活动执行为 0")
+                    return True
+                for execution in active:
+                    if execution.state in {
+                        ExecutionState.ENTRY_PENDING,
+                        ExecutionState.PARTIALLY_FILLED,
+                    }:
+                        action_key = (execution.id, "cancel_entry")
+                        if action_key in completed_closeout_actions:
+                            continue
+                        command = self.runtime.execution_service.cancel_entry(
+                            execution.id
+                        )
+                        self._wait_for_worker_command(
+                            command.id,
+                            action=f"收口撤销入场 {execution.id}",
+                        )
+                        completed_closeout_actions.add(action_key)
+                    elif execution.state in {
+                        ExecutionState.PROTECTING,
+                        ExecutionState.OPEN,
+                    }:
+                        action_key = (execution.id, "request_exit")
+                        if action_key in completed_closeout_actions:
+                            continue
+                        command = self.runtime.execution_service.request_exit(
+                            execution.id,
+                            reason="24 小时 OKX Demo 实验到期",
+                        )
+                        self._wait_for_worker_command(
+                            command.id,
+                            action=f"收口离场 {execution.id}",
+                        )
+                        completed_closeout_actions.add(action_key)
+                time.sleep(poll_interval)
+
+            remaining = self._owned_active_executions()
+            self._save_state(
+                status="needs_attention",
+                last_error=f"到期收口后仍有 {len(remaining)} 条活动执行",
+            )
+            logger.error(
+                "实验到期收口未完成, 仍有 %d 条活动执行", len(remaining)
+            )
+            return False
+        except BaseException as exc:
+            error = str(exc).strip() or type(exc).__name__
             try:
-                self._monitor_owned_executions(
-                    timeout_seconds=cleanup_deadline - time.monotonic(),
-                )
-            except DataSourceTransientError as exc:
-                logger.warning("收口等待交易后台对账暂时失败: %s", exc)
-                remaining = max(0.0, cleanup_deadline - time.monotonic())
-                if remaining > 0:
-                    time.sleep(min(poll_interval, remaining))
-                continue
-            except CampaignError as exc:
                 self._save_state(
                     status="needs_attention",
-                    last_error=str(exc),
+                    last_error=error,
                 )
-                logger.error("收口发现执行状态需要人工核对: %s", exc)
-                return False
-            active = self._owned_active_executions()
-            if not active:
-                if self.state.execution_ids:
-                    command = self.runtime.execution_service.refresh_account(
-                        self.state.execution_ids[-1]
-                    )
-                else:
-                    command = self.runtime.execution_service.refresh_account()
-                self._wait_for_worker_command(
-                    command.id,
-                    action="最终账户快照",
+            except BaseException as state_exc:
+                logger.exception(
+                    "实验收口异常，且 needs_attention 状态写入失败: %s",
+                    state_exc,
                 )
-                self._save_state(status="completed", last_error="")
-                logger.info("OKX Demo 实验已完成, 活动执行为 0")
-                return True
-            for execution in active:
-                if execution.state in {
-                    ExecutionState.ENTRY_PENDING,
-                    ExecutionState.PARTIALLY_FILLED,
-                }:
-                    self.runtime.execution_service.cancel_entry(execution.id)
-                elif execution.state in {
-                    ExecutionState.PROTECTING,
-                    ExecutionState.OPEN,
-                }:
-                    self.runtime.execution_service.request_exit(
-                        execution.id,
-                        reason="24 小时 OKX Demo 实验到期",
-                    )
-            time.sleep(poll_interval)
-
-        remaining = self._owned_active_executions()
-        self._save_state(
-            status="needs_attention",
-            last_error=f"到期收口后仍有 {len(remaining)} 条活动执行",
-        )
-        logger.error("实验到期收口未完成, 仍有 %d 条活动执行", len(remaining))
-        return False
+            logger.error("实验收口异常，已转人工处理: %s", error)
+            raise
 
     def stop(self) -> None:
         self.runtime.execution_service.stop_monitoring()
@@ -4024,17 +4073,21 @@ def main(argv: list[str] | None = None) -> int:
             state_store.save(state)
             runtime = build_runtime(base_settings=base_settings)
             campaign = OkxDemoCampaign(runtime, state_store, state)
-            completed = campaign.run()
+            try:
+                completed = campaign.run()
+            except KeyboardInterrupt:
+                if campaign.state.status != "active":
+                    logger.error(
+                        "人工中断发生在收口已开始之后，禁止再次发送收口命令"
+                    )
+                    raise
+                logger.warning("收到人工停止请求, 开始安全收口")
+                completed = campaign.close_out()
             return 0 if completed else 3
-    except KeyboardInterrupt:
-        logger.warning("收到人工停止请求, 开始安全收口")
-        if campaign is None:
-            return 130
-        return 0 if campaign.close_out() else 3
     except Exception as exc:
         logger.exception("OKX Demo 实验发生阻塞故障: %s", exc)
         state = state_store.load()
-        if state is not None:
+        if state is not None and state.status == "active":
             state_store.save(
                 state.model_copy(
                     update={"status": "needs_attention", "last_error": str(exc)}

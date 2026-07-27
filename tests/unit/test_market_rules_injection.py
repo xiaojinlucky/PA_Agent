@@ -105,9 +105,32 @@ def test_stage2_prefix_chain_mode_skips_duplicate_rules(
     assert "市场制度规则块" not in prompt
 
 
-def test_system_prompt_stays_market_free(assembler: PromptAssembler):
-    system_prompt = assembler._build_shared_system_prompt_inner()
-    assert "市场制度规则块" not in system_prompt
+def test_market_rule_injection_keeps_system_prompt_bytes_identical(
+    assembler: PromptAssembler,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(
+        assembler,
+        "_record_volume_shadow",
+        lambda _frame: None,
+    )
+    baseline = assembler._build_shared_system_prompt_inner().encode("utf-8")
+
+    stage1_messages = assembler.build_stage1(_frame("AAPL.US"))
+    stage2_messages = assembler.build_stage2(
+        frame=_frame("700.HK"),
+        stage1_json={"direction": "bullish"},
+        strategy_files=[],
+        experience_entries=[],
+    )
+    rebuilt = assembler._build_shared_system_prompt_inner().encode("utf-8")
+
+    assert "市场制度规则块 · 美股" in stage1_messages[1]["content"]
+    assert "市场制度规则块 · 港股" in stage2_messages[1]["content"]
+    assert stage1_messages[0]["content"].encode("utf-8") == baseline
+    assert stage2_messages[0]["content"].encode("utf-8") == baseline
+    assert rebuilt == baseline
+    assert "市场制度规则块".encode() not in baseline
 
 
 def _frame_at(symbol: str, utc_iso: str, *, n: int = 3):

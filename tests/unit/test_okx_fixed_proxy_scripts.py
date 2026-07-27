@@ -681,6 +681,86 @@ def test_activate_stops_candidate_when_rollback_write_fails(
     }
 
 
+def test_activate_downs_foreign_10981_takeover_during_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    runtime_core = (tmp_path / "sing-box.exe").resolve()
+    runtime_core.write_bytes(b"exe")
+    foreign_core = (tmp_path / "foreign-proxy.exe").resolve()
+    foreign_core.write_bytes(b"foreign")
+    active_path = tmp_path / "config.json"
+    active_path.write_text('{"old": true}', encoding="utf-8")
+    metadata_path = tmp_path / "metadata.json"
+    metadata_path.write_text('{"node_label": "old"}', encoding="utf-8")
+    listeners = iter(({101}, {909}, {909}, set()))
+    monkeypatch.setattr(
+        probe_module,
+        "_listener_pids",
+        lambda _port: next(listeners),
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "_process_path",
+        lambda process_id: (
+            foreign_core
+            if process_id == 909
+            else runtime_core
+        ),
+    )
+    killed: list[int] = []
+    monkeypatch.setattr(
+        probe_module.os,
+        "kill",
+        lambda process_id, _sig: killed.append(process_id),
+    )
+    reload_attempts = 0
+
+    def _reload_or_detect_takeover(**_kwargs):
+        nonlocal reload_attempts
+        reload_attempts += 1
+        if reload_attempts == 1:
+            return 202
+        raise RuntimeError("10981 已被外部进程占用")
+
+    monkeypatch.setattr(
+        probe_module,
+        "_wait_for_reloaded_proxy",
+        _reload_or_detect_takeover,
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "_probe_existing_proxy",
+        lambda **_kwargs: {
+            "private_read_ok": False,
+            "risk_bills_ok": False,
+            "endurance_ok": False,
+        },
+    )
+    monkeypatch.setattr(
+        probe_module,
+        "_runtime_supervisor_pids",
+        lambda _runtime_directory: set(),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="旧代理未能重新启动；10981 已下线",
+    ):
+        probe_module._activate(
+            runtime_directory=tmp_path,
+            active_config={"new": True},
+            metadata={"node_label": "new"},
+            attempts=3,
+        )
+
+    assert active_path.read_text(encoding="utf-8") == '{"old": true}'
+    assert metadata_path.read_text(encoding="utf-8") == (
+        '{"node_label": "old"}'
+    )
+    assert {101, 202, 909}.issubset(killed)
+
+
 def test_fail_closed_shutdown_stops_supervisor_and_runtime_proxy(
     tmp_path,
     monkeypatch,

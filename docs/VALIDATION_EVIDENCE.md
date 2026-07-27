@@ -593,3 +593,45 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 新 Campaign 日志没有真实 ERROR/CRITICAL 等级行；仅重复出现已登记的 Windows `WinError 32` 日志轮转警告，没有第三类新异常。
 - 这次运行验收证明正式入口已加载 WO-F 且自然样本没有被误杀。自然样本没有产生非法声明，因此不能声称现场实际触发过 `blocked:claim_validation`；非法声明拒绝与继续下一根由离线集成和 Campaign 测试证明。
 - 全程仅使用 OKX Demo 模拟账户，不构成 OKX Live 实盘、策略盈利或 Longbridge 验收证明。长桥 `401004` 与 WO-E 视觉方向阻塞均未解除。
+
+## 2026-07-27 WO-F 发布与总工单完成证据复审
+
+### 发布收口
+
+- WO-F 的 49 个精确目标文件以提交 `c0b58d0a859d4e0234862c785734ac860d256699` 推送到 PUBLIC `xiaojinlucky/PA_Agent` 的 `origin/main`。
+- 提交前 staged gitleaks 为零泄漏；暂存快照只有 `.py`、`.md`，没有删除、重命名、忽略文件、二进制、gitlink、禁入文件或超过 50 MiB 的文件。
+- 推送后本地 HEAD、`refs/remotes/origin/main` 和 `git ls-remote origin refs/heads/main` 均为同一 SHA，工作区干净。发布动作没有停止运行中的 Campaign 进程树。
+
+### 直接回归补证
+
+- `test_market_rules_injection.py` 不再只检查 system prompt 缺少某个子串，而是用真实 Stage1 美股和 Stage2 港股消息比较调用前后 UTF-8 bytes 完全一致，同时证明市场规则只进入 user。
+- `test_okx_fixed_proxy_scripts.py` 新增回滚期间 10981 被外部可执行文件抢占的直接测试：旧配置和 metadata 恢复，候选与抢占监听者停止，无法恢复旧代理时端口明确下线并抛错。
+- `test_longbridge_source.py` 新增历史页只返回重复时间戳时单次停止、美国切入/退出夏令时周末、半日市到下一交易日合法间隔及 4h 不枚举分钟的直接测试。
+- `test_okx_demo_campaign.py` 新增 owned execution 记录丢失、非法状态硬阻断、普通中断在进程锁内走真实 `close_out()`、收口中断不二次进入、`stopping / needs_attention` 不自动恢复且不覆盖原始错误，以及状态补写失败仍保留原始 `KeyboardInterrupt / SystemExit` 的直接测试。
+- 撤单与离场命令现在逐条等待 Worker 耐久终态；`FAILED / UNCERTAIN / TimeoutError` 均只调用一次并转 `needs_attention`。明确成功后，同一 execution 的同一种收口动作在本次收口中也最多发送一次；状态未推进就只读等待，最终超时转人工，不盲目重发。
+- 四个改动测试文件合并为 220 项通过、0 失败；最终 `tests/unit`、`tests/property`、`tests/integration` 为 1956 项通过、7 项跳过、0 失败。7 项仍是 3 个 KKAI 密钥固定跳过与 4 个 AkShare 端点条件跳过，没有新增普通 skip/xfail。
+- 全仓只读执行 `ruff check . --select E4,E7,E9,F,I,UP,B,C4 --output-format json --no-cache`，当前为 293 项历史诊断，其中 249 项带自动修复建议。本轮没有运行全仓 `--fix`。
+
+### 市场制度官方来源
+
+2026-07-27 复审只使用交易所和监管机构页面核对现有规则，没有修改提示词中的制度数值：
+
+- A 股经互联互通交易的印花税按成交额 0.05% 向卖方收取：[HKEX Stock Connect Investor Book](https://www.hkex.com.hk/-/media/HKEX-Market/Mutual-Market/Stock-Connect/Getting-Started/Information-Booklet-and-FAQ/Investor_Book_En.pdf)。
+- 香港上市证券通常由买卖双方各按成交额 0.1% 缴纳股票印花税：[HKEX Securities Transaction Fees](https://www.hkex.com.hk/Services/Rules-and-Forms-and-Fees/Fees/Securities-%28Hong-Kong%29/Trading/Transaction?sc_lang=en)。
+- 美国多数券商证券交易自 2024-05-28 起采用 T+1 标准交收周期：[SEC T+1 implementation statement](https://www.sec.gov/newsroom/press-releases/2024-62)。
+- 科创板买入申报不少于 200 股，超过 200 股的部分可按 1 股递增：[上海证券交易所投资者教育](https://edu.sse.com.cn/tib/)。
+
+### WO-E 阶段 0/1 合同
+
+- `docs/prd/05_多市场看盘前端设计包.md` 已补齐 `QuoteSnapshot` 的字段、来源、定点数值、真实 tick、行情模式、延迟窗口、时间与身份不变量。
+- 四市场最近标的和本地自选继续使用现有 `GeneralSettings`、`revision` 冲突检查和原子保存；文档已冻结旧设置幂等迁移、兼容镜像、会话已生效但保存失败以及迟到保存结果的语义。
+- 页面使用只增不减的 selection generation 绑定市场、来源、标的和周期；同一选择的报价、K 线与静态信息刷新另用各请求族只增的 request sequence，旧选择和旧刷新无论成功或失败都不得覆盖新状态。Longbridge 内 US/HK/CN 切换及 Longbridge↔OKX 跨源切换都明确了提交点、回滚、资源释放和迟到结果丢弃。
+- 验收矩阵现覆盖三只 Longbridge 股票、XAU-USDT-SWAP、双向跨源、认证失效、行情陈旧、日历未知、设置冲突、保存失败、分析中切换，以及选择与同一选择刷新逆序返回，共 17 个场景。
+- 本轮没有代用户选择 A/B/C，没有调用 ChatGPT Web、Stitch、图像生成或视觉审计，也没有修改 PyQt6、QSS、生产设置模型和数据源。
+
+### 仍未闭合
+
+- 固定代理 `metadata.json` 与实际 `config.json` 没有共同指纹。现有脚本无法把二者不一致本身识别为失败；只改测试无法忠实覆盖，而本轮明确禁止修改 `scripts`。
+- 长桥最后已知外部结果仍为 `401004 token invalid`，共享 env 自 2026-07-24 后没有更新；未运行真实三标的验收。
+- WO-E 仍等待用户在 A/B/C 中明确选择。前置合同完成不能冒充后续 PRD、Stitch、三轮图像精修、PyQt6 落地或桌面验收。
+- `D:\Desktop\Quant\shared` 是否建立独立 Git 仓库仍等待用户决定；没有执行 `git init`。
