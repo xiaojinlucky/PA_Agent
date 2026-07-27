@@ -195,14 +195,55 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] 2026-07-26 23:32 Campaign 3 根自然 K 线完成（阻断/no_order/阻断，0 失败）
 - [x] 2026-07-27 00:10 P1 后端全部落地，最终全量 unit=历史 18 失败零新增
 - [x] 2026-07-27 00:20 文档同步（CONTEXT/VALIDATION/handoff 横幅/PRD04）
-- [x] 2026-07-27 00:40 WO-A 对抗审查（Claude 主循环顺序执行，子 Agent 因额度未用）：
+- [x] 2026-07-27 07:15 WO-A 对抗审查（Claude 主循环顺序执行，子 Agent 因额度未用；时间为北京时间，此前误记 00:40）：
   ①交易安全——激活失败回滚已被 22:26 真实失败现场实证（旧配置恢复、守护拉起、无残留）；耐久闸门绕过被 argparse（--activate 强制 idle-cycles≥1）+ 测试双重封死；恢复命令未重锚高水位（DB + 独立只读审计双向核验）；频控器/SDK executor 改动不进交易链（execution/ 仅 longbridge_adapter.py 引用 normalize_longbridge_symbol 纯函数，本轮未改，且 OKX 生产链不经过它）。
   ②数据正确性——分页终止条件（fresh 空即 break）与去重在案并有测试；缺根校验对 >1h 周期显式跳过；DST 切换周末推演（美股 spring-forward/fall-back 两向）枚举槽均落在非交易分钟，无假阳性；港股半日市下午间隔被 xcals session_close=12:00 判定为合法；latest_snapshot_for_timeframe 不改主订阅周期（测试覆盖）。
   ③提示词/缓存——system 字节不变与前缀链去重均有测试（test_market_rules_injection 7 项）；规则块事实核对通过（A股印花税 0.05% 单边卖出、港股 0.1% 双边、美股 T+1 交收 2024-05 起、科创板 200 股起 1 股递增、LULD/三级熔断）；加密块"资金费不是交易信号"与既有 lessons 条款同语义无冲突。
   ④文档诚实性——CONTEXT/VALIDATION 新增主张逐条对应本轮实测数字与命令 ID。
   结论：无 P0/P1 实锤；全量 unit 复核 = 历史 18 失败零新增（最终权威一轮）。
-- [ ] WO-B 提交推送：确认清单已发用户，**等用户答复**
-- [ ] WO-C Campaign 重启加载新代码：等 WO-B 后执行（或与 WO-B 并行，硬门满足即可）
+- [x] 2026-07-27 07:25 WO-B 提交推送完成（用户已确认"是，提交并推送"；此前误记 00:55）：4 个模块化 commit
+  `372cd26`（前端工作台与执行链联通，21 文件）→ `aa1c91d`（代理耐久闸门，2 文件）→
+  `a5d2e19`（P1 多市场后端，17 文件）→ `b539cb5`（文档+总控工单，5 文件）；
+  每个 commit staged gitleaks 零泄漏；push 后 origin/main == 本地 HEAD == `b539cb5`；
+  工作区已净（仅剩 scratch/ 等忽略项）。
+- [x] 2026-07-27 07:30 前后 8 小时无人值守运行证据（23:10–07:25）：Campaign `ab245e48`
+  完成 **50 根自然 K 线、0 失败**，一根不落；北京 05:31 自然信号真实提交
+  execution `ed7711be-93f7-52eb-a544-adf9969f19bb`（submit 命令 `9dc7eafb` succeeded，
+  真实 OKX Demo 限价单），270 秒未成交后按规则正常撤销（canceled，未切市价）——
+  完整自然交易生命周期实证。P2 观察项：该笔交易的 NEW_RISK 租约 `4cf57283`
+  由 Campaign 的 Controller 在交易终态后仍滚动续期约 2 小时（不阻塞运行，
+  随进程消亡；接手者可在 WO-G 里排查 Controller 租约释放时机）。
+- [x] 2026-07-27 07:43 WO-C 完成：硬门核验后停旧树、租约自然过期、07:33 restart 语义重启，
+  新 Campaign `6cba8d3e` 继承 `last_completed_bar_ms` 正确、首根自然 K 线完成（no_order，0 失败）；
+  **新代码生效实证**：最新耐久分析记录（records/pending/2026-07-27_07-07-36_...json）包含
+  `市场制度规则块 · 加密货币`、`时间（UTC）` 表头与资金费率条款。
+- [x] 2026-07-27 08:25 WO-F Claim Validation 落地（Claude 主循环）：
+  ①`ValidationSettings.disable_truncation_repair` 默认 False→True（截断输出默认按语法失败
+  走带反馈重试；宽松修复只能产出 gate_result=unknown）；
+  ②`trace_normalize._repair_gate_result` 增加 AUTO 桩守卫——截断注入的 unknown 绝不再被
+  洗成 proceed（伪造闸门通过链路铲除）；
+  ③`stage2_normalizer` 不下单分支停止清空 entry/tp/tp2/sl/direction 五个提示词明示字段
+  （结构化矛盾主张交给 schema 拒绝 category c + 重试；未告知的 basis/win_rate 仍规范化；
+  标量 wait 决策构造属程序字典、显式置空合法）；
+  ④删除 `_coerce_breakout_without_basis`——突破单缺挂单依据不再静默降级限价单，
+  schema 突破单分支拒绝并在 missing_fields 指明；
+  ⑤next_bar argmax 平局改确定性规范序首胜（R3.3 幂等可审计）；
+  ⑥新增 `validate_price_grounding`：entry/stop 必须落在已收盘 K 线 OHLC 包络
+  ±max(ATR14, 3×tick) 内（反幻觉核心；TP 允许投射到区间外、由 RR/几何经 entry 传递锚定），
+  接线进 `validate_order_trade_metrics`，4 项新测试。
+  **结果**：property 6 个历史失败 → 0（54/54 全绿）；集成既有失败 8→7（no_order 测试转绿）；
+  全量 unit 基线保持历史 18 项零新增（openclaw 枚举 2 项列入 WO-G 裁决）。
+  测试夹具修订：5 处 trace_normalize + 1 处 lenient_fixes 补 take_profit_price_2=None
+  （夹具意图本就是全空，此前靠清洗兜底）；突破单降级测试改写为不降级断言。
+  **注意**：新校验随下次 Campaign 空仓安全重启生效（当前 6cba8d3e 进程仍为 07:33 代码）。
+- [x] 2026-07-27 08:40 CI 时区失败修复（AlphaMaster 会话跨会话转交定位，run 30225188125）：
+  `trading_workbench._local_time` 从取本机时区改为显式固定 Asia/Shanghai（产品验收语义
+  "UTC 运行时间转换为北京时间"，方案 1），测试补 -04:00 与无时区两个断言；UTC 环境模拟
+  （TZ=UTC）输出 03:21:54 证明 CI 将转绿。同文件扫描：其余三处 astimezone() 均为
+  "本机墙钟显示"语义（GUI 启动/代码加载/刷新时刻），无固定偏移断言，保留。
+  批次门禁：受影响套件全绿；全量 unit+property = 历史 18 项零新增；compileall/diff-check 过；
+  范围 Ruff 有 16 项**既有**历史债（settings 旧签名引号 UP037×11、C420×1、旧 import 排序
+  I001×4，均非本轮新增行），按"不顺手清理"纪律保留并如实记录。
 - [ ] WO-D：**被长桥 token 401004 阻塞，等用户重签**
 - [ ] WO-E / WO-F / WO-G：未开始
 
