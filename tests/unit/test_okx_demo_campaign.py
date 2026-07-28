@@ -450,6 +450,7 @@ class _FakeExecutionService:
         self.transient_risk_recovery_failure_code = ""
         self.waited_command_ids = []
         self.wait_error = None
+        self.disarm_error = None
 
     def _command(
         self,
@@ -562,8 +563,10 @@ class _FakeExecutionService:
         self.is_armed = True
 
     def disarm(self):
-        self.is_armed = False
         self.disarm_calls += 1
+        if self.disarm_error is not None:
+            raise self.disarm_error
+        self.is_armed = False
 
     def cancel_entry(self, execution_id):
         self.canceled.append(execution_id)
@@ -1902,6 +1905,8 @@ def test_new_bar_is_processed_once(monkeypatch, tmp_path):
     assert runner.state.executions_prepared == 1
     assert runner.state.execution_ids == ["execution-1"]
     assert runner.runtime.settings.execution.okx.quantity == "120"
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
 
 
 def test_new_bar_recovers_allowlisted_transient_risk_stop_once(
@@ -2157,6 +2162,173 @@ def test_submit_risk_block_is_a_completed_bar_and_campaign_keeps_running(
         runner.state.last_error
         == "资金流/回撤风险闸门阻断新增风险"
     )
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
+
+
+def test_submit_releases_new_risk_lease_after_uncertain_terminal(
+    monkeypatch, tmp_path
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    service = _FakeExecutionService()
+    service.is_armed = True
+    original_submit = service.submit
+
+    def _submit(execution_id):
+        command = original_submit(execution_id)
+        command.status = WorkerCommandStatus.UNCERTAIN
+        return command
+
+    service.submit = _submit
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(
+            _FakeOrchestrator(SimpleNamespace(exception=None)),
+            service,
+        ),
+        store,
+        state,
+    )
+
+    with pytest.raises(CampaignError, match="结果不明"):
+        runner.process_latest_closed_bar()
+
+    assert service.submitted == ["execution-1"]
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
+
+
+@pytest.mark.parametrize(
+    "wait_error",
+    [
+        pytest.param(TimeoutError("测试等待超时"), id="timeout"),
+        pytest.param(KeyError("测试命令读取失败"), id="read_error"),
+    ],
+)
+def test_submit_keeps_new_risk_lease_when_wait_has_no_terminal_result(
+    wait_error,
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    service = _FakeExecutionService()
+    service.is_armed = True
+    service.wait_error = wait_error
+    original_submit = service.submit
+
+    def _submit(execution_id):
+        command = original_submit(execution_id)
+        command.status = WorkerCommandStatus.RUNNING
+        return command
+
+    service.submit = _submit
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(
+            _FakeOrchestrator(SimpleNamespace(exception=None)),
+            service,
+        ),
+        store,
+        state,
+    )
+
+    with pytest.raises(type(wait_error), match=str(wait_error.args[0])):
+        runner.process_latest_closed_bar()
+
+    assert service.submitted == ["execution-1"]
+    assert service.disarm_calls == 0
+    assert service.is_armed is True
+
+
+def test_submit_creation_failure_releases_lease_and_preserves_error(
+    monkeypatch, tmp_path
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    service = _FakeExecutionService()
+    service.is_armed = True
+
+    def _submit(_execution_id):
+        raise RuntimeError("submit command creation failed")
+
+    service.submit = _submit
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(
+            _FakeOrchestrator(SimpleNamespace(exception=None)),
+            service,
+        ),
+        store,
+        state,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="submit command creation failed",
+    ):
+        runner.process_latest_closed_bar()
+
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
+
+
+def test_uncertain_terminal_preserved_when_lease_release_fails(
+    monkeypatch, tmp_path
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    service = _FakeExecutionService()
+    service.is_armed = True
+    service.disarm_error = RuntimeError("lease revoke failed")
+    original_submit = service.submit
+
+    def _submit(execution_id):
+        command = original_submit(execution_id)
+        command.status = WorkerCommandStatus.UNCERTAIN
+        return command
+
+    service.submit = _submit
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(
+        _runtime(
+            _FakeOrchestrator(SimpleNamespace(exception=None)),
+            service,
+        ),
+        store,
+        state,
+    )
+
+    with pytest.raises(
+        CampaignError,
+        match=r"命令状态=uncertain.*释放异常=RuntimeError",
+    ) as caught:
+        runner.process_latest_closed_bar()
+
+    assert isinstance(caught.value.__cause__, RuntimeError)
+    assert service.disarm_calls == 1
+    assert service.is_armed is True
 
 
 def test_integrity_risk_stop_is_never_auto_recovered(tmp_path):
@@ -2552,6 +2724,8 @@ def test_balance_change_after_plan_creation_expires_old_plan_before_submit(
     ]
     assert runner.state.last_plan_result == "blocked:risk:stale_risk_sizing"
     assert "旧计划禁止提交" in runner.state.last_error
+    assert service.disarm_calls == 2
+    assert service.is_armed is False
 
 
 def test_balance_change_above_fixed_cap_keeps_authorized_plan(
@@ -2683,6 +2857,12 @@ def test_campaign_changes_leverage_from_durable_script_and_rechecks_sizing(
         tmp_path,
         "allow_entry",
     )
+    preflights = []
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: preflights.append("okx-demo") or {},
+    )
     target_sizing = _sizing(quantity="580000")
     sizing_calls = 0
 
@@ -2726,6 +2906,102 @@ def test_campaign_changes_leverage_from_durable_script_and_rechecks_sizing(
     assert len(service.prepared) == 1
     assert service.submitted == ["execution-1"]
     assert runner.state.last_plan_result == "execution:entry_pending"
+    assert preflights == ["okx-demo"]
+    assert service.arm_calls == ["启用模拟交易", "启用模拟交易"]
+    assert service.disarm_calls == 3
+    assert service.is_armed is False
+
+
+@pytest.mark.parametrize(
+    ("command_status", "wait_error", "expected_error", "expected_message"),
+    [
+        pytest.param(
+            WorkerCommandStatus.FAILED,
+            None,
+            None,
+            "",
+            id="failed",
+        ),
+        pytest.param(
+            WorkerCommandStatus.UNCERTAIN,
+            None,
+            CampaignError,
+            "结果不明",
+            id="uncertain",
+        ),
+        pytest.param(
+            WorkerCommandStatus.RUNNING,
+            TimeoutError("测试等待超时"),
+            TimeoutError,
+            "测试等待超时",
+            id="timeout",
+        ),
+    ],
+)
+def test_leverage_releases_only_after_durable_terminal(
+    command_status,
+    wait_error,
+    expected_error,
+    expected_message,
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    runtime, service, _supervisor_client, _ = _supervised_runtime(
+        tmp_path,
+        "allow_entry",
+    )
+    target_sizing = _sizing(quantity="580000")
+
+    def _resolve_sizing(record):
+        raise CampaignRiskBlocked(
+            "max_size_exceeded",
+            "当前杠杆容量不足",
+            required_size=target_sizing.quantity,
+            maximum_size=Decimal("120000"),
+        )
+
+    runtime.sizing_resolver = _resolve_sizing
+    runtime.leverage_resolver = (
+        lambda _record, _digest: _leverage_candidate(target_sizing)
+    )
+    service.wait_error = wait_error
+    original_set_leverage = service.set_leverage
+
+    def _set_leverage(parameters):
+        command = original_set_leverage(parameters)
+        command.status = command_status
+        command.failure_code = "test_failure"
+        return command
+
+    service.set_leverage = _set_leverage
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC))
+    runner = OkxDemoCampaign(runtime, store, state)
+
+    if expected_error is None:
+        assert runner.process_latest_closed_bar() is True
+        assert runner.state.last_plan_result == (
+            "blocked:risk:leverage:test_failure"
+        )
+    else:
+        with pytest.raises(expected_error, match=expected_message):
+            runner.process_latest_closed_bar()
+
+    assert len(service.leverage_parameters) == 1
+    assert service.prepared == []
+    assert service.submitted == []
+    if wait_error is None:
+        assert service.disarm_calls == 2
+        assert service.is_armed is False
+    else:
+        assert service.disarm_calls == 1
+        assert service.is_armed is True
 
 
 def test_campaign_balance_jump_after_leverage_blocks_bar_and_keeps_running(
@@ -2743,6 +3019,12 @@ def test_campaign_balance_jump_after_leverage_blocks_bar_and_keeps_running(
     runtime, service, _supervisor_client, _ = _supervised_runtime(
         tmp_path,
         "allow_entry",
+    )
+    preflights = []
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: preflights.append("okx-demo") or {},
     )
     target_sizing = _sizing(quantity="580000")
     sizing_calls = 0
@@ -2782,6 +3064,9 @@ def test_campaign_balance_jump_after_leverage_blocks_bar_and_keeps_running(
     assert service.prepared == []
     assert service.submitted == []
     assert len(service.leverage_parameters) == 1
+    assert preflights == []
+    assert service.disarm_calls == 2
+    assert service.is_armed is False
 
     current_bar_ms["value"] = second_bar_ms
     runtime.orchestrator.record.kline_data[0]["ts_open"] = second_bar_ms
@@ -2794,6 +3079,10 @@ def test_campaign_balance_jump_after_leverage_blocks_bar_and_keeps_running(
     assert runner.state.status == "active"
     assert runner.state.last_completed_bar_ms == second_bar_ms
     assert service.submitted == ["execution-1"]
+    assert preflights == ["okx-demo"]
+    assert service.arm_calls == ["启用模拟交易", "启用模拟交易"]
+    assert service.disarm_calls == 3
+    assert service.is_armed is False
 
 
 def test_campaign_rearms_only_after_demo_read_check(monkeypatch, tmp_path):
@@ -3532,6 +3821,60 @@ def test_current_bar_ready_is_submitted_without_new_model_call(
     assert service.submitted == [ready.id]
     assert runner.state.last_completed_bar_ms == bar_ms
     assert runner.state.inflight_bar_ms is None
+    assert service.arm_calls == ["启用模拟交易"]
+    assert service.disarm_calls == 1
+    assert service.is_armed is False
+
+
+def test_current_bar_ready_wait_timeout_keeps_new_risk_lease(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: None,
+    )
+    bar_ms = 1_784_302_200_000
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    ready = SimpleNamespace(id="ready-current", state=ExecutionState.READY)
+    service = _FakeExecutionService(records={ready.id: ready})
+    service.wait_error = TimeoutError("恢复提交等待超时")
+    original_submit = service.submit
+
+    def _submit(execution_id):
+        command = original_submit(execution_id)
+        command.status = WorkerCommandStatus.RUNNING
+        return command
+
+    service.submit = _submit
+    orchestrator = _FakeOrchestrator(SimpleNamespace(exception=None))
+    store = CampaignStateStore(tmp_path / "campaign.json")
+    previous_bar_ms = bar_ms - 30 * 60 * 1000
+    state = _state(store, datetime(2026, 7, 17, tzinfo=UTC)).model_copy(
+        update={
+            "execution_ids": [ready.id],
+            "inflight_bar_ms": bar_ms,
+            "last_completed_bar_ms": previous_bar_ms,
+        }
+    )
+    store.save(state)
+    runner = OkxDemoCampaign(_runtime(orchestrator, service), store, state)
+    monkeypatch.setattr(runner, "_execution_bar_ms", lambda execution: bar_ms)
+
+    with pytest.raises(TimeoutError, match="恢复提交等待超时"):
+        runner.process_latest_closed_bar()
+
+    assert orchestrator.calls == 0
+    assert service.submitted == [ready.id]
+    assert service.disarm_calls == 0
+    assert service.is_armed is True
+    assert runner.state.last_completed_bar_ms == previous_bar_ms
+    assert runner.state.inflight_bar_ms == bar_ms
 
 
 def test_closeout_cancels_pending_entry_and_exits_open_position(

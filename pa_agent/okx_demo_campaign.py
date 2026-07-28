@@ -2864,9 +2864,20 @@ class OkxDemoCampaign:
 
         if not current:
             return False
-        self._ensure_demo_write_session()
-        command = self.runtime.execution_service.submit(current[0].id)
-        self._wait_for_worker_command(command.id, action="恢复提交")
+        try:
+            self._ensure_demo_write_session()
+            command = self.runtime.execution_service.submit(current[0].id)
+        except Exception as exc:
+            self._disarm_new_risk(
+                action="恢复提交命令创建",
+                primary_error=exc,
+            )
+            raise
+        self._wait_for_worker_command(
+            command.id,
+            action="恢复提交",
+            release_new_risk=True,
+        )
         execution = self.runtime.execution_service.get_execution(current[0].id)
         if execution is None:
             raise CampaignError("恢复提交后执行记录消失")
@@ -3257,23 +3268,25 @@ class OkxDemoCampaign:
                     analysis_digest=self._analysis_digest(record),
                 )
             if leverage_parameters is not None:
-                self._ensure_demo_write_session()
-                leverage_command = (
-                    self.runtime.execution_service.set_leverage(
-                        leverage_parameters
+                try:
+                    self._ensure_demo_write_session()
+                    leverage_command = (
+                        self.runtime.execution_service.set_leverage(
+                            leverage_parameters
+                        )
                     )
+                except Exception as exc:
+                    self._disarm_new_risk(
+                        action="动态杠杆命令创建",
+                        primary_error=exc,
+                    )
+                    raise
+                leverage_result = self._wait_for_worker_command(
+                    leverage_command.id,
+                    action="动态杠杆",
+                    allow_failed=True,
+                    release_new_risk=True,
                 )
-                leverage_result = (
-                    self.runtime.execution_service.wait_for_command(
-                        leverage_command.id,
-                        timeout=30.0,
-                    )
-                )
-                if leverage_result.status is WorkerCommandStatus.UNCERTAIN:
-                    raise CampaignError(
-                        "动态杠杆结果不明，禁止自动重试；"
-                        "请先完成券商只读对账"
-                    )
                 if leverage_result.status is not WorkerCommandStatus.SUCCEEDED:
                     self._save_state(
                         inflight_bar_ms=None,
@@ -3364,15 +3377,17 @@ class OkxDemoCampaign:
             execution.state == ExecutionState.READY
             and _utc_now() < self.state.expires_at_utc
         ):
-            self._ensure_demo_write_session()
-            if sizing is not None:
-                try:
+            try:
+                self._ensure_demo_write_session()
+                if sizing is not None:
                     _require_fresh_campaign_sizing(
                         self.runtime,
                         record,
                         sizing,
                     )
-                except CampaignRiskBlocked as exc:
+                command = self.runtime.execution_service.submit(execution.id)
+            except CampaignRiskBlocked as exc:
+                try:
                     self.runtime.execution_service.expire_unsubmitted(
                         execution.id,
                         reason="USDT 风险快照变化，旧计划禁止提交",
@@ -3385,12 +3400,25 @@ class OkxDemoCampaign:
                         last_error=str(exc),
                     )
                     logger.info("提交前风险快照已失效：%s", exc)
-                    return
-            command = self.runtime.execution_service.submit(execution.id)
+                except Exception as cleanup_exc:
+                    self._disarm_new_risk(
+                        action="提交前风险复核",
+                        primary_error=cleanup_exc,
+                    )
+                    raise
+                self._disarm_new_risk(action="提交前风险复核")
+                return
+            except Exception as exc:
+                self._disarm_new_risk(
+                    action="提交命令创建",
+                    primary_error=exc,
+                )
+                raise
             submit_result = self._wait_for_worker_command(
                 command.id,
                 action="提交入场",
                 allow_failed=True,
+                release_new_risk=True,
             )
             refreshed = self.runtime.execution_service.get_execution(
                 execution.id
@@ -3621,11 +3649,26 @@ class OkxDemoCampaign:
         *,
         action: str,
         allow_failed: bool = False,
+        release_new_risk: bool = False,
     ):
         result = self.runtime.execution_service.wait_for_command(
             command_id,
             timeout=30.0,
         )
+        terminal_statuses = {
+            WorkerCommandStatus.SUCCEEDED,
+            WorkerCommandStatus.FAILED,
+            WorkerCommandStatus.UNCERTAIN,
+        }
+        if result.status not in terminal_statuses:
+            raise CampaignError(
+                f"{action}命令尚未进入耐久终态：{result.status.value}"
+            )
+        if release_new_risk:
+            self._disarm_new_risk(
+                action=action,
+                terminal_result=result,
+            )
         if result.status is WorkerCommandStatus.SUCCEEDED:
             return result
         if result.status is WorkerCommandStatus.UNCERTAIN:
@@ -3637,6 +3680,39 @@ class OkxDemoCampaign:
         raise CampaignError(
             f"{action}失败：{result.failure_code or result.status.value}"
         )
+
+    def _disarm_new_risk(
+        self,
+        *,
+        action: str,
+        terminal_result=None,
+        primary_error: Exception | None = None,
+    ) -> None:
+        """释放新增风险租约；失败时保留已经确认的业务事实。"""
+
+        try:
+            self.runtime.execution_service.disarm()
+        except Exception as disarm_error:
+            facts = []
+            if terminal_result is not None:
+                facts.append(f"命令状态={terminal_result.status.value}")
+                if terminal_result.failure_code:
+                    facts.append(
+                        f"失败代码={terminal_result.failure_code}"
+                    )
+            if primary_error is not None:
+                facts.append(f"原始异常={type(primary_error).__name__}")
+            facts.append(f"释放异常={type(disarm_error).__name__}")
+            error = CampaignError(
+                f"{action}的新增风险租约释放失败（{'；'.join(facts)}）"
+            )
+            if primary_error is not None:
+                error.add_note(
+                    "租约释放异常："
+                    f"{type(disarm_error).__name__}: {disarm_error}"
+                )
+                raise error from primary_error
+            raise error from disarm_error
 
     def run(self) -> bool:
         validate_campaign_settings(self.runtime.settings)

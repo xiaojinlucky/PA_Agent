@@ -28,8 +28,8 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 
 | 项 | 值 |
 |---|---|
-| 风险高水位 `adjusted_high_water_usd` | `78303.57015174496`（任何"恢复"都不得重锚） |
-| OKX Demo 账户身份摘要 | `ba9b744dc78ae3fc203980e62b854b0a0e3d44c9c6d5e446de910bea74ef1def` |
+| 风险高水位 `adjusted_high_water_usd` | 已从 PUBLIC 文档脱敏；任何“恢复”都不得重锚，以本地风险账本为准 |
+| OKX Demo 账户身份摘要 | 已从 PUBLIC 文档脱敏；每次操作前以实时私有只读硬门逐字符核对 |
 | 历史 UNCERTAIN 命令 `686b6d0e-5c85-4430-a2d9-b9e069b76934` | 已处置 `confirmed_not_written_schema_validation`，禁止重放 |
 | 固定风险参数 | `20000 USDT 上限 / 10% / 20x / risk_budget` |
 
@@ -117,9 +117,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **验收标准**：4 个 commit 逐个通过 gitleaks；push 后 `git rev-parse origin/main` == 本地 HEAD；向用户报告最终 SHA。
 
-### WO-C Campaign 空仓安全重启（当前 active）
+### WO-C Campaign 空仓安全重启（历史验收完成）
 
-**状态**：2026-07-27 16:31 北京时间，原 Campaign 从正式 `run` 入口恢复并加载 WO-C2 修复，沿用 Campaign ID、完成水位和冻结风险参数。16:20–16:30 首根新 K 线已完成为 `blocked:no_order`，Campaign 持续 `active`。
+**状态**：2026-07-27 16:31 北京时间的历史验收中，原 Campaign 从正式 `run` 入口恢复并加载 WO-C2 修复，沿用 Campaign ID、完成水位和冻结风险参数。16:20–16:30 首根新 K 线完成为 `blocked:no_order`，当时 Campaign 为 `active`；这不能替代当前状态的实时核验。
 
 **硬门（全部满足才可动）**：活动 execution=0、PENDING/RUNNING 命令=0、未解决 UNCERTAIN=0、`NEW_RISK` 租约=0、OKX Demo 仓位=0、普通挂单=0、八类算法单=0、Worker 心跳/成功对账新鲜、两库 `integrity_check=ok`、账户身份一致。风险停止必须为 0；唯一例外是 `RECOVERABLE_TRANSIENT_RISK_STOP_REASONS` 中的临时读取停止，此时只允许 Campaign 针对新 K 线创建一次耐久的专用恢复命令，新账户/身份/账单读取完整前保持停写，禁止直接清除或重锚高水位。
 
@@ -137,7 +137,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - `UNKNOWN/ERROR`、非终态 `needs_attention`、记录丢失和非法状态继续硬阻断。监控错误不得覆盖本根既有 `blocked:no_order`、风险阻断等结果。
 - `close_out()` 在剩余窗口内重试临时只读对账；撤单/离场命令逐条等待耐久终态，同一 execution 的同一种写动作最多一次。状态存储可写时，命令失败、结果不明、等待超时或真实不安全状态会耐久写 `needs_attention` 并退出；补写失败时磁盘可能保留 `stopping`，但 `stopping / needs_attention` 都硬阻断自动恢复，人工中断不会二次收口。
 
-**验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。真实恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e` 完成新的账户与账单读取，`kill_active` 由白名单临时停止合法恢复为 0，高水位保持 `78303.57015174496`；首根新 K 线完成且零新增 execution/订单/仓位。
+**验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。真实恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e` 完成新的账户与账单读取，`kill_active` 由白名单临时停止合法恢复为 0，高水位未重锚；首根新 K 线完成且零新增 execution/订单/仓位。
 
 ### WO-D P1 三标的真实验收（被长桥 token 阻塞）
 
@@ -158,6 +158,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - 新增控件：市场切换（US/HK/CN/Crypto，与行情源联动路由）、多市场自选列表（本地持久化 `GeneralSettings`，不接长桥云端 watchlist 写 API）、状态栏市场时钟（开市/午休/闭市/半日市 + 下一变化时间，数据源 `pa_agent/data/market_calendar.py::session_state`）。
 - 已有基座：`_symbol_combo`（main_window.py:653）、`_switch_data_source` 事务（:1738）、`last_symbols_by_source` 持久化、`EnhancedStatusBar`（gui/widgets/status_bar.py，未挂载）。
 - 验收：同一桌面窗口对 AAPL.US、700.HK、600519.SH 各完成一次真实两阶段分析，并对 XAU-USDT-SWAP 完成 Crypto 正常路径与 Longbridge↔OKX 双向切换；认证失效、陈旧、日历未知、保存失败和 generation 逆序返回均须通过。最终桌面窗口由用户从 `.lnk` 启动并截图。
+
+**Product Design 阶段 2**：`docs/prd/06_WO-E_Product_Design_三方向证据.md` 已登记 WO-E 专用 Longbridge 对标清单、逐文件脱敏附件、三个独立 ImageGen 产物标识、项目 PNG、SHA-256 和人工视觉复核。三张候选稿按本次对话实际显示顺序编号 1、2、3；用户选择前仍禁止方向绑定 PRD、Stitch、图像精修和 PyQt6 生产实现。
 
 ### WO-F Claim Validation 反幻觉层（2026-07-27 完成）
 
@@ -274,7 +276,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 |---|---|
 | WO-A | 4 视角完成，P0/P1 修复+回归，账本回写；当前剩余 metadata/config 共同指纹 P2，未闭单 |
 | WO-B | 4 commit 逐个 gitleaks 零泄漏，push 后远端 SHA==本地，用户确认在先 |
-| WO-C | 硬门全过后重启，继承正确，≥1 根自然 K 线，无新 ERROR |
+| WO-C | 历史硬门全过后重启，继承正确，≥1 根自然 K 线，无新 ERROR；当前状态另行实时核验 |
+| WO-C2 | 安全终态不误等新对账；临时对账错误耐久记录且不重试写命令；UNKNOWN/ERROR 等继续硬阻断；异常收口零重复写 |
 | WO-D | 3 标的 complete、时区/规则块人工抽查过、acceptance_pass=true |
 | WO-E | 设计流程全走完+用户审美确认，零副标题，真实读写链接通；三标的桌面验收及 Crypto/跨源/失败/竞态矩阵通过 |
 | WO-F | Stage1/Stage2 受管价位、真实 K 线引用和行情源 tick 硬校验；稳定 `blocked:claim_validation:<code>` 耐久化并继续下一根；三套件零失败；OKX Demo 正式入口加载与自然样本无误杀验收通过 |
@@ -309,9 +312,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   完成 **50 根自然 K 线、0 失败**，一根不落；北京 05:31 自然信号真实提交
   execution `ed7711be-93f7-52eb-a544-adf9969f19bb`（submit 命令 `9dc7eafb` succeeded，
   真实 OKX Demo 限价单），270 秒未成交后按规则正常撤销（canceled，未切市价）——
-  完整自然交易生命周期实证。P2 观察项：该笔交易的 NEW_RISK 租约 `4cf57283`
-  由 Campaign 的 Controller 在交易终态后仍滚动续期约 2 小时（不阻塞运行，
-  随进程消亡；接手者可在 WO-G 里排查 Controller 租约释放时机）。
+  完整自然交易生命周期实证。当时同时发现 P2：该笔交易的 NEW_RISK 租约 `4cf57283`
+  由 Campaign 的 Controller 在交易终态后仍滚动续期约 2 小时；根因与修复见本账本后续
+  “NEW_RISK 最小权限收口”条目。
 - [x] 2026-07-27 07:43 WO-C 完成：硬门核验后停旧树、租约自然过期、07:33 restart 语义重启，
   新 Campaign `6cba8d3e` 继承 `last_completed_bar_ms` 正确、首根自然 K 线完成（no_order，0 失败）；
   **新代码生效实证**：最新耐久分析记录（records/pending/2026-07-27_07-07-36_...json）包含
@@ -361,7 +364,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-H 任务 3：成交量影子摘要、自动分析落盘、离线评分脚本和测试完成；未进提示词
 - [x] WO-H 任务 4：`CONTEXT.md` 一页化和多市场前端设计包完成
 - [x] WO-E 前置设计合同：`docs/prd/05_多市场看盘前端设计包.md` 已冻结读模型、设置、并发、跨源、脱敏和四市场验收矩阵
-- [ ] WO-E 生产实现：停在三个视觉方向待用户选择；PyQt6、Stitch 和桌面验收均未开始
+- [x] WO-E Product Design 阶段 2：三个独立高保真候选稿、附件清单、产物标识、哈希与人工视觉复核已登记
+- [ ] WO-E 生产实现：停在三张候选稿待用户按显示顺序选择；方向绑定 PRD、Stitch、精修、PyQt6 和桌面验收均未开始
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
@@ -380,6 +384,23 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   耐久收口与零重复写直接回归；四文件定向 220 项通过、0 失败，三套件 1956 项通过、7 项跳过、0 失败。全仓 Ruff
   只读基线刷新为 293 项，其中 249 项带修复建议。WO-E 阶段 0/1 合同补齐 Crypto 与
   跨源/失败/竞态矩阵。
+- [x] 2026-07-28 NEW_RISK 最小权限收口：根因是 Campaign 在新增风险 Worker 命令耐久
+  终态后没有 `disarm()`，Controller 监控线程因此继续滚动续租。最小修复只改
+  `pa_agent/okx_demo_campaign.py` 和测试，不改 `pa_agent/execution`：动态杠杆、正常
+  submit、READY 恢复 submit 在命令创建前失败时释放；命令创建成功后，只有等待函数返回
+  `SUCCEEDED`、`FAILED` 或 `UNCERTAIN` 耐久终态才释放。等待超时、命令读取异常或非终态
+  结果不由业务方法提前释放，进程收口仍会显式撤销租约；RUNNING 命令保持未解决并阻止
+  再次授权。下一条新增风险命令重新执行 OKX Demo 私有只读预检并申请新租约，减险命令
+  不受影响。定向回归 130 项通过、0 失败；unit/property/integration 1966 项通过、7 项
+  跳过、0 失败。
+- [ ] NEW_RISK 公共层一次性约束：对抗审查确认当前 Campaign 调用路径每个授权窗口只有
+  一条新增风险命令，但 `ExecutionController` / `WorkerStore` 的公共租约仍是时效授权，
+  不是全局一次性令牌，同一有效租约可排入多条新增风险命令。提升为执行层硬不变量必须
+  修改本轮明确禁止触碰的 `pa_agent/execution`；当前修复不冒充已提供该全局性质。
+- [ ] Campaign 新代码运行态激活：2026-07-27 21:33 的只读历史审计证明当时没有活动
+  execution、未解决写命令或有效租约；审计对象是 20:01 启动、早于 `7e6c095` 和本轮
+  租约修复的进程，确定未热加载。本轮没有重新核验当前进程是否仍存活；未经新的 OKX Demo
+  私有只读空仓/空单/身份/风险/Worker/两库硬门和用户运行态授权不重载。
 - [ ] WO-A 复审余项：固定代理 metadata 与实际配置缺共同指纹；当前禁止修改 `scripts`，
   因此不能闭单。
 
@@ -387,6 +408,6 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-E 的审美确认环节：A/B/C 三选一，当前推荐 B“证据优先”。
+3. WO-E 的审美确认环节：按本次对话中三张图的实际显示顺序选择 1、2、3。
 4. `shared/` 是否建 Git 仓库的决定。
 5. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。

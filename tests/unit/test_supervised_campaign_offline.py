@@ -8,12 +8,15 @@ from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import pa_agent.okx_demo_campaign as campaign_module
 from pa_agent.agents.supervisor import SupervisorAgent, SupervisorGate
 from pa_agent.config.settings import Settings
 from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame
 from pa_agent.execution.controller import ExecutionController
 from pa_agent.execution.credentials import account_identity_fingerprint
+from pa_agent.execution.errors import LiveTradingDisabled
 from pa_agent.execution.models import ExecutionState
 from pa_agent.execution.okx_adapter import OkxAdapter
 from pa_agent.execution.service import ExecutionService
@@ -525,10 +528,7 @@ def test_scripted_campaign_uses_real_controller_worker_offline(
         executions = runtime.execution_service.list_recent()
         assert len(executions) == 1
         assert executions[0].plan.quantity == 79440
-        final_lease = worker_store.current_new_risk_lease()
-        assert final_lease is not None
-        assert executions[0].plan.config_fingerprint == final_lease.config_fingerprint
-        assert final_lease.lease_id != initial_lease.lease_id
+        assert worker_store.current_new_risk_lease() is None
         assert client.calls == []
         assert orchestrator.calls == 1
 
@@ -549,10 +549,103 @@ def test_scripted_campaign_uses_real_controller_worker_offline(
     assert worker_errors == []
 
 
+def test_running_submit_timeout_keeps_real_lease_until_shutdown(
+    monkeypatch,
+    tmp_path,
+):
+    bar_ms = 1_784_300_400_000
+    monkeypatch.setattr(
+        campaign_module,
+        "_utc_now",
+        lambda: datetime(2026, 7, 17, 1, tzinfo=UTC),
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "build_analysis_frame",
+        lambda *args, **kwargs: _frame(bar_ms),
+    )
+    monkeypatch.setattr(
+        "pa_agent.config.paths.RECORDS_PENDING_DIR",
+        tmp_path / "pending",
+    )
+    monkeypatch.setattr(
+        campaign_module,
+        "RECORDS_PENDING_DIR",
+        tmp_path / "pending",
+    )
+    runtime, worker, worker_store, _adapter, _client, _orchestrator = (
+        _build_runtime(tmp_path)
+    )
+    state_store = CampaignStateStore(tmp_path / "campaign.json")
+    state = state_store.create_or_resume(
+        now=datetime(2026, 7, 17, tzinfo=UTC),
+        settings=runtime.settings,
+    )
+    state_store.save(state)
+    runner = OkxDemoCampaign(runtime, state_store, state)
+
+    worker.start()
+    try:
+        controller = runtime.execution_service
+        controller.arm("启用模拟交易")
+        monkeypatch.setattr(controller, "start_monitoring", lambda: None)
+        monkeypatch.setattr(
+            controller,
+            "wait_for_worker",
+            lambda *, timeout: None,
+        )
+
+        def _claim_then_timeout(command_id, *, timeout):
+            assert timeout == 30.0
+            claimed = worker_store.claim_next(
+                worker_id="offline-supervised-worker"
+            )
+            assert claimed is not None
+            assert claimed.id == command_id
+            raise TimeoutError("测试运行中命令等待超时")
+
+        monkeypatch.setattr(
+            controller,
+            "wait_for_command",
+            _claim_then_timeout,
+        )
+
+        with pytest.raises(
+            TimeoutError,
+            match="测试运行中命令等待超时",
+        ):
+            runner.process_latest_closed_bar()
+
+        commands = worker_store.list_commands()
+        assert len(commands) == 1
+        assert commands[0].action is WorkerCommandAction.SUBMIT
+        assert commands[0].status is WorkerCommandStatus.RUNNING
+        assert worker_store.current_new_risk_lease() is not None
+
+        controller.disarm()
+
+        assert worker_store.current_new_risk_lease() is None
+        assert (
+            worker_store.get_command(commands[0].id).status
+            is WorkerCommandStatus.RUNNING
+        )
+        with pytest.raises(LiveTradingDisabled, match="未解决"):
+            controller.arm("启用模拟交易")
+    finally:
+        runtime.execution_service.disarm()
+        worker.close()
+
+
 def test_max_size_leverage_script_controller_worker_okx_chain(
     monkeypatch,
     tmp_path,
 ):
+    private_preflight_calls: list[None] = []
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: private_preflight_calls.append(None),
+    )
     (
         runner,
         runtime,
@@ -605,6 +698,7 @@ def test_max_size_leverage_script_controller_worker_okx_chain(
             "set_leverage",
             "place_order",
         ]
+        assert len(private_preflight_calls) == 1
         assert supervisor_client.calls == []
         assert runner.state.last_plan_result == "execution:entry_pending"
     finally:
@@ -620,6 +714,12 @@ def test_normal_dynamic_leverage_does_not_invoke_monitor_block_response(
     monkeypatch,
     tmp_path,
 ):
+    private_preflight_calls: list[None] = []
+    monkeypatch.setattr(
+        campaign_module,
+        "okx_demo_private_preflight",
+        lambda: private_preflight_calls.append(None),
+    )
     (
         runner,
         runtime,
@@ -653,6 +753,7 @@ def test_normal_dynamic_leverage_does_not_invoke_monitor_block_response(
             for call in client.calls
             if call[0] in {"set_leverage", "place_order"}
         ] == ["set_leverage", "place_order"]
+        assert len(private_preflight_calls) == 1
         assert supervisor_client.calls == []
     finally:
         runtime.execution_service.disarm()
