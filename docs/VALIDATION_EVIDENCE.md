@@ -698,5 +698,6 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 ### 当前外部门与运行态
 
 - ChatGPT Web B3 通过。Stitch、R1–R3、R2 Taste 过程指导、R3 后独立视觉审计和用户最终审美确认仍未完成。
-- Chrome、Profile 1 的 ChatGPT 扩展 `1.2.27221.15725_0` 与 Native Messaging Host 均存在，但浏览器客户端在规定重试后仍无法通信；具体根因尚未证明。按控制规则，打开新 Chrome 窗口重试前需用户许可。
+- 用户授权官方恢复流程后，实际打开新的 Chrome Profile 1 窗口并只重试一次，扩展连接成功；登录态 Stitch 已打开并切换到 `Web` 模式。五个待上传文件均存在且指纹核对通过，但系统文件选择器没有打开；官方排障要求用户在扩展详情开启“允许访问文件网址”。当前未上传附件、未创建 Stitch 项目，也没有 Screen、版本或下载物。
+- 官方接口核查：Longbridge `QuoteContext.quote(symbols)` 单次最多 500 个标的，项目本地 `longbridge 4.3.2` 签名与官方入口一致；当前 100 项自选可单次读取，但真实 OpenAPI 权限仍受失效 token 阻塞。OKX `/market/tickers` 无需认证，按 SPOT/SWAP 最多两个串行类型快照后本地筛选，不能伪造多标的参数。OKX `/market/candles` 单页最多 300、`after` 向旧翻页、最近覆盖 1,440 根；现有最大 10m 请求最坏需 602 根 5m、最多三页，正确实现仍需极窄解除 `pa_agent/execution/okx_client.py` 禁区。
 - 11:24–11:28 只读运行态复核确认 Worker 与心跳运行、两库 `quick_check=ok`、活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；OKX 私有余额读取持续连接拒绝并触发风险停止，Campaign 进程不存在且磁盘状态过期。最后本地账户快照已陈旧约 13.35 小时；Agent 没有启动、停止、重载或另行调用私有接口。

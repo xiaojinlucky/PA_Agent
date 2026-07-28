@@ -253,7 +253,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
    开启，以及耐久写入方法名演进，修复证据在 `c5f71f9`；`no_order_with_prices` ×1 是旧
    normalizer 静默清空提示词明示价位，WO-F 现改为保留原始声明并交给 schema/claim
    validation 拒绝矛盾，修复证据在 `c0b58d0`。最新三套件均为零失败。
-3. `CONTEXT.md` 一页化：**已完成**。当前文件 39 行；旧流水账完整归档到
+3. `CONTEXT.md` 一页化：**已完成**。当前文件 40 行；旧流水账完整归档到
    `docs/archive/CONTEXT_full_history_through_20260727_wo_h.md`。
 4. `D:\Desktop\Quant\shared` 尚无 Git 版本管理：需用户拍板是否建仓（禁止擅自 git init）。
 5. 全仓 Ruff 历史债务：`4963` 是旧历史数字，已不能当当前精确基线。2026-07-27 完成证据
@@ -367,6 +367,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-E 前置设计合同：`docs/prd/05_多市场看盘前端设计包.md` 已冻结读模型、设置、并发、跨源、脱敏和四市场验收矩阵
 - [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
 - [x] WO-E ChatGPT Web 阶段 3：四个脱敏附件与完整提示词已真实提交；会话 URL、完整回答、内容指纹和 F01–F22 本地裁决已登记，B3 通过
+- [x] 2026-07-28 13:06 WO-E Chrome 官方恢复与接口事实核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，但系统文件选择器未打开，官方排障要求用户确认并开启扩展的“允许访问文件网址”，所以附件未上传、项目未创建。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
 - [ ] WO-E 剩余设计与生产实现：当前方向为 `Scan Rail Workbench`；Stitch、连续三轮精修、视觉审计、最终审美确认、PyQt6 和桌面验收仍未完成
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
@@ -417,6 +418,6 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-E 设计门：Product Design B1/B2 与 ChatGPT Web B3 已完成；下一步需用户许可打开新的 Chrome 窗口并重试扩展连接，恢复后进入 Stitch。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区。
+3. WO-E 设计门：Product Design B1/B2、ChatGPT Web B3 与 Chrome 扩展恢复已完成；下一步由用户在 ChatGPT Chrome Extension 详情确认并开启“允许访问文件网址”，随后继续五附件上传和 Stitch。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区；正确关闭 OKX 10m F11 还需仅授权 `pa_agent/execution/okx_client.py` 的只读 `candles(after=None)` 参数。
 4. `shared/` 是否建 Git 仓库的决定。
 5. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。
