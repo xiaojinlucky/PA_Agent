@@ -2,9 +2,9 @@
 
 ## 1. 文档状态
 
-- 状态：**方向已锁定；Product Design `ideate` 证据、外部设计门与生产实现均未完成**。
-- 用户选择证据：2026-07-28，用户按候选稿实际显示顺序回复 `1`。
-- 本文是网页版 ChatGPT PRD 的本地输入合同，只把已选视觉方向绑定到既有产品合同，不代替可核验的 Product Design `ideate`、网页版 ChatGPT PRD、Stitch、连续三轮 ImageGen 精修、`design-taste-frontend` 审计或 PyQt6 实现。
+- 状态：**Product Design B1 与用户选择 B2 已通过；网页版 ChatGPT、Stitch、连续三轮精修、视觉审计与生产实现未完成**。
+- 用户选择证据：2026-07-28，用户按 Product Design 重跑结果的实际显示顺序回复 `1`。
+- 本文是网页版 ChatGPT PRD 的本地输入合同，把已选视觉方向绑定到既有产品合同；真实调用与选择证据见 `docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md`。本文不代替网页版 ChatGPT PRD、Stitch、连续三轮 ImageGen 精修、`design-taste-frontend` 审计或 PyQt6 实现。
 - 真值优先级：`CLAUDE.md` → `docs/prd/05_多市场看盘前端设计包.md` → 本文 → 候选 PNG。候选图中的字段、指标、数值和文案不会因出现在图上而自动成为产品合同。
 
 ## 2. 唯一方向与资产指纹
@@ -12,11 +12,12 @@
 | 项目 | 冻结值 |
 | --- | --- |
 | 显示顺序 | `1` |
-| 方向名 | `Dense Scan Workbench` / 高密度标的扫描工作台 |
-| 项目文件 | `docs/prd/assets/wo_e_product_design/option-1-dense-scan-workbench.png` |
+| 方向名 | `Scan Rail Workbench` / 纵向高密扫描轨工作台 |
+| Product Design 产物标识 | `call_TRaeEW9gjx8NGlz3rYlacsyQ` |
+| 项目文件 | `docs/prd/assets/wo_e_product_design/ideate-20260728-1-scan-rail-workbench.png` |
 | 原生尺寸 | `1586×992` |
-| SHA-256 | `C2E4B45C62860C308B9F7EDD17825F0F72C8A96E98A742181486FCEF0AAA4C13` |
-| 候选结论 | `CONDITIONAL PASS`，只通过方向选择门 |
+| SHA-256 | `7D445535CD292C11DE963421EF99A46882600A997F4D4FDB0DA110FBC8B34805` |
+| 候选结论 | Product Design B1、用户选择 B2 通过；只锁定视觉方向 |
 
 必须保留的布局主轴：
 
@@ -26,10 +27,10 @@
 
 必须删除或修正的候选稿内容：
 
-1. 补唯一页面标题“多市场看盘”。
-2. 正常、异常和选中状态都使用文字与图标，不只使用颜色。
-3. 删除 `8/50`、括号注释、今日/昨收、OHLC、成交量和未冻结的多周期文案。
-4. 添加、删除和排序只管理本地自选，不能暗示修改长桥云端 watchlist；本页没有单独的“编辑”动作。
+1. 删除候选图顶部英文窗口标题，只保留唯一页面标题“多市场看盘”。
+2. “实时行情”不能写死；必须由真实 `quote_mode` 显示实时或延迟，并与 `expected_delay_ms` 和时间戳证据一致。
+3. 逐项复核表头、更新时间和必要状态文字，真实 Qt 渲染不得低于 `14px`；PNG 不能替代字号验收。
+4. 正常、异常和选中状态继续使用文字与图标，不能只依赖颜色；添加、删除和排序只管理本地自选。
 5. 第一轮精修必须输出精确 `1440×900`，不能把 `1586×992` 冒充尺寸验收。
 
 ## 3. 产品目标与边界
@@ -212,11 +213,11 @@
 
 顺序固定为：
 
-1. 本文锁定现有 ImageGen 候选稿的用户偏好与本地事实。
-2. 补齐 Product Design `ideate` 的可核验入口、提示词与三方向产物绑定；若旧证据无法恢复，重新生成三张独立方向并让用户按新一轮实际显示顺序重新选择，不能把当前编号自动套到新产物。
+1. `[已完成]` Product Design `ideate` 三方向已生成，调用入口、完整提示词、产物标识和文件指纹已登记。
+2. `[已完成]` 用户已按本轮实际显示顺序选择 `1`，唯一绑定为本文件第 2 节的 `Scan Rail Workbench`。
 3. 网页版 ChatGPT 输出完整 PRD，并保存会话 URL、完整提示词、逐文件附件、完整回答和本地事实校正。
 4. 使用本机已登录 Chrome 在 Stitch 生成方向绑定设计，并保存真实项目、页面、Screen/版本、输入、附件、结果和本地适配差异。
-5. ImageGen R1 结构轮：精确 `1440×900`，修正标题、越界文案、状态只靠颜色和本地自选语义。
+5. ImageGen R1 结构轮：精确 `1440×900`，删除英文窗口标题，把实时/延迟文案绑定真实 `quote_mode`，并复核必要文字不低于 `14px`。
 6. ImageGen R2 视觉轮：实际调用项目级 `design-taste-frontend` 作本轮指导，修正字号、对比度、留白、边框、数字对齐和比例。
 7. ImageGen R3 状态轮：覆盖加载、空、认证失败、陈旧、日历未知、切换失败、保存冲突和分析状态。
 8. 三轮完成后再次独立执行 `design-taste-frontend` 生产视觉审计，记录采用、调整和拒绝的参考；R2 的过程指导不能替代该终审。
@@ -283,7 +284,7 @@ M13 只适用于普通连接、传输、标的或数据验证失败；Longbridge
 ## 13. 当前未完成与硬阻塞
 
 - 网页版 ChatGPT PRD：未完成。
-- Product Design `ideate` 的调用入口、提示词与三方向产物绑定证据：当前文档未能独立核验，验收项 B1 按失败处理。
+- Product Design B1 与用户选择 B2：已通过，证据见 `docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md`。
 - Stitch：未完成。
 - ImageGen 连续三轮精修：`0/3`。
 - `design-taste-frontend` 生产视觉审计：未完成。

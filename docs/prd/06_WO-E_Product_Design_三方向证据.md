@@ -1,6 +1,6 @@
 # WO-E 三方向图稿与 Product Design 证据审计
 
-> 当前仓库能核验三次独立 ImageGen 产物、提示词合同、资产哈希和用户选择，但不能独立核验 Product Design `ideate` 的调用入口、完整提示词与三份产物绑定关系。`frontend-design` 验收项 B1 因此仍为失败；本文不把 ImageGen 三图冒充已完成的 Product Design `ideate`。
+> 本文记录 2026-07-28 第一组三张 ImageGen 候选稿及当时的用户偏好，只作历史证据。该组不能独立证明 Product Design `ideate` 的调用入口、完整提示词与产物绑定；后续已按正式入口重跑并由用户重新选择，当前权威证据见 `docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md`。旧 `Dense Scan Workbench` 不再是当前视觉目标。
 
 ## 1. 设计任务
 
@@ -147,3 +147,14 @@
 - SHA-256 `C2E4B45C62860C308B9F7EDD17825F0F72C8A96E98A742181486FCEF0AAA4C13`。
 
 本次选择记录的是用户对现有三张 ImageGen 候选稿的明确偏好，不等于 Product Design B1、最终精修稿或生产验收通过，也不清除第 6.3–6.4 节的已知偏差。方向绑定本地合同见 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md`。
+
+## 7. 当前替代关系
+
+Product Design `ideate` 已于 2026-07-28 通过正式入口重新执行，三张新方向、完整提示词、产物标识、文件指纹与人工复核登记在 `docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md`。用户按新一轮实际显示顺序再次回复 `1`，当前唯一选择是：
+
+- `Scan Rail Workbench` / 纵向高密扫描轨工作台；
+- `docs/prd/assets/wo_e_product_design/ideate-20260728-1-scan-rail-workbench.png`；
+- 原生尺寸 `1586×992`；
+- SHA-256 `7D445535CD292C11DE963421EF99A46882600A997F4D4FDB0DA110FBC8B34805`。
+
+因此，本文第 5–6 节的旧名称、旧编号、旧文件和旧选择不得再驱动 ChatGPT Web、Stitch、精修或生产实现。当前方向合同以 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md` 的修订版本为准。

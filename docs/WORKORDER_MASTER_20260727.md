@@ -159,7 +159,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - 已有基座：`_symbol_combo`、图表、设置 revision、Longbridge/OKX 已验证的只读能力可按合同复用；现有 `_switch_data_source` 只可参考事务意图，不能直接复用其提交点或同步界面线程调用。
 - 验收：同一桌面窗口对 AAPL.US、700.HK、600519.SH 各完成一次真实两阶段分析，并对 XAU-USDT-SWAP 完成 Crypto 正常路径与 Longbridge↔OKX 双向切换；M01–M17 与 D01–D07 全部通过。最终桌面窗口由用户从 `.lnk` 启动并截图。
 
-**三方向图稿与选择**：`docs/prd/06_WO-E_Product_Design_三方向证据.md` 已登记 WO-E 专用 Longbridge 对标清单、逐文件脱敏附件、三个独立 ImageGen 产物标识、项目 PNG、SHA-256、人工视觉复核和用户选择。用户于 2026-07-28 按实际显示顺序选择 `1`，唯一绑定为 `Dense Scan Workbench`；方向本地合同见 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md`。当前仓库不能独立核验 Product Design `ideate` 的调用入口、提示词与三方向产物绑定，因此 B1 尚未通过；网页版 ChatGPT 与 Stitch 的当前真实阻塞见 `docs/prd/08_WO-E_方向1_外部设计门证据.md`。
+**三方向图稿与选择**：第一组历史候选稿保留在 `docs/prd/06_WO-E_Product_Design_三方向证据.md`，不再驱动后续设计。Product Design `ideate` 已按正式入口重跑；`docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md` 登记插件版本、完整提示词、三个独立产物标识、项目 PNG、SHA-256、人工视觉复核和用户选择。用户于 2026-07-28 按本轮实际显示顺序选择 `1`，唯一绑定为 `Scan Rail Workbench`；B1、B2 已通过，方向本地合同见 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md`。脱敏现状截图和网页版 ChatGPT、Stitch 的当前真实阻塞见 `docs/prd/08_WO-E_方向1_外部设计门证据.md`。
 
 ### WO-F Claim Validation 反幻觉层（2026-07-27 完成）
 
@@ -364,8 +364,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-H 任务 3：成交量影子摘要、自动分析落盘、离线评分脚本和测试完成；未进提示词
 - [x] WO-H 任务 4：`CONTEXT.md` 一页化和多市场前端设计包完成
 - [x] WO-E 前置设计合同：`docs/prd/05_多市场看盘前端设计包.md` 已冻结读模型、设置、并发、跨源、脱敏和四市场验收矩阵
-- [ ] WO-E Product Design 阶段 2：三个独立 ImageGen 候选稿、附件清单、产物标识、哈希、人工视觉复核和用户选择已登记；但 B1 要求的 Product Design `ideate` 调用入口、提示词与三方向产物绑定证据尚不可独立核验
-- [ ] WO-E 生产实现：用户已选择显示顺序 1，方向绑定本地合同已完成；Product Design B1、网页版 ChatGPT、Stitch、连续三轮精修、视觉审计、最终审美确认、PyQt6 和桌面验收仍未完成
+- [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
+- [ ] WO-E 生产实现：当前方向为 `Scan Rail Workbench`，方向绑定本地合同与脱敏现状截图已完成；网页版 ChatGPT、Stitch、连续三轮精修、视觉审计、最终审美确认、PyQt6 和桌面验收仍未完成
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
@@ -404,7 +404,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   `ok`，活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；风险闸门为
   OKX 私有读取故障已触发风险停止，Campaign 进程不存在且磁盘
   `active` 状态已过期。最近完成的 21:50–22:00 K 线为 `blocked:no_order`。Worker 启动
-  早于当前 `771c951`，没有加载本轮代码；最后本地账户快照已陈旧，本轮未查 OKX 私有接口，
+  早于审计时 `771c951`，也不可能加载其后的提交；最后本地账户快照已陈旧，本轮未查 OKX 私有接口，
   所以当前仓位、普通挂单和全部算法挂单仍未知。未取得私有只读硬门与用户运行态授权前不恢复
   Campaign、不重载。
 - [ ] WO-A 复审余项：固定代理 metadata 与实际配置缺共同指纹；当前禁止修改 `scripts`，
@@ -414,6 +414,6 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-E 设计门：先补齐或重新执行可核验的 Product Design `ideate`，再由用户确认方向；同时检查本机 ChatGPT Chrome 插件连接和文件访问权限，随后提交脱敏方向稿与本地合同。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区。
+3. WO-E 设计门：Product Design B1/B2 已完成；下一步检查本机 ChatGPT Chrome 插件连接和文件访问权限，提交已选方向稿、PRD05、PRD07 与脱敏现状截图，取得网页版 PRD 后进入 Stitch。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区。
 4. `shared/` 是否建 Git 仓库的决定。
 5. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。
