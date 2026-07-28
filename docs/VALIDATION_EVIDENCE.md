@@ -633,5 +633,29 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 
 - 固定代理 `metadata.json` 与实际 `config.json` 没有共同指纹。现有脚本无法把二者不一致本身识别为失败；只改测试无法忠实覆盖，而本轮明确禁止修改 `scripts`。
 - 长桥最后已知外部结果仍为 `401004 token invalid`，共享 env 自 2026-07-24 后没有更新；未运行真实三标的验收。
-- WO-E 仍等待用户在 A/B/C 中明确选择。前置合同完成不能冒充后续 PRD、Stitch、三轮图像精修、PyQt6 落地或桌面验收。
+- WO-E 用户已于 2026-07-28 按实际显示顺序选择 `1`；该选择只锁定方向，不能冒充后续网页版 ChatGPT PRD、Stitch、连续三轮图像精修、视觉审计、PyQt6 落地或桌面验收。
 - `D:\Desktop\Quant\shared` 是否建立独立 Git 仓库仍等待用户决定；没有执行 `git init`。
+
+## 2026-07-28 WO-E 方向 1 锁定与外部设计门
+
+### 方向与文档证据
+
+- 用户按本次对话中的实际显示顺序回复 `1`，唯一绑定到 `Dense Scan Workbench`：项目文件 `docs/prd/assets/wo_e_product_design/option-1-dense-scan-workbench.png`、原生尺寸 `1586×992`、SHA-256 `C2E4B45C62860C308B9F7EDD17825F0F72C8A96E98A742181486FCEF0AAA4C13`。
+- `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md` 已冻结方向骨架、候选稿删除项、六个首屏对象、数据路由、`QuoteSnapshot`、generation/request sequence、回滚、状态、文案、视觉门、M01–M17 和方向 1 补充验收 D01–D07，性质是外部 PRD 的本地输入合同。
+- 当前仓库不能独立核验 Product Design `ideate` 的调用入口、提示词与三方向产物绑定；`frontend-design` 验收项 B1 按失败处理，三张 ImageGen 候选稿和用户选择不能替代该证据。
+- 本次选择只通过三方向审美门。候选图仍缺精确 `1440×900`、唯一标题、完整文字+图标状态和冻结文案清理，不能进入生产实现。
+- 只读代码审查确认当前仍没有按市场本地自选、页面 `QuoteSnapshot`、市场时钟或 generation-aware 刷新链；方向 1 的可见落地必然修改 `pa_agent/gui`。用户原始禁区仍有效，选择方向不等于解除代码范围。
+
+### 外部工具真实结果
+
+- 应用内浏览器可以打开 ChatGPT，但当前未登录；提示词填入后页面要求登录，消息没有提交。
+- 已登录 Chrome 可以读取 ChatGPT 页面，但附件上传失败，随后扩展连接不可用；具体是注册、权限还是其他扩展故障尚未证明。Agent 没有自行安装、修改注册或绕过安全限制。
+- `docs/prd/08_WO-E_方向1_外部设计门证据.md` 保存了预备提示词、逐文件脱敏附件清单、输入缺口和真实阻塞。没有会话 URL、外部回答、Stitch Screen/版本或下载物，因此网页版 ChatGPT、Stitch 和三轮 ImageGen 均明确记为未完成。
+
+### 09:55–09:58 只读运行监控
+
+- Worker 服务和心跳运行；两库 `quick_check` 均为 `ok`；活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0。
+- OKX 私有读取故障已触发风险停止。Campaign 进程不存在，磁盘 `active` 状态已经过期，不能称为后台运行。
+- 最近耐久完成的是 2026-07-27 21:50–22:00 已收盘 10m K 线：Stage1/Stage2 均存在，终点 `wait`、trade confidence 38、结果 `blocked:no_order`。
+- Worker 启动早于当前 `HEAD=771c951`，没有加载本轮代码。最后本地账户快照已陈旧；本轮没有 OKX 私有接口证据，所以当前仓位、普通挂单和全部算法挂单均为实时真相阻断。
+- 本轮没有启动、停止或重载 Worker/Campaign，没有读取凭据，没有写租约、execution、订单或券商。

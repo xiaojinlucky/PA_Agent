@@ -1,4 +1,6 @@
-# WO-E Product Design 三方向证据
+# WO-E 三方向图稿与 Product Design 证据审计
+
+> 当前仓库能核验三次独立 ImageGen 产物、提示词合同、资产哈希和用户选择，但不能独立核验 Product Design `ideate` 的调用入口、完整提示词与三份产物绑定关系。`frontend-design` 验收项 B1 因此仍为失败；本文不把 ImageGen 三图冒充已完成的 Product Design `ideate`。
 
 ## 1. 设计任务
 
@@ -108,9 +110,9 @@
 
 三张候选稿足以支持用户选择信息层级和视觉方向，但已知偏差不能进入生产实现。用户选定后，第一轮精修必须逐项清除偏差，再进入视觉审计。
 
-### 6.4 独立 Product Design 视觉审查
+### 6.4 独立视觉审查（不等于 Product Design `ideate` 证据）
 
-独立审查结论为 `CONDITIONAL PASS`：三张图足以进入用户审美选择门，但都不是精修或生产验收通过。
+独立审查结论为 `CONDITIONAL PASS`：三张图足以取得用户对现有候选稿的信息层级偏好，但都不是 Product Design `ideate`、精修或生产验收通过。
 
 共同结论：
 
@@ -134,3 +136,14 @@
 3. 消除状态仅靠颜色表达。
 4. 修正方向 1 标题和方向 2 当前/历史分析语义。
 5. 重新逐项人工视觉验收后，才可进入下一设计阶段。
+
+### 6.5 用户方向选择
+
+2026-07-28，用户按本次对话中的实际显示顺序回复 `1`。该选择唯一绑定为：
+
+- `Dense Scan Workbench` / 高密度标的扫描工作台；
+- `docs/prd/assets/wo_e_product_design/option-1-dense-scan-workbench.png`；
+- 原生尺寸 `1586×992`；
+- SHA-256 `C2E4B45C62860C308B9F7EDD17825F0F72C8A96E98A742181486FCEF0AAA4C13`。
+
+本次选择记录的是用户对现有三张 ImageGen 候选稿的明确偏好，不等于 Product Design B1、最终精修稿或生产验收通过，也不清除第 6.3–6.4 节的已知偏差。方向绑定本地合同见 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md`。
