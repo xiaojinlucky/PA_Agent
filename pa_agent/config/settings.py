@@ -10,6 +10,7 @@ import time
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
 from copy import deepcopy
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from threading import RLock
@@ -28,6 +29,7 @@ DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggr
 DataSourceKind = Literal[
     "mt5", "tradingview", "longbridge", "okx", "akshare", "eastmoney", "tushare"
 ]
+MarketWorkspaceMarket = Literal["US", "HK", "CN", "Crypto"]
 NormalizationMode = Literal["strict", "lenient"]
 ExecutionBroker = Literal["longbridge", "okx"]
 LongbridgeAccountProfile = Literal["paper", "comprehensive", "intraday"]
@@ -305,6 +307,110 @@ class GeneralSettings(BaseModel):
         return v
 
 
+_MARKET_WORKSPACE_MARKETS = ("US", "HK", "CN", "Crypto")
+_MARKET_WORKSPACE_DEFAULT_SYMBOLS = {
+    "US": "AAPL.US",
+    "HK": "700.HK",
+    "CN": "600519.SH",
+    "Crypto": "XAU-USDT-SWAP",
+}
+
+
+def _default_market_workspace_timeframes() -> dict[str, str]:
+    return {market: "10m" for market in _MARKET_WORKSPACE_MARKETS}
+
+
+def _default_market_workspace_watchlists() -> dict[str, list[str]]:
+    return {
+        market: [symbol]
+        for market, symbol in _MARKET_WORKSPACE_DEFAULT_SYMBOLS.items()
+    }
+
+
+class MarketWorkspaceSettings(BaseModel):
+    """新多市场看盘页的独立本地设置，不改写旧分析页选择。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    selected_market: MarketWorkspaceMarket = "US"
+    last_symbols_by_market: dict[str, str] = Field(
+        default_factory=lambda: dict(_MARKET_WORKSPACE_DEFAULT_SYMBOLS)
+    )
+    display_timeframes_by_market: dict[str, str] = Field(
+        default_factory=_default_market_workspace_timeframes
+    )
+    watchlists_by_market: dict[str, list[str]] = Field(
+        default_factory=_default_market_workspace_watchlists
+    )
+
+    @model_validator(mode="after")
+    def _normalise_complete_market_maps(self) -> MarketWorkspaceSettings:
+        from pa_agent.data.market_workspace import (
+            normalise_symbol_for_market,
+        )
+
+        expected = set(_MARKET_WORKSPACE_MARKETS)
+
+        def reject_unknown(mapping: dict[str, object], field_name: str) -> None:
+            unknown = set(mapping) - expected
+            if unknown:
+                raise ValueError(
+                    f"{field_name} 包含不支持的市场：{', '.join(sorted(unknown))}"
+                )
+
+        reject_unknown(self.last_symbols_by_market, "last_symbols_by_market")
+        reject_unknown(
+            self.display_timeframes_by_market,
+            "display_timeframes_by_market",
+        )
+        reject_unknown(self.watchlists_by_market, "watchlists_by_market")
+
+        symbols: dict[str, str] = {}
+        timeframes: dict[str, str] = {}
+        watchlists: dict[str, list[str]] = {}
+        for market in _MARKET_WORKSPACE_MARKETS:
+            raw_symbol = str(
+                self.last_symbols_by_market.get(
+                    market,
+                    _MARKET_WORKSPACE_DEFAULT_SYMBOLS[market],
+                )
+                or ""
+            ).strip()
+            symbols[market] = normalise_symbol_for_market(
+                market,  # type: ignore[arg-type]
+                raw_symbol,
+            )
+
+            timeframe = str(
+                self.display_timeframes_by_market.get(market, "10m") or ""
+            ).strip()
+            if timeframe not in {"10m", "1h", "4h"}:
+                raise ValueError(f"{market} 的展示周期只支持 10m、1h、4h")
+            timeframes[market] = timeframe
+
+            raw_watchlist = self.watchlists_by_market.get(
+                market,
+                [_MARKET_WORKSPACE_DEFAULT_SYMBOLS[market]],
+            )
+            if len(raw_watchlist) > 100:
+                raise ValueError(f"{market} 的自选不能超过 100 项")
+            normalized = [
+                normalise_symbol_for_market(
+                    market,  # type: ignore[arg-type]
+                    item,
+                )
+                for item in raw_watchlist
+            ]
+            if len(set(normalized)) != len(normalized):
+                raise ValueError(f"{market} 的自选标的不能重复")
+            watchlists[market] = normalized
+
+        self.last_symbols_by_market = symbols
+        self.display_timeframes_by_market = timeframes
+        self.watchlists_by_market = watchlists
+        return self
+
+
 _FEISHU_CONFIG_KEYS = (
     "enabled",
     "webhook_url",
@@ -421,6 +527,9 @@ class Settings(BaseModel):
     ai_profiles: dict[str, AIProviderProfile] = Field(default_factory=dict)
     ai_roles: AIRoleBindings = Field(default_factory=AIRoleBindings)
     general: GeneralSettings = Field(default_factory=GeneralSettings)
+    market_workspace: MarketWorkspaceSettings = Field(
+        default_factory=MarketWorkspaceSettings
+    )
     prompt: PromptSettings = Field(default_factory=PromptSettings)
     validation: ValidationSettings = Field(default_factory=ValidationSettings)
     feishu: FeishuSettings = Field(default_factory=FeishuSettings)
@@ -791,6 +900,73 @@ def save_ai_profile_activation(
         merged.active_ai_profile_id = requested.active_ai_profile_id
         merged.provider = requested.provider.model_copy(deep=True)
         merged.sync_active_ai_profile()
+        merged.revision = latest.revision + 1
+        _write_settings_candidate(path, merged)
+        return merged
+
+
+@dataclass(frozen=True, slots=True)
+class MarketWorkspacePersistenceBaseline:
+    """保存线程所需的最小非机密基线。"""
+
+    revision: int
+    workspace: MarketWorkspaceSettings
+
+    @classmethod
+    def from_settings(
+        cls,
+        settings: Settings,
+    ) -> MarketWorkspacePersistenceBaseline:
+        return cls(
+            revision=settings.revision,
+            workspace=settings.market_workspace.model_copy(deep=True),
+        )
+
+
+def save_market_workspace_settings(
+    baseline: MarketWorkspacePersistenceBaseline,
+    candidate_workspace: MarketWorkspaceSettings,
+    path: Path | None = None,
+) -> Settings:
+    """只保存多市场页设置，并保留其他进程已经落盘的无关设置。
+
+    若磁盘上的多市场页设置本身已由另一个窗口修改，则失败关闭，避免
+    一个迟到保存覆盖另一个窗口的更新。
+    """
+
+    from pa_agent.config.paths import SETTINGS_JSON_PATH
+
+    path = path or SETTINGS_JSON_PATH
+    path.parent.mkdir(parents=True, exist_ok=True)
+    requested = MarketWorkspaceSettings.model_validate(
+        candidate_workspace.model_dump(mode="python")
+    )
+
+    with _settings_file_lock(path):
+        if not path.exists():
+            raise OSError("当前设置文件不存在，不能执行分区合并保存")
+        latest = _read_settings_snapshot(path)
+        if latest.revision < baseline.revision:
+            raise SettingsConflictError(
+                "磁盘设置 revision 早于多市场页保存基线"
+            )
+        if (
+            latest.revision != baseline.revision
+            and latest.market_workspace != baseline.workspace
+        ):
+            raise SettingsConflictError(
+                "多市场看盘设置已在另一个窗口或进程中修改"
+            )
+        if (
+            latest.revision == baseline.revision
+            and latest.market_workspace != baseline.workspace
+        ):
+            raise SettingsConflictError(
+                "多市场看盘设置与当前基线不一致"
+            )
+
+        merged = latest.model_copy(deep=True)
+        merged.market_workspace = requested.model_copy(deep=True)
         merged.revision = latest.revision + 1
         _write_settings_candidate(path, merged)
         return merged

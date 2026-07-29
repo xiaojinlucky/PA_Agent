@@ -26,6 +26,45 @@ _MARKET_SOURCES: dict[str, str] = {
     "Crypto": "okx",
 }
 _DISPLAY_TIMEFRAMES = frozenset({"10m", "1h", "4h"})
+_STOCK_SUFFIXES = (".US", ".HK", ".SH", ".SZ")
+
+
+def normalise_symbol_for_market(
+    market: MarketCode,
+    symbol: object,
+) -> str:
+    """规范标的并拒绝把一个市场的代码套到另一个市场。"""
+
+    normalized = _normalise_identity_text(
+        symbol,
+        field_name="symbol",
+    ).upper()
+    valid = False
+    if market == "US":
+        valid = normalized.endswith(".US")
+    elif market == "HK":
+        valid = normalized.endswith(".HK")
+    elif market == "CN":
+        valid = normalized.endswith((".SH", ".SZ"))
+    elif market == "Crypto":
+        parts = normalized.split("-")
+        valid = (
+            len(parts) >= 2
+            and all(parts)
+            and not normalized.endswith(_STOCK_SUFFIXES)
+        )
+    if not valid:
+        raise ValueError(f"{market} 标的格式不匹配：{normalized}")
+    return normalized
+
+
+def quote_source_for_market(market: MarketCode) -> QuoteSource:
+    """返回固定市场路由，调用方不能自由声明行情来源。"""
+
+    source = _MARKET_SOURCES.get(str(market))
+    if source is None:
+        raise ValueError(f"不支持的市场：{market}")
+    return source  # type: ignore[return-value]
 
 
 class QuoteFreshness(StrEnum):
@@ -162,10 +201,10 @@ class SelectionIdentity:
             raise ValueError(f"不支持的市场：{market}")
         if source != expected_source:
             raise ValueError(f"{market} 必须使用 {expected_source} 行情源")
-        symbol = _normalise_identity_text(
+        symbol = normalise_symbol_for_market(
+            market,  # type: ignore[arg-type]
             self.symbol,
-            field_name="symbol",
-        ).upper()
+        )
         display_timeframe = _normalise_identity_text(
             self.display_timeframe,
             field_name="display_timeframe",
@@ -535,7 +574,8 @@ class WatchlistRequestToken:
         if not self.symbols or len(self.symbols) > 100:
             raise ValueError("首版自选必须包含 1 到 100 项")
         normalized = tuple(
-            _normalise_identity_text(symbol, field_name="symbol").upper() for symbol in self.symbols
+            normalise_symbol_for_market(self.market, symbol)
+            for symbol in self.symbols
         )
         if len(set(normalized)) != len(normalized):
             raise ValueError("自选标的不能重复")
@@ -600,6 +640,22 @@ class WatchlistGenerationGate:
         )
         self._latest = token
         return token
+
+    def invalidate(self, symbols: tuple[str, ...] | None = None) -> None:
+        """使在途批次失效；传入新列表时同时推进 change sequence。"""
+
+        if symbols is not None:
+            normalized = tuple(
+                _normalise_identity_text(
+                    symbol,
+                    field_name="symbol",
+                ).upper()
+                for symbol in symbols
+            )
+            if normalized != self._symbols:
+                self._change_sequence += 1
+                self._symbols = normalized
+        self._latest = None
 
     def accepts(
         self,
@@ -722,8 +778,10 @@ class KlineEvidenceView:
             raise ValueError("KlineEvidenceView schema_version 当前必须为 1")
         if self.request_sequence < 1:
             raise ValueError("request_sequence 必须大于等于 1")
-        if min(self.bar_count, self.closed_bar_count, self.required_closed_bars) < 0:
+        if min(self.bar_count, self.closed_bar_count) < 0:
             raise ValueError("K 线数量不能为负数")
+        if self.required_closed_bars < 2:
+            raise ValueError("required_closed_bars 至少为 2")
         if self.closed_bar_count > self.bar_count:
             raise ValueError("已收盘 K 线数量不能超过总数")
         if self.received_at_utc_ms < 0 or self.analysis_as_of_utc_ms < 0:
@@ -953,6 +1011,19 @@ class AnalysisResultView:
             raise ValueError("AnalysisResultView 只接受 analysis 请求")
         if not gate.accepts(token):
             raise ValueError("分析请求已经被较新的 generation 或 sequence 取代")
+        return cls.from_bound_record(record, token=token)
+
+    @classmethod
+    def from_bound_record(
+        cls,
+        record: Any,
+        *,
+        token: RequestToken,
+    ) -> AnalysisResultView:
+        """投影控制器确实发出的冻结请求，包括已被页面切换取代的历史结果。"""
+
+        if token.family != RequestFamily.ANALYSIS:
+            raise ValueError("AnalysisResultView 只接受 analysis 请求")
         meta = getattr(record, "meta", None)
         if meta is None:
             raise ValueError("分析记录缺少 meta")
@@ -1039,7 +1110,11 @@ class AnalysisResultView:
             terminal_outcome=_optional_text(terminal.get("outcome")),
             reasoning=_optional_text(decision.get("reasoning")),
             error_category=(
-                _optional_text(exception.get("category")) if isinstance(exception, dict) else None
+                _optional_text(
+                    exception.get("category") or exception.get("type")
+                )
+                if isinstance(exception, dict)
+                else None
             ),
             error_stage=(
                 _optional_text(exception.get("stage")) if isinstance(exception, dict) else None

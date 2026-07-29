@@ -705,9 +705,9 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - PRD05 已冻结 10m K 线宽限和交易槽算法：`max(15,000ms, 3 × refresh_interval_ms)`，日历可用时按最近应完成合法交易槽判断，Crypto 按 UTC 连续槽，股票日历未知时使用明确的失败关闭窗口。首版分析主周期固定为 10m；1h/4h 只作身份一致、顺序严格且全部已收盘的背景证据。当前界面“超过 10 秒没有刷新”的标签不得替代分析门禁。
 - PUBLIC 安全审查未发现凭据、真实 token、账户身份、余额、订单、持仓、盈亏、个人信息、绝对私密路径或密钥；保存的会话 URL 不授予第三方访问。ChatGPT 沙箱自报的另一 PNG 指纹没有可独立复算的上传副本，未用于覆盖项目原图身份。
 
-### 当前外部门与运行态
+### 当时的外部门与运行态（已被后续 PRD11 拍板取代）
 
-- ChatGPT Web B3 通过。Stitch 已实际提交并创建项目，但视觉结果被用户否决；新的 ChatGPT Images 2.0 三张样板、用户选择、机器可读设计规格、视觉审计和最终审美确认仍未完成。
+- ChatGPT Web B3 通过。Stitch 已实际提交并创建项目，但视觉结果被用户否决；当时计划的 ChatGPT Images 2.0 三张样板没有完成。后续 v0.1.0 工单已明确以 PRD11 直接实现，该历史缺口不再是生产前置条件。
 - 用户授权官方恢复流程后，实际打开新的 Chrome Profile 1 窗口并只重试一次，扩展连接成功；登录态 Stitch 已打开并切换到 `Web` 模式。五个文件均存在且指纹核对通过，用户随后明确确认“五个附件已显示”，因此此前“权限未开启、附件未上传”的推断作废。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 参考规则已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认项目 `8039115259020616674` 已创建，地址为 `https://stitch.withgoogle.com/projects/8039115259020616674`，页面标题为 `Stitch - Projects`。Chrome 后台页面接管没有取得 Screen ID、版本、生成图或下载物，但用户已直接看到结果并明确判定效果远未达到预期；该稿因此作废，不登记为现役设计资产。
 - 2026-07-28 用户改选网页版 ChatGPT Images 2.0 路线。PRD08 已冻结三张独立 1440×900 样板的共同提示词、三个差异方向，以及选图后的 evidence bundle：原始样板、标注图、DTCG 结构的 `design-spec.json`、组件状态、资产清单、PyQt6 映射和 `design-qa.md`。外部生成只上传两张已脱敏 PNG 与 PRD05/07/10；Longbridge 原始接触表只在本地提炼规则，不上传。用户刷新后，Chrome 后台接口能列出标签页；Agent 另开一个同登录态 ChatGPT 页后也曾成功读取“与 ChatGPT 聊天”输入框。但既有页的页面快照、截图和底层调试命令均超时；新页打开“添加文件等”后也在附件菜单、上传控件读取阶段连续超时并失去响应。没有文件上传成功、没有提示词提交、没有生成任务。用户允许可视操作后，Windows 控制仍因无法高置信确认当前网址而在点击、输入和上传前安全终止，所以新样板真实产物仍为 0/3。
 - 官方接口核查：Longbridge `QuoteContext.quote(symbols)` 单次最多 500 个标的，项目本地 `longbridge 4.3.2` 签名与官方入口一致；当前 100 项自选可单次读取，但真实 OpenAPI 权限仍受失效 token 阻塞。OKX `/market/tickers` 无需认证，按 SPOT/SWAP 最多两个串行类型快照后本地筛选，不能伪造多标的参数。OKX `/market/candles` 单页最多 300、`after` 向旧翻页、最近覆盖 1,440 根；现有最大 10m 请求最坏需 602 根 5m、最多三页，正确实现仍需极窄解除 `pa_agent/execution/okx_client.py` 禁区。
@@ -750,3 +750,10 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 首轮同一非 live 全仓命令为 2074 项通过、0 失败、0 错误、0 跳过；补入供应商乱序、权限元数据失败、权限证据矛盾、短时缓存到期刷新、未知行情级别、失败重连旧权限、半日市闭市标签和响应后收到时间八条边界回归后，最终为 2082 项通过、0 失败、0 错误、0 跳过，CI 下限同步固定为 2082。
 - staged gitleaks 首次把测试中的公开 Longbridge 套餐标识误判为通用 API key；扫描失败后先清空暂存区，再把测试改为运行时拼接同一公开值，没有设置扫描豁免。该测试表达式改写后的 Windows 单进程全量连续两次在第 2 项后触发既有 pyqtgraph `AxisItem` 析构竞态并使进程崩溃，没有产生断言失败；按既有 Windows 隔离方法，4 个 E2E 各自生成 JUnit，其余 2078 项另行生成 JUnit，机器汇总为 2082 项通过、0 失败、0 错误、0 跳过。提交级 GitHub CI 仍使用原始单进程全量命令，不能用本地隔离结果替代远端复证。
 - B1 实现提交 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 已精确推送到 `origin/main`；GitHub Actions run `30477680216` 全绿。远端原始单进程确定性门共 2082 项、0 失败、0 错误、1 项跳过；该跳过仍是 UTC 主机上的既有 `tests.unit.test_datetime_ts::test_naive_local_to_utc_uses_host_offset`。独立 live 健康检查共 7 项、0 失败、0 错误、7 项跳过，`step_outcome=success`、`health_status=unavailable`。证据包 `ci-evidence-1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 已下载核对：完整 Git SHA 与目标提交一致，Python 为 3.12.10，`pip-freeze.txt` 为 91 行且 SHA-256 为 `E3202E1E9B4E9F76F8A1267F52D20B42AF37777217DAC6B3E061CCBF0EFBC602`。
+
+## 2026-07-29 v0.1.0 阶段 B2：无 Qt 多市场 Controller
+
+- 新增纯 Python `MarketWorkspaceController`，统一拥有市场选择、自选、各请求族序号、行情来源、唯一分析截止时间、设置保存和分析状态；`AppContext` 只负责构造它。源码静态检查证明不导入 Qt 或 `pa_agent.execution`，测试替身也没有调用交易写接口。
+- 设置保存采用独立 `MarketWorkspaceSettings` 快照和 revision 基线：迟到成功不能覆盖新状态，失败可重试，revision 冲突失败关闭；不完整或与请求不一致的返回值会先进入明确失败终态，再抛出错误，不会卡在“保存中”。
+- 行情、自选和分析回调均绑定 Controller 发出的完整请求快照。逆序回调、快速切换、认证失败恢复、行情陈旧、Crypto 连续市场、分析中切换及不完整返回值都有直接反例。三轮对抗审查指出的 P1 均已按原反例复证关闭；旧的 32 项静默淘汰会遗忘迟到认证失败和分析证据，现已移除。长期无回调时登记表可能增长，作为不影响当前正确性的 P2 资源治理项保留，禁止用静默丢事实的方式处理。
+- 扩展定向测试 230 项通过、0 失败；原始完整非 live 命令为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为忽略目录 `scratch/validation/b2-final.xml`。Ruff 定向检查和 `git diff --check` 均通过；提交级 SHA 与 GitHub CI 证据将在推送后追加。

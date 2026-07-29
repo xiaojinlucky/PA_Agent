@@ -150,9 +150,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **验收标准**：3 个符号 `record_status=complete`、无 error；人工抽查 Stage1 输出里 K 线时间为交易所当地时间、市场规则块出现在提示词（记录文件里有完整 prompt）；`acceptance_pass: true`。
 
-### WO-E P1 前端（市场切换 + 自选 + 市场时钟）——必须走 GUI 强制设计流程
+### WO-E P1 前端（市场切换 + 自选 + 市场时钟）——按 PRD11 直接实现
 
-**不可跳过的流程**（`CLAUDE.md` GUI 设计强制流程）：页面功能/字段/状态/交互合同 → Product Design 三方向 → **用户审美确认** → 网页版 ChatGPT PRD → Stitch → ≥3 轮图片精修 → `$design-taste-frontend` 审计 → 才可写 PyQt6 生产代码。零副标题门禁。
+**当前拍板**：PRD11 是新多市场页的最终实现规格，覆盖旧 Stitch、ImageGen、外部样稿和历史图片精修门。B2 无 Qt Controller 通过提交级 CI 后直接进入原生 PyQt6 实现；仍须执行 `$frontend-design`、`$design-taste-frontend` 审计、离屏尺寸/缩放矩阵和最终真实桌面验收。
 
 **页面合同真值**：`docs/prd/05_多市场看盘前端设计包.md` 已完成阶段 0/1，并冻结以下内容：`QuoteSnapshot` 精确字段与新鲜度、可测 K 线新鲜度、四市场最近标的/本地自选及旧设置迁移、selection generation、Longbridge 内 US/HK/CN 事务、Longbridge↔OKX 跨源提交/回滚/迟到结果、界面文案、脱敏输入和 M01–M17 二元验收。方向 1 的 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md` 另冻结 D01–D07，包括高密自选集合、同 generation 设置保存、只分析不执行、完整壳层尺寸、认证优先级和异步暂存提交。下列摘要只作索引，不替代两份合同：
 - 主问题：当前看的是哪个市场的哪个标的、市场开没开、数据新不新鲜。
@@ -368,7 +368,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
 - [x] WO-E ChatGPT Web 阶段 3：四个脱敏附件与完整提示词已真实提交；会话 URL、完整回答、内容指纹和 F01–F22 本地裁决已登记，B3 通过
 - [x] 2026-07-28 WO-E Chrome 官方恢复、附件与参考规则核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，用户已确认附件显示。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 结构、令牌、密度和负面约束已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认 Stitch 项目 `8039115259020616674` 已创建（`https://stitch.withgoogle.com/projects/8039115259020616674`，标题 `Stitch - Projects`）。用户已直接审美否决该结果，Stitch 稿作废且不进入实现。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
-- [ ] WO-E 剩余设计与生产实现：用本机 Chrome 网页版 ChatGPT Images 2.0 生成三张独立 1440×900 样板，用户选择后生成机器可读设计规格并完成同尺寸视觉审计；PyQt6 和桌面验收仍未完成
+- [ ] WO-E 剩余生产实现：PRD11 已取代 ChatGPT Images 2.0 样板路线；B2 提交级 CI
+  通过后直接实现原生 PyQt6、离屏视觉矩阵和真实桌面验收
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
@@ -431,12 +432,13 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   execution service 或券商写接口。
 - [x] 2026-07-29 WO-E 外部设计移交：PRD11 成为唯一版前端设计合同。旧 Stitch、
   ChatGPT Images 和浏览器自动化路线降为历史，不再是开发门。
-- [ ] WO-E 视觉生产实现：等待用户从其他大模型取得样稿后实现原生 PyQt6，并使用已验证的
-  Longbridge 行情档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
+- [ ] WO-E 视觉生产实现：B2 无 Qt Controller 已完成本地 2137 项非 live 零失败验证，待目标
+  SHA 的 CI 复证后直接实现原生 PyQt6；不等待外部样稿。最终使用已验证的 Longbridge 行情
+  档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
 
 ## 6. 用户侧待办（只有用户能做）
 
 1. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作，轮换后记得同步仓库外的 `D:\Desktop\Quant\env`。当前 `LONGBRIDGE_COMPREHENSIVE` 行情档案已真实可用，不要求为本工单重签。
-2. WO-E 设计门：外部视觉设计只认 PRD11；Stitch、ChatGPT Images 和浏览器自动化过程已经降为历史。用户取得外部样稿后，再解除 `pa_agent/gui` 禁区并进入原生 PyQt6 实现与同尺寸视觉审计。
+2. WO-E 真实桌面终验：生产实现只认 PRD11，不等待外部样稿。Agent 先完成 PyQt6 与离屏矩阵；用户最后从 `D:\Desktop\PA_Agent.lnk` 启动并完成真实 Longbridge/Crypto 快速切换与缩放验收。
 3. `shared/` 是否建 Git 仓库的决定。
 4. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。

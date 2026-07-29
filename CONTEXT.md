@@ -8,7 +8,7 @@
 - WO-F Claim Validation 完整闭环已由 `c0b58d0` 推送：Stage1 支撑/阻力、Stage2 入场/止损/两档止盈、K 线引用和行情源声明的真实 `price_tick` 均已接入硬校验；校验只拒绝，不修正或补写模型声明。
 - 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
 - 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
-- v0.1.0 正在按 PRD11 直接推进，不再等待 Stitch、ImageGen 或外部样稿。B1 已由 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 完成 Longbridge 时间、服务端权限、批量一致性、统一 `analysis_as_of`、高周期可缺、半日市与 tick 能力门；GitHub Actions run `30477680216` 全绿。下一步是无 Qt Controller、AppContext 和原生 PyQt6 新页，旧 OKX Demo 工作台保持不动。
+- v0.1.0 正在按 PRD11 直接推进，不再等待 Stitch、ImageGen 或外部样稿。B1 已由 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 完成 Longbridge 合同并通过 CI；B2 已完成无 Qt `MarketWorkspaceController`、独立设置持久化合同和 `AppContext` 接线，本地非 live 2137 项通过、0 失败，待提交级 CI 复证。下一步是原生 PyQt6 新页，旧 OKX Demo 工作台保持不动。
 - P0-01 公共执行层一次性授权已完成源码与 CI 闭环，并由 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 发布：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的竞态和证据缺口均已补齐。本地确定性主门 2048 项通过、0 失败；该 SHA 的 GitHub Actions run `30447988360` 全绿，远端确定性门 2047 项通过、0 失败，另有 1 项因 CI 主机使用 UTC 而按既有规则跳过。独立 live 健康检查 7 项均因外部端点或测试密钥不可用而跳过、0 失败。P0 源码与提交级证据已关闭；运行中的旧 Worker 未重载，所以运行态尚未生效。
 
 ## 上次停在哪
@@ -20,7 +20,7 @@
 - `COMPREHENSIVE` 行情档案已用同一只读 QuoteContext 真实验证 AAPL.US、700.HK、600519.SH 的报价与 10m/1h/4h；三市场服务端权限均为实时。Longbridge 未提供权威统一 tick，股票页只能展示并在 AI 前阻断价格分析；真实三市场桌面矩阵仍留给 C 阶段。
 - WO-A 仍有一个真实 P2：固定代理 metadata 与实际 `config.json` 没有共同指纹，无法检测二者不一致；本轮明确禁止修改 `scripts`，因此不能用假测试冒充完成。
 - WO-E 已核实 Longbridge 官方批量报价单次 500 个标的，当前 100 项自选无需循环订阅；OKX 可按 SPOT/SWAP 最多两个串行全量 ticker 快照后严格筛选。OKX 10m 最坏需 602 根 5m、最多三页；现有只读客户端缺 `after`，正确修复需要极窄解除 `pa_agent/execution/okx_client.py` 禁区。
-- B1 最终全仓非 live 覆盖为 2082 项通过、0 失败、0 错误、0 跳过，CI 数量下限同步固定为 2082；Windows 最终候选因既有 Qt 析构竞态采用 4 个 E2E 独立进程加其余 2078 项的机器 JUnit 汇总，目标提交的 GitHub CI 仍用原始单进程命令复证。权限套餐与行情级别矛盾或级别未知都会失败关闭，实时和延迟权限证据最多缓存 5 分钟并在到期后重读服务端。报价收到时间由数据源在响应后盖章，半日市提前收盘后仍保留半日市标签。阶段 A 仍因固定 OKX 代理端口无监听而冻结，未迁移数据库、重载 Worker、清风险停止或发 Demo 命令。
+- B2 最终本地非 live 覆盖为 2137 项通过、0 失败、0 错误、0 跳过，CI 数量下限同步提高到 2137。Controller 独占 selection/watchlist/request sequence/source/as_of/设置保存/分析状态；逆序回调、快速切换、认证恢复、保存迟到/失败、分析中切换和不完整响应均失败关闭，且源码不导入 Qt 或执行层。阶段 A 仍因固定 OKX 代理端口无监听而冻结，未迁移数据库、重载 Worker、清风险停止或发 Demo 命令。
 
 ## 近期关键决定
 

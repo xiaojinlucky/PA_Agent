@@ -12,10 +12,13 @@ import pytest
 import pa_agent.config.settings as settings_module
 from pa_agent.config.settings import (
     AIProviderSettings,
+    MarketWorkspacePersistenceBaseline,
+    MarketWorkspaceSettings,
     Settings,
     SettingsConflictError,
     load_settings,
     save_ai_profile_activation,
+    save_market_workspace_settings,
     save_settings,
 )
 
@@ -94,6 +97,163 @@ def test_longbridge_source_and_per_source_symbols_round_trip(tmp_path):
     assert loaded.general.last_symbol == "AAPL.US"
     assert loaded.general.last_symbols_by_source["mt5"] == "XAUUSD"
     assert loaded.general.last_symbols_by_source["longbridge"] == "AAPL.US"
+
+
+def test_market_workspace_settings_round_trip_is_independent_from_legacy_page(
+    tmp_path,
+) -> None:
+    path = tmp_path / "settings.json"
+    settings = Settings()
+    settings.market_workspace = MarketWorkspaceSettings(
+        selected_market="HK",
+        last_symbols_by_market={
+            "US": "MSFT.US",
+            "HK": "700.HK",
+            "CN": "600519.SH",
+            "Crypto": "BTC-USDT",
+        },
+        display_timeframes_by_market={
+            "US": "1h",
+            "HK": "10m",
+            "CN": "4h",
+            "Crypto": "10m",
+        },
+        watchlists_by_market={
+            "US": ["MSFT.US", "AAPL.US"],
+            "HK": ["700.HK"],
+            "CN": [],
+            "Crypto": ["BTC-USDT"],
+        },
+    )
+    settings.general.last_data_source = "mt5"
+    settings.general.last_symbol = "XAUUSDm"
+
+    save_settings(settings, path)
+    loaded = load_settings(path)
+
+    assert loaded.market_workspace == settings.market_workspace
+    assert loaded.general.last_data_source == "mt5"
+    assert loaded.general.last_symbol == "XAUUSDm"
+
+
+def test_market_workspace_settings_reject_unknown_market_duplicate_or_bad_timeframe() -> None:
+    with pytest.raises(ValueError):
+        MarketWorkspaceSettings(
+            watchlists_by_market={
+                "US": ["AAPL.US", "aapl.us"],
+                "HK": ["700.HK"],
+                "CN": ["600519.SH"],
+                "Crypto": ["BTC-USDT"],
+            }
+        )
+    with pytest.raises(ValueError):
+        MarketWorkspaceSettings(
+            display_timeframes_by_market={
+                "US": "5m",
+                "HK": "10m",
+                "CN": "10m",
+                "Crypto": "10m",
+            }
+        )
+    with pytest.raises(ValueError):
+        MarketWorkspaceSettings(
+            last_symbols_by_market={
+                "US": "AAPL.US",
+                "HK": "700.HK",
+                "CN": "600519.SH",
+                "Crypto": "BTC-USDT",
+                "OTHER": "UNKNOWN",
+            }
+        )
+    with pytest.raises(ValueError, match="US"):
+        MarketWorkspaceSettings(
+            last_symbols_by_market={
+                "US": "700.HK",
+                "HK": "700.HK",
+                "CN": "600519.SH",
+                "Crypto": "BTC-USDT",
+            }
+        )
+
+
+def test_market_workspace_save_merges_unrelated_concurrent_change(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    original = Settings()
+    save_settings(original, path)
+    baseline = load_settings(path)
+
+    concurrent = load_settings(path)
+    concurrent.general.last_timeframe = "1m"
+    save_settings(concurrent, path)
+
+    requested = baseline.market_workspace.model_copy(
+        update={
+            "selected_market": "HK",
+            "last_symbols_by_market": {
+                **baseline.market_workspace.last_symbols_by_market,
+                "HK": "9988.HK",
+            },
+        },
+        deep=True,
+    )
+    saved = save_market_workspace_settings(
+        MarketWorkspacePersistenceBaseline.from_settings(baseline),
+        requested,
+        path,
+    )
+    reloaded = load_settings(path)
+
+    assert saved.market_workspace.selected_market == "HK"
+    assert reloaded.market_workspace.last_symbols_by_market["HK"] == "9988.HK"
+    assert reloaded.general.last_timeframe == "1m"
+
+
+def test_market_workspace_save_fails_closed_on_concurrent_workspace_change(
+    tmp_path,
+) -> None:
+    path = tmp_path / "settings.json"
+    original = Settings()
+    save_settings(original, path)
+    stale = load_settings(path)
+
+    current = load_settings(path)
+    current.market_workspace = current.market_workspace.model_copy(
+        update={"selected_market": "CN"},
+        deep=True,
+    )
+    save_settings(current, path)
+
+    requested = stale.market_workspace.model_copy(
+        update={"selected_market": "HK"},
+        deep=True,
+    )
+    with pytest.raises(SettingsConflictError, match="多市场"):
+        save_market_workspace_settings(
+            MarketWorkspacePersistenceBaseline.from_settings(stale),
+            requested,
+            path,
+        )
+
+    assert load_settings(path).market_workspace.selected_market == "CN"
+
+
+def test_market_workspace_save_rejects_regressed_disk_revision(tmp_path) -> None:
+    path = tmp_path / "settings.json"
+    save_settings(Settings(), path)
+    baseline = load_settings(path)
+    regressed = baseline.model_copy(deep=True)
+    regressed.revision = baseline.revision - 1
+    path.write_text(
+        json.dumps(regressed.model_dump(mode="json")),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SettingsConflictError, match="revision"):
+        save_market_workspace_settings(
+            MarketWorkspacePersistenceBaseline.from_settings(baseline),
+            baseline.market_workspace,
+            path,
+        )
 
 
 def test_active_source_symbol_map_drives_startup_symbol(tmp_path):

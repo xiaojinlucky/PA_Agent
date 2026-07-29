@@ -1,7 +1,7 @@
 # PA_Agent 工单进度
 
 - 2026-07-29 多市场后端与无界面连接层已补强：新增 `market_workspace` 纯合同、Longbridge/OKX 批量报价、OKX K 线 `after` 分页与 10m 三页聚合、类型化 Longbridge 认证失败、K 线证据和独立只分析结果投影。全仓 2030 项通过、3 项跳过、0 失败；没有交易写入或运行态修改。
-- 外部前端设计只认 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`。Stitch、ChatGPT Web Images 和浏览器自动化记录降为历史，不再是开发门；`pa_agent/gui` 尚未修改，PyQt6 视觉实现仍待外部样稿返回后开始。
+- 前端实现只认 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`。Stitch、ChatGPT Web Images、浏览器自动化和外部样稿都不再是开发门；`pa_agent/gui` 尚未修改，B2 通过提交级 CI 后直接开始 PyQt6 视觉实现。
 - 本轮 WO-E 文档开工基线为 `HEAD=origin/main=86bfb8e0c668479866038dd959e2b72cefc94811`；分支为 `main`，上游为 PUBLIC `origin/main`。更早的 WO-F 与完成证据复审已分别由 `c0b58d0`、`7e6c095` 发布。
 - 完成证据复审补齐了 system prompt 字节稳定、固定代理端口抢占、长桥分页/日历边界，以及 Campaign 异常耐久收口与零重复写回归。
 - NEW_RISK 最小权限修复已落在 `pa_agent/okx_demo_campaign.py`：动态杠杆、正常提交和 READY 恢复提交只在 Worker 命令返回耐久终态后释放租约；等待超时、读取异常或非终态结果不提前释放，进程收口仍会撤销租约，RUNNING 命令继续阻止再次授权。下一条新增风险命令重新执行私有只读预检并申请租约。定向回归 130 项通过、0 失败，unit/property/integration 为 1966 项通过、7 项跳过、0 失败。
@@ -10,7 +10,7 @@
 - WO-E 设计合同已补齐 `QuoteSnapshot`、可测的 10m K 线新鲜度、四市场设置迁移、generation、Longbridge 内切换、Longbridge↔OKX 跨源回滚、脱敏输入、M01–M17 和 D01–D07；首版分析主周期固定为 10m，1h/4h 只作背景证据。Product Design B1、用户选择 B2 与 ChatGPT Web B3 已通过。完整网页回答、内容指纹和 F01–F22 本地裁决已落盘；当前没有修改 PyQt6。
 - WO-A 仍有一项未闭合：固定代理 metadata 与实际配置缺共同指纹。只改测试无法证明不存在不一致，本轮又禁止修改 `scripts`。
 - 长桥旧默认档案仍无效，但完整的 `COMPREHENSIVE` 行情档案已经服务端真实验证；沪深报价和 1h/4h/1d K 线均可读取。该档案只通过非机密选择项启用，凭据没有进入代码、日志、测试或 Git。
-- WO-E 的浏览器、Stitch 和 ChatGPT Images 路线已由用户终止。后端与无界面连接层已经补齐；外部视觉设计只认 PRD11。当前剩余工作是用户取得外部样稿后实现 PyQt6，并使用已验证的 Longbridge 行情档案完成三股票市场桌面验收。
+- WO-E 的浏览器、Stitch 和 ChatGPT Images 路线已由用户终止。后端与无界面连接层已经补齐；生产实现只认 PRD11，不等待外部样稿。当前剩余工作是实现 PyQt6，并使用已验证的 Longbridge 行情档案完成三股票市场与 Crypto 桌面验收。
 - 当前最新已知运行态证据来自 2026-07-29 15:17 的只读审计：Worker 与心跳运行，两库健康，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；但风险停止为 `risk_runtime_BrokerTransportError`，Campaign 不存在且磁盘 `active` 状态过期。运行中 Worker 仍是旧 schema v4 代码；未经新的 OKX Demo 私有只读硬门和用户授权不重载。
 - WO-H、WO-C2、WO-F、WO-G-1/2/3 已完成；成交量仍不进入提示词或交易判断。
 - `WO-POS-05` 只有路线图级目标且会触碰当前禁止修改的执行链，本轮不越界开工。
@@ -53,3 +53,6 @@
 - B1 全仓非 live 门最终为 2082 项通过、0 失败、0 错误、0 跳过；CI 数量下限同步固定为 2082。权限套餐与行情级别矛盾或级别未知会失败关闭，失败重连不暴露旧权限；实时和延迟权限证据最多缓存 5 分钟，到期后原子重读服务端且失败不沿用旧证据。报价收到时间由数据源在响应后盖章，半日市提前收盘后仍保留半日市标签。
 - staged gitleaks 首次把测试中的公开 Longbridge 套餐标识误判成通用 API key；暂存区已立即清空，测试改为运行时拼接同一公开值。修改后的 Windows 单进程全量连续两次触发既有 pyqtgraph `AxisItem` 析构崩溃，没有测试断言失败；改用 4 个 E2E 各自独立进程加其余 2078 项的机器 JUnit 汇总，合计仍为 2082 项通过、0 失败。目标提交的 GitHub CI 继续运行原始单进程命令，不降低门槛。
 - B1 实现提交 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 已精确推送到 `origin/main`；GitHub Actions run `30477680216` 全绿。远端原始单进程确定性门为 2082 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；独立 live 健康检查 7 项均跳过并明确记录 `health_status=unavailable`。证据包 `ci-evidence-1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 的完整 SHA、Python 3.12.10、JUnit 和环境文件均已下载核对。
+- B2 已实现无 Qt `MarketWorkspaceController`、独立 `MarketWorkspaceSettings` 保存合同和 `AppContext` 接线。Controller 是 selection generation、watchlist generation、请求序号、来源/截止时间、设置保存与分析状态的唯一所有者；不导入 Qt 或执行层。
+- B2 反例覆盖逆序回调、快速切市场、共享认证失败与恢复、报价/K 线陈旧、Crypto 连续市场、保存迟到/失败/冲突、分析中切换、不完整返回值，以及超过 32 个迟到回调仍保留认证与审计事实。三轮对抗审查的 P1 反例均已闭合；不再用静默淘汰旧请求换取内存上限，长期无回调时的请求登记表资源上限留作 P2 后续治理。
+- B2 扩展定向测试 230 项通过、0 失败；最终本地非 live 为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为 `scratch/validation/b2-final.xml`，CI 最低测试数同步提高到 2137。尚待精确提交、推送和目标 SHA 的 GitHub CI 复证。

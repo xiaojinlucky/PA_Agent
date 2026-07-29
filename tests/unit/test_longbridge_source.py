@@ -726,7 +726,7 @@ def test_batch_quotes_rejects_market_suffix_mismatch(
     _install_fake_sdk(monkeypatch, sdk)
     source = LongbridgeSource(env_file=env_file)
     source.connect()
-    token = WatchlistRequestToken(
+    token = SimpleNamespace(
         selection_generation=1,
         market="HK",
         source="longbridge",
@@ -736,7 +736,7 @@ def test_batch_quotes_rejects_market_suffix_mismatch(
     )
 
     with pytest.raises(ValueError, match="与所选市场"):
-        source.batch_quote_snapshots(token)
+        source.batch_quote_snapshots(token)  # type: ignore[arg-type]
 
 
 def test_batch_quotes_requires_current_server_permission_evidence(
