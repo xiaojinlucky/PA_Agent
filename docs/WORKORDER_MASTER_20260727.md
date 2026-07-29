@@ -396,17 +396,21 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   再次授权。下一条新增风险命令重新执行 OKX Demo 私有只读预检并申请新租约，减险命令
   不受影响。定向回归 130 项通过、0 失败；unit/property/integration 1966 项通过、7 项
   跳过、0 失败。
-- [ ] NEW_RISK 公共层一次性约束：schema v5 已在本地把租约耐久绑定到唯一
+- [x] NEW_RISK 公共层一次性约束：schema v5 已把租约耐久绑定到唯一
   `command_id`；`enqueue()` 在同一个 `BEGIN IMMEDIATE` 事务内完成绑定与插入，
   非空 NEW_RISK 租约另有数据库部分唯一索引。Controller 消费后不再显示可授权，
   Worker 按命令、路由、申请者和配置指纹复核唯一消费者；v4 历史库若已有同租约多条
   新增风险命令则原样保留并失败关闭。线程、进程、崩溃、回滚、过期、UNCERTAIN、
   跨动作复用、Controller 提交/续租与终态续租竞态、真正写入前授权撤销，以及重复消费者/身份
   不一致迁移均已回归；相关七文件 269 项通过，最终复审无 P0/P1/P2。用户已明确授权把
-  确定性主门与真实数据源健康检查分开，所有测试仍分别运行：确定性主门 2048 项通过、
-  0 项跳过、0 失败；live 检查 7 项跳过、0 失败，并单独保存 JUnit 与运行状态。
+  确定性主门与真实数据源健康检查分开，所有测试仍分别运行。本地确定性主门 2048 项
+  通过、0 失败；live 检查 7 项跳过、0 失败，并单独保存 JUnit 与运行状态。
   `LONGBRIDGE_COMPREHENSIVE` 已用官方只读接口真实取得沪深报价和 1h/4h/1d K 线。
-  目标 SHA 的 GitHub CI 与 JUnit/环境产物尚未完成，绿色前本项保持未勾选。
+  实现提交 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 已推送到 `origin/main`；
+  GitHub Actions run `30447988360` 全绿。远端确定性 JUnit 共 2048 项，其中 2047 项
+  通过、0 失败、0 错误，1 项因 CI 主机为 UTC 按既有条件跳过；证据包同时保存完整
+  Git SHA、Python 3.12.10、91 行 `pip freeze`、live JUnit 与 `health_status=unavailable`。
+  P0 源码与提交级证据至此关闭；运行中的旧 Worker 未重载，运行态激活仍按下一项处理。
 - [ ] Campaign 新代码运行态激活：2026-07-27 21:33 的历史只读审计当时没有活动
   execution、未解决写命令或有效租约；审计对象是 20:01 启动、早于 `7e6c095` 和租约修复
   的进程，确定未热加载。当前运行态以下一项 2026-07-28 实时复核为准。

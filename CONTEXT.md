@@ -9,7 +9,7 @@
 - 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
 - 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
 - 完成证据复审与 Campaign 异常收口已由 `7e6c095` 推送；Campaign 的 NEW_RISK 最小权限修复已完成并发布。WO-E 的 Stitch 与浏览器图像生成路线已由用户终止，不再是前端开发门。后端与无界面连接层已补齐：不可变报价、行情新鲜度、K 线证据、批量自选、generation/请求序号门禁、Longbridge/OKX 批量报价、OKX 10m 三页聚合和独立只分析结果投影均已落地。最终前端唯一 PRD 为 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`；用户将交给其他大模型做视觉设计，当前仍未修改 `pa_agent/gui`，PyQt6 视觉实现未开始。
-- P0-01 公共执行层一次性授权已在本地实现：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的 Controller 提交/续租与终态续租竞态和证据缺口已补齐。用户已授权把确定性主门与真实数据源健康检查分开；确定性主门 2048 项通过、0 项跳过、0 失败，独立 live 检查 7 项跳过、0 失败。目标 SHA CI 尚未开始，运行中的旧 Worker 未重载，因此仍不能说 P0 已关闭或运行态已生效。
+- P0-01 公共执行层一次性授权已完成源码与 CI 闭环，并由 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 发布：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的竞态和证据缺口均已补齐。本地确定性主门 2048 项通过、0 失败；该 SHA 的 GitHub Actions run `30447988360` 全绿，远端确定性门 2047 项通过、0 失败，另有 1 项因 CI 主机使用 UTC 而按既有规则跳过。独立 live 健康检查 7 项均因外部端点或测试密钥不可用而跳过、0 失败。P0 源码与提交级证据已关闭；运行中的旧 Worker 未重载，所以运行态尚未生效。
 
 ## 上次停在哪
 
@@ -29,7 +29,7 @@
 - 成交量摘要只使用已收盘 K 线。最新一根与此前最多 20 根形成基线；不足 6 根、参与计算的成交量无效或基准中位数为零时返回空结果，不猜值。
 - 多市场前端首版固定 `analysis_timeframe=10m`，`display_timeframe` 只控制 10m/1h/4h 图表；报价与展示周期无关。页面异步结果统一绑定 generation 和请求族序号。Longbridge 报价接口不声明真实最小跳动时允许只读显示，但不得从小数位或市场默认值猜 tick，更不得据此生成可执行价格。PRD11 取代旧 Stitch/ImageGen 流程，外部模型只负责高保真设计和组件规格；生产实现仍必须使用原生 PyQt6/QWidget/QSS/pyqtgraph。
 - Campaign 的每个 NEW_RISK 授权窗口只包住一条新增风险 Worker 命令：`set_leverage`、正常 `submit` 和 READY 恢复 `submit` 在命令创建前失败时释放；只有等待函数返回 `SUCCEEDED`、`FAILED` 或 `UNCERTAIN` 耐久终态后才释放。等待超时、命令读取异常或非终态结果不会由业务方法提前释放，进程收口仍会显式撤销租约；RUNNING 命令保持未解决并阻止再次授权。下一条新增风险命令重新执行 OKX Demo 私有只读预检并申请新租约；撤单和离场等减险命令不依赖该租约。
-- 公共执行层现已把 NEW_RISK 租约升级为 schema v5 一次性令牌：租约与唯一 `command_id` 在同一 SQLite 事务中绑定并插入命令；线程、进程、调用者崩溃、插入回滚、过期边界、UNCERTAIN、跨动作复用、Controller 提交/续租与终态续租竞态、真正写入前授权撤销，以及 v4→v5 重复消费者和身份不一致迁移都有直接回归。绑定后 Controller 不再显示可授权，Worker 还会按命令、路由、申请者和配置指纹做最终核验。该结论目前只适用于本地源代码与测试，待合格全量结果和目标 SHA 的 CI 绿色后发布；运行中的 schema v4 Worker 未重载。
+- 公共执行层现已把 NEW_RISK 租约升级为 schema v5 一次性令牌：租约与唯一 `command_id` 在同一 SQLite 事务中绑定并插入命令；线程、进程、调用者崩溃、插入回滚、过期边界、UNCERTAIN、跨动作复用、Controller 提交/续租与终态续租竞态、真正写入前授权撤销，以及 v4→v5 重复消费者和身份不一致迁移都有直接回归。绑定后 Controller 不再显示可授权，Worker 还会按命令、路由、申请者和配置指纹做最终核验。源码、测试与提交级 CI 已由 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 闭环；运行中的 schema v4 Worker 未重载，运行态激活仍是独立后续工单。
 - 市场切换分为跨数据源事务与 Longbridge 内市场事务；US、HK、CN 路由到 Longbridge，Crypto 路由到 OKX。认证失败、标的或来源不一致、行情或已收盘 K 线陈旧时失败关闭；日历未知只关闭市场时钟事实，不猜阶段，但完整且新鲜的已收盘 K 线仍可分析；不静默换源。
 - 自选列表只写本地 `GeneralSettings`，不写长桥云端 watchlist。
 - 市场时钟读取 `market_calendar.session_state` 的开市、午休、闭市、半日市与下一变化时间；加密显示连续交易，不伪造股票会话。

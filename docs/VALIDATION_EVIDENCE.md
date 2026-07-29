@@ -713,7 +713,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 官方接口核查：Longbridge `QuoteContext.quote(symbols)` 单次最多 500 个标的，项目本地 `longbridge 4.3.2` 签名与官方入口一致；当前 100 项自选可单次读取，但真实 OpenAPI 权限仍受失效 token 阻塞。OKX `/market/tickers` 无需认证，按 SPOT/SWAP 最多两个串行类型快照后本地筛选，不能伪造多标的参数。OKX `/market/candles` 单页最多 300、`after` 向旧翻页、最近覆盖 1,440 根；现有最大 10m 请求最坏需 602 根 5m、最多三页，正确实现仍需极窄解除 `pa_agent/execution/okx_client.py` 禁区。
 - 11:24–11:28 只读运行态复核确认 Worker 与心跳运行、两库 `quick_check=ok`、活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；OKX 私有余额读取持续连接拒绝并触发风险停止，Campaign 进程不存在且磁盘状态过期。最后本地账户快照已陈旧约 13.35 小时；Agent 没有启动、停止、重载或另行调用私有接口。
 
-## 2026-07-29 P0-01 一次性 NEW_RISK 授权本地验收
+## 2026-07-29 P0-01 一次性 NEW_RISK 授权本地与提交级验收
 
 - 固定开工基线为 `main/e815d42268efac5b83842a33b7e24c9054329c78`，当时本地与 `origin/main` 一致、暂存区为空；既有未跟踪 `.agents/`、`.claude/` 全程不触碰。基线全仓为 2030 项通过、3 项跳过、0 失败。
 - 15:17 只读运行态门确认 Worker 与心跳运行，两库 `quick_check=ok`，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；Campaign 无进程，风险停止为 `risk_runtime_BrokerTransportError`。只允许离线修复，没有调用券商、重启 Worker/Campaign、解除风险停止或修改生产数据库。
@@ -731,5 +731,8 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 新增非机密选择项 `PA_AGENT_LONGBRIDGE_QUOTE_PROFILE`，只允许 `default`、`comprehensive`、`intraday`。选择项与同组凭据均优先进程环境、其次共享文件；任一层出现所选档案的部分凭据便失败关闭，禁止回退到另一层补齐，更不会跨档案拼接。新增契约首轮为 1 项通过、3 项失败，实现后原有 4 项全部通过；独立审查补出的 `INTRADAY` 正向隔离用例也已通过，Longbridge 数据源单文件 73 项通过。
 - 仓库外 `D:\Desktop\Quant\env` 只新增 `PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=COMPREHENSIVE`，没有修改或输出凭据。PA_Agent 正常加载路径通过官方 `QuoteContext` 真实取得 `600519.SH`、`000001.SZ` 两只股票的正数报价，并取得 1h 20 根、4h 15 根、1d 30 根结构有效 K 线；只创建行情上下文，没有创建交易上下文，也没有读取账户、持仓、订单或成交。
 - 确定性全量首次在第 3 个界面冒烟用例附近出现一次 Qt 底层对象销毁竞态；随后 4 个 E2E 冒烟用例独立为 4 项通过、0 失败，最终原样重跑确定性命令为 2048 项通过、0 项跳过、0 失败，JUnit 为 `scratch/wo-review-p0-deterministic-final.xml`。没有修改 `pa_agent/gui`、跳过测试或放宽断言。
-- 独立 live 命令收集 7 项：4 项因 AkShare 公共端点不可达跳过，3 项因未提供 KKAI 测试密钥跳过，0 失败；JUnit 为 `scratch/wo-review-p0-live-provider.xml`。工作流还会上传完整 Git SHA、Python 版本和 `pip freeze`。本节仍是发布前本地证据；目标 SHA 的 GitHub CI 与产物尚待完成，绿色前 P0 不关闭。
-- 独立审查先后报告的 CI 边界均已整改：live JUnit 缺失或损坏分别记录 `missing` / `invalid`，不再是强制文件；数量门提升至 2048；Git SHA、Python 和 `pip freeze` 使用 `if: always()` 采集，任一命令失败都先写标准 `unavailable` 再让 CI 变红；`INTRADAY` 正向隔离测试已补齐。本地已实际执行环境采集成功、损坏 XML 和 pip 失败三条 PowerShell 分支，输出分别符合预期。目标 SHA 的远端 CI 仍待实际验证。
+- 独立 live 命令收集 7 项：4 项因 AkShare 公共端点不可达跳过，3 项因未提供 KKAI 测试密钥跳过，0 失败；JUnit 为 `scratch/wo-review-p0-live-provider.xml`。工作流还会上传完整 Git SHA、Python 版本和 `pip freeze`。
+- 独立审查先后报告的 CI 边界均已整改：live JUnit 缺失或损坏分别记录 `missing` / `invalid`，不再是强制文件；数量门提升至 2048；Git SHA、Python 和 `pip freeze` 使用 `if: always()` 采集，任一命令失败都先写标准 `unavailable` 再让 CI 变红；`INTRADAY` 正向隔离测试已补齐。本地已实际执行环境采集成功、损坏 XML 和 pip 失败三条 PowerShell 分支，输出分别符合预期。
+- 实现提交 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 已精确推送到 `origin/main`。GitHub Actions run `30447988360` 的全部步骤绿色，确定性主门、JUnit 数量门、live 健康检查、环境证据校验与证据上传均成功。
+- 远端证据包 `ci-evidence-c932e0113e9c4e33771d1cc5afc1f16beda46421` 已下载核对：`full-git-sha.txt` 与目标提交完全一致，`python-version.txt` 为 Python 3.12.10，`pip-freeze.txt` 共 91 行且 SHA-256 为 `9FB753B6B5661C5646A9131C26434AC8128310A2C1A9546F930DEF9FD2B883EA`。确定性 JUnit 共 2048 项、0 失败、0 错误、1 项跳过；该跳过是 `tests.unit.test_datetime_ts::test_naive_local_to_utc_uses_host_offset` 在 UTC 主机上的既有平台条件。live JUnit 共 7 项、0 失败、0 错误、7 项跳过，运行状态明确记录 `step_outcome=success` 与 `health_status=unavailable`。
+- 该次运行唯一注解是 GitHub 托管运行器提示 Node.js 20 已弃用，并把官方 checkout、setup-python、upload-artifact Action 强制切换到 Node.js 24；不影响测试或证据结论。P0-01 的源码、测试、对抗审查与提交级 CI 至此关闭；运行中的旧 Worker 未重载，生产运行态仍未加载 schema v5。
