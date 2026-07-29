@@ -152,13 +152,13 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 ### WO-E P1 前端（市场切换 + 自选 + 市场时钟）——按 PRD11 直接实现
 
-**当前拍板**：PRD11 是新多市场页的最终实现规格，覆盖旧 Stitch、ImageGen、外部样稿和历史图片精修门。B2 无 Qt Controller 通过提交级 CI 后直接进入原生 PyQt6 实现；仍须执行 `$frontend-design`、`$design-taste-frontend` 审计、离屏尺寸/缩放矩阵和最终真实桌面验收。
+**当前拍板**：PRD11 是新多市场页的最终实现规格，覆盖旧 Stitch、ImageGen、外部样稿和历史图片精修门。B2 无 Qt Controller 和 C 原生 PyQt6 离线实现均已通过提交级 CI；16 张离屏尺寸/状态/缩放矩阵已复核，最后只认正式快捷方式的真实桌面验收。
 
 **页面合同真值**：`docs/prd/05_多市场看盘前端设计包.md` 已完成阶段 0/1，并冻结以下内容：`QuoteSnapshot` 精确字段与新鲜度、可测 K 线新鲜度、四市场最近标的/本地自选及旧设置迁移、selection generation、Longbridge 内 US/HK/CN 事务、Longbridge↔OKX 跨源提交/回滚/迟到结果、界面文案、脱敏输入和 M01–M17 二元验收。方向 1 的 `docs/prd/07_WO-E_方向1_多市场看盘方向绑定PRD.md` 另冻结 D01–D07，包括高密自选集合、同 generation 设置保存、只分析不执行、完整壳层尺寸、认证优先级和异步暂存提交。下列摘要只作索引，不替代两份合同：
 - 主问题：当前看的是哪个市场的哪个标的、市场开没开、数据新不新鲜。
 - 新增控件：市场切换（US/HK/CN/Crypto，与行情源联动路由）、多市场自选列表（本地持久化 `GeneralSettings`，不接长桥云端 watchlist 写 API）、市场时钟（US/HK/CN 使用 `market_calendar.session_state`；Crypto 使用连续市场规则与 UTC）。
 - 已有基座：`_symbol_combo`、图表、设置 revision、Longbridge/OKX 已验证的只读能力可按合同复用；现有 `_switch_data_source` 只可参考事务意图，不能直接复用其提交点或同步界面线程调用。
-- 验收：同一桌面窗口对 AAPL.US、700.HK、600519.SH 各完成一次真实两阶段分析，并对 XAU-USDT-SWAP 完成 Crypto 正常路径与 Longbridge↔OKX 双向切换；M01–M17 与 D01–D07 全部通过。最终桌面窗口由用户从 `.lnk` 启动并截图。
+- 验收：同一桌面窗口展示 AAPL.US、700.HK、600519.SH，并对 XAU-USDT-SWAP 完成 Crypto 正常路径与 Longbridge↔OKX 双向切换；股票无权威 tick 时必须保持“仅展示，价格分析不可用”，不得强跑两阶段分析。M01–M17 与 D01–D07 全部通过，最终桌面窗口由用户从 `.lnk` 启动并截图。
 
 **三方向图稿、选择与 ChatGPT Web**：第一组历史候选稿保留在 `docs/prd/06_WO-E_Product_Design_三方向证据.md`，不再驱动后续设计。Product Design `ideate` 已按正式入口重跑；`docs/prd/09_WO-E_Product_Design_ideate_重跑证据.md` 登记插件版本、完整提示词、三个独立产物标识、项目 PNG、SHA-256、人工视觉复核和用户选择。用户于 2026-07-28 按本轮实际显示顺序选择 `1`，唯一绑定为 `Scan Rail Workbench`；B1、B2 已通过。应用内 ChatGPT 已真实接收四附件和完整提示词，B3 通过；完整回答、指纹与 F01–F22 本地裁决见 `docs/prd/10_WO-E_方向1_ChatGPT_Web_PRD.md`，Stitch 的真实阻塞见 PRD08。
 
@@ -368,8 +368,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
 - [x] WO-E ChatGPT Web 阶段 3：四个脱敏附件与完整提示词已真实提交；会话 URL、完整回答、内容指纹和 F01–F22 本地裁决已登记，B3 通过
 - [x] 2026-07-28 WO-E Chrome 官方恢复、附件与参考规则核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，用户已确认附件显示。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 结构、令牌、密度和负面约束已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认 Stitch 项目 `8039115259020616674` 已创建（`https://stitch.withgoogle.com/projects/8039115259020616674`，标题 `Stitch - Projects`）。用户已直接审美否决该结果，Stitch 稿作废且不进入实现。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
-- [ ] WO-E 剩余生产实现：PRD11 已取代 ChatGPT Images 2.0 样板路线；B2 提交级 CI
-  通过后直接实现原生 PyQt6、离屏视觉矩阵和真实桌面验收
+- [x] WO-E 原生 PyQt6 离线实现：`91715ee2c8af0e6e829031b5a4f375d18f71cf52`
+  已发布且 CI 全绿；16 张离屏状态/尺寸/缩放图逐张复核通过
+- [ ] WO-E 真实桌面验收：从正式快捷方式完成 Longbridge 三市场、Crypto、快速切换与缩放矩阵
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
@@ -432,9 +433,11 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   execution service 或券商写接口。
 - [x] 2026-07-29 WO-E 外部设计移交：PRD11 成为唯一版前端设计合同。旧 Stitch、
   ChatGPT Images 和浏览器自动化路线降为历史，不再是开发门。
-- [ ] WO-E 视觉生产实现：B2 无 Qt Controller 已由 `18951dc53a5d2b075bda0759676a68dd62dca172`
-  发布且 CI 全绿，现在直接实现原生 PyQt6；不等待外部样稿。最终使用已验证的 Longbridge
-  行情档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
+- [x] WO-E 视觉生产实现：B2 无 Qt Controller 后的原生 PyQt6 页面已由
+  `91715ee2c8af0e6e829031b5a4f375d18f71cf52` 发布，GitHub Actions run
+  `30492305516` 全绿；16 张离屏状态/尺寸/缩放图和对抗审查均通过。
+- [ ] WO-E 真实桌面矩阵：使用已验证的 Longbridge 行情档案完成 AAPL.US、700.HK、
+  600519.SH 与 Crypto 的正式快捷方式验收；无权威 tick 的股票只展示、不运行价格分析。
 
 ## 6. 用户侧待办（只有用户能做）
 

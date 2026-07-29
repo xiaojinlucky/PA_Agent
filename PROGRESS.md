@@ -1,16 +1,16 @@
 # PA_Agent 工单进度
 
 - 2026-07-29 多市场后端与无界面连接层已补强：新增 `market_workspace` 纯合同、Longbridge/OKX 批量报价、OKX K 线 `after` 分页与 10m 三页聚合、类型化 Longbridge 认证失败、K 线证据和独立只分析结果投影。全仓 2030 项通过、3 项跳过、0 失败；没有交易写入或运行态修改。
-- 前端实现只认 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`。Stitch、ChatGPT Web Images、浏览器自动化和外部样稿都不再是开发门；`pa_agent/gui` 尚未修改，B2 通过提交级 CI 后直接开始 PyQt6 视觉实现。
+- 前端实现只认 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`。Stitch、ChatGPT Web Images、浏览器自动化和外部样稿都不再是开发门；原生 PyQt6 四市场只读页已由 `91715ee2c8af0e6e829031b5a4f375d18f71cf52` 发布，旧 OKX Demo 工作台保留。
 - 本轮 WO-E 文档开工基线为 `HEAD=origin/main=86bfb8e0c668479866038dd959e2b72cefc94811`；分支为 `main`，上游为 PUBLIC `origin/main`。更早的 WO-F 与完成证据复审已分别由 `c0b58d0`、`7e6c095` 发布。
 - 完成证据复审补齐了 system prompt 字节稳定、固定代理端口抢占、长桥分页/日历边界，以及 Campaign 异常耐久收口与零重复写回归。
 - NEW_RISK 最小权限修复已落在 `pa_agent/okx_demo_campaign.py`：动态杠杆、正常提交和 READY 恢复提交只在 Worker 命令返回耐久终态后释放租约；等待超时、读取异常或非终态结果不提前释放，进程收口仍会撤销租约，RUNNING 命令继续阻止再次授权。下一条新增风险命令重新执行私有只读预检并申请租约。定向回归 130 项通过、0 失败，unit/property/integration 为 1966 项通过、7 项跳过、0 失败。
 - P0-01 已完成源码与提交级 CI 闭环：`c932e0113e9c4e33771d1cc5afc1f16beda46421` 把公共 `ExecutionController` / `WorkerStore` 租约升级为 schema v5 一次性令牌，数据库、Controller 和 Worker 共同限制每租约最多一条新增风险命令；本地确定性主门 2048 项通过、0 失败，GitHub Actions run `30447988360` 全绿，远端确定性门 2047 项通过、0 失败，另有 1 项 UTC 主机条件跳过。运行中的旧 Worker 尚未重载，运行态激活不属于本项。
 - 全仓 Ruff 只读基线已刷新为 293 项诊断，其中 249 项带自动修复建议；这是历史债账本，不授权全仓 `--fix`。
-- WO-E 设计合同已补齐 `QuoteSnapshot`、可测的 10m K 线新鲜度、四市场设置迁移、generation、Longbridge 内切换、Longbridge↔OKX 跨源回滚、脱敏输入、M01–M17 和 D01–D07；首版分析主周期固定为 10m，1h/4h 只作背景证据。Product Design B1、用户选择 B2 与 ChatGPT Web B3 已通过。完整网页回答、内容指纹和 F01–F22 本地裁决已落盘；当前没有修改 PyQt6。
+- WO-E 设计合同已补齐 `QuoteSnapshot`、可测的 10m K 线新鲜度、四市场设置迁移、generation、Longbridge 内切换、Longbridge↔OKX 跨源回滚、脱敏输入、M01–M17 和 D01–D07；首版分析主周期固定为 10m，1h/4h 只作可缺失背景。原生 PyQt6 已接通 Controller 与独立只读运行层，不导入或调用执行层。
 - WO-A 仍有一项未闭合：固定代理 metadata 与实际配置缺共同指纹。只改测试无法证明不存在不一致，本轮又禁止修改 `scripts`。
 - 长桥旧默认档案仍无效，但完整的 `COMPREHENSIVE` 行情档案已经服务端真实验证；沪深报价和 1h/4h/1d K 线均可读取。该档案只通过非机密选择项启用，凭据没有进入代码、日志、测试或 Git。
-- WO-E 的浏览器、Stitch 和 ChatGPT Images 路线已由用户终止。后端与无界面连接层已经补齐；生产实现只认 PRD11，不等待外部样稿。当前剩余工作是实现 PyQt6，并使用已验证的 Longbridge 行情档案完成三股票市场与 Crypto 桌面验收。
+- WO-E 的浏览器、Stitch 和 ChatGPT Images 路线已由用户终止。后端、无界面连接层和 PyQt6 离线实现已经补齐；当前剩余工作是 D 发布证据/安装链，以及使用已验证的 Longbridge 行情档案完成三股票市场与 Crypto 真实桌面验收。
 - 当前最新已知运行态证据来自 2026-07-29 15:17 的只读审计：Worker 与心跳运行，两库健康，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；但风险停止为 `risk_runtime_BrokerTransportError`，Campaign 不存在且磁盘 `active` 状态过期。运行中 Worker 仍是旧 schema v4 代码；未经新的 OKX Demo 私有只读硬门和用户授权不重载。
 - WO-H、WO-C2、WO-F、WO-G-1/2/3 已完成；成交量仍不进入提示词或交易判断。
 - `WO-POS-05` 只有路线图级目标且会触碰当前禁止修改的执行链，本轮不越界开工。
@@ -57,3 +57,12 @@
 - B2 反例覆盖逆序回调、快速切市场、共享认证失败与恢复、报价/K 线陈旧、Crypto 连续市场、保存迟到/失败/冲突、分析中切换、不完整返回值，以及超过 32 个迟到回调仍保留认证与审计事实。三轮对抗审查的 P1 反例均已闭合；不再用静默淘汰旧请求换取内存上限，长期无回调时的请求登记表资源上限留作 P2 后续治理。
 - B2 扩展定向测试 230 项通过、0 失败；最终本地非 live 为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为 `scratch/validation/b2-final.xml`，CI 最低测试数同步提高到 2137。
 - B2 实现提交 `18951dc53a5d2b075bda0759676a68dd62dca172` 已精确推送到 `origin/main`；GitHub Actions run `30484797101` 全绿。远端确定性门共 2137 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；独立 live 健康检查 7 项均跳过并记录 `health_status=unavailable`。证据包中的完整 SHA、Python 3.12.10、JUnit 和 91 行依赖快照均已核对。
+
+## 2026-07-30 v0.1.0 阶段 C：原生 PyQt6 多市场页
+
+- 新页复用 PRD11 三列结构并只消费 `MarketWorkspaceController`；Longbridge 与 OKX 使用彼此独立的只读运行层。旧 OKX Demo 工作台、交易执行层和默认关闭的交易安全门均保留，新页没有买入、卖出、下单、撤单或平仓控件。
+- 行情报价先固定唯一 `analysis_as_of`，再读取 10m/1h/4h；10m 是分析硬输入，1h/4h 缺失不会终止 10m。K 线新鲜度使用来源计算的真实收盘时间，禁止把开盘时间冒充收盘时间。股票没有权威 tick 时仍可展示，但分析按钮明确关闭；成交量继续不进入提示词。
+- 红灯直接证明旧分析回调可清空新分析状态、旧 CancelToken 未取消、K 线开盘时间会把有效数据误判过期；最小修复后全部转绿。对抗审查复核后无 P0/P1/P2。
+- 本地相关定向测试 334 项通过、0 失败；最终非 live 为 2164 项通过、0 失败、0 错误、0 跳过，CI 数量下限同步提高到 2164。实现提交 `91715ee2c8af0e6e829031b5a4f375d18f71cf52` 已推送，GitHub Actions run `30492305516` 全绿。
+- 远端证据包的完整 SHA 与提交一致，Python 为 3.12.10；确定性 JUnit 共 2164 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过。live JUnit 共 7 项、0 失败、0 错误、7 项跳过，明确记录 `health_status=unavailable`。
+- 已用目标提交重新生成并逐张打开 16 张离屏图：1440×900 九种状态、1920×1080 正常态，以及 100%/125%/150% × 两种逻辑尺寸。机器门为 16 张通过、0 失败、界面运行态读取 0；完整 SHA 可见。离屏夹具不冒充真实桌面，正式快捷方式的四市场快速切换与缩放验收仍为 Release 硬门。

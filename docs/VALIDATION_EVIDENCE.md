@@ -758,3 +758,13 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 行情、自选和分析回调均绑定 Controller 发出的完整请求快照。逆序回调、快速切换、认证失败恢复、行情陈旧、Crypto 连续市场、分析中切换及不完整返回值都有直接反例。三轮对抗审查指出的 P1 均已按原反例复证关闭；旧的 32 项静默淘汰会遗忘迟到认证失败和分析证据，现已移除。长期无回调时登记表可能增长，作为不影响当前正确性的 P2 资源治理项保留，禁止用静默丢事实的方式处理。
 - 扩展定向测试 230 项通过、0 失败；原始完整非 live 命令为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为忽略目录 `scratch/validation/b2-final.xml`。Ruff 定向检查和 `git diff --check` 均通过。
 - 实现提交 `18951dc53a5d2b075bda0759676a68dd62dca172` 已精确推送到 `origin/main`；GitHub Actions run `30484797101` 全绿。下载的 `ci-evidence-18951dc53a5d2b075bda0759676a68dd62dca172` 中，确定性 JUnit 共 2137 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；live JUnit 共 7 项、0 失败、0 错误、7 项跳过，状态为 `health_status=unavailable`。完整 SHA 与目标提交一致，Python 为 3.12.10，`pip-freeze.txt` 为 91 行、SHA-256 `3335F90A90B4C8169FC6825CDEF5E62861564EC5B9936FF86DCC2999F3FF6BEA`。
+
+## 2026-07-30 v0.1.0 阶段 C：原生 PyQt6 多市场页
+
+- 新增独立的 Longbridge/OKX 只读运行层、Qt bridge 和 `MultiMarketWorkbench`。页面只消费 `MarketWorkspaceController`，没有导入或调用执行层，也没有买入、卖出、下单、撤单或平仓控件；旧 OKX Demo 工作台保持可达。
+- 报价先固定唯一 `analysis_as_of`，随后用同一截止时间读取 10m/1h/4h。10m 是硬输入，1h/4h 是可缺失背景；K 线证据使用来源按真实交易时段计算的收盘时间，缺少或无效的收盘时间合同直接失败关闭。Longbridge 无权威 tick 时股票仍可展示，但分析按钮明确关闭；成交量字段已从提示词表格移除，影子记录不变。
+- 红灯首先证明三类缺口：旧分析完成回调会清空新分析状态、分析中切换没有取消旧 `CancelToken`、以开盘时间代替收盘时间会误判 K 线新鲜度。最小实现后原反例全部转绿；日历未知夹具改为真实让日历加载器失败，不再用手工标签伪造状态。最终对抗复审无 P0/P1/P2。
+- 相关定向测试共 334 项通过、0 失败；最终本地非 live 原始命令共 2164 项通过、0 失败、0 错误、0 跳过，JUnit 位于忽略目录 `scratch/validation/c-full-final.xml`。新增文件完整 Ruff、改动 Python 的 `F/E9`、`git diff --check` 均通过。
+- 实现提交 `91715ee2c8af0e6e829031b5a4f375d18f71cf52` 已精确推送到 `origin/main`；GitHub Actions run `30492305516` 全绿。证据包的完整 SHA 与目标提交一致，Python 为 3.12.10，`pip-freeze.txt` 为 91 行、SHA-256 `0B7D7C37F7FA3DE4C768DD7C78837A8BDED18ECAB95229CAA5B271E59DBDB3C3`。远端确定性 JUnit 共 2164 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；live JUnit 共 7 项、0 失败、0 错误、7 项跳过，状态为 `step_outcome=success`、`health_status=unavailable`。
+- 在该提交上重新生成 16 份离屏图和同名 JSON：1440×900 的正常、加载、空、过期、认证失败、日历未知、切换失败、分析中、分析失败九种状态；1920×1080 正常态；100%/125%/150% × 1440×900/1920×1080 六种缩放组合。16 张均逐张打开复核，无截断、遮挡或错误状态；机器门确认尺寸、菜单/页签高度、正文字号、零交易按钮和 `ui_runtime_read_calls=0`，结果为 16 张通过、0 失败。图中状态栏显示完整目标 SHA。
+- 以上只是确定性离屏证据，不读取网络、数据库、券商或生产设置，不能冒充真实桌面成功。AAPL.US、700.HK、600519.SH、Crypto、快速切换及系统缩放仍须由用户从 `D:\Desktop\PA_Agent.lnk` 启动完成；该门未过前不得创建稳定 Release。
