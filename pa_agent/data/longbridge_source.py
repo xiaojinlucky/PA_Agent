@@ -1,7 +1,9 @@
 """Longbridge OpenAPI 只读行情数据源。"""
+
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import logging
 import math
@@ -16,7 +18,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
-from decimal import InvalidOperation
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -32,7 +34,11 @@ from pa_agent.data.base import (
     normalize_kline_bar,
 )
 from pa_agent.data.datetime_ts import datetime_to_ts_ms
-from pa_agent.data.market_calendar import MarketCalendarError, is_trading_minute
+from pa_agent.data.market_calendar import (
+    MarketCalendarError,
+    is_trading_minute,
+    session_close_utc_ms,
+)
 from pa_agent.data.market_workspace import (
     QuoteMode,
     QuoteSnapshot,
@@ -93,14 +99,23 @@ _QUOTE_PROFILE_PREFIXES: dict[str, tuple[str, ...]] = {
     "comprehensive": ("LONGBRIDGE_COMPREHENSIVE",),
     "intraday": ("LONGBRIDGE_INTRADAY",),
 }
+_REALTIME_QUOTE_PACKAGE_KEYS: dict[str, frozenset[str]] = {
+    # 这些 key 来自 QuoteContext.quote_package_details() 的服务端结果；
+    # 未列出的套餐不作猜测，保持不可用。
+    "US": frozenset({"US_QBBO_OpenAPI"}),
+    "HK": frozenset({"HK_L1_OpenAPI"}),
+    "CN": frozenset({"CN_L1_ChinaMainland_EL"}),
+}
+_HK_DELAY_MS = 15 * 60 * 1000
+_QUOTE_PERMISSION_TTL_MS = 5 * 60 * 1000
+_REALTIME_QUOTE_LEVELS = frozenset({"LV1", "LV2", "NBBO", "QBBO"})
+_NON_REALTIME_QUOTE_LEVELS = frozenset({"DELAY", "BMP", "LV0"})
 
 
 class _QuoteRateLimiter:
     """长桥行情 SDK 频控：官方限制每秒最多 10 次调用。"""
 
-    def __init__(
-        self, max_calls_per_second: int = _QUOTE_RATE_LIMIT_PER_SECOND
-    ) -> None:
+    def __init__(self, max_calls_per_second: int = _QUOTE_RATE_LIMIT_PER_SECOND) -> None:
         self._max_calls = max_calls_per_second
         self._calls: deque[float] = deque()
         self._lock = threading.Lock()
@@ -116,6 +131,7 @@ class _QuoteRateLimiter:
                     return
                 wait_seconds = 1.0 - (now - self._calls[0])
             time.sleep(max(wait_seconds, 0.01))
+
 
 LongbridgeTokenStatus = Literal["valid", "expiring", "expired", "unknown"]
 
@@ -135,6 +151,19 @@ class LongbridgeTokenExpiry:
 
     status: LongbridgeTokenStatus
     expires_at_utc: datetime | None
+
+
+@dataclass(frozen=True)
+class LongbridgeQuotePermissionEvidence:
+    """一项由 Longbridge 服务端权限响应推导出的市场行情能力。"""
+
+    market: Literal["US", "HK", "CN"]
+    quote_mode: QuoteMode
+    expected_delay_ms: int
+    observed_at_utc_ms: int
+    valid_until_utc_ms: int
+    active_package_keys: tuple[str, ...]
+    evidence_sha256: str
 
 
 def inspect_longbridge_token_expiry(
@@ -238,9 +267,7 @@ def _credentials_from_mapping(
                 )
                 if not configured
             ]
-            raise DataSourceTransientError(
-                f"{prefix}_* 凭据不完整，缺少：{', '.join(missing)}"
-            )
+            raise DataSourceTransientError(f"{prefix}_* 凭据不完整，缺少：{', '.join(missing)}")
     return None
 
 
@@ -250,15 +277,12 @@ def _selected_quote_profile(
 ) -> str:
     """读取非机密的行情凭据档案选择；进程环境优先于共享文件。"""
     raw = str(
-        process_values.get(_QUOTE_PROFILE_ENV)
-        or file_values.get(_QUOTE_PROFILE_ENV)
-        or "default"
+        process_values.get(_QUOTE_PROFILE_ENV) or file_values.get(_QUOTE_PROFILE_ENV) or "default"
     ).strip()
     profile = raw.lower()
     if profile not in _QUOTE_PROFILE_PREFIXES:
         raise DataSourceTransientError(
-            "Longbridge 行情凭据档案无效；只允许 default、"
-            "comprehensive 或 intraday"
+            "Longbridge 行情凭据档案无效；只允许 default、comprehensive 或 intraday"
         )
     return profile
 
@@ -277,8 +301,7 @@ def load_longbridge_credentials(env_file: Path | None = None) -> LongbridgeCrede
             return credentials
     expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise DataSourceTransientError(
-        f"未找到完整的 Longbridge 行情凭据档案 {profile}；"
-        f"请在 Quant\\env 配置同组 {expected}"
+        f"未找到完整的 Longbridge 行情凭据档案 {profile}；请在 Quant\\env 配置同组 {expected}"
     )
 
 
@@ -287,8 +310,7 @@ def normalize_longbridge_symbol(symbol: str) -> str:
     value = (symbol or "").strip().upper()
     if not _SYMBOL_RE.fullmatch(value):
         raise ValueError(
-            "Longbridge 品种代码必须为 ticker.region，例如 AAPL.US、700.HK、"
-            "600519.SH 或 000001.SZ"
+            "Longbridge 品种代码必须为 ticker.region，例如 AAPL.US、700.HK、600519.SH 或 000001.SZ"
         )
     suffix = value.rsplit(".", 1)[-1]
     if suffix not in _SUPPORTED_MARKET_SUFFIXES:
@@ -301,13 +323,204 @@ def _now_in_market_timezone(timezone: ZoneInfo) -> datetime:
     return datetime.now(timezone)
 
 
+def _longbridge_datetime_to_utc(
+    timestamp: datetime,
+    *,
+    host_timezone: ZoneInfo | None = None,
+) -> datetime:
+    """把 SDK datetime 统一还原为 UTC。
+
+    Longbridge Python SDK 4.3.2 会把原始 Unix 时间转换成宿主机本地
+    墙钟时间，再返回不带时区的 datetime。显式传入 ``host_timezone``
+    只用于跨宿主机的确定性测试；生产环境由 Python 按操作系统本地
+    时区和目标日期的夏令时规则解释。
+    """
+    if timestamp.tzinfo is not None:
+        return timestamp.astimezone(UTC)
+    if host_timezone is not None:
+        return timestamp.replace(tzinfo=host_timezone).astimezone(UTC)
+    return timestamp.astimezone(UTC)
+
+
+def _longbridge_datetime_to_epoch_ms(
+    timestamp: datetime,
+    *,
+    host_timezone: ZoneInfo | None = None,
+) -> int:
+    return int(
+        _longbridge_datetime_to_utc(
+            timestamp,
+            host_timezone=host_timezone,
+        ).timestamp()
+        * 1000
+    )
+
+
 def _timestamp_in_market_timezone(timestamp: datetime, timezone: ZoneInfo) -> datetime:
     """把 SDK 时间戳转换为交易所本地时间。"""
-    if timestamp.tzinfo is None:
-        # Longbridge SDK 的 naive datetime 表示宿主机本地墙钟时间；
-        # astimezone 会先按宿主机时区解释，再转换到交易所时区。
-        return timestamp.astimezone(timezone)
-    return timestamp.astimezone(timezone)
+    return _longbridge_datetime_to_utc(timestamp).astimezone(timezone)
+
+
+def _permission_evidence_digest(
+    quote_level: str,
+    package_rows: list[tuple[str, int, int]],
+) -> str:
+    payload = json.dumps(
+        {
+            "quote_level": quote_level,
+            "packages": sorted(package_rows),
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _quote_permission_evidence(
+    quote_level: object,
+    package_details: object,
+    *,
+    observed_at_utc_ms: int,
+) -> dict[str, LongbridgeQuotePermissionEvidence]:
+    """从服务端 quote_level/package_details 生成保守的逐市场权限证据。"""
+    level_text = str(quote_level or "").strip()
+    levels_by_market: dict[str, set[str]] = {"US": set(), "HK": set(), "CN": set()}
+    for part in level_text.split(";"):
+        normalized_part = part.strip().upper()
+        if not normalized_part:
+            continue
+        if normalized_part.startswith("US"):
+            market = "US"
+        elif normalized_part.startswith("HK"):
+            market = "HK"
+        elif normalized_part.startswith(("SH", "SZ", "CN")):
+            market = "CN"
+        else:
+            continue
+        levels_by_market[market].add(normalized_part.rsplit("|", 1)[-1].strip())
+
+    rows = list(package_details or [])
+    active_keys: set[str] = set()
+    active_rows: list[tuple[str, int, int]] = []
+    end_by_key: dict[str, int] = {}
+    for row in rows:
+        key = str(getattr(row, "key", "") or "").strip()
+        start_at = getattr(row, "start_at", None)
+        end_at = getattr(row, "end_at", None)
+        if not key or not isinstance(start_at, datetime) or not isinstance(end_at, datetime):
+            continue
+        start_ms = _longbridge_datetime_to_epoch_ms(start_at)
+        end_ms = _longbridge_datetime_to_epoch_ms(end_at)
+        if start_ms <= observed_at_utc_ms <= end_ms:
+            active_keys.add(key)
+            active_rows.append((key, start_ms, end_ms))
+            end_by_key[key] = end_ms
+
+    digest = _permission_evidence_digest(level_text, active_rows)
+    evidence: dict[str, LongbridgeQuotePermissionEvidence] = {}
+    for market, accepted_keys in _REALTIME_QUOTE_PACKAGE_KEYS.items():
+        proving_keys = tuple(sorted(active_keys & accepted_keys))
+        if not proving_keys:
+            continue
+        market_levels = levels_by_market[market]
+        if not market_levels & _REALTIME_QUOTE_LEVELS:
+            if market_levels & _NON_REALTIME_QUOTE_LEVELS:
+                raise DataSourcePermissionError(
+                    f"Longbridge {market} 行情权限证据矛盾：实时套餐与非实时级别同时出现"
+                )
+            raise DataSourcePermissionError(f"Longbridge {market} 行情级别未证明实时")
+        evidence[market] = LongbridgeQuotePermissionEvidence(
+            market=market,  # type: ignore[arg-type]
+            quote_mode="realtime",
+            expected_delay_ms=0,
+            observed_at_utc_ms=observed_at_utc_ms,
+            valid_until_utc_ms=min(
+                min(end_by_key[key] for key in proving_keys),
+                observed_at_utc_ms + _QUOTE_PERMISSION_TTL_MS,
+            ),
+            active_package_keys=proving_keys,
+            evidence_sha256=digest,
+        )
+
+    # 官方基础权限把港股 BMP 明确为约 15 分钟延迟。只有服务端自身
+    # quote_level 明写 Delay/BMP，且没有实时套餐证据时才接受；LV0
+    # 或未知文本都不能被猜成延迟行情。
+    hk_levels = levels_by_market["HK"]
+    if "HK" not in evidence and hk_levels & {"DELAY", "BMP"}:
+        evidence["HK"] = LongbridgeQuotePermissionEvidence(
+            market="HK",
+            quote_mode="delayed",
+            expected_delay_ms=_HK_DELAY_MS,
+            observed_at_utc_ms=observed_at_utc_ms,
+            # quote_level 本身没有套餐到期时间，短时缓存后必须重读服务端，
+            # 防止长连接把已经变化的权限永久当成有效。
+            valid_until_utc_ms=observed_at_utc_ms + _QUOTE_PERMISSION_TTL_MS,
+            active_package_keys=(),
+            evidence_sha256=digest,
+        )
+    return evidence
+
+
+def _raise_typed_longbridge_error(prefix: str, exc: Exception) -> None:
+    text = str(exc)
+    if "401004" in text:
+        raise DataSourceAuthenticationError(f"{prefix}（认证失败）") from exc
+    if "301604" in text:
+        raise DataSourcePermissionError(f"{prefix}（行情权限不足）") from exc
+    raise DataSourceTransientError(f"{prefix}（{type(exc).__name__}）") from exc
+
+
+def _strict_provider_rows(
+    rows: object,
+    *,
+    requested_symbols: tuple[str, ...],
+    label: str,
+) -> dict[str, Any]:
+    """供应商批量结果必须与请求集合一一对应，禁止覆盖或忽略。"""
+    requested = set(requested_symbols)
+    indexed: dict[str, Any] = {}
+    for row in list(rows or []):
+        symbol = str(getattr(row, "symbol", "") or "").strip().upper()
+        if not symbol:
+            raise DataSourceError(f"Longbridge {label}包含空 symbol")
+        if symbol not in requested:
+            raise DataSourceError(f"Longbridge {label}返回未请求标的：{symbol}")
+        if symbol in indexed:
+            raise DataSourceError(f"Longbridge {label}包含重复标的：{symbol}")
+        indexed[symbol] = row
+    missing = [symbol for symbol in requested_symbols if symbol not in indexed]
+    if missing:
+        raise DataSourceTransientError(f"Longbridge {label}缺少 {', '.join(missing)}")
+    return indexed
+
+
+def _canonical_bar_number(value: object, *, field_name: str) -> str:
+    try:
+        number = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise DataSourceError(f"Longbridge K 线 {field_name} 无法解析") from exc
+    if not number.is_finite():
+        raise DataSourceError(f"Longbridge K 线 {field_name} 不是有限数")
+    return format(number.normalize(), "f")
+
+
+def _bar_signature(row: Any) -> tuple[int, str, str, str, str, str, str]:
+    timestamp = getattr(row, "timestamp", None)
+    if not isinstance(timestamp, datetime):
+        raise DataSourceError("Longbridge K 线缺少有效时间戳")
+    return (
+        _longbridge_datetime_to_epoch_ms(timestamp),
+        _canonical_bar_number(getattr(row, "open", None), field_name="open"),
+        _canonical_bar_number(getattr(row, "high", None), field_name="high"),
+        _canonical_bar_number(getattr(row, "low", None), field_name="low"),
+        _canonical_bar_number(getattr(row, "close", None), field_name="close"),
+        _canonical_bar_number(getattr(row, "volume", None), field_name="volume"),
+        _canonical_bar_number(
+            getattr(row, "turnover", None),
+            field_name="turnover",
+        ),
+    )
 
 
 def _sdk_market_name(sdk: Any, market: Any) -> str | None:
@@ -332,6 +545,8 @@ class LongbridgeSource(DataSource):
         self._regular_session_windows: dict[
             str, tuple[tuple[datetime_time, datetime_time], ...]
         ] = {}
+        self._quote_permissions: dict[str, LongbridgeQuotePermissionEvidence] = {}
+        self._quote_permissions_refresh_due_utc_ms = 0
         self._market: Any = None
         self._market_name = ""
         self._market_timezone: ZoneInfo | None = None
@@ -365,6 +580,65 @@ class LongbridgeSource(DataSource):
         """返回当前凭据的本地到期预检结果, 不暴露 Token。"""
         return classify_longbridge_token_expiry(self._token_expiry.expires_at_utc)
 
+    def quote_permission_evidence(
+        self,
+        market: str,
+    ) -> LongbridgeQuotePermissionEvidence:
+        """返回当前连接从服务端取得的逐市场权限证据。"""
+        market_name = str(market or "").strip().upper()
+        if market_name not in {"US", "HK", "CN"}:
+            raise ValueError("Longbridge 行情权限市场只支持 US、HK、CN")
+        if not self._connected:
+            raise DataSourceTransientError("Longbridge 未连接")
+        evidence = self._quote_permissions.get(market_name)
+        if evidence is None:
+            raise DataSourcePermissionError(
+                f"Longbridge {market_name} 行情套餐未证明实时或延迟模式"
+            )
+        if int(time.time() * 1000) > evidence.valid_until_utc_ms:
+            raise DataSourcePermissionError(f"Longbridge {market_name} 行情套餐证据已经过期")
+        return evidence
+
+    def _refresh_quote_permissions_if_due(self, market: str) -> None:
+        """权限证据到期后原子重读，失败时不沿用旧证据。"""
+        now_utc_ms = int(time.time() * 1000)
+        current = self._quote_permissions.get(market)
+        if current is not None and now_utc_ms <= current.valid_until_utc_ms:
+            return
+        if current is None and now_utc_ms < self._quote_permissions_refresh_due_utc_ms:
+            return
+
+        with self._snapshot_lock:
+            now_utc_ms = int(time.time() * 1000)
+            current = self._quote_permissions.get(market)
+            if current is not None and now_utc_ms <= current.valid_until_utc_ms:
+                return
+            if current is None and now_utc_ms < self._quote_permissions_refresh_due_utc_ms:
+                return
+            quote_context = self._quote_context
+            if not self._connected or quote_context is None:
+                raise DataSourceTransientError("Longbridge 未连接")
+            try:
+                quote_level = self._call_quote_sdk(
+                    "行情级别刷新",
+                    quote_context.quote_level,
+                )
+                quote_packages = self._call_quote_sdk(
+                    "行情套餐刷新",
+                    quote_context.quote_package_details,
+                )
+                refreshed = _quote_permission_evidence(
+                    quote_level,
+                    quote_packages,
+                    observed_at_utc_ms=now_utc_ms,
+                )
+            except DataSourceError:
+                raise
+            except Exception as exc:
+                _raise_typed_longbridge_error("Longbridge 行情权限刷新失败", exc)
+            self._quote_permissions = refreshed
+            self._quote_permissions_refresh_due_utc_ms = now_utc_ms + _QUOTE_PERMISSION_TTL_MS
+
     def connect(self) -> None:
         credentials = load_longbridge_credentials(self._env_file)
         token_expiry = inspect_longbridge_token_expiry(credentials.access_token)
@@ -397,11 +671,18 @@ class LongbridgeSource(DataSource):
                 "未安装 Longbridge SDK，请执行：pip install longbridge"
             ) from exc
 
-        if self._sdk_executor is not None:
-            self._sdk_executor.shutdown(wait=False, cancel_futures=True)
-        self._sdk_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="lb-quote"
-        )
+        with self._snapshot_lock:
+            self._connected = False
+            self._quote_context = None
+            self._sdk = None
+            self._quote_permissions = {}
+            self._quote_permissions_refresh_due_utc_ms = 0
+            if self._sdk_executor is not None:
+                self._sdk_executor.shutdown(wait=False, cancel_futures=True)
+            self._sdk_executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="lb-quote",
+            )
         try:
             config = sdk.Config.from_apikey(
                 credentials.app_key,
@@ -410,10 +691,22 @@ class LongbridgeSource(DataSource):
                 enable_print_quote_packages=False,
             )
             quote_context = self._call_quote_sdk("连接", sdk.QuoteContext, config)
+            observed_at_utc_ms = int(time.time() * 1000)
+            quote_level = self._call_quote_sdk(
+                "行情级别读取",
+                quote_context.quote_level,
+            )
+            quote_packages = self._call_quote_sdk(
+                "行情套餐读取",
+                quote_context.quote_package_details,
+            )
+            quote_permissions = _quote_permission_evidence(
+                quote_level,
+                quote_packages,
+                observed_at_utc_ms=observed_at_utc_ms,
+            )
             session_closes: dict[str, datetime_time] = {}
-            session_windows: dict[
-                str, tuple[tuple[datetime_time, datetime_time], ...]
-            ] = {}
+            session_windows: dict[str, tuple[tuple[datetime_time, datetime_time], ...]] = {}
             for market_session in self._call_quote_sdk(
                 "交易时段读取", quote_context.trading_session
             ):
@@ -425,13 +718,10 @@ class LongbridgeSource(DataSource):
                 market_name = _sdk_market_name(sdk, market_session.market)
                 if market_name is not None and intraday_sessions:
                     windows = [
-                        (session.begin_time, session.end_time)
-                        for session in intraday_sessions
+                        (session.begin_time, session.end_time) for session in intraday_sessions
                     ]
                     if market_name == "CN":
-                        last_index = max(
-                            range(len(windows)), key=lambda index: windows[index][1]
-                        )
+                        last_index = max(range(len(windows)), key=lambda index: windows[index][1])
                         begin_time, end_time = windows[last_index]
                         windows[last_index] = (
                             begin_time,
@@ -441,22 +731,29 @@ class LongbridgeSource(DataSource):
                     session_closes[market_name] = max(end for _, end in windows)
             # SDK 的 CN Intraday 尾点可能是最后一根分钟线的起始时间（如 14:57），
             # 日线/周线是否收盘必须按沪深常规收盘 15:00 判断。
-        except DataSourceTransientError:
+        except DataSourceError:
             self._connected = False
+            if self._sdk_executor is not None:
+                self._sdk_executor.shutdown(wait=False, cancel_futures=True)
+                self._sdk_executor = None
             raise
         except Exception as exc:
             self._connected = False
-            error_type = (
-                DataSourceAuthenticationError
-                if "401004" in str(exc)
-                else DataSourceTransientError
-            )
-            raise error_type(
+            if self._sdk_executor is not None:
+                self._sdk_executor.shutdown(wait=False, cancel_futures=True)
+                self._sdk_executor = None
+            if "401004" in str(exc):
+                raise DataSourceAuthenticationError("Longbridge 连接失败（认证失败）") from exc
+            if "301604" in str(exc):
+                raise DataSourcePermissionError("Longbridge 连接失败（行情权限不足）") from exc
+            raise DataSourceTransientError(
                 f"Longbridge 连接失败（认证或网络异常，{type(exc).__name__}）"
             ) from exc
 
         self._sdk = sdk
         self._quote_context = quote_context
+        self._quote_permissions = quote_permissions
+        self._quote_permissions_refresh_due_utc_ms = observed_at_utc_ms + _QUOTE_PERMISSION_TTL_MS
         self._regular_session_closes = session_closes
         self._regular_session_windows = session_windows
         self._connected = True
@@ -469,6 +766,8 @@ class LongbridgeSource(DataSource):
             self._connected = False
             self._regular_session_closes = {}
             self._regular_session_windows = {}
+            self._quote_permissions = {}
+            self._quote_permissions_refresh_due_utc_ms = 0
             self._market = None
             self._market_name = ""
             self._market_timezone = None
@@ -486,9 +785,7 @@ class LongbridgeSource(DataSource):
 
     def subscribe(self, symbol: str, timeframe: str) -> None:
         if timeframe not in _TF_MAP:
-            raise ValueError(
-                f"Longbridge 不支持周期 {timeframe!r}；可用周期：{list(_TF_MAP)}"
-            )
+            raise ValueError(f"Longbridge 不支持周期 {timeframe!r}；可用周期：{list(_TF_MAP)}")
         normalized = normalize_longbridge_symbol(symbol)
         if not self._connected or self._quote_context is None:
             raise DataSourceTransientError("Longbridge 未连接")
@@ -512,9 +809,7 @@ class LongbridgeSource(DataSource):
         market = getattr(self._sdk.Market, market_name)
         market_timezone = _MARKET_TIMEZONES[market_name]
         if market_name not in self._regular_session_closes:
-            raise DataSourceTransientError(
-                f"Longbridge 未返回 {market_name} 市场常规交易时段"
-            )
+            raise DataSourceTransientError(f"Longbridge 未返回 {market_name} 市场常规交易时段")
         self._symbol = normalized
         self._timeframe = timeframe
         self._market = market
@@ -540,24 +835,10 @@ class LongbridgeSource(DataSource):
     def batch_quote_snapshots(
         self,
         token: WatchlistRequestToken,
-        *,
-        received_at_utc_ms: int,
-        quote_mode: QuoteMode | None = None,
-        expected_delay_ms: int = 0,
     ) -> tuple[QuoteSnapshot, ...]:
-        """一次 SDK 调用读取最多 100 个股票报价，不改变主图订阅。"""
+        """一次 SDK 调用读取最多 100 个股票报价，并在响应后盖接收时间。"""
         if not self._connected or self._quote_context is None:
             raise DataSourceTransientError("Longbridge 未连接")
-        if quote_mode is None:
-            raise DataSourcePermissionError(
-                "Longbridge 行情套餐未证明实时或延迟模式，拒绝标记报价"
-            )
-        if quote_mode not in {"realtime", "delayed"}:
-            raise ValueError("Longbridge quote_mode 只支持 realtime 或 delayed")
-        if quote_mode == "realtime" and expected_delay_ms != 0:
-            raise ValueError("Longbridge 实时报价的 expected_delay_ms 必须为 0")
-        if quote_mode == "delayed" and expected_delay_ms <= 0:
-            raise ValueError("Longbridge 延迟报价必须声明正数 expected_delay_ms")
         if token.source != "longbridge" or token.market == "Crypto":
             raise ValueError("Longbridge 批量报价只接受 US/HK/CN 批次")
 
@@ -572,6 +853,9 @@ class LongbridgeSource(DataSource):
                 raise ValueError(f"批量报价包含重复品种：{symbol}")
             request_by_symbol[symbol] = symbol
 
+        self._refresh_quote_permissions_if_due(token.market)
+        permission = self.quote_permission_evidence(token.market)
+
         symbols = list(request_by_symbol)
         try:
             with self._snapshot_lock:
@@ -585,33 +869,29 @@ class LongbridgeSource(DataSource):
                     self._quote_context.quote,
                     symbols,
                 )
+                received_at_utc_ms = int(time.time() * 1000)
         except DataSourceTransientError:
             raise
         except Exception as exc:
-            if "401004" in str(exc):
-                raise DataSourceAuthenticationError(
-                    "Longbridge 批量报价认证失败，请更换 Legacy Access Token"
-                ) from exc
-            raise DataSourceTransientError(
-                f"Longbridge 批量报价失败（{type(exc).__name__}）"
-            ) from exc
+            _raise_typed_longbridge_error("Longbridge 批量报价失败", exc)
 
-        static_by_symbol = {
-            str(getattr(row, "symbol", "") or "").strip().upper(): row
-            for row in (static_rows or [])
-        }
-        quote_by_symbol = {
-            str(getattr(row, "symbol", "") or "").strip().upper(): row
-            for row in (quote_rows or [])
-        }
+        requested_symbols = tuple(request_by_symbol)
+        static_by_symbol = _strict_provider_rows(
+            static_rows,
+            requested_symbols=requested_symbols,
+            label="静态资料",
+        )
+        quote_by_symbol = _strict_provider_rows(
+            quote_rows,
+            requested_symbols=requested_symbols,
+            label="报价",
+        )
         snapshots: list[QuoteSnapshot] = []
         for symbol in request_by_symbol:
             static = static_by_symbol.get(symbol)
             quote = quote_by_symbol.get(symbol)
             if static is None or quote is None:
-                raise DataSourceTransientError(
-                    f"Longbridge 批量报价缺少 {symbol} 的静态资料或报价"
-                )
+                raise DataSourceTransientError(f"Longbridge 批量报价缺少 {symbol} 的静态资料或报价")
             market = token.market
             name_fields = (
                 ("name_cn", "name_en", "name_hk")
@@ -630,9 +910,7 @@ class LongbridgeSource(DataSource):
             )
             timestamp = getattr(quote, "timestamp", None)
             if not isinstance(timestamp, datetime):
-                raise DataSourceTransientError(
-                    f"Longbridge {symbol} 报价缺少有效时间"
-                )
+                raise DataSourceTransientError(f"Longbridge {symbol} 报价缺少有效时间")
             try:
                 snapshots.append(
                     QuoteSnapshot.from_prices(
@@ -648,16 +926,14 @@ class LongbridgeSource(DataSource):
                         # Longbridge quote/static_info 不声明真实最小跳动；
                         # 报价可以展示，但不得据此生成可执行价格。
                         price_tick=None,
-                        quote_ts_utc_ms=datetime_to_ts_ms(timestamp),
+                        quote_ts_utc_ms=_longbridge_datetime_to_epoch_ms(timestamp),
                         received_at_utc_ms=received_at_utc_ms,
-                        quote_mode=quote_mode,
-                        expected_delay_ms=expected_delay_ms,
+                        quote_mode=permission.quote_mode,
+                        expected_delay_ms=permission.expected_delay_ms,
                     )
                 )
             except (InvalidOperation, TypeError, ValueError) as exc:
-                raise DataSourceTransientError(
-                    f"Longbridge {symbol} 报价字段无法解析"
-                ) from exc
+                raise DataSourceTransientError(f"Longbridge {symbol} 报价字段无法解析") from exc
         return tuple(snapshots)
 
     def _last_trading_day_of_week(self, week_start: date) -> date:
@@ -695,24 +971,28 @@ class LongbridgeSource(DataSource):
         timestamp: datetime,
         duration_s: int | None,
         timeframe: str,
+        *,
+        analysis_as_of_utc_ms: int | None = None,
     ) -> bool:
         if self._market is None or self._market_timezone is None:
             raise DataSourceTransientError("Longbridge 未订阅市场")
         market_open = _timestamp_in_market_timezone(timestamp, self._market_timezone)
-        market_now = _now_in_market_timezone(self._market_timezone)
-        session_close = self._regular_session_closes[self._market_name]
+        market_now = (
+            datetime.fromtimestamp(
+                analysis_as_of_utc_ms / 1000,
+                tz=UTC,
+            ).astimezone(self._market_timezone)
+            if analysis_as_of_utc_ms is not None
+            else _now_in_market_timezone(self._market_timezone)
+        )
 
         if timeframe == "1d":
-            close_at = datetime.combine(
-                market_open.date(), session_close, self._market_timezone
-            )
+            close_at = self._actual_session_close(market_open.date())
             return market_now < close_at
         if timeframe == "1w":
             week_start = market_open.date() - timedelta(days=market_open.weekday())
             last_trading_day = self._last_trading_day_of_week(week_start)
-            close_at = datetime.combine(
-                last_trading_day, session_close, self._market_timezone
-            )
+            close_at = self._actual_session_close(last_trading_day)
             return market_now < close_at
         if duration_s is None:
             return False
@@ -722,6 +1002,17 @@ class LongbridgeSource(DataSource):
             close_at = min(close_at, market_close_at)
         return market_now < close_at
 
+    def _actual_session_close(self, session_date: date) -> datetime:
+        if self._market_timezone is None:
+            raise DataSourceTransientError("Longbridge 未订阅市场")
+        try:
+            close_ms = session_close_utc_ms(self._market_name, session_date)
+        except MarketCalendarError as exc:
+            raise DataSourceTransientError(
+                f"Longbridge 无法确认 {session_date.isoformat()} 的真实收盘时间"
+            ) from exc
+        return datetime.fromtimestamp(close_ms / 1000, tz=UTC).astimezone(self._market_timezone)
+
     def _session_close_for_bar(self, market_open: datetime) -> datetime | None:
         if self._market_timezone is None:
             raise DataSourceTransientError("Longbridge 未订阅市场")
@@ -729,8 +1020,12 @@ class LongbridgeSource(DataSource):
         open_time = market_open.timetz().replace(tzinfo=None)
         for begin_time, end_time in windows:
             if begin_time <= open_time <= end_time:
-                return datetime.combine(
+                regular_close = datetime.combine(
                     market_open.date(), end_time, self._market_timezone
+                )
+                return min(
+                    regular_close,
+                    self._actual_session_close(market_open.date()),
                 )
         return None
 
@@ -744,21 +1039,42 @@ class LongbridgeSource(DataSource):
         """最近 1000 根用 candlesticks；更早历史用 by_offset 分页回溯。"""
         period = getattr(self._sdk.Period, _TF_MAP[timeframe])
         try:
-            rows = list(
+            first_page_limit = int(min(n, _MAX_CANDLESTICKS))
+            first_page = list(
                 self._call_quote_sdk(
                     "K 线拉取",
                     self._quote_context.candlesticks,
                     self._symbol,
                     period,
-                    int(min(n, _MAX_CANDLESTICKS)),
+                    first_page_limit,
                     self._sdk.AdjustType.NoAdjust,
                     self._sdk.TradeSessions.Intraday,
                 )
                 or []
             )
-            seen_timestamps = {row.timestamp for row in rows}
-            while rows and len(rows) < n:
-                oldest = min(rows, key=lambda row: row.timestamp)
+            rows_by_timestamp: dict[int, tuple[Any, tuple[Any, ...]]] = {}
+
+            def merge_page(page: list[Any]) -> int:
+                added = 0
+                for row in page:
+                    signature = _bar_signature(row)
+                    timestamp_ms = signature[0]
+                    existing = rows_by_timestamp.get(timestamp_ms)
+                    if existing is not None:
+                        if existing[1] != signature:
+                            raise DataSourceError(
+                                "Longbridge K 线同一时间戳内容冲突，拒绝选择任一版本"
+                            )
+                        continue
+                    rows_by_timestamp[timestamp_ms] = (row, signature)
+                    added += 1
+                return added
+
+            merge_page(first_page)
+            should_page = len(first_page) >= first_page_limit
+            while should_page and rows_by_timestamp and len(rows_by_timestamp) < n:
+                oldest_timestamp = min(rows_by_timestamp)
+                oldest = rows_by_timestamp[oldest_timestamp][0]
                 older_rows = self._call_quote_sdk(
                     "历史 K 线分页",
                     self._quote_context.history_candlesticks_by_offset,
@@ -766,29 +1082,26 @@ class LongbridgeSource(DataSource):
                     period,
                     self._sdk.AdjustType.NoAdjust,
                     False,
-                    int(min(n - len(rows) + 1, _MAX_CANDLESTICKS)),
+                    int(
+                        min(
+                            n - len(rows_by_timestamp) + 1,
+                            _MAX_CANDLESTICKS,
+                        )
+                    ),
                     oldest.timestamp,
                 )
-                fresh = [
-                    row
-                    for row in (older_rows or [])
-                    if row.timestamp not in seen_timestamps
-                ]
-                if not fresh:
+                if merge_page(list(older_rows or [])) == 0:
                     break
-                rows.extend(fresh)
-                seen_timestamps.update(row.timestamp for row in fresh)
+            rows = [row for row, _ in rows_by_timestamp.values()]
+        except DataSourceError:
+            raise
         except DataSourceTransientError:
             raise
         except Exception as exc:
-            raise DataSourceTransientError(
-                f"Longbridge K 线拉取失败（{type(exc).__name__}）"
-            ) from exc
+            _raise_typed_longbridge_error("Longbridge K 线拉取失败", exc)
         return rows
 
-    def _assert_no_intraday_gaps(
-        self, closed_ts_ascending_ms: list[int], timeframe: str
-    ) -> None:
+    def _assert_no_intraday_gaps(self, closed_ts_ascending_ms: list[int], timeframe: str) -> None:
         """校验交易时段内不缺根（上游已知 5m 类缺根 issue #890）。
 
         相邻已收盘 K 线之间若存在"应有开盘时刻落在连续交易时段内却没有
@@ -811,39 +1124,56 @@ class LongbridgeSource(DataSource):
                         f"Longbridge 缺口校验无法取得交易日历（{exc}）"
                     ) from exc
                 if slot_is_trading:
-                    missing_at = datetime.fromtimestamp(
-                        slot_ms / 1000, tz=UTC
-                    ).isoformat()
+                    missing_at = datetime.fromtimestamp(slot_ms / 1000, tz=UTC).isoformat()
                     raise DataSourceError(
                         f"Longbridge {self._symbol} {timeframe} 在交易时段内"
                         f"缺根（{missing_at} 应有 K 线未返回，参考上游 issue "
                         "#890），拒绝用不完整数据分析"
                     )
 
-    def _snapshot_for(self, timeframe: str, n: int) -> list[KlineBar]:
+    def _snapshot_for(
+        self,
+        timeframe: str,
+        n: int,
+        *,
+        analysis_as_of_utc_ms: int | None = None,
+    ) -> list[KlineBar]:
         if not self._connected or self._quote_context is None or self._sdk is None:
             raise DataSourceTransientError("Longbridge 未连接")
         if not self._symbol or not self._timeframe:
             raise DataSourceTransientError("Longbridge 未订阅品种/周期")
         if timeframe not in _TF_MAP:
-            raise ValueError(
-                f"Longbridge 不支持周期 {timeframe!r}；可用周期：{list(_TF_MAP)}"
-            )
+            raise ValueError(f"Longbridge 不支持周期 {timeframe!r}；可用周期：{list(_TF_MAP)}")
         if n < 1:
             return []
+        if analysis_as_of_utc_ms is not None and analysis_as_of_utc_ms < 0:
+            raise ValueError("analysis_as_of_utc_ms 不能为负数")
         if n > _MAX_TOTAL_CANDLESTICKS:
             raise DataSourceTransientError(
-                f"Longbridge 单次快照上限 {_MAX_TOTAL_CANDLESTICKS} 根"
-                f"（含分页），请求 {n} 根被拒绝"
+                f"Longbridge 单次快照上限 {_MAX_TOTAL_CANDLESTICKS} 根（含分页），请求 {n} 根被拒绝"
             )
 
         with self._snapshot_lock:
-            rows = self._fetch_rows(timeframe, n)
+            rows = self._fetch_rows(
+                timeframe,
+                min(
+                    n + (1 if analysis_as_of_utc_ms is not None else 0),
+                    _MAX_TOTAL_CANDLESTICKS,
+                ),
+            )
 
         if not rows:
-            raise DataSourceTransientError(
-                f"Longbridge 未返回 K 线：{self._symbol} {timeframe}"
-            )
+            raise DataSourceTransientError(f"Longbridge 未返回 K 线：{self._symbol} {timeframe}")
+        if analysis_as_of_utc_ms is not None:
+            rows = [
+                row
+                for row in rows
+                if self._timestamp_to_market_epoch_ms(row.timestamp) <= analysis_as_of_utc_ms
+            ]
+            if not rows:
+                raise DataSourceTransientError(
+                    f"Longbridge {self._symbol} {timeframe} 在统一分析截止时间前没有 K 线"
+                )
 
         ordered = sorted(
             rows,
@@ -852,7 +1182,10 @@ class LongbridgeSource(DataSource):
         )
         duration_s = timeframe_to_seconds(timeframe)
         head_is_forming = self._head_bar_is_forming(
-            ordered[0].timestamp, duration_s, timeframe
+            ordered[0].timestamp,
+            duration_s,
+            timeframe,
+            analysis_as_of_utc_ms=analysis_as_of_utc_ms,
         )
         bars: list[KlineBar] = []
         closed_seq = 1
@@ -877,9 +1210,7 @@ class LongbridgeSource(DataSource):
                     )
                 )
             )
-        closed_ts_ascending = sorted(
-            int(bar.ts_open) for bar in bars if bar.closed
-        )
+        closed_ts_ascending = sorted(int(bar.ts_open) for bar in bars if bar.closed)
         self._assert_no_intraday_gaps(closed_ts_ascending, timeframe)
         return bars
 
@@ -887,7 +1218,15 @@ class LongbridgeSource(DataSource):
         return self._snapshot_for(self._timeframe, n)
 
     def latest_snapshot_for_timeframe(
-        self, timeframe: str, n: int
+        self,
+        timeframe: str,
+        n: int,
+        *,
+        analysis_as_of_utc_ms: int | None = None,
     ) -> list[KlineBar]:
         """按指定周期返回最近 K 线；供 1h/4h 高周期薄背景使用。"""
-        return self._snapshot_for(timeframe, n)
+        return self._snapshot_for(
+            timeframe,
+            n,
+            analysis_as_of_utc_ms=analysis_as_of_utc_ms,
+        )

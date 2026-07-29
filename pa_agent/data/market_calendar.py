@@ -5,9 +5,11 @@ US→XNYS、HK→XHKG、SH/SZ→XSHG，加密市场 24/7。
 本模块无状态、只读，供 K 线缺口校验、收盘等待和市场时钟共用。
 PA_Agent 仓库自包含：不 import 仓库外的共享包，依赖 exchange_calendars。
 """
+
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from enum import StrEnum
 from functools import lru_cache
 
@@ -50,9 +52,7 @@ def _load_calendar(calendar_name: str):
     try:
         import exchange_calendars as xcals
     except ImportError as exc:
-        raise MarketCalendarError(
-            "exchange_calendars 未安装，无法判定市场交易时段"
-        ) from exc
+        raise MarketCalendarError("exchange_calendars 未安装，无法判定市场交易时段") from exc
     return xcals.get_calendar(calendar_name)
 
 
@@ -80,16 +80,22 @@ def session_state(market: str, at_utc_ms: int) -> MarketSessionState:
     calendar = _calendar_for_market(market)
     minute = _timestamp(at_utc_ms)
     open_strict = bool(calendar.is_open_on_minute(minute, ignore_breaks=False))
-    open_ignoring_breaks = bool(
-        calendar.is_open_on_minute(minute, ignore_breaks=True)
-    )
+    open_ignoring_breaks = bool(calendar.is_open_on_minute(minute, ignore_breaks=True))
 
     if not open_ignoring_breaks:
+        local_session_label = pd.Timestamp(minute.tz_convert(calendar.tz).date())
+        is_half_day = False
+        if bool(calendar.is_session(local_session_label)):
+            local_session = calendar.date_to_session(
+                local_session_label,
+                direction="none",
+            )
+            is_half_day = bool(local_session in calendar.early_closes)
         next_open = calendar.next_open(minute)
         return MarketSessionState(
             market=market,
             phase=SessionPhase.CLOSED,
-            is_half_day=False,
+            is_half_day=is_half_day,
             as_of_utc_ms=at_utc_ms,
             next_change_utc_ms=_to_utc_ms(next_open),
         )
@@ -127,6 +133,22 @@ def is_trading_minute(market: str, at_utc_ms: int) -> bool:
     return session_state(market, at_utc_ms).phase is SessionPhase.OPEN
 
 
+def session_close_utc_ms(market: str, session_date: date) -> int:
+    """返回指定交易所当地交易日的真实收盘时间。
+
+    常规日和半日市都直接读取 exchange_calendars 的该日会话，禁止用
+    “通常几点收盘”覆盖实际提前收盘。
+    """
+    import pandas as pd
+
+    calendar = _calendar_for_market(market)
+    session_label = pd.Timestamp(session_date)
+    if not bool(calendar.is_session(session_label)):
+        raise MarketCalendarError(f"{market} 的 {session_date.isoformat()} 不是交易日")
+    session = calendar.date_to_session(session_label, direction="none")
+    return _to_utc_ms(calendar.session_close(session))
+
+
 #: 开盘时段与尾盘各自的窗口长度（分钟）。日内结构在这两段与中段差异显著。
 _EDGE_WINDOW_MINUTES = 60
 
@@ -150,7 +172,7 @@ def intraday_phase(market: str, at_utc_ms: int) -> IntradayPhase:
     """
     state = session_state(market, at_utc_ms)
     if state.phase is SessionPhase.CLOSED:
-        return IntradayPhase("闭市", False, None, None)
+        return IntradayPhase("闭市", state.is_half_day, None, None)
     if state.phase is SessionPhase.BREAK:
         return IntradayPhase("午休", state.is_half_day, None, None)
 

@@ -92,6 +92,23 @@ class AnalysisResultState(StrEnum):
     FAILED = "failed"
 
 
+class AnalysisCapabilityState(StrEnum):
+    """当前数据包允许的分析能力。"""
+
+    READY = "ready"
+    DISPLAY_ONLY = "display_only"
+    BLOCKED = "blocked"
+
+
+class AnalysisGateReason(StrEnum):
+    """分析能力门的稳定原因。"""
+
+    OK = "ok"
+    QUOTE_NOT_READY = "quote_not_ready"
+    TEN_MINUTE_NOT_READY = "ten_minute_not_ready"
+    PRICE_TICK_UNAVAILABLE = "price_tick_unavailable"
+
+
 def _normalise_decimal(
     value: object,
     *,
@@ -308,9 +325,7 @@ class QuoteSnapshot:
     ) -> QuoteSnapshot:
         """由供应商原始价格构造快照，涨跌只在后端计算一次。"""
 
-        last_decimal = Decimal(
-            _normalise_decimal(last, field_name="last", positive=True) or "0"
-        )
+        last_decimal = Decimal(_normalise_decimal(last, field_name="last", positive=True) or "0")
         previous_text = _normalise_decimal(
             prev_close,
             field_name="prev_close",
@@ -438,10 +453,7 @@ def evaluate_quote_freshness(
             QuoteFreshness.SESSION_PAUSED,
             QuoteFreshnessReason.SESSION_PAUSED,
         )
-    if (
-        received_age_ms > transport_budget_ms
-        or corrected_quote_age_ms > allowed_quote_age_ms
-    ):
+    if received_age_ms > transport_budget_ms or corrected_quote_age_ms > allowed_quote_age_ms:
         return QuoteFreshnessView(
             identity.selection_generation,
             request_sequence,
@@ -508,11 +520,14 @@ class WatchlistRequestToken:
     watchlist_refresh_sequence: int
 
     def __post_init__(self) -> None:
-        if min(
-            self.selection_generation,
-            self.watchlist_change_sequence,
-            self.watchlist_refresh_sequence,
-        ) < 1:
+        if (
+            min(
+                self.selection_generation,
+                self.watchlist_change_sequence,
+                self.watchlist_refresh_sequence,
+            )
+            < 1
+        ):
             raise ValueError("自选 generation 和序号必须大于等于 1")
         expected_source = _MARKET_SOURCES.get(str(self.market))
         if expected_source is None or self.source != expected_source:
@@ -520,8 +535,7 @@ class WatchlistRequestToken:
         if not self.symbols or len(self.symbols) > 100:
             raise ValueError("首版自选必须包含 1 到 100 项")
         normalized = tuple(
-            _normalise_identity_text(symbol, field_name="symbol").upper()
-            for symbol in self.symbols
+            _normalise_identity_text(symbol, field_name="symbol").upper() for symbol in self.symbols
         )
         if len(set(normalized)) != len(normalized):
             raise ValueError("自选标的不能重复")
@@ -544,10 +558,7 @@ class WatchlistQuoteSet:
                 raise ValueError("自选快照 generation 与批次不一致")
             if snapshot.request_sequence != self.token.watchlist_refresh_sequence:
                 raise ValueError("自选快照 request_sequence 与刷新批次不一致")
-            if (
-                snapshot.market != self.token.market
-                or snapshot.source != self.token.source
-            ):
+            if snapshot.market != self.token.market or snapshot.source != self.token.source:
                 raise ValueError("自选快照市场或来源与批次不一致")
             if snapshot.symbol in by_symbol:
                 raise ValueError(f"自选报价包含重复标的：{snapshot.symbol}")
@@ -571,8 +582,7 @@ class WatchlistGenerationGate:
         symbols: tuple[str, ...],
     ) -> WatchlistRequestToken:
         normalized = tuple(
-            _normalise_identity_text(symbol, field_name="symbol").upper()
-            for symbol in symbols
+            _normalise_identity_text(symbol, field_name="symbol").upper() for symbol in symbols
         )
         if normalized != self._symbols:
             self._change_sequence += 1
@@ -656,10 +666,7 @@ class SelectionGenerationGate:
     def accepts(self, token: RequestToken) -> bool:
         current = self._staged or self._committed
         key = (token.identity.selection_generation, token.family)
-        return (
-            current == token.identity
-            and self._sequences.get(key, 0) == token.request_sequence
-        )
+        return current == token.identity and self._sequences.get(key, 0) == token.request_sequence
 
     def commit(self, identity: SelectionIdentity) -> None:
         if self._staged != identity:
@@ -695,6 +702,7 @@ class KlineEvidenceView:
     required_closed_bars: int
     latest_closed_ts_utc_ms: int | None
     received_at_utc_ms: int
+    analysis_as_of_utc_ms: int
     now_utc_ms: int
     max_age_ms: int
     price_tick: str | None
@@ -718,16 +726,13 @@ class KlineEvidenceView:
             raise ValueError("K 线数量不能为负数")
         if self.closed_bar_count > self.bar_count:
             raise ValueError("已收盘 K 线数量不能超过总数")
-        if self.received_at_utc_ms < 0:
-            raise ValueError("接收时间不能为负数")
+        if self.received_at_utc_ms < 0 or self.analysis_as_of_utc_ms < 0:
+            raise ValueError("接收时间与分析截止时间不能为负数")
         if self.now_utc_ms < 0 or self.max_age_ms <= 0:
             raise ValueError("当前时间必须非负，最大年龄必须为正数")
         if self.received_at_utc_ms > self.now_utc_ms + 5_000:
             raise ValueError("K 线接收时间快于当前时间超过 5 秒")
-        if (
-            self.latest_closed_ts_utc_ms is not None
-            and self.latest_closed_ts_utc_ms < 0
-        ):
+        if self.latest_closed_ts_utc_ms is not None and self.latest_closed_ts_utc_ms < 0:
             raise ValueError("最新收盘时间不能为负数")
         if (
             self.latest_closed_ts_utc_ms is not None
@@ -739,6 +744,13 @@ class KlineEvidenceView:
             and self.latest_closed_ts_utc_ms > self.now_utc_ms + 5_000
         ):
             raise ValueError("最新已收盘 K 线时间快于当前时间超过 5 秒")
+        if self.analysis_as_of_utc_ms > self.now_utc_ms + 5_000:
+            raise ValueError("分析截止时间快于当前时间超过 5 秒")
+        if (
+            self.latest_closed_ts_utc_ms is not None
+            and self.latest_closed_ts_utc_ms > self.analysis_as_of_utc_ms + 5_000
+        ):
+            raise ValueError("最新已收盘 K 线快于分析截止时间超过 5 秒")
         object.__setattr__(self, "symbol", identity.symbol)
         object.__setattr__(self, "market", identity.market)
         object.__setattr__(self, "source", identity.source)
@@ -767,6 +779,119 @@ class KlineEvidenceView:
         else:
             state = EvidenceState.READY
         object.__setattr__(self, "state", state)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketDataBundle:
+    """一次冻结的报价和三周期证据；1h/4h 缺失不阻断 10m。"""
+
+    schema_version: int
+    token: RequestToken
+    analysis_as_of_utc_ms: int
+    quote: QuoteFreshnessView
+    ten_minute: KlineEvidenceView
+    one_hour: KlineEvidenceView | None
+    four_hour: KlineEvidenceView | None
+    analysis_state: AnalysisCapabilityState = field(init=False)
+    analysis_reason: AnalysisGateReason = field(init=False)
+    ready_higher_timeframes: tuple[str, ...] = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.schema_version != 1:
+            raise ValueError("MarketDataBundle schema_version 当前必须为 1")
+        if self.token.family is not RequestFamily.KLINE:
+            raise ValueError("MarketDataBundle 只接受 KLINE 请求 token")
+        if self.analysis_as_of_utc_ms < 0:
+            raise ValueError("analysis_as_of_utc_ms 不能为负数")
+
+        identity = self.token.identity
+        if self.quote.generation != identity.selection_generation:
+            raise ValueError("报价 generation 与数据包 identity 不一致")
+        snapshot = self.quote.snapshot
+        if snapshot is not None:
+            if not snapshot.matches(
+                identity,
+                request_sequence=self.quote.request_sequence,
+            ):
+                raise ValueError("报价 identity 或 request_sequence 不一致")
+            if (
+                snapshot.quote_ts_utc_ms > self.analysis_as_of_utc_ms + 5_000
+                or snapshot.received_at_utc_ms > self.analysis_as_of_utc_ms + 5_000
+            ):
+                raise ValueError("报价时间快于 analysis_as_of")
+
+        def validate_kline(
+            evidence: KlineEvidenceView,
+            *,
+            expected_timeframe: str,
+        ) -> None:
+            if evidence.timeframe != expected_timeframe:
+                raise ValueError(f"K 线周期应为 {expected_timeframe}，实际为 {evidence.timeframe}")
+            if (
+                evidence.selection_generation != identity.selection_generation
+                or evidence.market != identity.market
+                or evidence.source != identity.source
+                or evidence.symbol != identity.symbol
+            ):
+                raise ValueError("K 线 identity 与数据包不一致")
+            if evidence.request_sequence != self.token.request_sequence:
+                raise ValueError("K 线 request_sequence 与数据包不一致")
+            if evidence.analysis_as_of_utc_ms != self.analysis_as_of_utc_ms:
+                raise ValueError("K 线 analysis_as_of 与数据包不一致")
+
+        validate_kline(self.ten_minute, expected_timeframe="10m")
+        if self.one_hour is not None:
+            validate_kline(self.one_hour, expected_timeframe="1h")
+        if self.four_hour is not None:
+            validate_kline(self.four_hour, expected_timeframe="4h")
+
+        ready_higher = tuple(
+            timeframe
+            for timeframe, evidence in (
+                ("1h", self.one_hour),
+                ("4h", self.four_hour),
+            )
+            if evidence is not None and evidence.state is EvidenceState.READY
+        )
+        object.__setattr__(
+            self,
+            "ready_higher_timeframes",
+            ready_higher,
+        )
+
+        quote_ready = snapshot is not None and self.quote.freshness in {
+            QuoteFreshness.FRESH,
+            QuoteFreshness.SESSION_PAUSED,
+        }
+        if not quote_ready:
+            state = AnalysisCapabilityState.BLOCKED
+            reason = AnalysisGateReason.QUOTE_NOT_READY
+        elif self.ten_minute.state is not EvidenceState.READY:
+            state = AnalysisCapabilityState.BLOCKED
+            reason = AnalysisGateReason.TEN_MINUTE_NOT_READY
+        else:
+            ticks = {
+                tick
+                for tick in (
+                    snapshot.price_tick,
+                    self.ten_minute.price_tick,
+                )
+                if tick is not None
+            }
+            if len(ticks) > 1:
+                raise ValueError("报价与 10m K 线的 price_tick 不一致")
+            if not ticks:
+                state = AnalysisCapabilityState.DISPLAY_ONLY
+                reason = AnalysisGateReason.PRICE_TICK_UNAVAILABLE
+            else:
+                state = AnalysisCapabilityState.READY
+                reason = AnalysisGateReason.OK
+        object.__setattr__(self, "analysis_state", state)
+        object.__setattr__(self, "analysis_reason", reason)
+
+    @property
+    def analysis_allowed(self) -> bool:
+        return self.analysis_state is AnalysisCapabilityState.READY
 
 
 def _optional_text(value: object) -> str | None:
@@ -874,11 +999,7 @@ class AnalysisResultView:
             market=token.identity.market,
             source=token.identity.source,
             analysis_timeframe="10m",
-            state=(
-                AnalysisResultState.SUCCEEDED
-                if succeeded
-                else AnalysisResultState.FAILED
-            ),
+            state=(AnalysisResultState.SUCCEEDED if succeeded else AnalysisResultState.FAILED),
             cycle_position=_optional_text(diagnosis_summary.get("cycle_position")),
             direction=_optional_text(diagnosis_summary.get("direction")),
             diagnosis_confidence=_optional_score(
@@ -918,13 +1039,9 @@ class AnalysisResultView:
             terminal_outcome=_optional_text(terminal.get("outcome")),
             reasoning=_optional_text(decision.get("reasoning")),
             error_category=(
-                _optional_text(exception.get("category"))
-                if isinstance(exception, dict)
-                else None
+                _optional_text(exception.get("category")) if isinstance(exception, dict) else None
             ),
             error_stage=(
-                _optional_text(exception.get("stage"))
-                if isinstance(exception, dict)
-                else None
+                _optional_text(exception.get("stage")) if isinstance(exception, dict) else None
             ),
         )

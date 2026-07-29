@@ -736,3 +736,16 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 实现提交 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 已精确推送到 `origin/main`。GitHub Actions run `30447988360` 的全部步骤绿色，确定性主门、JUnit 数量门、live 健康检查、环境证据校验与证据上传均成功。
 - 远端证据包 `ci-evidence-c932e0113e9c4e33771d1cc5afc1f16beda46421` 已下载核对：`full-git-sha.txt` 与目标提交完全一致，`python-version.txt` 为 Python 3.12.10，`pip-freeze.txt` 共 91 行且 SHA-256 为 `9FB753B6B5661C5646A9131C26434AC8128310A2C1A9546F930DEF9FD2B883EA`。确定性 JUnit 共 2048 项、0 失败、0 错误、1 项跳过；该跳过是 `tests.unit.test_datetime_ts::test_naive_local_to_utc_uses_host_offset` 在 UTC 主机上的既有平台条件。live JUnit 共 7 项、0 失败、0 错误、7 项跳过，运行状态明确记录 `step_outcome=success` 与 `health_status=unavailable`。
 - 该次运行唯一注解是 GitHub 托管运行器提示 Node.js 20 已弃用，并把官方 checkout、setup-python、upload-artifact Action 强制切换到 Node.js 24；不影响测试或证据结论。P0-01 的源码、测试、对抗审查与提交级 CI 至此关闭；运行中的旧 Worker 未重载，生产运行态仍未加载 schema v5。
+
+## 2026-07-29 v0.1.0 阶段 B1：Longbridge 只读合同
+
+- 首轮反例为 14 项失败，直接暴露 SDK 无时区时间未统一、权限仍由调用者声明、供应商重复/额外 symbol 被静默覆盖，以及分页同时间戳内容冲突被丢弃；对应最小实现完成后 Longbridge 单文件为 83 项通过、0 失败。
+- SDK 4.3.2 的无时区 datetime 统一按宿主机当地墙钟解释再转换为 UTC；UTC、上海、东京宿主机矩阵与美股夏令时边界均有回归。报价和 K 线不再分别采用“naive 即 UTC”和“naive 即本地”的冲突规则。
+- 连接阶段读取服务端 `quote_level()` 与 `quote_package_details()`，生成不可变的逐市场权限证据；调用者不能再传入或覆盖 `realtime` / `delayed`。未知、过期或冲突套餐失败关闭；套餐声称实时而行情级别只有延迟/低级别、为空或未知时同样拒绝。失败重连不会继续暴露旧权限。实时和延迟证据均最多缓存 5 分钟，到期后原子重读服务端，刷新失败不沿用旧证据；`401004` 与 `301604` 分别成为认证失败和权限失败。
+- 静态资料和报价必须与请求 symbol 集合一一对应；重复、额外或缺失行整批失败。K 线同一 UTC 时间戳只有内容完全一致时才可去重，OHLC、成交量或成交额任一冲突即拒绝。
+- `KlineEvidenceView` 与 `MarketDataBundle` 固定唯一 `analysis_as_of_utc_ms`。10m 是硬输入；1h/4h 缺失或过期不会阻断合格 10m，也不会进入已证明高周期集合。无权威 tick 时数据保持可展示，但分析能力在 AI 调用前变为 `display_only`。
+- 交易日真实收盘时间直接读取 exchange_calendars；港股半日市日线在提前收盘后立即视为已收盘，不再等到常规 16:00，且闭市状态仍保留“半日市”事实。Longbridge 报价的本机收到时间由数据源在 SDK 响应完成后盖章，调用者不能预填网络请求开始时间冒充收到时间。
+- 真实只读验收复用一个 `COMPREHENSIVE` QuoteContext，依次核对 AAPL.US、700.HK、600519.SH。三市场服务端权限均为实时；三组报价与 10m/1h/4h 使用各自同一分析截止时间，根数和 UTC 首尾时间均有效。证据未保存价格、凭据、账户或订单信息，也没有创建交易上下文。
+- 三市场报价均未提供可追溯 `price_tick`，所以没有运行股票两阶段 AI；页面必须显示“仅展示，价格分析不可用”。该结论不是凭据阻塞，也不是 Longbridge 交易验收。
+- 首轮同一非 live 全仓命令为 2074 项通过、0 失败、0 错误、0 跳过；补入供应商乱序、权限元数据失败、权限证据矛盾、短时缓存到期刷新、未知行情级别、失败重连旧权限、半日市闭市标签和响应后收到时间八条边界回归后，最终为 2082 项通过、0 失败、0 错误、0 跳过，CI 下限同步固定为 2082。
+- staged gitleaks 首次把测试中的公开 Longbridge 套餐标识误判为通用 API key；扫描失败后先清空暂存区，再把测试改为运行时拼接同一公开值，没有设置扫描豁免。该测试表达式改写后的 Windows 单进程全量连续两次在第 2 项后触发既有 pyqtgraph `AxisItem` 析构竞态并使进程崩溃，没有产生断言失败；按既有 Windows 隔离方法，4 个 E2E 各自生成 JUnit，其余 2078 项另行生成 JUnit，机器汇总为 2082 项通过、0 失败、0 错误、0 跳过。提交级 GitHub CI 仍使用原始单进程全量命令，不能用本地隔离结果替代远端复证。

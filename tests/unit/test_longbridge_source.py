@@ -1,4 +1,5 @@
 """Longbridge 只读行情数据源测试。"""
+
 from __future__ import annotations
 
 import base64
@@ -15,8 +16,10 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from pa_agent.data import longbridge_source as longbridge_module
 from pa_agent.data.base import (
     DataSourceAuthenticationError,
+    DataSourceError,
     DataSourcePermissionError,
     DataSourceTransientError,
 )
@@ -100,6 +103,41 @@ def _fake_sdk(rows: list[SimpleNamespace] | None = None) -> tuple[object, dict[s
         def __init__(self, config: object) -> None:
             calls["quote_context"] = config
 
+        def quote_level(self) -> str:
+            calls["quote_level"] = True
+            return (
+                "USOQ:OpenAPI|USOQ|Global|LV1;"
+                "HKAC:OpenAPI|HKAC|Global|LV1;"
+                "SHAC:OpenAPI|SHAC|Mainland|LV1;"
+                "SZAC:OpenAPI|SZAC|Mainland|LV1"
+            )
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            calls["quote_package_details"] = True
+            return [
+                SimpleNamespace(
+                    key="US_QBBO_OpenAPI",
+                    name="LV1 Real-time Quotes",
+                    description="US",
+                    start_at=datetime(2025, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2030, 1, 1, tzinfo=UTC),
+                ),
+                SimpleNamespace(
+                    key="HK_L1_OpenAPI",
+                    name="LV1 Real-time Quotes",
+                    description="HK",
+                    start_at=datetime(2025, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2030, 1, 1, tzinfo=UTC),
+                ),
+                SimpleNamespace(
+                    key="_".join(("CN", "L1", "ChinaMainland", "EL")),
+                    name="LV1 Real-time Quotes",
+                    description="CN",
+                    start_at=datetime(2025, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2030, 1, 1, tzinfo=UTC),
+                ),
+            ]
+
         def static_info(self, symbols: list[str]) -> list[SimpleNamespace]:
             calls["static_info"] = symbols
             return [
@@ -147,9 +185,7 @@ def _fake_sdk(rows: list[SimpleNamespace] | None = None) -> tuple[object, dict[s
                 for market, market_sessions in sessions.items()
             ]
 
-        def trading_days(
-            self, market: object, begin: date, end: date
-        ) -> SimpleNamespace:
+        def trading_days(self, market: object, begin: date, end: date) -> SimpleNamespace:
             calls["trading_days"] = (market, begin, end)
             days: list[date] = []
             current = begin
@@ -183,9 +219,7 @@ def _fake_sdk(rows: list[SimpleNamespace] | None = None) -> tuple[object, dict[s
     return sdk, calls
 
 
-def _install_fake_sdk(
-    monkeypatch: pytest.MonkeyPatch, sdk: object
-) -> None:
+def _install_fake_sdk(monkeypatch: pytest.MonkeyPatch, sdk: object) -> None:
     package = types.ModuleType("longbridge")
     package.openapi = sdk  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "longbridge", package)
@@ -505,6 +539,28 @@ def test_naive_sdk_timestamp_is_interpreted_as_host_wall_clock() -> None:
     assert converted == timestamp.astimezone(market_timezone)
 
 
+@pytest.mark.parametrize(
+    "host_timezone",
+    [
+        ZoneInfo("UTC"),
+        ZoneInfo("Asia/Shanghai"),
+        ZoneInfo("Asia/Tokyo"),
+    ],
+)
+def test_sdk_naive_timestamp_normalizes_to_same_utc_on_each_host(
+    host_timezone: ZoneInfo,
+) -> None:
+    instant = datetime(2025, 11, 3, 14, 30, tzinfo=UTC)
+    sdk_naive = instant.astimezone(host_timezone).replace(tzinfo=None)
+
+    converted = longbridge_module._longbridge_datetime_to_utc(
+        sdk_naive,
+        host_timezone=host_timezone,
+    )
+
+    assert converted == instant
+
+
 def test_connect_uses_quote_context_only_and_disables_package_print(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -521,8 +577,38 @@ def test_connect_uses_quote_context_only_and_disables_package_print(
     assert calls["credentials"] == ("test-key", "test-secret", "test-token")
     assert calls["config_kwargs"] == {"enable_print_quote_packages": False}
     assert "quote_context" in calls
+    assert calls["quote_level"] is True
+    assert calls["quote_package_details"] is True
     assert not hasattr(sdk, "TradeContext")
     assert source._regular_session_closes["CN"] == time(15, 0)
+    evidence = source.quote_permission_evidence("US")
+    assert evidence.quote_mode == "realtime"
+    assert evidence.expected_delay_ms == 0
+    assert evidence.active_package_keys == ("US_QBBO_OpenAPI",)
+    assert len(evidence.evidence_sha256) == 64
+
+
+def test_permission_metadata_read_failure_closes_connection(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _PermissionMetadataFailure(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            raise RuntimeError("permission metadata unavailable")
+
+    sdk.QuoteContext = _PermissionMetadataFailure
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+
+    with pytest.raises(DataSourceTransientError, match="连接失败"):
+        source.connect()
+
+    assert source._connected is False
 
 
 def test_batch_quotes_uses_one_quote_call_and_backend_change_math(
@@ -545,11 +631,7 @@ def test_batch_quotes_uses_one_quote_call_and_backend_change_math(
         watchlist_refresh_sequence=4,
     )
 
-    snapshots = source.batch_quote_snapshots(
-        token,
-        received_at_utc_ms=1_785_297_600_100,
-        quote_mode="realtime",
-    )
+    snapshots = source.batch_quote_snapshots(token)
 
     assert calls["static_info"] == ["AAPL.US", "MSFT.US"]
     assert calls["quote"] == ["AAPL.US", "MSFT.US"]
@@ -557,6 +639,80 @@ def test_batch_quotes_uses_one_quote_call_and_backend_change_math(
     assert [snapshot.change for snapshot in snapshots] == ["1.25", "1.25"]
     assert [snapshot.change_pct for snapshot in snapshots] == ["1.25", "1.25"]
     assert all(snapshot.price_tick is None for snapshot in snapshots)
+    assert all(snapshot.quote_mode == "realtime" for snapshot in snapshots)
+    assert all(snapshot.expected_delay_ms == 0 for snapshot in snapshots)
+
+
+def test_batch_quote_receive_time_is_stamped_after_provider_returns(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    clock = {"seconds": 1_785_297_600.0}
+
+    class _SlowQuote(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            rows = super().quote(symbols)
+            clock["seconds"] += 10
+            return rows
+
+    sdk.QuoteContext = _SlowQuote
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source.time.time",
+        lambda: clock["seconds"],
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    snapshots = source.batch_quote_snapshots(token)
+
+    assert snapshots[0].received_at_utc_ms == 1_785_297_610_000
+
+
+def test_batch_quotes_restores_requested_order_when_provider_reverses_rows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _ReversedRows(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def static_info(self, symbols: list[str]) -> list[SimpleNamespace]:
+            return list(reversed(super().static_info(symbols)))
+
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            return list(reversed(super().quote(symbols)))
+
+    sdk.QuoteContext = _ReversedRows
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US", "MSFT.US"),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    snapshots = source.batch_quote_snapshots(token)
+
+    assert tuple(snapshot.symbol for snapshot in snapshots) == token.symbols
 
 
 def test_batch_quotes_rejects_market_suffix_mismatch(
@@ -580,14 +736,10 @@ def test_batch_quotes_rejects_market_suffix_mismatch(
     )
 
     with pytest.raises(ValueError, match="与所选市场"):
-        source.batch_quote_snapshots(
-            token,
-            received_at_utc_ms=1_775_016_100_000,
-            quote_mode="realtime",
-        )
+        source.batch_quote_snapshots(token)
 
 
-def test_batch_quotes_requires_proven_quote_mode(
+def test_batch_quotes_requires_current_server_permission_evidence(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -595,6 +747,15 @@ def test_batch_quotes_requires_proven_quote_mode(
     env_file = tmp_path / "env"
     _write_env(env_file)
     sdk, _ = _fake_sdk()
+
+    class _NoPackages(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            return "HKZA:OpenAPI|HKZA|Global|LV0"
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return []
+
+    sdk.QuoteContext = _NoPackages
     _install_fake_sdk(monkeypatch, sdk)
     source = LongbridgeSource(env_file=env_file)
     source.connect()
@@ -608,13 +769,206 @@ def test_batch_quotes_requires_proven_quote_mode(
     )
 
     with pytest.raises(DataSourcePermissionError, match="行情套餐未证明"):
-        source.batch_quote_snapshots(
-            token,
-            received_at_utc_ms=1_785_297_600_100,
-        )
+        source.batch_quote_snapshots(token)
 
 
-def test_batch_quotes_rejects_unknown_quote_mode(
+def test_hk_explicit_server_delay_is_preserved_as_fifteen_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _DelayedHK(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            return "HKAC:OpenAPI|HKAC|Global|Delay"
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return []
+
+    sdk.QuoteContext = _DelayedHK
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="HK",
+        source="longbridge",
+        symbols=("700.HK",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    snapshots = source.batch_quote_snapshots(token)
+
+    assert snapshots[0].quote_mode == "delayed"
+    assert snapshots[0].expected_delay_ms == 900_000
+
+
+def test_expired_server_package_does_not_prove_realtime_permission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _ExpiredPackages(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    key="US_QBBO_OpenAPI",
+                    name="LV1 Real-time Quotes",
+                    description="US",
+                    start_at=datetime(2020, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2021, 1, 1, tzinfo=UTC),
+                )
+            ]
+
+    sdk.QuoteContext = _ExpiredPackages
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+
+    with pytest.raises(DataSourcePermissionError, match="未证明"):
+        source.quote_permission_evidence("US")
+
+
+def test_conflicting_realtime_package_and_delay_level_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _ContradictoryHK(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            return "HKAC:OpenAPI|HKAC|Global|Delay"
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    key="HK_L1_OpenAPI",
+                    name="LV1 Real-time Quotes",
+                    description="HK",
+                    start_at=datetime(2025, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2030, 1, 1, tzinfo=UTC),
+                )
+            ]
+
+    sdk.QuoteContext = _ContradictoryHK
+    _install_fake_sdk(monkeypatch, sdk)
+
+    with pytest.raises(DataSourcePermissionError, match="权限证据矛盾"):
+        LongbridgeSource(env_file=env_file).connect()
+
+
+def test_realtime_package_without_known_realtime_level_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _UnknownHKLevel(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            return "HKAC:OpenAPI|HKAC|Global|UNKNOWN"
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return [
+                SimpleNamespace(
+                    key="HK_L1_OpenAPI",
+                    name="LV1 Real-time Quotes",
+                    description="HK",
+                    start_at=datetime(2025, 1, 1, tzinfo=UTC),
+                    end_at=datetime(2030, 1, 1, tzinfo=UTC),
+                )
+            ]
+
+    sdk.QuoteContext = _UnknownHKLevel
+    _install_fake_sdk(monkeypatch, sdk)
+
+    with pytest.raises(DataSourcePermissionError, match="行情级别未证明实时"):
+        LongbridgeSource(env_file=env_file).connect()
+
+
+def test_failed_reconnect_cannot_expose_stale_permission(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    assert source.quote_permission_evidence("US").quote_mode == "realtime"
+
+    class _ReconnectFailure(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            raise RuntimeError("permission metadata unavailable")
+
+    sdk.QuoteContext = _ReconnectFailure
+
+    with pytest.raises(DataSourceTransientError, match="连接失败"):
+        source.connect()
+    with pytest.raises(DataSourceTransientError, match="未连接"):
+        source.quote_permission_evidence("US")
+
+
+def test_delayed_permission_is_refreshed_after_short_ttl(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, calls = _fake_sdk()
+    clock = {"seconds": 1_785_297_600.0}
+
+    class _DelayedHK(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote_level(self) -> str:
+            calls["quote_level_count"] = int(calls.get("quote_level_count", 0)) + 1
+            return "HKAC:OpenAPI|HKAC|Global|Delay"
+
+        def quote_package_details(self) -> list[SimpleNamespace]:
+            return []
+
+    sdk.QuoteContext = _DelayedHK
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source.time.time",
+        lambda: clock["seconds"],
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    initial = source.quote_permission_evidence("HK")
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="HK",
+        source="longbridge",
+        symbols=("700.HK",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+    clock["seconds"] = initial.valid_until_utc_ms / 1000 + 1
+
+    snapshots = source.batch_quote_snapshots(token)
+
+    assert calls["quote_level_count"] == 2
+    assert snapshots[0].quote_mode == "delayed"
+    assert source.quote_permission_evidence("HK").observed_at_utc_ms > (initial.observed_at_utc_ms)
+
+
+def test_batch_quotes_cannot_be_downgraded_by_caller_declared_mode(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -634,12 +988,10 @@ def test_batch_quotes_rejects_unknown_quote_mode(
         watchlist_refresh_sequence=1,
     )
 
-    with pytest.raises(ValueError, match="quote_mode 只支持"):
-        source.batch_quote_snapshots(
-            token,
-            received_at_utc_ms=1_785_297_600_100,
-            quote_mode="unknown",  # type: ignore[arg-type]
-        )
+    snapshots = source.batch_quote_snapshots(token)
+
+    assert snapshots[0].quote_mode == "realtime"
+    assert snapshots[0].expected_delay_ms == 0
 
 
 def test_batch_quotes_fails_whole_batch_when_provider_omits_one_symbol(
@@ -668,12 +1020,112 @@ def test_batch_quotes_fails_whole_batch_when_provider_omits_one_symbol(
         watchlist_refresh_sequence=1,
     )
 
-    with pytest.raises(DataSourceTransientError, match="缺少 MSFT.US"):
-        source.batch_quote_snapshots(
-            token,
-            received_at_utc_ms=1_785_297_600_100,
-            quote_mode="realtime",
-        )
+    with pytest.raises(DataSourceTransientError, match=r"缺少 MSFT\.US"):
+        source.batch_quote_snapshots(token)
+
+
+@pytest.mark.parametrize("row_kind", ["static", "quote"])
+def test_batch_quotes_rejects_duplicate_provider_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    row_kind: str,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _DuplicateRows(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def static_info(self, symbols: list[str]) -> list[SimpleNamespace]:
+            rows = super().static_info(symbols)
+            return [*rows, rows[0]] if row_kind == "static" else rows
+
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            rows = super().quote(symbols)
+            return [*rows, rows[0]] if row_kind == "quote" else rows
+
+    sdk.QuoteContext = _DuplicateRows
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(DataSourceError, match="重复"):
+        source.batch_quote_snapshots(token)
+
+
+@pytest.mark.parametrize("row_kind", ["static", "quote"])
+def test_batch_quotes_rejects_unrequested_provider_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    row_kind: str,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _ExtraRows(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def static_info(self, symbols: list[str]) -> list[SimpleNamespace]:
+            rows = super().static_info(symbols)
+            return rows + super().static_info(["MSFT.US"]) if row_kind == "static" else rows
+
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            rows = super().quote(symbols)
+            return rows + super().quote(["MSFT.US"]) if row_kind == "quote" else rows
+
+    sdk.QuoteContext = _ExtraRows
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(DataSourceError, match="未请求"):
+        source.batch_quote_snapshots(token)
+
+
+def test_server_301604_is_typed_permission_failure_for_quotes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _DeniedQuote(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            raise RuntimeError("301604 no quote permission")
+
+    sdk.QuoteContext = _DeniedQuote
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(DataSourcePermissionError):
+        source.batch_quote_snapshots(token)
 
 
 def test_subscribe_rejects_well_formed_but_unknown_symbol(
@@ -809,9 +1261,7 @@ def test_snapshot_normalizes_naive_sdk_timestamp_before_epoch_conversion(
     assert bar.ts_open == expected_market_time.timestamp() * 1000
 
 
-def test_snapshot_marks_stale_head_closed(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_snapshot_marks_stale_head_closed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _clear_credentials(monkeypatch)
     env_file = tmp_path / "env"
     _write_env(env_file)
@@ -891,6 +1341,30 @@ def test_daily_bar_uses_market_session_close(
 
     assert bar.closed is expected_closed
     assert bar.seq == (1 if expected_closed else 0)
+
+
+def test_hk_half_day_daily_bar_closes_at_actual_early_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    # 2025-12-24 港股半日市；日线开盘时间按香港当地午夜表达。
+    sdk, _ = _fake_sdk([_market_bar(datetime(2025, 12, 23, 16, 0, tzinfo=UTC))])
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 12, 24, 12, 1, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("700.HK", "1d")
+
+    bar = source.latest_snapshot(1)[0]
+
+    assert bar.closed is True
+    assert bar.seq == 1
 
 
 @pytest.mark.parametrize("timeframe", ["1h", "2h", "3h", "4h"])
@@ -1004,9 +1478,7 @@ def test_weekly_bar_uses_last_market_trading_day(
     )
 
 
-def test_empty_snapshot_and_disconnect(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_empty_snapshot_and_disconnect(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _clear_credentials(monkeypatch)
     env_file = tmp_path / "env"
     _write_env(env_file)
@@ -1052,17 +1524,13 @@ def test_paged_history_merges_older_rows_without_duplicates(
     sdk, calls = _fake_sdk(recent)
 
     class PagedContext(sdk.QuoteContext):  # type: ignore[misc, valid-type]
-        def history_candlesticks_by_offset(
-            self, *args: object
-        ) -> list[SimpleNamespace]:
+        def history_candlesticks_by_offset(self, *args: object) -> list[SimpleNamespace]:
             calls["history_by_offset"] = args
             return list(older) + [recent[0]]
 
     sdk.QuoteContext = PagedContext
     _install_fake_sdk(monkeypatch, sdk)
-    monkeypatch.setattr(
-        "pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2
-    )
+    monkeypatch.setattr("pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2)
     monkeypatch.setattr(
         "pa_agent.data.longbridge_source._now_in_market_timezone",
         lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
@@ -1094,18 +1562,14 @@ def test_paged_history_stops_when_page_only_repeats_seen_rows(
     history_calls = 0
 
     class DuplicateOnlyContext(sdk.QuoteContext):  # type: ignore[misc, valid-type]
-        def history_candlesticks_by_offset(
-            self, *args: object
-        ) -> list[SimpleNamespace]:
+        def history_candlesticks_by_offset(self, *args: object) -> list[SimpleNamespace]:
             nonlocal history_calls
             history_calls += 1
             return list(recent)
 
     sdk.QuoteContext = DuplicateOnlyContext
     _install_fake_sdk(monkeypatch, sdk)
-    monkeypatch.setattr(
-        "pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2
-    )
+    monkeypatch.setattr("pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2)
     monkeypatch.setattr(
         "pa_agent.data.longbridge_source._now_in_market_timezone",
         lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
@@ -1118,6 +1582,57 @@ def test_paged_history_stops_when_page_only_repeats_seen_rows(
 
     assert len(bars) == 2
     assert history_calls == 1
+
+
+def test_paged_history_rejects_same_timestamp_with_conflicting_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    recent = _closed_us_5m_rows(0, 5)
+    conflicting = SimpleNamespace(**vars(recent[0]))
+    conflicting.close = Decimal("999.0")
+    sdk, _ = _fake_sdk(recent)
+
+    class _ConflictingPage(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def history_candlesticks_by_offset(self, *args: object) -> list[SimpleNamespace]:
+            return [conflicting]
+
+    sdk.QuoteContext = _ConflictingPage
+    _install_fake_sdk(monkeypatch, sdk)
+    monkeypatch.setattr("pa_agent.data.longbridge_source._MAX_CANDLESTICKS", 2)
+    monkeypatch.setattr(
+        "pa_agent.data.longbridge_source._now_in_market_timezone",
+        lambda timezone: datetime(2025, 6, 4, 23, 0, tzinfo=timezone),
+    )
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    with pytest.raises(DataSourceError, match="同一时间戳内容冲突"):
+        source.latest_snapshot(4)
+
+
+def test_first_kline_page_rejects_same_timestamp_with_conflicting_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    rows = _closed_us_5m_rows(0)
+    conflicting = SimpleNamespace(**vars(rows[0]))
+    conflicting.volume = 999
+    sdk, _ = _fake_sdk([*rows, conflicting])
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    with pytest.raises(DataSourceError, match="同一时间戳内容冲突"):
+        source.latest_snapshot(2)
 
 
 def test_gap_inside_trading_session_is_rejected(
@@ -1143,9 +1658,7 @@ def test_gap_inside_trading_session_is_rejected(
         source.latest_snapshot(2)
 
 
-def test_cn_lunch_break_gap_is_legitimate(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_cn_lunch_break_gap_is_legitimate(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     _clear_credentials(monkeypatch)
     env_file = tmp_path / "env"
     _write_env(env_file)
@@ -1283,6 +1796,55 @@ def test_latest_snapshot_for_timeframe_uses_requested_period(
     assert source._timeframe == "5m"
 
 
+def test_snapshot_respects_shared_analysis_as_of_cutoff(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    rows = _closed_us_5m_rows(0, 10)
+    sdk, _ = _fake_sdk(rows)
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+    cutoff = int(datetime(2025, 6, 4, 13, 35, tzinfo=UTC).timestamp() * 1000)
+
+    bars = source.latest_snapshot_for_timeframe(
+        "5m",
+        2,
+        analysis_as_of_utc_ms=cutoff,
+    )
+
+    assert len(bars) == 1
+    assert bars[0].ts_open == rows[0].timestamp.timestamp() * 1000
+    assert bars[0].closed is True
+
+
+def test_server_301604_is_typed_permission_failure_for_klines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _DeniedKlines(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def candlesticks(self, *args: object) -> list[SimpleNamespace]:
+            raise RuntimeError("301604 no quote permission")
+
+    sdk.QuoteContext = _DeniedKlines
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "5m")
+
+    with pytest.raises(DataSourcePermissionError):
+        source.latest_snapshot(1)
+
+
 def test_rate_limiter_delays_over_limit_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1317,9 +1879,7 @@ def test_sdk_call_timeout_guard_fails_closed(
     _write_env(env_file)
     sdk, _ = _fake_sdk([])
     _install_fake_sdk(monkeypatch, sdk)
-    monkeypatch.setattr(
-        "pa_agent.data.longbridge_source._SDK_CALL_TIMEOUT_SECONDS", 0.05
-    )
+    monkeypatch.setattr("pa_agent.data.longbridge_source._SDK_CALL_TIMEOUT_SECONDS", 0.05)
     source = LongbridgeSource(env_file=env_file)
     source.connect()
 

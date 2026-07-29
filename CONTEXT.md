@@ -8,7 +8,7 @@
 - WO-F Claim Validation 完整闭环已由 `c0b58d0` 推送：Stage1 支撑/阻力、Stage2 入场/止损/两档止盈、K 线引用和行情源声明的真实 `price_tick` 均已接入硬校验；校验只拒绝，不修正或补写模型声明。
 - 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
 - 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
-- 完成证据复审与 Campaign 异常收口已由 `7e6c095` 推送；Campaign 的 NEW_RISK 最小权限修复已完成并发布。WO-E 的 Stitch 与浏览器图像生成路线已由用户终止，不再是前端开发门。后端与无界面连接层已补齐：不可变报价、行情新鲜度、K 线证据、批量自选、generation/请求序号门禁、Longbridge/OKX 批量报价、OKX 10m 三页聚合和独立只分析结果投影均已落地。最终前端唯一 PRD 为 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`；用户将交给其他大模型做视觉设计，当前仍未修改 `pa_agent/gui`，PyQt6 视觉实现未开始。
+- v0.1.0 正在按 PRD11 直接推进，不再等待 Stitch、ImageGen 或外部样稿。B1 已完成 Longbridge 时间、服务端权限、批量一致性、统一 `analysis_as_of`、高周期可缺、半日市与 tick 能力门；下一步是无 Qt Controller、AppContext 和原生 PyQt6 新页，旧 OKX Demo 工作台保持不动。
 - P0-01 公共执行层一次性授权已完成源码与 CI 闭环，并由 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 发布：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的竞态和证据缺口均已补齐。本地确定性主门 2048 项通过、0 失败；该 SHA 的 GitHub Actions run `30447988360` 全绿，远端确定性门 2047 项通过、0 失败，另有 1 项因 CI 主机使用 UTC 而按既有规则跳过。独立 live 健康检查 7 项均因外部端点或测试密钥不可用而跳过、0 失败。P0 源码与提交级证据已关闭；运行中的旧 Worker 未重载，所以运行态尚未生效。
 
 ## 上次停在哪
@@ -17,10 +17,10 @@
 - 2026-07-28 NEW_RISK 修复后的 unit/property/integration 为 1966 项通过、7 项跳过、0 失败；Campaign 与离线 Controller/Worker 定向回归为 130 项通过、0 失败。全仓 Ruff 当前基线仍为 293 项，其中 249 项带自动修复建议，本轮没有批量修复历史债。
 - 2026-07-29 18:01 的只读复核显示：Worker 服务和心跳运行，两库 `quick_check=ok`，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；风险停止仍为 `risk_runtime_BrokerTransportError`，Campaign 无 Python 进程，两个正式配置文件哈希与开工基线一致。只允许离线整改，本轮没有重启进程、解除风险停止、修改生产数据库或调用券商。
 - 最近耐久完成的是 2026-07-27 21:50–22:00 已收盘 10m K 线：Stage1/Stage2 均存在，终点 `wait`、trade confidence 38、结果 `blocked:no_order`。Worker 自 2026-07-26 13:32:11 启动，不可能加载其后的提交。最后本地账户快照在审计时已陈旧约 13.35 小时；Worker 自动私有读取持续失败，Agent 未另行调用，因此当前券商仓位、普通挂单和全部算法挂单均为实时真相阻断。未经新的 OKX Demo 私有只读硬门和用户运行态授权不得恢复 Campaign 或重载。
-- 长桥旧默认档案仍会被服务端拒绝，但已在 `Quant\env` 找到完整的 `COMPREHENSIVE` 行情档案并用官方 `QuoteContext` 真实验证：沪深两只股票报价为正，1h/4h/1d K 线结构有效。PA_Agent 现在通过非机密选择项显式使用该档案，不猜测、不跨组拼接凭据；完整三标的桌面矩阵留给后续前端验收。
+- `COMPREHENSIVE` 行情档案已用同一只读 QuoteContext 真实验证 AAPL.US、700.HK、600519.SH 的报价与 10m/1h/4h；三市场服务端权限均为实时。Longbridge 未提供权威统一 tick，股票页只能展示并在 AI 前阻断价格分析；真实三市场桌面矩阵仍留给 C 阶段。
 - WO-A 仍有一个真实 P2：固定代理 metadata 与实际 `config.json` 没有共同指纹，无法检测二者不一致；本轮明确禁止修改 `scripts`，因此不能用假测试冒充完成。
 - WO-E 已核实 Longbridge 官方批量报价单次 500 个标的，当前 100 项自选无需循环订阅；OKX 可按 SPOT/SWAP 最多两个串行全量 ticker 快照后严格筛选。OKX 10m 最坏需 602 根 5m、最多三页；现有只读客户端缺 `after`，正确修复需要极窄解除 `pa_agent/execution/okx_client.py` 禁区。
-- 2026-07-29 用户授权先快速补强后端与前后端连接，再把前端视觉交给其他大模型。只读 `OkxRestClient.candles(after)`、SPOT/SWAP 批量 ticker、10m 最多三页分页、Longbridge 单次批量 quote、类型化认证失败、页面 generation/sequence 门禁、K 线证据与独立只分析结果投影已完成；未调用交易准备或券商写接口。全仓共收集 2033 项，2030 项通过、3 项跳过、0 失败。
+- B1 最终全仓非 live 覆盖为 2082 项通过、0 失败、0 错误、0 跳过，CI 数量下限同步固定为 2082；Windows 最终候选因既有 Qt 析构竞态采用 4 个 E2E 独立进程加其余 2078 项的机器 JUnit 汇总，目标提交的 GitHub CI 仍用原始单进程命令复证。权限套餐与行情级别矛盾或级别未知都会失败关闭，实时和延迟权限证据最多缓存 5 分钟并在到期后重读服务端。报价收到时间由数据源在响应后盖章，半日市提前收盘后仍保留半日市标签。阶段 A 仍因固定 OKX 代理端口无监听而冻结，未迁移数据库、重载 Worker、清风险停止或发 Demo 命令。
 
 ## 近期关键决定
 

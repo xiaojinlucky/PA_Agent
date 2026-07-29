@@ -1,23 +1,24 @@
 """多市场交易日历会话状态测试（真实 exchange_calendars 数据）。"""
+
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
 from pa_agent.data.market_calendar import (
     MarketCalendarError,
     SessionPhase,
+    intraday_phase,
     is_trading_minute,
+    session_close_utc_ms,
     session_state,
     supported_market,
 )
 
 
 def _utc_ms(text: str) -> int:
-    return int(
-        datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp() * 1000
-    )
+    return int(datetime.fromisoformat(text).replace(tzinfo=UTC).timestamp() * 1000)
 
 
 @pytest.mark.parametrize(
@@ -56,6 +57,34 @@ def test_hk_christmas_eve_flagged_half_day():
     state = session_state("HK", _utc_ms("2024-12-24T02:30:00"))
     assert state.phase is SessionPhase.OPEN
     assert state.is_half_day is True
+
+
+def test_hk_half_day_flag_survives_after_early_close():
+    at = _utc_ms("2024-12-24T04:30:00")
+
+    state = session_state("HK", at)
+    phase = intraday_phase("HK", at)
+
+    assert state.phase is SessionPhase.CLOSED
+    assert state.is_half_day is True
+    assert phase.label == "闭市"
+    assert phase.is_half_day is True
+
+
+@pytest.mark.parametrize(
+    ("market", "session_date", "expected_close"),
+    (
+        ("HK", date(2025, 12, 24), "2025-12-24T04:00:00"),
+        ("US", date(2025, 11, 28), "2025-11-28T18:00:00"),
+        ("CN", date(2025, 6, 5), "2025-06-05T07:00:00"),
+    ),
+)
+def test_session_close_uses_actual_regular_or_half_day_boundary(
+    market: str,
+    session_date: date,
+    expected_close: str,
+) -> None:
+    assert session_close_utc_ms(market, session_date) == _utc_ms(expected_close)
 
 
 def test_is_trading_minute_excludes_break():

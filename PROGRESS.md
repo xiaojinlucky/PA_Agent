@@ -36,3 +36,19 @@
 - 独立 live 命令收集 7 项：4 项因 AkShare 公共端点不可达跳过，3 项因未提供 KKAI 测试密钥跳过，0 失败；JUnit 为 `scratch/wo-review-p0-live-provider.xml`。实现提交 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 已精确推送到 `origin/main`；GitHub Actions run `30447988360` 全绿并上传同 SHA 的 JUnit 与环境证据，P0 源码与 CI 闭环已关闭。
 - 最新独立审查先后报告的 CI 边界均已整改：live JUnit 缺失或损坏分别记录 `missing` / `invalid`，不会反向阻塞主门；数量门提升到 2048；Git SHA、Python、`pip freeze` 使用 `always()` 采集，任一失败先写标准 `unavailable` 再让 CI 变红；`INTRADAY` 正向隔离用例已补齐。三条 PowerShell 成功、损坏 XML 和 pip 失败分支均已本地执行验证。
 - 远端证据包 `ci-evidence-c932e0113e9c4e33771d1cc5afc1f16beda46421` 已下载核对：完整 Git SHA 与目标提交一致，Python 为 3.12.10，`pip freeze` 为 91 行；确定性 JUnit 共 2048 项、0 失败、0 错误、1 项因 CI 主机为 UTC 跳过，live JUnit 共 7 项、0 失败、0 错误、7 项跳过并明确记录 `health_status=unavailable`。唯一注解是 GitHub 托管运行器把部分官方 Action 从已弃用的 Node.js 20 强制切到 Node.js 24，不影响本轮结论。
+
+## 2026-07-29 v0.1.0 发布工单
+
+- 目标：交付 Windows + Python 3.12 源码部署版 v0.1.0；保留 OKX Demo 工作台，新增四市场只读看盘页，并让运行 Worker 加载 schema v5。
+- 顺序：任务 0 基线 → A 运行态 v5 → B1 Longbridge 合同 → B2 Controller → C 原生 PyQt6 页面与桌面验收 → D 发布证据 → tag/Release。
+- 固定基线：本地、`origin/main` 与 GitHub `main` 均为 `53c2267468f997956475e0934b2c9e0f2a20cda9`；暂存区和受跟踪文件无改动，既有 `.agents/`、`.claude/` 不触碰。
+- 远端门：PUBLIC `xiaojinlucky/PA_Agent` 可写；远端当前不存在 `v0.1.0` tag 或 Release。
+- 基线实测：确定性非 live 门为 2048 项通过、0 失败、0 错误、0 跳过；JUnit 位于忽略目录 `scratch/validation/baseline.xml`。
+- 运行态只读门：Worker/心跳/对账与两库健康，活动 execution、活动命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；控制库仍为 v4，风险停止仍开启，券商实时空仓空单尚未证明。
+- 最大风险：没有新鲜 OKX Demo 私有真相时绝不能迁移、重载、清风险停止或发 Demo 命令；Longbridge tick/权限/时间语义不能靠猜测补齐。
+- 发布硬门：A/B/C 真实验收、全新 Python 3.12 安装、CI、脱敏证据和源码包均通过后，main、tag 与 Release 才可指向同一 SHA。
+- B1 红灯覆盖时间解释、服务端权限、批量重复/额外标的、分页冲突、统一截止时间、半日市、高周期降级和 tick 能力门；最终相关 153 项通过、0 失败。
+- B1 真实只读门：同一个 `COMPREHENSIVE` QuoteContext 已取得 AAPL.US、700.HK、600519.SH 的报价和 10m/1h/4h；三市场均由服务端证明为实时，所有周期绑定各自唯一 `analysis_as_of`，未创建交易上下文或调用 AI。
+- Longbridge 当前没有给出可追溯的统一 `price_tick`，因此股票市场明确为 `display_only`；这是诚实能力边界，不阻塞只读页面，但会在两阶段 AI 之前阻断价格分析。
+- B1 全仓非 live 门最终为 2082 项通过、0 失败、0 错误、0 跳过；CI 数量下限同步固定为 2082。权限套餐与行情级别矛盾或级别未知会失败关闭，失败重连不暴露旧权限；实时和延迟权限证据最多缓存 5 分钟，到期后原子重读服务端且失败不沿用旧证据。报价收到时间由数据源在响应后盖章，半日市提前收盘后仍保留半日市标签。
+- staged gitleaks 首次把测试中的公开 Longbridge 套餐标识误判成通用 API key；暂存区已立即清空，测试改为运行时拼接同一公开值。修改后的 Windows 单进程全量连续两次触发既有 pyqtgraph `AxisItem` 析构崩溃，没有测试断言失败；改用 4 个 E2E 各自独立进程加其余 2078 项的机器 JUnit 汇总，合计仍为 2082 项通过、0 失败。目标提交的 GitHub CI 继续运行原始单进程命令，不降低门槛。

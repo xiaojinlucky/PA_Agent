@@ -6,10 +6,13 @@ from types import SimpleNamespace
 import pytest
 
 from pa_agent.data.market_workspace import (
+    AnalysisCapabilityState,
+    AnalysisGateReason,
     AnalysisResultState,
     AnalysisResultView,
     EvidenceState,
     KlineEvidenceView,
+    MarketDataBundle,
     QuoteFailureKind,
     QuoteFreshness,
     QuoteFreshnessReason,
@@ -62,6 +65,68 @@ def _snapshot(
         price_tick="0.01",
         quote_ts_utc_ms=quote_ts,
         received_at_utc_ms=received_at,
+    )
+
+
+def _quote_view(
+    *,
+    snapshot: QuoteSnapshot | None = None,
+    now_ms: int = 100_500,
+) -> object:
+    return evaluate_quote_freshness(
+        snapshot or _snapshot(),
+        identity=_identity(),
+        request_sequence=1,
+        now_utc_ms=now_ms,
+        transport_budget_ms=1_500,
+    )
+
+
+def _kline_evidence(
+    timeframe: str,
+    *,
+    analysis_as_of_utc_ms: int = 100_500,
+    now_utc_ms: int = 100_500,
+    price_tick: str | None = "0.01",
+    closed_bar_count: int = 100,
+    failure_reason: str | None = None,
+) -> KlineEvidenceView:
+    return KlineEvidenceView(
+        schema_version=1,
+        selection_generation=1,
+        request_sequence=2,
+        symbol="AAPL.US",
+        market="US",
+        source="longbridge",
+        timeframe=timeframe,
+        bar_count=101,
+        closed_bar_count=closed_bar_count,
+        required_closed_bars=100,
+        latest_closed_ts_utc_ms=100_000,
+        received_at_utc_ms=100_500,
+        analysis_as_of_utc_ms=analysis_as_of_utc_ms,
+        now_utc_ms=now_utc_ms,
+        max_age_ms=1_000,
+        price_tick=price_tick,
+        failure_reason=failure_reason,
+    )
+
+
+def _market_bundle(
+    *,
+    quote_snapshot: QuoteSnapshot | None = None,
+    ten_minute: KlineEvidenceView | None = None,
+    one_hour: KlineEvidenceView | None = None,
+    four_hour: KlineEvidenceView | None = None,
+) -> MarketDataBundle:
+    return MarketDataBundle(
+        schema_version=1,
+        token=RequestToken(_identity(), RequestFamily.KLINE, 2),
+        analysis_as_of_utc_ms=100_500,
+        quote=_quote_view(snapshot=quote_snapshot),
+        ten_minute=ten_minute or _kline_evidence("10m"),
+        one_hour=one_hour,
+        four_hour=four_hour,
     )
 
 
@@ -408,6 +473,7 @@ def test_kline_evidence_ready_requires_enough_closed_bars_and_timestamp() -> Non
         required_closed_bars=100,
         latest_closed_ts_utc_ms=100_000,
         received_at_utc_ms=100_500,
+        analysis_as_of_utc_ms=100_500,
         now_utc_ms=100_500,
         max_age_ms=1_000,
         price_tick=None,
@@ -423,6 +489,99 @@ def test_kline_evidence_ready_requires_enough_closed_bars_and_timestamp() -> Non
             view,
             received_at_utc_ms=105_500,
             latest_closed_ts_utc_ms=105_501,
+        )
+
+
+def test_market_bundle_allows_missing_or_stale_higher_timeframes() -> None:
+    stale_4h = _kline_evidence("4h", now_utc_ms=101_001)
+
+    bundle = _market_bundle(
+        one_hour=None,
+        four_hour=stale_4h,
+    )
+
+    assert bundle.analysis_state is AnalysisCapabilityState.READY
+    assert bundle.analysis_reason is AnalysisGateReason.OK
+    assert bundle.ready_higher_timeframes == ()
+
+
+def test_market_bundle_accepts_only_ready_higher_timeframe_context() -> None:
+    bundle = _market_bundle(
+        one_hour=_kline_evidence("1h"),
+        four_hour=_kline_evidence("4h", failure_reason="permission_denied"),
+    )
+
+    assert bundle.analysis_state is AnalysisCapabilityState.READY
+    assert bundle.ready_higher_timeframes == ("1h",)
+
+
+def test_market_bundle_without_authoritative_tick_is_display_only() -> None:
+    bundle = _market_bundle(
+        quote_snapshot=replace(_snapshot(), price_tick=None),
+        ten_minute=_kline_evidence("10m", price_tick=None),
+    )
+
+    assert bundle.analysis_state is AnalysisCapabilityState.DISPLAY_ONLY
+    assert bundle.analysis_reason is AnalysisGateReason.PRICE_TICK_UNAVAILABLE
+    assert bundle.analysis_allowed is False
+
+
+def test_market_bundle_blocks_stale_quote_but_not_optional_context() -> None:
+    stale_quote = evaluate_quote_freshness(
+        _snapshot(),
+        identity=_identity(),
+        request_sequence=1,
+        now_utc_ms=102_001,
+        transport_budget_ms=1_500,
+    )
+
+    bundle = MarketDataBundle(
+        schema_version=1,
+        token=RequestToken(_identity(), RequestFamily.KLINE, 2),
+        analysis_as_of_utc_ms=100_500,
+        quote=stale_quote,
+        ten_minute=_kline_evidence("10m"),
+        one_hour=None,
+        four_hour=None,
+    )
+
+    assert bundle.analysis_state is AnalysisCapabilityState.BLOCKED
+    assert bundle.analysis_reason is AnalysisGateReason.QUOTE_NOT_READY
+
+
+def test_market_bundle_blocks_insufficient_ten_minute_evidence() -> None:
+    bundle = _market_bundle(
+        ten_minute=_kline_evidence("10m", closed_bar_count=99),
+    )
+
+    assert bundle.analysis_state is AnalysisCapabilityState.BLOCKED
+    assert bundle.analysis_reason is AnalysisGateReason.TEN_MINUTE_NOT_READY
+
+
+def test_market_bundle_rejects_mixed_analysis_as_of() -> None:
+    one_hour = _kline_evidence(
+        "1h",
+        analysis_as_of_utc_ms=100_499,
+    )
+
+    with pytest.raises(ValueError, match="analysis_as_of"):
+        _market_bundle(one_hour=one_hour)
+
+
+def test_market_bundle_rejects_wrong_kline_identity_or_sequence() -> None:
+    wrong_sequence = replace(_kline_evidence("10m"), request_sequence=3)
+
+    with pytest.raises(ValueError, match="request_sequence"):
+        _market_bundle(ten_minute=wrong_sequence)
+
+
+def test_kline_evidence_rejects_bar_after_analysis_cutoff() -> None:
+    with pytest.raises(ValueError, match="分析截止时间"):
+        replace(
+            _kline_evidence("10m"),
+            latest_closed_ts_utc_ms=105_501,
+            received_at_utc_ms=105_501,
+            now_utc_ms=105_501,
         )
 
 
