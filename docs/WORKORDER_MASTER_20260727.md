@@ -432,9 +432,9 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   execution service 或券商写接口。
 - [x] 2026-07-29 WO-E 外部设计移交：PRD11 成为唯一版前端设计合同。旧 Stitch、
   ChatGPT Images 和浏览器自动化路线降为历史，不再是开发门。
-- [ ] WO-E 视觉生产实现：B2 无 Qt Controller 已完成本地 2137 项非 live 零失败验证，待目标
-  SHA 的 CI 复证后直接实现原生 PyQt6；不等待外部样稿。最终使用已验证的 Longbridge 行情
-  档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
+- [ ] WO-E 视觉生产实现：B2 无 Qt Controller 已由 `18951dc53a5d2b075bda0759676a68dd62dca172`
+  发布且 CI 全绿，现在直接实现原生 PyQt6；不等待外部样稿。最终使用已验证的 Longbridge
+  行情档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
 
 ## 6. 用户侧待办（只有用户能做）
 

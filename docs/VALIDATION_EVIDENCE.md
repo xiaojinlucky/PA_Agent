@@ -756,4 +756,5 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 新增纯 Python `MarketWorkspaceController`，统一拥有市场选择、自选、各请求族序号、行情来源、唯一分析截止时间、设置保存和分析状态；`AppContext` 只负责构造它。源码静态检查证明不导入 Qt 或 `pa_agent.execution`，测试替身也没有调用交易写接口。
 - 设置保存采用独立 `MarketWorkspaceSettings` 快照和 revision 基线：迟到成功不能覆盖新状态，失败可重试，revision 冲突失败关闭；不完整或与请求不一致的返回值会先进入明确失败终态，再抛出错误，不会卡在“保存中”。
 - 行情、自选和分析回调均绑定 Controller 发出的完整请求快照。逆序回调、快速切换、认证失败恢复、行情陈旧、Crypto 连续市场、分析中切换及不完整返回值都有直接反例。三轮对抗审查指出的 P1 均已按原反例复证关闭；旧的 32 项静默淘汰会遗忘迟到认证失败和分析证据，现已移除。长期无回调时登记表可能增长，作为不影响当前正确性的 P2 资源治理项保留，禁止用静默丢事实的方式处理。
-- 扩展定向测试 230 项通过、0 失败；原始完整非 live 命令为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为忽略目录 `scratch/validation/b2-final.xml`。Ruff 定向检查和 `git diff --check` 均通过；提交级 SHA 与 GitHub CI 证据将在推送后追加。
+- 扩展定向测试 230 项通过、0 失败；原始完整非 live 命令为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为忽略目录 `scratch/validation/b2-final.xml`。Ruff 定向检查和 `git diff --check` 均通过。
+- 实现提交 `18951dc53a5d2b075bda0759676a68dd62dca172` 已精确推送到 `origin/main`；GitHub Actions run `30484797101` 全绿。下载的 `ci-evidence-18951dc53a5d2b075bda0759676a68dd62dca172` 中，确定性 JUnit 共 2137 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；live JUnit 共 7 项、0 失败、0 错误、7 项跳过，状态为 `health_status=unavailable`。完整 SHA 与目标提交一致，Python 为 3.12.10，`pip-freeze.txt` 为 91 行、SHA-256 `3335F90A90B4C8169FC6825CDEF5E62861564EC5B9936FF86DCC2999F3FF6BEA`。

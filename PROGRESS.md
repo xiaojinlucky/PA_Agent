@@ -55,4 +55,5 @@
 - B1 实现提交 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 已精确推送到 `origin/main`；GitHub Actions run `30477680216` 全绿。远端原始单进程确定性门为 2082 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；独立 live 健康检查 7 项均跳过并明确记录 `health_status=unavailable`。证据包 `ci-evidence-1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 的完整 SHA、Python 3.12.10、JUnit 和环境文件均已下载核对。
 - B2 已实现无 Qt `MarketWorkspaceController`、独立 `MarketWorkspaceSettings` 保存合同和 `AppContext` 接线。Controller 是 selection generation、watchlist generation、请求序号、来源/截止时间、设置保存与分析状态的唯一所有者；不导入 Qt 或执行层。
 - B2 反例覆盖逆序回调、快速切市场、共享认证失败与恢复、报价/K 线陈旧、Crypto 连续市场、保存迟到/失败/冲突、分析中切换、不完整返回值，以及超过 32 个迟到回调仍保留认证与审计事实。三轮对抗审查的 P1 反例均已闭合；不再用静默淘汰旧请求换取内存上限，长期无回调时的请求登记表资源上限留作 P2 后续治理。
-- B2 扩展定向测试 230 项通过、0 失败；最终本地非 live 为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为 `scratch/validation/b2-final.xml`，CI 最低测试数同步提高到 2137。尚待精确提交、推送和目标 SHA 的 GitHub CI 复证。
+- B2 扩展定向测试 230 项通过、0 失败；最终本地非 live 为 2137 项通过、0 失败、0 错误、0 跳过，JUnit 为 `scratch/validation/b2-final.xml`，CI 最低测试数同步提高到 2137。
+- B2 实现提交 `18951dc53a5d2b075bda0759676a68dd62dca172` 已精确推送到 `origin/main`；GitHub Actions run `30484797101` 全绿。远端确定性门共 2137 项、0 失败、0 错误、1 项既有 UTC 主机条件跳过；独立 live 健康检查 7 项均跳过并记录 `health_status=unavailable`。证据包中的完整 SHA、Python 3.12.10、JUnit 和 91 行依赖快照均已核对。

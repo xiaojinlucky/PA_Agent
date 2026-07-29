@@ -8,7 +8,7 @@
 - WO-F Claim Validation 完整闭环已由 `c0b58d0` 推送：Stage1 支撑/阻力、Stage2 入场/止损/两档止盈、K 线引用和行情源声明的真实 `price_tick` 均已接入硬校验；校验只拒绝，不修正或补写模型声明。
 - 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
 - 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
-- v0.1.0 正在按 PRD11 直接推进，不再等待 Stitch、ImageGen 或外部样稿。B1 已由 `1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf` 完成 Longbridge 合同并通过 CI；B2 已完成无 Qt `MarketWorkspaceController`、独立设置持久化合同和 `AppContext` 接线，本地非 live 2137 项通过、0 失败，待提交级 CI 复证。下一步是原生 PyQt6 新页，旧 OKX Demo 工作台保持不动。
+- v0.1.0 正在按 PRD11 直接推进，不再等待 Stitch、ImageGen 或外部样稿。B1 已完成 Longbridge 合同；B2 已由 `18951dc53a5d2b075bda0759676a68dd62dca172` 完成无 Qt `MarketWorkspaceController`、独立设置持久化合同和 `AppContext` 接线，GitHub Actions run `30484797101` 全绿。下一步是原生 PyQt6 新页，旧 OKX Demo 工作台保持不动。
 - P0-01 公共执行层一次性授权已完成源码与 CI 闭环，并由 `c932e0113e9c4e33771d1cc5afc1f16beda46421` 发布：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的竞态和证据缺口均已补齐。本地确定性主门 2048 项通过、0 失败；该 SHA 的 GitHub Actions run `30447988360` 全绿，远端确定性门 2047 项通过、0 失败，另有 1 项因 CI 主机使用 UTC 而按既有规则跳过。独立 live 健康检查 7 项均因外部端点或测试密钥不可用而跳过、0 失败。P0 源码与提交级证据已关闭；运行中的旧 Worker 未重载，所以运行态尚未生效。
 
 ## 上次停在哪
