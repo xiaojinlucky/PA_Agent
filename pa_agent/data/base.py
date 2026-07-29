@@ -4,7 +4,6 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 
-
 # ── KlineBar ──────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -92,6 +91,14 @@ class DataSourceError(Exception):
 
 class DataSourceTransientError(DataSourceError):
     """Transient (retryable) error from a data source."""
+
+
+class DataSourceAuthenticationError(DataSourceError):
+    """凭据无效或已过期；只有更换凭据后才可重试。"""
+
+
+class DataSourcePermissionError(DataSourceError):
+    """行情权限或实时/延迟套餐无法证明。"""
 
 
 class DataSource(ABC):

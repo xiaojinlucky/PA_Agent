@@ -367,8 +367,8 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-E 前置设计合同：`docs/prd/05_多市场看盘前端设计包.md` 已冻结读模型、设置、并发、跨源、脱敏和四市场验收矩阵
 - [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
 - [x] WO-E ChatGPT Web 阶段 3：四个脱敏附件与完整提示词已真实提交；会话 URL、完整回答、内容指纹和 F01–F22 本地裁决已登记，B3 通过
-- [x] 2026-07-28 13:06 WO-E Chrome 官方恢复与接口事实核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，但系统文件选择器未打开，官方排障要求用户确认并开启扩展的“允许访问文件网址”，所以附件未上传、项目未创建。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
-- [ ] WO-E 剩余设计与生产实现：当前方向为 `Scan Rail Workbench`；Stitch、连续三轮精修、视觉审计、最终审美确认、PyQt6 和桌面验收仍未完成
+- [x] 2026-07-28 WO-E Chrome 官方恢复、附件与参考规则核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，用户已确认附件显示。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 结构、令牌、密度和负面约束已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认 Stitch 项目 `8039115259020616674` 已创建（`https://stitch.withgoogle.com/projects/8039115259020616674`，标题 `Stitch - Projects`）。用户已直接审美否决该结果，Stitch 稿作废且不进入实现。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
+- [ ] WO-E 剩余设计与生产实现：用本机 Chrome 网页版 ChatGPT Images 2.0 生成三张独立 1440×900 样板，用户选择后生成机器可读设计规格并完成同尺寸视觉审计；PyQt6 和桌面验收仍未完成
 - [x] 2026-07-27 16:33 WO-C2：Campaign 对账监控耐久化完成；三套件 1886 项通过、
   0 失败，两轮对抗审查 PASS。原 Campaign 从正式 `run` 入口恢复，白名单临时风险停止
   经专用命令合法解除且高水位未重锚，首根新 10m K 线完成为 `blocked:no_order`。
@@ -413,11 +413,20 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   Campaign、不重载。
 - [ ] WO-A 复审余项：固定代理 metadata 与实际配置缺共同指纹；当前禁止修改 `scripts`，
   因此不能闭单。
+- [x] 2026-07-29 WO-E 后端与无界面连接层：新增不可变页面合同、generation/请求族序号
+  门禁、100 项批量自选、K 线证据和独立只分析结果投影；Longbridge 复用单一
+  QuoteContext 批量 quote，OKX 按 SPOT/SWAP 批量 ticker，并用最多三页 5m 覆盖默认
+  10m 分析与 55 根指标预热。全仓 2030 项通过、3 项跳过、0 失败；未修改 GUI、未调用
+  execution service 或券商写接口。
+- [x] 2026-07-29 WO-E 外部设计移交：PRD11 成为唯一版前端设计合同。旧 Stitch、
+  ChatGPT Images 和浏览器自动化路线降为历史，不再是开发门。
+- [ ] WO-E 视觉生产实现：等待用户从其他大模型取得样稿后实现原生 PyQt6，并在有效
+  Longbridge token 下完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
 
 ## 6. 用户侧待办（只有用户能做）
 
 1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
 2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-E 设计门：Product Design B1/B2、ChatGPT Web B3 与 Chrome 扩展恢复已完成；下一步由用户在 ChatGPT Chrome Extension 详情确认并开启“允许访问文件网址”，随后继续五附件上传和 Stitch。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区；正确关闭 OKX 10m F11 还需仅授权 `pa_agent/execution/okx_client.py` 的只读 `candles(after=None)` 参数。
+3. WO-E 设计门：Product Design B1/B2、ChatGPT Web B3、Chrome 扩展恢复、五附件显示确认、Stitch 提交和 `D:\Desktop\Quant\前端设计` 规则吸收已完成；Stitch 结果已被用户审美否决。下一步在本机 Chrome 网页版 ChatGPT 按 PRD08 分别生成三张 GPT‑Image‑2 样板，等待用户选择后再做 image-to-code 规格和视觉审计。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区；正确关闭 OKX 10m F11 还需仅授权 `pa_agent/execution/okx_client.py` 的只读 `candles(after=None)` 参数。
 4. `shared/` 是否建 Git 仓库的决定。
 5. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。

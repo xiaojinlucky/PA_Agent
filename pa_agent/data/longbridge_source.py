@@ -16,6 +16,7 @@ from concurrent.futures import TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from datetime import time as datetime_time
+from decimal import InvalidOperation
 from pathlib import Path
 from typing import Any, Literal
 from zoneinfo import ZoneInfo
@@ -23,13 +24,20 @@ from zoneinfo import ZoneInfo
 from pa_agent.data.bar_close_wait import timeframe_to_seconds
 from pa_agent.data.base import (
     DataSource,
+    DataSourceAuthenticationError,
     DataSourceError,
+    DataSourcePermissionError,
     DataSourceTransientError,
     KlineBar,
     normalize_kline_bar,
 )
 from pa_agent.data.datetime_ts import datetime_to_ts_ms
 from pa_agent.data.market_calendar import MarketCalendarError, is_trading_minute
+from pa_agent.data.market_workspace import (
+    QuoteMode,
+    QuoteSnapshot,
+    WatchlistRequestToken,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -339,7 +347,7 @@ class LongbridgeSource(DataSource):
                 if expires_at is not None
                 else "未知时间"
             )
-            raise DataSourceTransientError(
+            raise DataSourceAuthenticationError(
                 f"Longbridge Legacy Access Token 已过期 ({expires_text}), 请更换凭据"
             )
         if token_expiry.status == "expiring":
@@ -408,7 +416,12 @@ class LongbridgeSource(DataSource):
             raise
         except Exception as exc:
             self._connected = False
-            raise DataSourceTransientError(
+            error_type = (
+                DataSourceAuthenticationError
+                if "401004" in str(exc)
+                else DataSourceTransientError
+            )
+            raise error_type(
                 f"Longbridge 连接失败（认证或网络异常，{type(exc).__name__}）"
             ) from exc
 
@@ -493,6 +506,129 @@ class LongbridgeSource(DataSource):
         except ValueError:
             return False
         return True
+
+    def batch_quote_snapshots(
+        self,
+        token: WatchlistRequestToken,
+        *,
+        received_at_utc_ms: int,
+        quote_mode: QuoteMode | None = None,
+        expected_delay_ms: int = 0,
+    ) -> tuple[QuoteSnapshot, ...]:
+        """一次 SDK 调用读取最多 100 个股票报价，不改变主图订阅。"""
+        if not self._connected or self._quote_context is None:
+            raise DataSourceTransientError("Longbridge 未连接")
+        if quote_mode is None:
+            raise DataSourcePermissionError(
+                "Longbridge 行情套餐未证明实时或延迟模式，拒绝标记报价"
+            )
+        if quote_mode not in {"realtime", "delayed"}:
+            raise ValueError("Longbridge quote_mode 只支持 realtime 或 delayed")
+        if quote_mode == "realtime" and expected_delay_ms != 0:
+            raise ValueError("Longbridge 实时报价的 expected_delay_ms 必须为 0")
+        if quote_mode == "delayed" and expected_delay_ms <= 0:
+            raise ValueError("Longbridge 延迟报价必须声明正数 expected_delay_ms")
+        if token.source != "longbridge" or token.market == "Crypto":
+            raise ValueError("Longbridge 批量报价只接受 US/HK/CN 批次")
+
+        request_by_symbol: dict[str, str] = {}
+        for symbol_value in token.symbols:
+            symbol = normalize_longbridge_symbol(symbol_value)
+            suffix = symbol.rsplit(".", 1)[-1]
+            actual_market = "CN" if suffix in {"SH", "SZ"} else suffix
+            if actual_market != token.market:
+                raise ValueError(f"{symbol} 与所选市场 {token.market} 不一致")
+            if symbol in request_by_symbol:
+                raise ValueError(f"批量报价包含重复品种：{symbol}")
+            request_by_symbol[symbol] = symbol
+
+        symbols = list(request_by_symbol)
+        try:
+            with self._snapshot_lock:
+                static_rows = self._call_quote_sdk(
+                    "静态资料批量读取",
+                    self._quote_context.static_info,
+                    symbols,
+                )
+                quote_rows = self._call_quote_sdk(
+                    "批量报价读取",
+                    self._quote_context.quote,
+                    symbols,
+                )
+        except DataSourceTransientError:
+            raise
+        except Exception as exc:
+            if "401004" in str(exc):
+                raise DataSourceAuthenticationError(
+                    "Longbridge 批量报价认证失败，请更换 Legacy Access Token"
+                ) from exc
+            raise DataSourceTransientError(
+                f"Longbridge 批量报价失败（{type(exc).__name__}）"
+            ) from exc
+
+        static_by_symbol = {
+            str(getattr(row, "symbol", "") or "").strip().upper(): row
+            for row in (static_rows or [])
+        }
+        quote_by_symbol = {
+            str(getattr(row, "symbol", "") or "").strip().upper(): row
+            for row in (quote_rows or [])
+        }
+        snapshots: list[QuoteSnapshot] = []
+        for symbol in request_by_symbol:
+            static = static_by_symbol.get(symbol)
+            quote = quote_by_symbol.get(symbol)
+            if static is None or quote is None:
+                raise DataSourceTransientError(
+                    f"Longbridge 批量报价缺少 {symbol} 的静态资料或报价"
+                )
+            market = token.market
+            name_fields = (
+                ("name_cn", "name_en", "name_hk")
+                if market == "CN"
+                else ("name_hk", "name_cn", "name_en")
+                if market == "HK"
+                else ("name_en", "name_cn", "name_hk")
+            )
+            name = next(
+                (
+                    str(getattr(static, field, "") or "").strip()
+                    for field in name_fields
+                    if str(getattr(static, field, "") or "").strip()
+                ),
+                symbol,
+            )
+            timestamp = getattr(quote, "timestamp", None)
+            if not isinstance(timestamp, datetime):
+                raise DataSourceTransientError(
+                    f"Longbridge {symbol} 报价缺少有效时间"
+                )
+            try:
+                snapshots.append(
+                    QuoteSnapshot.from_prices(
+                        selection_generation=token.selection_generation,
+                        request_sequence=token.watchlist_refresh_sequence,
+                        symbol=symbol,
+                        market=market,
+                        source="longbridge",
+                        name=name,
+                        currency=getattr(static, "currency", None),
+                        last=getattr(quote, "last_done", None),
+                        prev_close=getattr(quote, "prev_close", None),
+                        # Longbridge quote/static_info 不声明真实最小跳动；
+                        # 报价可以展示，但不得据此生成可执行价格。
+                        price_tick=None,
+                        quote_ts_utc_ms=datetime_to_ts_ms(timestamp),
+                        received_at_utc_ms=received_at_utc_ms,
+                        quote_mode=quote_mode,
+                        expected_delay_ms=expected_delay_ms,
+                    )
+                )
+            except (InvalidOperation, TypeError, ValueError) as exc:
+                raise DataSourceTransientError(
+                    f"Longbridge {symbol} 报价字段无法解析"
+                ) from exc
+        return tuple(snapshots)
 
     def _last_trading_day_of_week(self, week_start: date) -> date:
         if self._market is None or self._quote_context is None:

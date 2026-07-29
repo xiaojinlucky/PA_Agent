@@ -15,7 +15,11 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from pa_agent.data.base import DataSourceTransientError
+from pa_agent.data.base import (
+    DataSourceAuthenticationError,
+    DataSourcePermissionError,
+    DataSourceTransientError,
+)
 from pa_agent.data.longbridge_source import (
     LONGBRIDGE_TOKEN_EXPIRING_THRESHOLD,
     LongbridgeSource,
@@ -24,6 +28,9 @@ from pa_agent.data.longbridge_source import (
     inspect_longbridge_token_expiry,
     load_longbridge_credentials,
     normalize_longbridge_symbol,
+)
+from pa_agent.data.market_workspace import (
+    WatchlistRequestToken,
 )
 
 _CREDENTIAL_KEYS = (
@@ -88,7 +95,28 @@ def _fake_sdk(rows: list[SimpleNamespace] | None = None) -> tuple[object, dict[s
 
         def static_info(self, symbols: list[str]) -> list[SimpleNamespace]:
             calls["static_info"] = symbols
-            return [SimpleNamespace(symbol=symbols[0])]
+            return [
+                SimpleNamespace(
+                    symbol=symbol,
+                    name_en=f"Name {symbol}",
+                    name_cn=f"名称 {symbol}",
+                    name_hk=f"名稱 {symbol}",
+                    currency="USD" if symbol.endswith(".US") else "HKD",
+                )
+                for symbol in symbols
+            ]
+
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            calls["quote"] = symbols
+            return [
+                SimpleNamespace(
+                    symbol=symbol,
+                    last_done=Decimal("101.25"),
+                    prev_close=Decimal("100"),
+                    timestamp=datetime(2026, 7, 29, 4, 0, tzinfo=UTC),
+                )
+                for symbol in symbols
+            ]
 
         def trading_session(self) -> list[SimpleNamespace]:
             calls["trading_session"] = True
@@ -259,7 +287,10 @@ def test_expired_token_fails_before_sdk_connection_without_leaking_token(
     _install_fake_sdk(monkeypatch, sdk)
     source = LongbridgeSource(env_file=env_file)
 
-    with pytest.raises(DataSourceTransientError, match="Access Token 已过期") as exc_info:
+    with pytest.raises(
+        DataSourceAuthenticationError,
+        match="Access Token 已过期",
+    ) as exc_info:
         source.connect()
 
     assert source.token_expiry.status == "expired"
@@ -313,6 +344,26 @@ def test_future_exp_does_not_replace_read_only_server_authentication(
     assert token not in str(exc_info.value)
 
 
+def test_server_401004_is_typed_authentication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class RevokedQuoteContext(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def trading_session(self) -> list[SimpleNamespace]:
+            raise RuntimeError("401004 token invalid")
+
+    sdk.QuoteContext = RevokedQuoteContext
+    _install_fake_sdk(monkeypatch, sdk)
+
+    with pytest.raises(DataSourceAuthenticationError):
+        LongbridgeSource(env_file=env_file).connect()
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("aapl.us", "AAPL.US"), ("700.hk", "700.HK"), ("000001.sz", "000001.SZ")],
@@ -354,6 +405,157 @@ def test_connect_uses_quote_context_only_and_disables_package_print(
     assert "quote_context" in calls
     assert not hasattr(sdk, "TradeContext")
     assert source._regular_session_closes["CN"] == time(15, 0)
+
+
+def test_batch_quotes_uses_one_quote_call_and_backend_change_math(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, calls = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US", "MSFT.US"),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=4,
+    )
+
+    snapshots = source.batch_quote_snapshots(
+        token,
+        received_at_utc_ms=1_785_297_600_100,
+        quote_mode="realtime",
+    )
+
+    assert calls["static_info"] == ["AAPL.US", "MSFT.US"]
+    assert calls["quote"] == ["AAPL.US", "MSFT.US"]
+    assert [snapshot.symbol for snapshot in snapshots] == ["AAPL.US", "MSFT.US"]
+    assert [snapshot.change for snapshot in snapshots] == ["1.25", "1.25"]
+    assert [snapshot.change_pct for snapshot in snapshots] == ["1.25", "1.25"]
+    assert all(snapshot.price_tick is None for snapshot in snapshots)
+
+
+def test_batch_quotes_rejects_market_suffix_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="HK",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(ValueError, match="与所选市场"):
+        source.batch_quote_snapshots(
+            token,
+            received_at_utc_ms=1_775_016_100_000,
+            quote_mode="realtime",
+        )
+
+
+def test_batch_quotes_requires_proven_quote_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(DataSourcePermissionError, match="行情套餐未证明"):
+        source.batch_quote_snapshots(
+            token,
+            received_at_utc_ms=1_785_297_600_100,
+        )
+
+
+def test_batch_quotes_rejects_unknown_quote_mode(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("aapl.us",),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(ValueError, match="quote_mode 只支持"):
+        source.batch_quote_snapshots(
+            token,
+            received_at_utc_ms=1_785_297_600_100,
+            quote_mode="unknown",  # type: ignore[arg-type]
+        )
+
+
+def test_batch_quotes_fails_whole_batch_when_provider_omits_one_symbol(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+
+    class _MissingQuote(sdk.QuoteContext):  # type: ignore[misc, valid-type]
+        def quote(self, symbols: list[str]) -> list[SimpleNamespace]:
+            return super().quote(symbols[:1])
+
+    sdk.QuoteContext = _MissingQuote
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    token = WatchlistRequestToken(
+        selection_generation=1,
+        market="US",
+        source="longbridge",
+        symbols=("AAPL.US", "MSFT.US"),
+        watchlist_change_sequence=1,
+        watchlist_refresh_sequence=1,
+    )
+
+    with pytest.raises(DataSourceTransientError, match="缺少 MSFT.US"):
+        source.batch_quote_snapshots(
+            token,
+            received_at_utc_ms=1_785_297_600_100,
+            quote_mode="realtime",
+        )
 
 
 def test_subscribe_rejects_well_formed_but_unknown_symbol(

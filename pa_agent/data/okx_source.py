@@ -5,6 +5,7 @@ import re
 from decimal import Decimal, InvalidOperation
 
 from pa_agent.data.base import DataSource, DataSourceTransientError, KlineBar
+from pa_agent.data.market_workspace import QuoteSnapshot, WatchlistRequestToken
 from pa_agent.execution.credentials import OkxCredentials
 from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
 from pa_agent.execution.okx_client import OkxRestClient
@@ -32,6 +33,8 @@ _PRESET_INSTRUMENTS: tuple[str, ...] = (
 )
 _INSTRUMENT_RE = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+){1,2}$")
 _MAX_CANDLES = 300
+_MAX_CANDLE_PAGES = 3
+_MAX_TEN_MINUTE_BARS = 300
 _TEN_MINUTE_MS = 10 * 60 * 1000
 _FIVE_MINUTE_MS = 5 * 60 * 1000
 
@@ -226,6 +229,76 @@ class OkxSource(DataSource):
             return False
         return True
 
+    def batch_quote_snapshots(
+        self,
+        token: WatchlistRequestToken,
+        *,
+        received_at_utc_ms: int,
+    ) -> tuple[QuoteSnapshot, ...]:
+        """按产品类型批量读取报价；不改变当前主图订阅。"""
+        if not self._connected:
+            raise DataSourceTransientError("OKX 公共行情源尚未连接")
+        if token.market != "Crypto" or token.source != "okx":
+            raise ValueError("OKX 批量报价只接受 Crypto/okx 批次")
+        requested_by_type: dict[str, dict[str, str]] = {}
+        request_order = list(token.symbols)
+        for symbol_value in token.symbols:
+            symbol = normalize_okx_instrument(symbol_value)
+            bucket = requested_by_type.setdefault(okx_instrument_type(symbol), {})
+            if symbol in bucket:
+                raise ValueError(f"批量报价包含重复品种：{symbol}")
+            bucket[symbol] = symbol
+
+        snapshots_by_symbol: dict[str, QuoteSnapshot] = {}
+        try:
+            for instrument_type, requested in requested_by_type.items():
+                ticker_rows = self._client.tickers(instrument_type)
+                instrument_rows = self._client.public_instruments(instrument_type)
+                tick_by_symbol = {
+                    str(row.get("instId") or "").strip().upper(): row.get("tickSz")
+                    for row in instrument_rows
+                    if str(row.get("state") or "").strip().lower() == "live"
+                }
+                ticker_by_symbol = {
+                    str(row.get("instId") or "").strip().upper(): row
+                    for row in ticker_rows
+                }
+                for symbol in requested:
+                    row = ticker_by_symbol.get(symbol)
+                    price_tick = tick_by_symbol.get(symbol)
+                    if row is None or price_tick in {None, ""}:
+                        raise DataSourceTransientError(
+                            f"OKX 批量报价缺少 {symbol} 的报价或真实 tickSz"
+                        )
+                    parts = symbol.split("-")
+                    quote_currency = parts[-2] if parts[-1] == "SWAP" else parts[-1]
+                    snapshots_by_symbol[symbol] = QuoteSnapshot.from_prices(
+                            selection_generation=(
+                                token.selection_generation
+                            ),
+                            request_sequence=token.watchlist_refresh_sequence,
+                            symbol=symbol,
+                            market="Crypto",
+                            source="okx",
+                            name=symbol,
+                            currency=quote_currency,
+                            last=row.get("last"),
+                            # OKX tickers 没有“上一交易日收盘价”字段；
+                            # 禁止用 24 小时开盘价伪装。
+                            prev_close=None,
+                            price_tick=price_tick,
+                            quote_ts_utc_ms=int(str(row.get("ts") or "")),
+                            received_at_utc_ms=received_at_utc_ms,
+                    )
+        except (BrokerApiError, BrokerTransportError) as exc:
+            raise DataSourceTransientError(f"OKX 批量报价暂时不可用：{exc}") from exc
+        except (InvalidOperation, TypeError, ValueError) as exc:
+            raise DataSourceTransientError("OKX 批量报价字段无法解析") from exc
+        return tuple(
+            snapshots_by_symbol[symbol]
+            for symbol in request_order
+        )
+
     def latest_snapshot(self, n: int) -> list[KlineBar]:
         if not self._connected:
             raise DataSourceTransientError("OKX 公共行情源尚未连接")
@@ -256,18 +329,19 @@ class OkxSource(DataSource):
     ) -> list[KlineBar]:
         if n < 1:
             return []
-        max_requested = _MAX_CANDLES // 2 if timeframe == "10m" else _MAX_CANDLES
+        max_requested = (
+            _MAX_TEN_MINUTE_BARS if timeframe == "10m" else _MAX_CANDLES
+        )
         if n > max_requested:
             raise DataSourceTransientError(
                 f"OKX {timeframe} 单次最多返回 {max_requested} 根；"
-                "10m 由真实 5m 两两聚合，不能突破 OKX 300 行上限"
+                "10m 由真实 5m 分页后两两聚合"
             )
-        raw_limit = min(_MAX_CANDLES, n * 2 + 2) if timeframe == "10m" else n
+        raw_limit = n * 2 + 2 if timeframe == "10m" else n
         try:
-            rows = self._client.candles(
-                instrument=self._symbol,
-                bar=_TIMEFRAME_TO_OKX_BAR[timeframe],
-                limit=raw_limit,
+            rows = self._fetch_candle_rows(
+                timeframe=timeframe,
+                required_rows=raw_limit,
             )
         except (BrokerApiError, BrokerTransportError) as exc:
             raise DataSourceTransientError(f"OKX K 线暂时不可用：{exc}") from exc
@@ -341,3 +415,63 @@ class OkxSource(DataSource):
                 )
             )
         return bars
+
+    def _fetch_candle_rows(
+        self,
+        *,
+        timeframe: str,
+        required_rows: int,
+    ) -> list[list[str]]:
+        """分页读取并按时间去重；冲突重复行和游标不前进都会失败关闭。"""
+        rows_by_timestamp: dict[int, list[str]] = {}
+        after: str | None = None
+        oldest_timestamp: int | None = None
+        max_pages = _MAX_CANDLE_PAGES if timeframe == "10m" else 1
+        for _ in range(max_pages):
+            remaining = required_rows - len(rows_by_timestamp)
+            if remaining <= 0:
+                break
+            page = self._client.candles(
+                instrument=self._symbol,
+                bar=_TIMEFRAME_TO_OKX_BAR[timeframe],
+                limit=min(_MAX_CANDLES, remaining),
+                after=after,
+            )
+            if not page:
+                break
+            page_oldest: int | None = None
+            for row in page:
+                try:
+                    if len(row) < 9:
+                        raise ValueError("missing fields")
+                    timestamp = int(row[0])
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise DataSourceTransientError(
+                        "OKX K 线分页结果的时间字段无法解析"
+                    ) from exc
+                existing = rows_by_timestamp.get(timestamp)
+                if existing is not None and existing != row:
+                    raise DataSourceTransientError(
+                        "OKX K 线分页返回同时间戳但内容冲突的数据"
+                    )
+                rows_by_timestamp[timestamp] = row
+                page_oldest = (
+                    timestamp
+                    if page_oldest is None
+                    else min(page_oldest, timestamp)
+                )
+            if page_oldest is None:
+                break
+            if oldest_timestamp is not None and page_oldest >= oldest_timestamp:
+                raise DataSourceTransientError("OKX K 线分页游标没有向更早时间推进")
+            oldest_timestamp = page_oldest
+            after = str(page_oldest)
+        if len(rows_by_timestamp) < required_rows:
+            raise DataSourceTransientError(
+                f"OKX K 线分页不足：需要 {required_rows} 行，"
+                f"实际 {len(rows_by_timestamp)} 行"
+            )
+        return [
+            rows_by_timestamp[timestamp]
+            for timestamp in sorted(rows_by_timestamp, reverse=True)
+        ]

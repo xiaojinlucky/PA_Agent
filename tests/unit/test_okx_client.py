@@ -474,6 +474,72 @@ def test_candles_use_public_endpoint_and_bounded_limit():
     assert "OK-ACCESS-KEY" not in call["headers"]
 
 
+def test_candles_forwards_after_cursor_only_when_provided():
+    transport = FakeTransport(
+        [
+            _response({"code": "0", "data": [], "msg": ""}),
+            _response({"code": "0", "data": [], "msg": ""}),
+        ]
+    )
+    client = _client(transport)
+
+    client.candles(instrument="BTC-USDT", bar="5m", limit=10)
+    client.candles(
+        instrument="BTC-USDT",
+        bar="5m",
+        limit=10,
+        after="1700000000000",
+    )
+
+    assert transport.calls[0]["url"].endswith(
+        "/api/v5/market/candles?bar=5m&instId=BTC-USDT&limit=10"
+    )
+    assert transport.calls[1]["url"].endswith(
+        "/api/v5/market/candles"
+        "?after=1700000000000&bar=5m&instId=BTC-USDT&limit=10"
+    )
+
+
+@pytest.mark.parametrize("after", ["", "-1", "12.5", "not-a-timestamp"])
+def test_candles_rejects_invalid_after_cursor(after):
+    with pytest.raises(BrokerTransportError, match="after 游标"):
+        _client(FakeTransport([])).candles(
+            instrument="BTC-USDT",
+            bar="5m",
+            limit=10,
+            after=after,
+        )
+
+
+@pytest.mark.parametrize("inst_type", ["SPOT", "swap"])
+def test_tickers_uses_public_endpoint_without_private_headers(inst_type):
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [{"instId": "BTC-USDT", "last": "100"}],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+
+    rows = _client(transport, simulated=True).tickers(inst_type)
+
+    assert rows == [{"instId": "BTC-USDT", "last": "100"}]
+    call = transport.calls[0]
+    assert call["url"].endswith(
+        f"/api/v5/market/tickers?instType={inst_type.upper()}"
+    )
+    assert "OK-ACCESS-KEY" not in call["headers"]
+
+
+def test_tickers_rejects_unsupported_instrument_type():
+    with pytest.raises(BrokerTransportError, match="SPOT 或 SWAP"):
+        _client(FakeTransport([])).tickers("FUTURES")
+
+
 def test_leverage_info_uses_read_only_private_endpoint():
     transport = FakeTransport(
         [

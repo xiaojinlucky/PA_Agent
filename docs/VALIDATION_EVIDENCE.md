@@ -1,6 +1,16 @@
 # PA_Agent 移交验证证据
 
-> **按时间追加的验证账本（已更新至 2026-07-28）**：早期章节中的 SHA、测试数字和运行态只在各自记录时间成立。当前静态代码与 Git 基线以根目录 `CONTEXT.md`、`docs/WORKORDER_MASTER_20260727.md` 和最新 GitHub `main` 为准；进程、账户、服务、仓位、订单和券商状态必须重新实时核验。
+> **按时间追加的验证账本（已更新至 2026-07-29）**：早期章节中的 SHA、测试数字和运行态只在各自记录时间成立。当前静态代码与 Git 基线以根目录 `CONTEXT.md`、`docs/WORKORDER_MASTER_20260727.md` 和最新 GitHub `main` 为准；进程、账户、服务、仓位、订单和券商状态必须重新实时核验。
+
+## 2026-07-29 多市场后端、无界面连接层与外部前端 PRD
+
+- 运行安全只读基线：Worker 与心跳可见、两库 `quick_check=ok`、活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；固定代理 10981 无监听，OKX 私有真相不可得，风险停止保持激活。Campaign 进程不存在且磁盘 active 状态过期。本轮未恢复 Campaign、未清风险停止、未调用券商写接口。
+- 新增 `pa_agent/data/market_workspace.py`：不可变选择身份、请求 token、报价快照和新鲜度、100 项批量自选集合、generation/请求族序号门禁、K 线证据视图和独立只分析结果投影。分析投影不依赖 `pa_agent.execution`，不会调用交易准备。
+- OKX 只读增强：`candles(after=None)` 仅给公共 K 线增加可选向旧分页游标；新增 SPOT/SWAP 全量公共 ticker。10m 默认分析加 55 根指标预热最坏需要 602 根 5m，现最多读取三页；重复时间戳内容冲突、分页游标不前进、缺根或未收盘状态异常均失败关闭。批量报价按产品类型最多两个串行快照，不逐标的调用；OKX 没有上一交易日收盘字段时保持空值，不用 24 小时开盘价冒充。
+- Longbridge 只读增强：复用单一 QuoteContext 和已有串行 SDK executor，一次 `quote(symbols)` 读取最多 100 项本地自选；静态信息与报价按标的严格连接。已过期 JWT 和已知服务端 `401004` 映射为类型化认证失败。Longbridge quote/static_info 不声明真实最小跳动时保持 `price_tick=None`，只允许展示，禁止猜值或用于可执行定价。
+- 测试：定向 175 项通过、0 失败；全仓收集 2033 项，2030 项通过、3 项跳过、0 失败。
+- 前端交付：新增 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`，冻结 1440×900 / 1920×1080 布局、状态、视觉令牌、PyQt6 映射、后端合同和 M01–M17。该文件取代 Stitch、ChatGPT Images 和浏览器自动化流程；当前未修改 `pa_agent/gui`，不冒充视觉生产实现完成。
+- 外部阻塞：Longbridge 真实 AAPL.US、700.HK、600519.SH 验收仍受 `401004 token invalid` 阻塞；没有绕过凭据或用测试替身冒充真实通过。
 
 ## 2026-07-26 深夜 固定代理换节点恢复 + P1 多市场后端（Claude 会话）
 
@@ -697,7 +707,8 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 
 ### 当前外部门与运行态
 
-- ChatGPT Web B3 通过。Stitch、R1–R3、R2 Taste 过程指导、R3 后独立视觉审计和用户最终审美确认仍未完成。
-- 用户授权官方恢复流程后，实际打开新的 Chrome Profile 1 窗口并只重试一次，扩展连接成功；登录态 Stitch 已打开并切换到 `Web` 模式。五个待上传文件均存在且指纹核对通过，但系统文件选择器没有打开；官方排障要求用户在扩展详情开启“允许访问文件网址”。当前未上传附件、未创建 Stitch 项目，也没有 Screen、版本或下载物。
+- ChatGPT Web B3 通过。Stitch 已实际提交并创建项目，但视觉结果被用户否决；新的 ChatGPT Images 2.0 三张样板、用户选择、机器可读设计规格、视觉审计和最终审美确认仍未完成。
+- 用户授权官方恢复流程后，实际打开新的 Chrome Profile 1 窗口并只重试一次，扩展连接成功；登录态 Stitch 已打开并切换到 `Web` 模式。五个文件均存在且指纹核对通过，用户随后明确确认“五个附件已显示”，因此此前“权限未开启、附件未上传”的推断作废。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 参考规则已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认项目 `8039115259020616674` 已创建，地址为 `https://stitch.withgoogle.com/projects/8039115259020616674`，页面标题为 `Stitch - Projects`。Chrome 后台页面接管没有取得 Screen ID、版本、生成图或下载物，但用户已直接看到结果并明确判定效果远未达到预期；该稿因此作废，不登记为现役设计资产。
+- 2026-07-28 用户改选网页版 ChatGPT Images 2.0 路线。PRD08 已冻结三张独立 1440×900 样板的共同提示词、三个差异方向，以及选图后的 evidence bundle：原始样板、标注图、DTCG 结构的 `design-spec.json`、组件状态、资产清单、PyQt6 映射和 `design-qa.md`。外部生成只上传两张已脱敏 PNG 与 PRD05/07/10；Longbridge 原始接触表只在本地提炼规则，不上传。用户刷新后，Chrome 后台接口能列出标签页；Agent 另开一个同登录态 ChatGPT 页后也曾成功读取“与 ChatGPT 聊天”输入框。但既有页的页面快照、截图和底层调试命令均超时；新页打开“添加文件等”后也在附件菜单、上传控件读取阶段连续超时并失去响应。没有文件上传成功、没有提示词提交、没有生成任务。用户允许可视操作后，Windows 控制仍因无法高置信确认当前网址而在点击、输入和上传前安全终止，所以新样板真实产物仍为 0/3。
 - 官方接口核查：Longbridge `QuoteContext.quote(symbols)` 单次最多 500 个标的，项目本地 `longbridge 4.3.2` 签名与官方入口一致；当前 100 项自选可单次读取，但真实 OpenAPI 权限仍受失效 token 阻塞。OKX `/market/tickers` 无需认证，按 SPOT/SWAP 最多两个串行类型快照后本地筛选，不能伪造多标的参数。OKX `/market/candles` 单页最多 300、`after` 向旧翻页、最近覆盖 1,440 根；现有最大 10m 请求最坏需 602 根 5m、最多三页，正确实现仍需极窄解除 `pa_agent/execution/okx_client.py` 禁区。
 - 11:24–11:28 只读运行态复核确认 Worker 与心跳运行、两库 `quick_check=ok`、活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；OKX 私有余额读取持续连接拒绝并触发风险停止，Campaign 进程不存在且磁盘状态过期。最后本地账户快照已陈旧约 13.35 小时；Agent 没有启动、停止、重载或另行调用私有接口。

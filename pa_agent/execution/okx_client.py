@@ -430,15 +430,25 @@ class OkxRestClient:
         instrument: str,
         bar: str,
         limit: int,
+        after: str | None = None,
     ) -> list[list[str]]:
+        params: dict[str, Any] = {
+            "instId": instrument,
+            "bar": bar,
+            "limit": max(1, min(int(limit), 300)),
+        }
+        if after is not None:
+            clean_after = str(after).strip()
+            if not clean_after.isdigit():
+                raise BrokerTransportError(
+                    "OKX K 线 after 游标必须是非负毫秒时间戳",
+                    write_may_have_reached=False,
+                )
+            params["after"] = clean_after
         payload = self._request(
             "GET",
             "/api/v5/market/candles",
-            params={
-                "instId": instrument,
-                "bar": bar,
-                "limit": max(1, min(int(limit), 300)),
-            },
+            params=params,
             private=False,
         )
         rows: list[list[str]] = []
@@ -650,6 +660,23 @@ class OkxRestClient:
         )
         data = payload.get("data") or []
         return dict(data[0]) if data else {}
+
+    def tickers(self, inst_type: str) -> list[dict[str, Any]]:
+        """读取一个产品类型的全量公共报价，不需要账户认证。"""
+
+        clean_type = str(inst_type).strip().upper()
+        if clean_type not in {"SPOT", "SWAP"}:
+            raise BrokerTransportError(
+                "PA 多市场看盘只允许读取 OKX SPOT 或 SWAP 全量报价",
+                write_may_have_reached=False,
+            )
+        payload = self._request(
+            "GET",
+            "/api/v5/market/tickers",
+            params={"instType": clean_type},
+            private=False,
+        )
+        return [dict(item) for item in payload.get("data") or []]
 
     def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         payload = self._request("POST", "/api/v5/trade/order", body=body, private=True)
