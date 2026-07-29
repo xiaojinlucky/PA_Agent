@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
@@ -528,6 +529,148 @@ def test_submit_is_durable_command_and_never_calls_broker(
     assert commands[0].action is WorkerCommandAction.SUBMIT
     assert commands[0].status is WorkerCommandStatus.PENDING
     assert commands[0].new_risk_lease_id
+    lease = worker_store.current_new_risk_lease()
+    assert lease is not None
+    assert lease.command_id == command.id
+    assert controller.is_armed is False
+
+
+def test_submit_binding_and_local_command_are_atomic_against_renewal(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, _settings_obj, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    execution = controller.prepare_analysis(record)
+    committed = threading.Event()
+    release_submit = threading.Event()
+    real_enqueue = worker_store.enqueue
+
+    def enqueue_then_pause_after_real_commit(*args, **kwargs):
+        result = real_enqueue(*args, **kwargs)
+        committed.set()
+        assert release_submit.wait(5), "测试未释放已提交的 enqueue"
+        return result
+
+    monkeypatch.setattr(worker_store, "enqueue", enqueue_then_pause_after_real_commit)
+    submitted = []
+    submit_errors = []
+
+    def submit() -> None:
+        try:
+            submitted.append(controller.submit(execution.id))
+        except BaseException as exc:
+            submit_errors.append(exc)
+
+    submit_thread = threading.Thread(target=submit)
+    submit_thread.start()
+    assert committed.wait(5), "真实 WorkerStore.enqueue 没有完成提交"
+
+    # 这里只给真实 enqueue 增加提交后的同步点，不伪造安全结果。
+    # 修复后，提交线程仍持有 Controller 锁，续租只能等本地 command_id 落定。
+    lock_was_free = controller._lock.acquire(blocking=False)
+    renew_thread = None
+    if lock_was_free:
+        controller._lock.release()
+        controller._renew_lease()
+    else:
+        renew_thread = threading.Thread(target=controller._renew_lease)
+        renew_thread.start()
+    release_submit.set()
+    submit_thread.join(timeout=5)
+    if renew_thread is not None:
+        renew_thread.join(timeout=5)
+
+    assert submit_thread.is_alive() is False
+    assert renew_thread is None or renew_thread.is_alive() is False
+    assert lock_was_free is False
+    assert submit_errors == []
+    assert len(submitted) == 1
+    lease = worker_store.current_new_risk_lease()
+    assert lease is not None
+    assert lease.command_id == submitted[0].id
+    assert controller._lease_id == lease.lease_id
+    assert controller._lease_command_id == submitted[0].id
+
+
+@pytest.mark.parametrize(
+    "terminal_status",
+    [WorkerCommandStatus.SUCCEEDED, WorkerCommandStatus.FAILED],
+)
+def test_terminal_new_risk_command_releases_consumed_lease_without_rearming(
+    tmp_path,
+    monkeypatch,
+    terminal_status,
+):
+    controller, worker_store, _settings_obj, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    execution = controller.prepare_analysis(record)
+    command = controller.submit(execution.id)
+    claimed = worker_store.claim_next(worker_id="worker-a")
+    assert claimed is not None
+    result_code = (
+        "done"
+        if terminal_status is WorkerCommandStatus.SUCCEEDED
+        else ""
+    )
+    failure_code = (
+        "rejected"
+        if terminal_status is WorkerCommandStatus.FAILED
+        else ""
+    )
+    worker_store.finish_command(
+        command.id,
+        worker_id="worker-a",
+        status=terminal_status,
+        result_code=result_code,
+        failure_code=failure_code,
+    )
+
+    controller._renew_lease()
+
+    assert controller.is_armed is False
+    assert worker_store.current_new_risk_lease() is None
+
+
+def test_terminal_race_during_renewal_still_releases_database_lease(
+    tmp_path,
+    monkeypatch,
+):
+    controller, worker_store, _settings_obj, record = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    controller.arm("启用模拟交易")
+    execution = controller.prepare_analysis(record)
+    command = controller.submit(execution.id)
+    assert worker_store.claim_next(worker_id="worker-a").id == command.id
+    real_renew = worker_store.renew_new_risk_lease
+
+    def finish_then_run_real_renew(*args, **kwargs):
+        worker_store.finish_command(
+            command.id,
+            worker_id="worker-a",
+            status=WorkerCommandStatus.SUCCEEDED,
+            result_code="done",
+        )
+        return real_renew(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker_store,
+        "renew_new_risk_lease",
+        finish_then_run_real_renew,
+    )
+
+    controller._renew_lease()
+
+    assert controller.is_armed is False
+    assert worker_store.current_new_risk_lease() is None
 
 
 def test_disarm_blocks_new_risk_but_not_de_risk_commands(
@@ -589,7 +732,8 @@ def test_unresolved_broker_write_blocks_rearm_until_durable_resolution(
     worker_store.recover_inflight(failure_code="worker_restarted")
 
     assert controller.is_armed is False
-    controller.disarm()
+    controller._renew_lease()
+    assert worker_store.current_new_risk_lease() is None
     with pytest.raises(LiveTradingDisabled, match="未解决"):
         controller.arm("启用模拟交易")
 
@@ -1297,7 +1441,7 @@ def test_longbridge_fallback_authority_is_limited_to_intraday_to_comprehensive(
         account="intraday",
         ttl_seconds=60,
     )
-    command, _ = worker_store.enqueue(
+    _command, _ = worker_store.enqueue(
         action=WorkerCommandAction.SUBMIT,
         execution_id=plan.id,
         requester="gui-lb",

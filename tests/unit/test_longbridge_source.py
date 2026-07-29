@@ -34,9 +34,16 @@ from pa_agent.data.market_workspace import (
 )
 
 _CREDENTIAL_KEYS = (
+    "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE",
     "LONGBRIDGE_APP_KEY",
     "LONGBRIDGE_APP_SECRET",
     "LONGBRIDGE_ACCESS_TOKEN",
+    "LONGBRIDGE_COMPREHENSIVE_APP_KEY",
+    "LONGBRIDGE_COMPREHENSIVE_APP_SECRET",
+    "LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN",
+    "LONGBRIDGE_INTRADAY_APP_KEY",
+    "LONGBRIDGE_INTRADAY_APP_SECRET",
+    "LONGBRIDGE_INTRADAY_ACCESS_TOKEN",
     "LONGPORT_APP_KEY",
     "LONGPORT_APP_SECRET",
     "LONGPORT_ACCESS_TOKEN",
@@ -221,6 +228,117 @@ def test_longport_legacy_names_are_supported(
     credentials = load_longbridge_credentials(env_file)
 
     assert credentials.app_key == "test-key"
+
+
+def test_explicit_comprehensive_profile_uses_only_named_file_triplet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "process-default-key")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "process-default-secret")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "process-default-token")
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=COMPREHENSIVE\n"
+        "LONGBRIDGE_APP_KEY=file-default-key\n"
+        "LONGBRIDGE_APP_SECRET=file-default-secret\n"
+        "LONGBRIDGE_ACCESS_TOKEN=file-default-token\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_KEY=quote-key\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_SECRET=quote-secret\n"
+        "LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=quote-token\n",
+        encoding="utf-8",
+    )
+
+    credentials = load_longbridge_credentials(env_file)
+
+    assert credentials.app_key == "quote-key"
+    assert credentials.app_secret == "quote-secret"
+    assert credentials.access_token == "quote-token"
+
+
+def test_explicit_intraday_profile_uses_only_named_file_triplet(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=INTRADAY\n"
+        "LONGBRIDGE_APP_KEY=default-key\n"
+        "LONGBRIDGE_APP_SECRET=default-secret\n"
+        "LONGBRIDGE_ACCESS_TOKEN=default-token\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_KEY=quote-key\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_SECRET=quote-secret\n"
+        "LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=quote-token\n"
+        "LONGBRIDGE_INTRADAY_APP_KEY=intraday-key\n"
+        "LONGBRIDGE_INTRADAY_APP_SECRET=intraday-secret\n"
+        "LONGBRIDGE_INTRADAY_ACCESS_TOKEN=intraday-token\n",
+        encoding="utf-8",
+    )
+
+    credentials = load_longbridge_credentials(env_file)
+
+    assert credentials.app_key == "intraday-key"
+    assert credentials.app_secret == "intraday-secret"
+    assert credentials.access_token == "intraday-token"
+
+
+def test_process_quote_profile_overrides_file_profile(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv("PA_AGENT_LONGBRIDGE_QUOTE_PROFILE", "default")
+    monkeypatch.setenv("LONGBRIDGE_APP_KEY", "process-key")
+    monkeypatch.setenv("LONGBRIDGE_APP_SECRET", "process-secret")
+    monkeypatch.setenv("LONGBRIDGE_ACCESS_TOKEN", "process-token")
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=COMPREHENSIVE\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_KEY=quote-key\n"
+        "LONGBRIDGE_COMPREHENSIVE_APP_SECRET=quote-secret\n"
+        "LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=quote-token\n",
+        encoding="utf-8",
+    )
+
+    credentials = load_longbridge_credentials(env_file)
+
+    assert credentials.app_key == "process-key"
+    assert credentials.app_secret == "process-secret"
+    assert credentials.access_token == "process-token"
+
+
+def test_selected_profile_partial_process_credentials_do_not_mix_with_file(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    monkeypatch.setenv("PA_AGENT_LONGBRIDGE_QUOTE_PROFILE", "comprehensive")
+    monkeypatch.setenv("LONGBRIDGE_COMPREHENSIVE_APP_KEY", "partial")
+    env_file = tmp_path / "env"
+    _write_env(env_file, prefix="LONGBRIDGE_COMPREHENSIVE")
+
+    with pytest.raises(DataSourceTransientError, match="凭据不完整"):
+        load_longbridge_credentials(env_file)
+
+
+def test_unknown_quote_profile_fails_closed_without_default_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    env_file.write_text(
+        "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=automatic\n"
+        "LONGBRIDGE_APP_KEY=default-key\n"
+        "LONGBRIDGE_APP_SECRET=default-secret\n"
+        "LONGBRIDGE_ACCESS_TOKEN=default-token\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(DataSourceTransientError, match="行情凭据档案无效"):
+        load_longbridge_credentials(env_file)
 
 
 @pytest.mark.parametrize(

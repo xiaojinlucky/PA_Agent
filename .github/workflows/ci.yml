@@ -23,27 +23,151 @@ jobs:
       - name: Verify install
         run: python -c "import pa_agent; print('OK')"
 
-      # 18 条 --deselect 是 2026-07-26 时点的既有历史失败（清单与
-      # docs/CLAUDE_HANDOFF_20260726.md 第 10 节一致），修复一条就删一条；
-      # 除此之外任何失败都应让 CI 变红。
-      - name: Run unit tests
+      - name: Capture commit and Python environment
+        if: always()
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path scratch/ci-evidence | Out-Null
+          $captureErrors = @()
+          $gitSha = (git rev-parse HEAD 2>&1 | Out-String).Trim()
+          $gitExitCode = $LASTEXITCODE
+          if ($gitExitCode -ne 0 -or $gitSha -notmatch "^[0-9a-f]{40}$") {
+            "unavailable: git rev-parse HEAD failed" |
+              Set-Content -Encoding utf8 scratch/ci-evidence/full-git-sha.txt
+            $captureErrors += "git_sha"
+          } else {
+            $gitSha |
+              Set-Content -Encoding utf8 scratch/ci-evidence/full-git-sha.txt
+          }
+          $pythonCommand = Get-Command python -ErrorAction SilentlyContinue
+          if ($null -eq $pythonCommand) {
+            "unavailable: python command not found" |
+              Set-Content -Encoding utf8 scratch/ci-evidence/python-version.txt
+            "unavailable: python command not found" |
+              Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
+            $captureErrors += "python_command"
+          } else {
+            $pythonVersion = (python --version 2>&1 | Out-String).Trim()
+            $pythonExitCode = $LASTEXITCODE
+            if ($pythonExitCode -ne 0) {
+              "unavailable: python --version failed" |
+                Set-Content -Encoding utf8 scratch/ci-evidence/python-version.txt
+              "unavailable: python --version failed" |
+                Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
+              $captureErrors += "python_version"
+            } else {
+              $pythonVersion |
+                Set-Content -Encoding utf8 scratch/ci-evidence/python-version.txt
+              $pipFreeze = @(python -m pip freeze 2>&1)
+              $pipExitCode = $LASTEXITCODE
+              if ($pipExitCode -ne 0) {
+                "unavailable: pip freeze failed" |
+                  Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
+                $captureErrors += "pip_freeze"
+              } else {
+                $pipFreeze |
+                  Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
+              }
+            }
+          }
+          if ($captureErrors.Count -ne 0) {
+            throw "CI environment capture failed: $($captureErrors -join ', ')"
+          }
+
+      - name: Run deterministic test suite
         run: >-
-          python -m pytest tests/unit -q -p no:cacheprovider
-          --deselect tests/unit/test_coherence_checks.py::test_structural_inside_outside_mismatch_still_errors_in_strict
-          --deselect tests/unit/test_decision_continuity.py::test_audit_relation_flip_label
-          --deselect tests/unit/test_decision_continuity.py::test_bars_elapsed_between_parses_iso_t_separator
-          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_after_3_bars_unfilled_limit
-          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_on_cycle_change_unfilled_limit
-          --deselect tests/unit/test_decision_continuity.py::test_build_continuity_context_auto_cancels_on_direction_change_unfilled_limit
-          --deselect tests/unit/test_decision_nodes_judges.py::test_normalize_stage2_upgrades_9_0_for_planned_limit
-          --deselect tests/unit/test_decision_panel.py::test_panel_no_prediction_hidden
-          --deselect tests/unit/test_decision_panel.py::test_panel_unpredictable_renders_gray
-          --deselect tests/unit/test_decision_panel.py::test_panel_bullish_renders_green
-          --deselect tests/unit/test_decision_panel.py::test_panel_bearish_renders_red
-          --deselect tests/unit/test_decision_panel.py::test_panel_neutral_renders_yellow
-          --deselect tests/unit/test_decision_panel.py::test_panel_clear_hides_group
-          --deselect tests/unit/test_order_opportunity.py::test_play_order_alert_sound_uses_wav_on_windows
-          --deselect tests/unit/test_price_tick.py::test_stage2_normalizer_passes_breakout_price_check
-          --deselect tests/unit/test_provider_override_by_model.py::test_openclaw_cs_overrides_user_url_and_key
-          --deselect tests/unit/test_validation_lenient_fixes.py::test_lenient_validator_maps_openclaw_enum_slips
-          --deselect tests/unit/test_validation_lenient_fixes.py::test_lenient_validator_maps_action_and_limit_order_pending
+          python -m pytest -p no:cacheprovider -m "not live"
+          --junitxml=scratch/ci-evidence/pytest-deterministic-junit.xml
+
+      - name: Enforce deterministic test and skip budget
+        if: always()
+        shell: pwsh
+        run: |
+          $report = [xml](Get-Content -Raw scratch/ci-evidence/pytest-deterministic-junit.xml)
+          $suite = $report.testsuites.testsuite
+          $tests = [int]$suite.tests
+          $failures = [int]$suite.failures
+          $errors = [int]$suite.errors
+          $skipped = [int]$suite.skipped
+          if ($tests -lt 2048 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+            throw "pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
+          }
+
+      - name: Run live provider health checks
+        id: live_provider
+        if: always()
+        continue-on-error: true
+        run: >-
+          python -m pytest -p no:cacheprovider -m live
+          --junitxml=scratch/ci-evidence/pytest-live-provider-junit.xml
+
+      - name: Record live provider outcome
+        if: always()
+        shell: pwsh
+        run: |
+          $outcome = "${{ steps.live_provider.outcome }}"
+          "step_outcome=$outcome" | Set-Content -Encoding utf8 scratch/ci-evidence/live-provider-outcome.txt
+          $reportPath = "scratch/ci-evidence/pytest-live-provider-junit.xml"
+          $healthStatus = "missing"
+          if (Test-Path $reportPath) {
+            try {
+              $report = [xml](Get-Content -Raw $reportPath)
+              $suite = $report.testsuites.testsuite
+              $tests = [int]$suite.tests
+              $failures = [int]$suite.failures
+              $errors = [int]$suite.errors
+              $skipped = [int]$suite.skipped
+              if ($failures -ne 0 -or $errors -ne 0) {
+                $healthStatus = "unhealthy"
+              } elseif ($tests -eq $skipped) {
+                $healthStatus = "unavailable"
+              } elseif ($skipped -ne 0) {
+                $healthStatus = "partial"
+              } else {
+                $healthStatus = "healthy"
+              }
+              "tests=$tests failures=$failures errors=$errors skipped=$skipped" |
+                Add-Content -Encoding utf8 scratch/ci-evidence/live-provider-outcome.txt
+            } catch {
+              $healthStatus = "invalid"
+              "junit_status=invalid" |
+                Add-Content -Encoding utf8 scratch/ci-evidence/live-provider-outcome.txt
+            }
+          }
+          "health_status=$healthStatus" |
+            Add-Content -Encoding utf8 scratch/ci-evidence/live-provider-outcome.txt
+          if ($outcome -ne "success" -or $healthStatus -ne "healthy") {
+            "Live provider health status: $healthStatus; inspect the uploaded JUnit evidence." |
+              Add-Content -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          }
+
+      - name: Verify CI evidence files
+        if: always()
+        shell: pwsh
+        run: |
+          $required = @(
+            "scratch/ci-evidence/pytest-deterministic-junit.xml",
+            "scratch/ci-evidence/live-provider-outcome.txt",
+            "scratch/ci-evidence/full-git-sha.txt",
+            "scratch/ci-evidence/python-version.txt",
+            "scratch/ci-evidence/pip-freeze.txt"
+          )
+          $missing = @($required | Where-Object { -not (Test-Path $_) })
+          if ($missing.Count -gt 0) {
+            throw "CI evidence missing: $($missing -join ', ')"
+          }
+
+      - name: Upload test and environment evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-evidence-${{ github.sha }}
+          path: |
+            scratch/ci-evidence/pytest-deterministic-junit.xml
+            scratch/ci-evidence/pytest-live-provider-junit.xml
+            scratch/ci-evidence/live-provider-outcome.txt
+            scratch/ci-evidence/full-git-sha.txt
+            scratch/ci-evidence/python-version.txt
+            scratch/ci-evidence/pip-freeze.txt
+          if-no-files-found: error
+          retention-days: 30

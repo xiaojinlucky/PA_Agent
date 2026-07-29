@@ -87,6 +87,12 @@ _MARKET_TIMEZONES = {
 # 超过 1000 根的部分由 history_candlesticks_by_offset 分页补齐。
 LONGBRIDGE_MAX_ANALYSIS_BARS = 3000
 LONGBRIDGE_TOKEN_EXPIRING_THRESHOLD = timedelta(days=7)
+_QUOTE_PROFILE_ENV = "PA_AGENT_LONGBRIDGE_QUOTE_PROFILE"
+_QUOTE_PROFILE_PREFIXES: dict[str, tuple[str, ...]] = {
+    "default": ("LONGBRIDGE", "LONGPORT"),
+    "comprehensive": ("LONGBRIDGE_COMPREHENSIVE",),
+    "intraday": ("LONGBRIDGE_INTRADAY",),
+}
 
 
 class _QuoteRateLimiter:
@@ -211,9 +217,13 @@ def _read_env_file(path: Path) -> dict[str, str]:
     return values
 
 
-def _credentials_from_mapping(values: Mapping[str, str]) -> LongbridgeCredentials | None:
+def _credentials_from_mapping(
+    values: Mapping[str, str],
+    *,
+    prefixes: tuple[str, ...] = _QUOTE_PROFILE_PREFIXES["default"],
+) -> LongbridgeCredentials | None:
     """只接受同一命名空间中完整的三项凭据，禁止跨组拼接。"""
-    for prefix in ("LONGBRIDGE", "LONGPORT"):
+    for prefix in prefixes:
         app_key = str(values.get(f"{prefix}_APP_KEY", "") or "").strip()
         app_secret = str(values.get(f"{prefix}_APP_SECRET", "") or "").strip()
         access_token = str(values.get(f"{prefix}_ACCESS_TOKEN", "") or "").strip()
@@ -234,21 +244,41 @@ def _credentials_from_mapping(values: Mapping[str, str]) -> LongbridgeCredential
     return None
 
 
+def _selected_quote_profile(
+    process_values: Mapping[str, str],
+    file_values: Mapping[str, str],
+) -> str:
+    """读取非机密的行情凭据档案选择；进程环境优先于共享文件。"""
+    raw = str(
+        process_values.get(_QUOTE_PROFILE_ENV)
+        or file_values.get(_QUOTE_PROFILE_ENV)
+        or "default"
+    ).strip()
+    profile = raw.lower()
+    if profile not in _QUOTE_PROFILE_PREFIXES:
+        raise DataSourceTransientError(
+            "Longbridge 行情凭据档案无效；只允许 default、"
+            "comprehensive 或 intraday"
+        )
+    return profile
+
+
 def load_longbridge_credentials(env_file: Path | None = None) -> LongbridgeCredentials:
-    """先读进程环境，再读 Quant 根目录共享 ``env``。"""
+    """按显式行情档案先读进程环境，再读 Quant 根目录共享 ``env``。"""
     from pa_agent.execution.credentials import shared_env_path
 
-    credentials = _credentials_from_mapping(os.environ)
-    if credentials is not None:
-        return credentials
-
     shared_env = env_file or shared_env_path()
-    credentials = _credentials_from_mapping(_read_env_file(shared_env))
-    if credentials is not None:
-        return credentials
+    file_values = _read_env_file(shared_env)
+    profile = _selected_quote_profile(os.environ, file_values)
+    prefixes = _QUOTE_PROFILE_PREFIXES[profile]
+    for values in (os.environ, file_values):
+        credentials = _credentials_from_mapping(values, prefixes=prefixes)
+        if credentials is not None:
+            return credentials
+    expected = " 或 ".join(f"{prefix}_*" for prefix in prefixes)
     raise DataSourceTransientError(
-        "未找到完整的 Longbridge 凭据；请在 Quant\\env 配置 "
-        "LONGBRIDGE_APP_KEY、LONGBRIDGE_APP_SECRET、LONGBRIDGE_ACCESS_TOKEN"
+        f"未找到完整的 Longbridge 行情凭据档案 {profile}；"
+        f"请在 Quant\\env 配置同组 {expected}"
     )
 
 

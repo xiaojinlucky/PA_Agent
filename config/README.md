@@ -32,7 +32,16 @@
    LONGBRIDGE_ACCESS_TOKEN=...
    ```
 
-   程序优先读取进程环境，其次读取该共享文件；也兼容旧名 `LONGPORT_*`。凭据不会复制到 `settings.json`。Longbridge **行情数据源**仍只创建官方 `QuoteContext`；只有单独启用下述交易执行模块时，才会按所选账户创建交易上下文。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
+   默认档案仍使用上面的 `LONGBRIDGE_*`，也兼容旧名 `LONGPORT_*`。如果行情凭据保存在已有命名档案中，必须显式选择，不能让程序猜测或跨组拼接：
+
+   ```text
+   PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=COMPREHENSIVE
+   LONGBRIDGE_COMPREHENSIVE_APP_KEY=...
+   LONGBRIDGE_COMPREHENSIVE_APP_SECRET=...
+   LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=...
+   ```
+
+   选择项只允许 `DEFAULT`、`COMPREHENSIVE` 或 `INTRADAY`。程序优先读取进程环境中的选择项和同组凭据，其次读取该共享文件；凭据不会复制到 `settings.json`。Longbridge **行情数据源**仍只创建官方 `QuoteContext`；只有单独启用下述交易执行模块时，才会按所选账户创建交易上下文。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
 
 6. 如需使用交易执行，在同一 `Quant\env` 中配置（不要写入仓库）：
 

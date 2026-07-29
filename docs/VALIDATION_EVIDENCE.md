@@ -10,7 +10,7 @@
 - Longbridge 只读增强：复用单一 QuoteContext 和已有串行 SDK executor，一次 `quote(symbols)` 读取最多 100 项本地自选；静态信息与报价按标的严格连接。已过期 JWT 和已知服务端 `401004` 映射为类型化认证失败。Longbridge quote/static_info 不声明真实最小跳动时保持 `price_tick=None`，只允许展示，禁止猜值或用于可执行定价。
 - 测试：定向 175 项通过、0 失败；全仓收集 2033 项，2030 项通过、3 项跳过、0 失败。
 - 前端交付：新增 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`，冻结 1440×900 / 1920×1080 布局、状态、视觉令牌、PyQt6 映射、后端合同和 M01–M17。该文件取代 Stitch、ChatGPT Images 和浏览器自动化流程；当前未修改 `pa_agent/gui`，不冒充视觉生产实现完成。
-- 外部阻塞：Longbridge 真实 AAPL.US、700.HK、600519.SH 验收仍受 `401004 token invalid` 阻塞；没有绕过凭据或用测试替身冒充真实通过。
+- 当时外部阻塞：Longbridge 真实 AAPL.US、700.HK、600519.SH 验收受旧默认档案的 `401004 token invalid` 阻塞；没有绕过凭据或用测试替身冒充真实通过。该状态已被本文件后续“2026-07-29 P0-01”中的 `COMPREHENSIVE` 档案真实验证所更新，但三标的两阶段验收仍未执行。
 
 ## 2026-07-26 深夜 固定代理换节点恢复 + P1 多市场后端（Claude 会话）
 
@@ -23,7 +23,7 @@
 - fail-closed 现场证据（不做人为断网实验的理由）：当日自然故障期（13:05–22:36）风险运行态全程保持 `kill_active=1`、无一次回退直连或系统代理（传输层硬绑定 10981，代码与测试双重保证）；22:42 切换瞬间的 `ConnectionResetError` 立即重新触发 kill，也证明故障→闭锁路径实时有效。以上为真实运行证据，优于合成断网实验，后者会无谓打断刚恢复的红线运行。
 - 独立只读交叉审计（23:17，子 Agent）：无 CRITICAL——高水位/身份逐字符一致（身份同时经券商 `account_config` 实时重算比对）、kill 解除仅那一条授权命令、执行账本 `blocked 3 / canceled 22 / closed 11` 与基线一致零新增、券商侧全品种持仓 0/普通挂单 0/八类算法单全 0、`AlphaMaster` 未读未写。
 - P1 多市场后端（同晚落地，均带测试）：共享合同层 `Quant/shared/market_contracts`（39 通过）；`LongbridgeSource` 分页/频控/卡顿保护/缺根校验/`latest_snapshot_for_timeframe`（长桥源与日历、市场规则、注入、时区相关定向套件合计 `142` 通过、`0` 失败：78+25+58 去重后按最终一次全绿运行为准）；`market_calendar`（XNYS/XHKG/XSHG+半日市）；市场规则块 ×4 按符号路由注入用户回合（system 字节不变，前缀缓存安全）；K 线表时间列按交易所时区渲染并标注。`pyproject` 新增 `exchange_calendars>=4.5`。全量 unit 早跑一次：历史 18 失败 + 2 个因 945→3000 上限变化的旧契约测试（已按新分页语义更新为全过）；最终全量数字以收口一节为准。
-- 已知硬阻塞：长桥 access token 服务端 `401004 token invalid`（本地 exp 预检通过），P1 三标的真实两阶段验收（`scratch/p1_multimarket_acceptance.py`）等用户重签 token 后执行。
+- 当时的硬阻塞：长桥 access token 服务端 `401004 token invalid`（本地 exp 预检通过），P1 三标的真实两阶段验收（`scratch/p1_multimarket_acceptance.py`）等待用户重签 token 后执行。该凭据状态已被本文件后续 `COMPREHENSIVE` 档案验证更新。
 
 ## 2026-07-25 实盘交易工作台 Stitch 视觉重构
 
@@ -545,7 +545,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 
 - `pa_agent/data/volume_shadow.py` 继续只做放量组与缩量组的后续相对振幅描述性比较。摘要没有预测方向，因此没有伪造 Wilson 方向准确率，也没有据均值差宣称统计显著或转正。
 - 本机 `scratch/p1_multimarket_acceptance.py` 原先把枚举类名误记为事件名，并读取不存在的 `RecordMeta.status/error_type`，导致成功记录也无法通过。接手批次已改为记录 `event.name`，用 `RecordSaved + exception is None + Stage1/Stage2 结果存在` 判定完成，明确把内存设置来源标为 `longbridge`，并用 `finally` 释放订阅和连接。
-- 该脚本通过目标 Ruff、`py_compile` 和成功/取消判定函数的离线对象检查；没有读取真实凭据或调用外部 API。真实 AAPL.US、700.HK、600519.SH 验收仍被长桥 `401004 token invalid` 硬阻塞。
+- 该脚本通过目标 Ruff、`py_compile` 和成功/取消判定函数的离线对象检查；没有读取真实凭据或调用外部 API。当时真实 AAPL.US、700.HK、600519.SH 验收仍被长桥 `401004 token invalid` 硬阻塞；该凭据状态已被后续 `COMPREHENSIVE` 档案验证更新。
 
 ### 工程门禁与范围
 
@@ -602,7 +602,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 20:13 最终回查：Campaign 保持 `active`；两库 `integrity_check=ok`，Worker 心跳与成功对账新鲜；活动 execution、PENDING/RUNNING 命令、未解决 UNCERTAIN、有效 NEW_RISK 租约、非零仓位、普通挂单和八类算法挂单均为 0。账户身份仍为 `ba9b744dc78ae3fc203980e62b854b0a0e3d44c9c6d5e446de910bea74ef1def`，高水位仍为 `78303.57015174496`，风险停止为 0。
 - 新 Campaign 日志没有真实 ERROR/CRITICAL 等级行；仅重复出现已登记的 Windows `WinError 32` 日志轮转警告，没有第三类新异常。
 - 这次运行验收证明正式入口已加载 WO-F 且自然样本没有被误杀。自然样本没有产生非法声明，因此不能声称现场实际触发过 `blocked:claim_validation`；非法声明拒绝与继续下一根由离线集成和 Campaign 测试证明。
-- 全程仅使用 OKX Demo 模拟账户，不构成 OKX Live 实盘、策略盈利或 Longbridge 验收证明。长桥 `401004` 与 WO-E 视觉方向阻塞均未解除。
+- 全程仅使用 OKX Demo 模拟账户，不构成 OKX Live 实盘、策略盈利或 Longbridge 验收证明。在该次记录时长桥 `401004` 与 WO-E 视觉方向阻塞均未解除；后续状态以本文件末尾的新证据为准。
 
 ## 2026-07-27 WO-F 发布与总工单完成证据复审
 
@@ -642,7 +642,7 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 ### 仍未闭合
 
 - 固定代理 `metadata.json` 与实际 `config.json` 没有共同指纹。现有脚本无法把二者不一致本身识别为失败；只改测试无法忠实覆盖，而本轮明确禁止修改 `scripts`。
-- 长桥最后已知外部结果仍为 `401004 token invalid`，共享 env 自 2026-07-24 后没有更新；未运行真实三标的验收。
+- 当时长桥最后已知外部结果仍为 `401004 token invalid`，共享 env 自 2026-07-24 后没有更新；该历史状态已被本文件后续 `COMPREHENSIVE` 档案真实验证所更新，但真实三标的两阶段验收仍未运行。
 - WO-E 用户已于 2026-07-28 按实际显示顺序选择 `1`；该选择只锁定方向，不能冒充后续网页版 ChatGPT PRD、Stitch、连续三轮图像精修、视觉审计、PyQt6 落地或桌面验收。
 - `D:\Desktop\Quant\shared` 是否建立独立 Git 仓库仍等待用户决定；没有执行 `git init`。
 
@@ -712,3 +712,24 @@ watchdog 对 pytest 进程设置 `180000 ms` 硬超时。结果：
 - 2026-07-28 用户改选网页版 ChatGPT Images 2.0 路线。PRD08 已冻结三张独立 1440×900 样板的共同提示词、三个差异方向，以及选图后的 evidence bundle：原始样板、标注图、DTCG 结构的 `design-spec.json`、组件状态、资产清单、PyQt6 映射和 `design-qa.md`。外部生成只上传两张已脱敏 PNG 与 PRD05/07/10；Longbridge 原始接触表只在本地提炼规则，不上传。用户刷新后，Chrome 后台接口能列出标签页；Agent 另开一个同登录态 ChatGPT 页后也曾成功读取“与 ChatGPT 聊天”输入框。但既有页的页面快照、截图和底层调试命令均超时；新页打开“添加文件等”后也在附件菜单、上传控件读取阶段连续超时并失去响应。没有文件上传成功、没有提示词提交、没有生成任务。用户允许可视操作后，Windows 控制仍因无法高置信确认当前网址而在点击、输入和上传前安全终止，所以新样板真实产物仍为 0/3。
 - 官方接口核查：Longbridge `QuoteContext.quote(symbols)` 单次最多 500 个标的，项目本地 `longbridge 4.3.2` 签名与官方入口一致；当前 100 项自选可单次读取，但真实 OpenAPI 权限仍受失效 token 阻塞。OKX `/market/tickers` 无需认证，按 SPOT/SWAP 最多两个串行类型快照后本地筛选，不能伪造多标的参数。OKX `/market/candles` 单页最多 300、`after` 向旧翻页、最近覆盖 1,440 根；现有最大 10m 请求最坏需 602 根 5m、最多三页，正确实现仍需极窄解除 `pa_agent/execution/okx_client.py` 禁区。
 - 11:24–11:28 只读运行态复核确认 Worker 与心跳运行、两库 `quick_check=ok`、活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；OKX 私有余额读取持续连接拒绝并触发风险停止，Campaign 进程不存在且磁盘状态过期。最后本地账户快照已陈旧约 13.35 小时；Agent 没有启动、停止、重载或另行调用私有接口。
+
+## 2026-07-29 P0-01 一次性 NEW_RISK 授权本地验收
+
+- 固定开工基线为 `main/e815d42268efac5b83842a33b7e24c9054329c78`，当时本地与 `origin/main` 一致、暂存区为空；既有未跟踪 `.agents/`、`.claude/` 全程不触碰。基线全仓为 2030 项通过、3 项跳过、0 失败。
+- 15:17 只读运行态门确认 Worker 与心跳运行，两库 `quick_check=ok`，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；Campaign 无进程，风险停止为 `risk_runtime_BrokerTransportError`。只允许离线修复，没有调用券商、重启 Worker/Campaign、解除风险停止或修改生产数据库。
+- 18:01 再次用 SQLite 只读 URI 和 Windows 服务查询复核：Worker 服务与心跳运行，两库 `quick_check=ok`，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；一条历史 UNCERTAIN 命令已有耐久处置证据，不计为未解决。风险停止仍为 `risk_runtime_BrokerTransportError`，Campaign 无 Python 进程；`config/settings.json` 与 `records/okx_demo_campaign.json` 的 SHA-256 仍分别为 `592C20C012C59C9694AA79F87557DBB0CFDF16713BBD8B54A3FB94FD56AA98CA`、`B8C3E1555F1E2A18FD47FEEE7CADFB7535A398CEE334760CE320AFA28BE4CF72`。没有重启进程、解除风险停止、修改生产数据库或调用券商。
+- 先加入并发、进程、调用者崩溃、插入失败回滚、错误命令、精确过期、UNCERTAIN、`set_leverage→submit`、新租约和 v4→v5 迁移场景；未实现时同一组为 13 项失败，实现后为 13 项通过。
+- Worker schema v5 为租约增加耐久 `command_id`。`enqueue()` 在同一 `BEGIN IMMEDIATE` 事务内完成“确认未消费→绑定候选命令→插入命令”，插入失败会整体回滚；非空 NEW_RISK 租约上的提交与调整杠杆命令另受数据库部分唯一索引约束，减险命令共用的空字符串不进入该索引。
+- Controller 在消费后立即撤下“已授权”状态，只给已绑定且仍为 pending/running 的命令续期；确定终态按既有规则释放，UNCERTAIN 继续阻断。Worker 在领取命令和真正写入前都按 `command_id`、路由、申请者与配置指纹复核唯一消费者。
+- v4→v5 正常迁移会把唯一历史消费者绑定到租约；若存在同一租约多条新增风险命令，或命令与租约身份不一致，则整个迁移回滚、版本与历史行原样保留并失败关闭。现有证据只证明代码能发现此类状态，不证明历史上实际发生过重复下单事故。
+- 首轮本地全仓命令原样收集 2046 项：2043 项通过、3 项跳过、0 失败。前两次全量运行分别遇到 Qt 原生访问冲突和进程提前退出；没有修改 GUI、跳过测试或放宽断言，相同命令第三次原样通过。
+- 独立对抗审查随后发现一个不产生重复写、但会让合法命令失去续租的 Controller 竞态：数据库已提交绑定而本地 `_lease_command_id` 尚未赋值时，续租线程可能按空命令续租失败。确定性同步点测试修复前失败，修复后通过；提交/调整杠杆现在都让真实 `enqueue()` 与本地命令编号赋值处于同一 Controller 锁内。复审又补出“读到运行中、续租 SQL 前刚好终态”的夹缝；续租失败现在先撤销数据库租约再清本地状态，对应测试同样先红后绿。
+- 另补真实 `ExecutionService` 全链测试：Worker 首次核验后、适配器写入前撤销租约，最终 `submit_entry` 调用为 0；同时补 v4 唯一消费者与租约申请者不一致时的迁移回滚，版本、历史行、租约表结构和部分唯一索引均原样。四项审查增量全部通过，相关七文件共 269 项通过；最终独立复审无 P0/P1/P2，也未发现锁顺序反转。
+- 旧式混合全仓收集 2050 项：2043 项通过、7 项跳过、0 失败，JUnit 为 `scratch/wo-review-p0-final-local.xml`。新增的 4 个跳过均为既有 AkShare 公共行情冒烟测试访问 `push2his.eastmoney.com` 时连接被远端断开；经当前代理时为 `ProxyError/RemoteDisconnected`，只在隔离子进程临时清除代理变量后仍为 `RemoteDisconnected`，域名解析和 443 端口正常。单个 `1h` 用例曾在 17:38 恢复并通过，但随后整组 4 项再次全部跳过，证明本机到该接口的 HTTPS 访问链路尚未稳定。未修改系统代理、测试或行情结果。
+- 18:05 的最终单用例探针仍因同一 HTTPS 连接错误跳过；同一外部阻塞已连续出现三个目标轮次，按任务规则停止重复请求，等待访问链路发生外部变化后再恢复最终全量验收。
+- 用户明确授权把真实数据源健康检查从无凭据确定性主门分离。CI 不再排除 18 个历史用例，也没有删除任何 live 用例：`-m "not live"` 是发布硬门，按 JUnit 强制测试数不低于当前 2048、失败/错误为 0、跳过不高于 3；`-m live` 独立运行并保存步骤状态，正常结束时上传 JUnit，启动失败或硬崩未生成 XML 时记录 `health_status=missing`，XML 截断或损坏时记录 `health_status=invalid`。外部服务状态不会掩盖确定性主门失败，也不会反向阻塞主门。两组命令合起来覆盖全部测试。
+- 新增非机密选择项 `PA_AGENT_LONGBRIDGE_QUOTE_PROFILE`，只允许 `default`、`comprehensive`、`intraday`。选择项与同组凭据均优先进程环境、其次共享文件；任一层出现所选档案的部分凭据便失败关闭，禁止回退到另一层补齐，更不会跨档案拼接。新增契约首轮为 1 项通过、3 项失败，实现后原有 4 项全部通过；独立审查补出的 `INTRADAY` 正向隔离用例也已通过，Longbridge 数据源单文件 73 项通过。
+- 仓库外 `D:\Desktop\Quant\env` 只新增 `PA_AGENT_LONGBRIDGE_QUOTE_PROFILE=COMPREHENSIVE`，没有修改或输出凭据。PA_Agent 正常加载路径通过官方 `QuoteContext` 真实取得 `600519.SH`、`000001.SZ` 两只股票的正数报价，并取得 1h 20 根、4h 15 根、1d 30 根结构有效 K 线；只创建行情上下文，没有创建交易上下文，也没有读取账户、持仓、订单或成交。
+- 确定性全量首次在第 3 个界面冒烟用例附近出现一次 Qt 底层对象销毁竞态；随后 4 个 E2E 冒烟用例独立为 4 项通过、0 失败，最终原样重跑确定性命令为 2048 项通过、0 项跳过、0 失败，JUnit 为 `scratch/wo-review-p0-deterministic-final.xml`。没有修改 `pa_agent/gui`、跳过测试或放宽断言。
+- 独立 live 命令收集 7 项：4 项因 AkShare 公共端点不可达跳过，3 项因未提供 KKAI 测试密钥跳过，0 失败；JUnit 为 `scratch/wo-review-p0-live-provider.xml`。工作流还会上传完整 Git SHA、Python 版本和 `pip freeze`。本节仍是发布前本地证据；目标 SHA 的 GitHub CI 与产物尚待完成，绿色前 P0 不关闭。
+- 独立审查先后报告的 CI 边界均已整改：live JUnit 缺失或损坏分别记录 `missing` / `invalid`，不再是强制文件；数量门提升至 2048；Git SHA、Python 和 `pip freeze` 使用 `if: always()` 采集，任一命令失败都先写标准 `unavailable` 再让 CI 变红；`INTRADAY` 正向隔离测试已补齐。本地已实际执行环境采集成功、损坏 XML 和 pip 失败三条 PowerShell 分支，输出分别符合预期。目标 SHA 的远端 CI 仍待实际验证。

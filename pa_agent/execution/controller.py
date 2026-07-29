@@ -100,6 +100,7 @@ class ExecutionController:
         self._lease_id = ""
         self._lease_worker_id = ""
         self._lease_fingerprint = ""
+        self._lease_command_id = ""
         self._stop_event = threading.Event()
         self._poll_thread: threading.Thread | None = None
         self._seen_revisions: dict[str, int] = {}
@@ -282,6 +283,7 @@ class ExecutionController:
             self._lease_id = lease.lease_id
             self._lease_worker_id = lease.worker_id
             self._lease_fingerprint = lease.config_fingerprint
+            self._lease_command_id = ""
         self._emit_armed(True)
 
     def disarm(self) -> None:
@@ -290,6 +292,7 @@ class ExecutionController:
             self._lease_id = ""
             self._lease_worker_id = ""
             self._lease_fingerprint = ""
+            self._lease_command_id = ""
             if lease_id:
                 self._worker_store.revoke_new_risk_lease(lease_id)
         self._emit_armed(False)
@@ -378,6 +381,22 @@ class ExecutionController:
                     "待执行计划的券商、环境或账户与当前新增风险授权不一致"
                 )
             lease_id = self._lease_id
+        if action is WorkerCommandAction.SUBMIT:
+            with self._lock:
+                command, _created = self._worker_store.enqueue(
+                    action=action,
+                    execution_id=record.id,
+                    requester=self._requester_id,
+                    broker=broker,
+                    environment=environment,
+                    account=account,
+                    new_risk_lease_id=lease_id,
+                    reason_code=reason_code,
+                )
+                if self._lease_id == command.new_risk_lease_id:
+                    self._lease_command_id = command.id
+            self._emit_armed(False)
+            return command
         command, _created = self._worker_store.enqueue(
             action=action,
             execution_id=record.id,
@@ -426,15 +445,19 @@ class ExecutionController:
             raise LiveTradingDisabled(
                 f"杠杆命令没有匹配的耐久脚本授权：{exc}"
             ) from exc
-        command, _created = self._worker_store.enqueue(
-            action=WorkerCommandAction.SET_LEVERAGE,
-            requester=self._requester_id,
-            broker=broker,
-            environment=environment,
-            account=account,
-            new_risk_lease_id=self._lease_id,
-            parameters=parameters,
-        )
+        with self._lock:
+            command, _created = self._worker_store.enqueue(
+                action=WorkerCommandAction.SET_LEVERAGE,
+                requester=self._requester_id,
+                broker=broker,
+                environment=environment,
+                account=account,
+                new_risk_lease_id=self._lease_id,
+                parameters=parameters,
+            )
+            if self._lease_id == command.new_risk_lease_id:
+                self._lease_command_id = command.id
+        self._emit_armed(False)
         return command
 
     def cancel_entry(self, execution_id: str) -> WorkerCommand:
@@ -732,6 +755,42 @@ class ExecutionController:
         with self._lock:
             if not self._lease_id:
                 return
+            if self._lease_command_id:
+                command = self._worker_store.get_command(
+                    self._lease_command_id
+                )
+                if (
+                    command is None
+                    or command.new_risk_lease_id != self._lease_id
+                    or command.requester != self._requester_id
+                ):
+                    lease_id = self._lease_id
+                    self._lease_id = ""
+                    self._lease_worker_id = ""
+                    self._lease_fingerprint = ""
+                    self._lease_command_id = ""
+                    self._worker_store.revoke_new_risk_lease(
+                        lease_id,
+                        failure_code="lease_command_binding_invalid",
+                    )
+                    self._emit_armed(False)
+                    return
+                if command.status in {
+                    WorkerCommandStatus.SUCCEEDED,
+                    WorkerCommandStatus.FAILED,
+                    WorkerCommandStatus.UNCERTAIN,
+                }:
+                    lease_id = self._lease_id
+                    self._lease_id = ""
+                    self._lease_worker_id = ""
+                    self._lease_fingerprint = ""
+                    self._lease_command_id = ""
+                    self._worker_store.revoke_new_risk_lease(
+                        lease_id,
+                        failure_code="new_risk_command_terminal",
+                    )
+                    self._emit_armed(False)
+                    return
             try:
                 broker, environment, _account = self._selected_route_identity()
                 self._require_environment_gate(broker, environment)
@@ -749,6 +808,7 @@ class ExecutionController:
                 self._lease_id = ""
                 self._lease_worker_id = ""
                 self._lease_fingerprint = ""
+                self._lease_command_id = ""
                 self._worker_store.revoke_new_risk_lease(
                     lease_id,
                     failure_code="lease_health_check_failed",
@@ -760,12 +820,19 @@ class ExecutionController:
                 worker_id=self._lease_worker_id,
                 config_fingerprint=self._lease_fingerprint,
                 requester=self._requester_id,
+                command_id=self._lease_command_id,
                 ttl_seconds=_LEASE_TTL_SECONDS,
             )
             if renewed is None:
+                lease_id = self._lease_id
+                self._worker_store.revoke_new_risk_lease(
+                    lease_id,
+                    failure_code="lease_renewal_failed",
+                )
                 self._lease_id = ""
                 self._lease_worker_id = ""
                 self._lease_fingerprint = ""
+                self._lease_command_id = ""
                 self._emit_armed(False)
 
     def _poll_loop(self) -> None:

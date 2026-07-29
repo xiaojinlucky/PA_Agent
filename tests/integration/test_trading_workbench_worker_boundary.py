@@ -42,6 +42,17 @@ class _ThreadRecordingAdapter(FakeAdapter):
         return super().submit_entry(record)
 
 
+class _RevokingBeforeWriteAdapter(_ThreadRecordingAdapter):
+    def __init__(self, revoke_lease) -> None:
+        super().__init__()
+        self._revoke_lease = revoke_lease
+
+    def prepare_submit(self, record):
+        prepared = super().prepare_submit(record)
+        assert self._revoke_lease() is True
+        return prepared
+
+
 def _imported_modules(path: Path) -> set[str]:
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     modules: set[str] = set()
@@ -213,6 +224,10 @@ def test_gui_enqueues_once_and_only_worker_calls_adapter(
             controller.get_execution(execution.id).state
             is ExecutionState.READY
         )
+        lease = worker_store.current_new_risk_lease()
+        assert lease is not None
+        assert lease.command_id == queued[0].id
+        assert controller.is_armed is False
         assert adapter.write_threads == []
 
         finished: list[object] = []
@@ -258,3 +273,122 @@ def test_gui_enqueues_once_and_only_worker_calls_adapter(
     finally:
         controller.stop_monitoring()
         worker.close()
+
+
+def test_worker_rechecks_bound_lease_immediately_before_adapter_write(
+    tmp_path,
+    monkeypatch,
+):
+    records_dir = tmp_path / "pending"
+    records_dir.mkdir()
+    analysis_record = _record()
+    record_path = records_dir / "record.json"
+    record_path.write_text(
+        analysis_record.model_dump_json(indent=2),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "pa_agent.config.paths.RECORDS_PENDING_DIR",
+        records_dir,
+    )
+
+    settings = _settings()
+    execution_store = ExecutionStore(tmp_path / "execution.sqlite3")
+    worker_store = WorkerStore(tmp_path / "control.sqlite3")
+    worker_id = "worker-prewrite-recheck"
+    authority = WorkerNewRiskAuthority(worker_store, worker_id)
+    lease_id = {"value": ""}
+    adapter = _RevokingBeforeWriteAdapter(
+        lambda: worker_store.revoke_new_risk_lease(
+            lease_id["value"],
+            failure_code="test_revoked_before_write",
+        )
+    )
+    original_preflight = adapter.preflight
+    adapter.preflight = lambda plan: original_preflight(plan).model_copy(
+        update={"broker_metadata": {"current_leverage": "20"}}
+    )
+    service = ExecutionService(
+        settings=settings,
+        pending_writer=None,
+        store=execution_store,
+        adapter_factories={
+            "okx": lambda _plan: adapter,
+            "longbridge": lambda _plan: adapter,
+        },
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+        new_risk_authorizer=authority.is_authorized,
+        new_risk_revoker=lambda: worker_store.revoke_current_new_risk_lease(
+            failure_code="service_disarmed",
+        ),
+    )
+    worker = ExecutionWorker(
+        store=worker_store,
+        service=service,
+        settings=settings,
+        settings_path=tmp_path / "settings.json",
+        lock_path=tmp_path / "worker.lock",
+        worker_id=worker_id,
+        new_risk_authority=authority,
+    )
+    controller = ExecutionController(
+        settings=settings,
+        pending_writer=_PendingWriter(record_path),
+        store=execution_store,
+        worker_store=worker_store,
+        worker_launcher=lambda: None,
+        gate_checker=lambda: False,
+        paper_gate_checker=lambda: True,
+        okx_live_gate_checker=lambda: False,
+    )
+
+    worker.start()
+    try:
+        now = datetime.now(UTC)
+        execution_store.save_account_snapshot(
+            AccountSnapshot(
+                broker="okx",
+                account_profile="okx-demo",
+                equity=Decimal("1000"),
+                available=Decimal("900"),
+            )
+        )
+        worker_store.save_risk_runtime_state(
+            RiskRuntimeState(
+                route_key="okx:demo:okx",
+                broker="okx",
+                environment="demo",
+                account="okx",
+                account_identity="fixture-okx-demo",
+                last_external_cashflow_bill_id="",
+                last_account_bill_id="",
+                last_account_bill_timestamp_ms=None,
+                last_bill_scan_at=now,
+                adjusted_high_water_usd=Decimal("1000"),
+                last_total_equity_usd=Decimal("1000"),
+                drawdown_usd=Decimal("0"),
+                drawdown_fraction=Decimal("0"),
+                kill_active=False,
+                kill_reason="",
+                kill_activated_at=None,
+                updated_at=now,
+            )
+        )
+        controller.arm("启用模拟交易")
+        execution = controller.prepare_analysis(analysis_record)
+        command = controller.submit(execution.id)
+        lease_id["value"] = command.new_risk_lease_id
+
+        finished = worker.run_once()
+    finally:
+        worker.close()
+
+    assert finished is not None
+    assert finished.id == command.id
+    assert finished.status is WorkerCommandStatus.FAILED
+    assert adapter.write_threads == []
+    assert not [call for call in adapter.calls if call[0] == "submit_entry"]
+    assert execution_store.get(execution.id).state is ExecutionState.BLOCKED
+    assert worker_store.current_new_risk_lease() is None

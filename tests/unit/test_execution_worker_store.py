@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import sqlite3
+import threading
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from filelock import FileLock
@@ -57,6 +60,159 @@ def _claim_in_process(
         )
     except BaseException as exc:
         result_queue.put((worker_id, None, repr(exc)))
+
+
+def _enqueue_new_risk_in_process(
+    path: str,
+    execution_id: str,
+    lease_id: str,
+    command_id: str,
+    start_event,
+    ready_queue,
+    result_queue,
+) -> None:
+    try:
+        store = WorkerStore(Path(path))
+        ready_queue.put(execution_id)
+        if not start_event.wait(_PROCESS_TIMEOUT_SECONDS):
+            raise TimeoutError("enqueue start timeout")
+        command, created = store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id=execution_id,
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease_id,
+            command_id=command_id,
+        )
+        result_queue.put((execution_id, command.id, created, "", ""))
+    except BaseException as exc:
+        result_queue.put(
+            (execution_id, None, False, type(exc).__name__, str(exc))
+        )
+
+
+def _enqueue_new_risk_then_exit(
+    path: str,
+    lease_id: str,
+    command_id: str,
+) -> None:
+    store = WorkerStore(Path(path))
+    store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-crashed-caller",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease_id,
+        command_id=command_id,
+    )
+    os._exit(0)
+
+
+def _create_v4_worker_database(
+    path: Path,
+    *,
+    command_count: int,
+    command_requester: str = "gui-session",
+) -> tuple[tuple[object, ...], ...]:
+    with sqlite3.connect(path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE worker_meta(
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            INSERT INTO worker_meta(key, value)
+            VALUES ('worker_schema_version', '4');
+            CREATE TABLE worker_commands (
+                id TEXT PRIMARY KEY,
+                scope_key TEXT NOT NULL,
+                action TEXT NOT NULL,
+                execution_id TEXT NOT NULL,
+                requester TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                account TEXT NOT NULL,
+                new_risk_lease_id TEXT NOT NULL,
+                reason_code TEXT NOT NULL,
+                parameters_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                worker_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT,
+                result_code TEXT NOT NULL,
+                failure_code TEXT NOT NULL,
+                result_json TEXT NOT NULL
+            );
+            CREATE TABLE worker_new_risk_lease (
+                slot TEXT PRIMARY KEY CHECK(slot='NEW_RISK'),
+                lease_id TEXT NOT NULL UNIQUE,
+                worker_id TEXT NOT NULL,
+                config_fingerprint TEXT NOT NULL,
+                requester TEXT NOT NULL,
+                broker TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                account TEXT NOT NULL,
+                granted_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            );
+            INSERT INTO worker_new_risk_lease(
+                slot, lease_id, worker_id, config_fingerprint, requester,
+                broker, environment, account, granted_at, expires_at
+            ) VALUES (
+                'NEW_RISK', 'legacy-lease', 'worker-one',
+                'route-fingerprint', 'gui-session',
+                'okx', 'demo', 'paper-account',
+                '2026-07-29T00:00:00+00:00',
+                '2030-07-29T00:00:00+00:00'
+            );
+            """
+        )
+        rows = [
+            (
+                f"legacy-command-{index}",
+                f"execution:legacy-execution-{index}",
+                "submit",
+                f"legacy-execution-{index}",
+                command_requester,
+                "okx",
+                "demo",
+                "paper-account",
+                "legacy-lease",
+                "",
+                "null",
+                "failed",
+                "worker-one",
+                f"2026-07-29T00:00:0{index}+00:00",
+                None,
+                f"2026-07-29T00:00:1{index}+00:00",
+                "",
+                "legacy_failure",
+                "null",
+            )
+            for index in range(command_count)
+        ]
+        connection.executemany(
+            """
+            INSERT INTO worker_commands(
+                id, scope_key, action, execution_id, requester,
+                broker, environment, account, new_risk_lease_id,
+                reason_code, parameters_json, status, worker_id,
+                created_at, started_at, finished_at, result_code,
+                failure_code, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        return tuple(
+            connection.execute(
+                "SELECT * FROM worker_commands ORDER BY created_at, id"
+            )
+        )
 
 
 def _grant_submit_lease(store: WorkerStore):
@@ -156,7 +312,7 @@ def test_worker_schema_is_independent_and_protocol_rejects_extra_fields(tmp_path
         synchronous = connection.execute("PRAGMA synchronous").fetchone()
 
     assert execution_version == ("2",)
-    assert worker_version == ("4",)
+    assert worker_version == ("5",)
     assert journal_mode == ("wal",)
     assert synchronous == (2,)
     with pytest.raises(ValidationError, match="Extra inputs"):
@@ -174,7 +330,9 @@ def test_worker_schema_is_independent_and_protocol_rejects_extra_fields(tmp_path
         )
 
 
-def test_enqueue_deduplicates_active_but_failed_command_can_retry(tmp_path):
+def test_enqueue_deduplicates_active_but_terminal_command_needs_new_lease(
+    tmp_path,
+):
     store = WorkerStore(tmp_path / "worker.sqlite3")
     lease = _grant_submit_lease(store)
 
@@ -204,6 +362,23 @@ def test_enqueue_deduplicates_active_but_failed_command_can_retry(tmp_path):
         status=WorkerCommandStatus.FAILED,
         failure_code="broker_rejected",
     )
+    assert first_created is True
+    assert duplicate_created is False
+    assert duplicate.id == first.id
+    assert failed.status is WorkerCommandStatus.FAILED
+    with pytest.raises(PermissionError, match="已经绑定"):
+        store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id="execution-one",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+        )
+
+    assert store.revoke_new_risk_lease(lease.lease_id) is True
+    replacement_lease = _grant_submit_lease(store)
     retried, retried_created = store.enqueue(
         action=WorkerCommandAction.SUBMIT,
         execution_id="execution-one",
@@ -211,13 +386,8 @@ def test_enqueue_deduplicates_active_but_failed_command_can_retry(tmp_path):
         broker="okx",
         environment="demo",
         account="paper-account",
-        new_risk_lease_id=lease.lease_id,
+        new_risk_lease_id=replacement_lease.lease_id,
     )
-
-    assert first_created is True
-    assert duplicate_created is False
-    assert duplicate.id == first.id
-    assert failed.status is WorkerCommandStatus.FAILED
     assert retried_created is True
     assert retried.id != first.id
 
@@ -311,6 +481,262 @@ def test_claim_next_is_atomic_across_processes(tmp_path):
     stored = seed.get_command(command.id)
     assert stored is not None
     assert stored.status is WorkerCommandStatus.RUNNING
+
+
+def test_one_lease_allows_only_one_new_risk_command_across_two_threads(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    seed = WorkerStore(path)
+    lease = _grant_submit_lease(seed)
+    barrier = threading.Barrier(3)
+    results: list[tuple[str, str, str]] = []
+    results_lock = threading.Lock()
+
+    def enqueue(execution_id: str) -> None:
+        store = WorkerStore(path)
+        barrier.wait()
+        try:
+            command, _created = store.enqueue(
+                action=WorkerCommandAction.SUBMIT,
+                execution_id=execution_id,
+                requester="gui-session",
+                broker="okx",
+                environment="demo",
+                account="paper-account",
+                new_risk_lease_id=lease.lease_id,
+                command_id=f"command-{execution_id}",
+            )
+            result = (execution_id, "created", command.id)
+        except BaseException as exc:
+            result = (execution_id, type(exc).__name__, str(exc))
+        with results_lock:
+            results.append(result)
+
+    threads = [
+        threading.Thread(target=enqueue, args=(execution_id,))
+        for execution_id in ("execution-thread-a", "execution-thread-b")
+    ]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(timeout=10)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert [kind for _, kind, _ in results].count("created") == 1
+    assert [kind for _, kind, _ in results].count("PermissionError") == 1
+    commands = [
+        command
+        for command in seed.list_commands()
+        if command.action in {
+            WorkerCommandAction.SUBMIT,
+            WorkerCommandAction.SET_LEVERAGE,
+        }
+    ]
+    assert len(commands) == 1
+    assert seed.current_new_risk_lease().command_id == commands[0].id
+
+
+def test_one_lease_allows_only_one_new_risk_command_across_processes(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    seed = WorkerStore(path)
+    lease = _grant_submit_lease(seed)
+    context = multiprocessing.get_context("spawn")
+    start_event = context.Event()
+    ready_queue = context.Queue()
+    result_queue = context.Queue()
+    processes = [
+        context.Process(
+            target=_enqueue_new_risk_in_process,
+            args=(
+                str(path),
+                execution_id,
+                lease.lease_id,
+                f"command-{execution_id}",
+                start_event,
+                ready_queue,
+                result_queue,
+            ),
+        )
+        for execution_id in ("execution-process-a", "execution-process-b")
+    ]
+    for process in processes:
+        process.start()
+    try:
+        assert {
+            ready_queue.get(timeout=_PROCESS_TIMEOUT_SECONDS)
+            for _ in processes
+        } == {"execution-process-a", "execution-process-b"}
+        start_event.set()
+        results = [
+            result_queue.get(timeout=_PROCESS_TIMEOUT_SECONDS)
+            for _ in processes
+        ]
+    finally:
+        for process in processes:
+            process.join(timeout=_PROCESS_TIMEOUT_SECONDS)
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert [result[2] for result in results].count(True) == 1
+    assert [result[3] for result in results].count("PermissionError") == 1
+    commands = [
+        command
+        for command in seed.list_commands()
+        if command.action in {
+            WorkerCommandAction.SUBMIT,
+            WorkerCommandAction.SET_LEVERAGE,
+        }
+    ]
+    assert len(commands) == 1
+    assert seed.current_new_risk_lease().command_id == commands[0].id
+
+
+def test_committed_binding_survives_caller_process_exit(tmp_path):
+    path = tmp_path / "worker.sqlite3"
+    store = WorkerStore(path)
+    lease = _grant_submit_lease(store)
+    context = multiprocessing.get_context("spawn")
+    process = context.Process(
+        target=_enqueue_new_risk_then_exit,
+        args=(str(path), lease.lease_id, "crash-command"),
+    )
+    process.start()
+    process.join(timeout=_PROCESS_TIMEOUT_SECONDS)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=5)
+
+    assert process.exitcode == 0
+    command = store.get_command("crash-command")
+    assert command is not None
+    assert store.current_new_risk_lease().command_id == command.id
+    with pytest.raises(PermissionError, match="已经绑定"):
+        store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id="execution-after-crash",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+        )
+    assert len(store.list_commands()) == 1
+
+
+def test_command_insert_failure_rolls_back_lease_binding(tmp_path):
+    path = tmp_path / "worker.sqlite3"
+    store = WorkerStore(path)
+    store.enqueue(
+        action=WorkerCommandAction.RECONCILE,
+        requester="system",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        command_id="duplicate-command-id",
+    )
+    lease = _grant_submit_lease(store)
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id="execution-insert-fails",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+            command_id="duplicate-command-id",
+        )
+
+    assert store.current_new_risk_lease().command_id == ""
+    command, created = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-after-rollback",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+        command_id="new-risk-after-rollback",
+    )
+    assert created is True
+    assert store.current_new_risk_lease().command_id == command.id
+
+
+def test_database_unique_index_blocks_duplicate_nonempty_lease_only(tmp_path):
+    path = tmp_path / "worker.sqlite3"
+    store = WorkerStore(path)
+    lease = _grant_submit_lease(store)
+    command, _ = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-index-owner",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+    )
+
+    with sqlite3.connect(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO worker_commands(
+                    id, scope_key, action, execution_id, requester,
+                    broker, environment, account, new_risk_lease_id,
+                    reason_code, parameters_json, status, worker_id,
+                    created_at, started_at, finished_at, result_code,
+                    failure_code, result_json
+                )
+                SELECT
+                    'forged-second-consumer',
+                    'execution:forged-second-consumer',
+                    'submit',
+                    'forged-second-consumer',
+                    requester, broker, environment, account,
+                    new_risk_lease_id, reason_code, parameters_json,
+                    'failed', worker_id, created_at, started_at, finished_at,
+                    result_code, failure_code, result_json
+                FROM worker_commands
+                WHERE id=?
+                """,
+                (command.id,),
+            )
+        connection.rollback()
+        for index, action in enumerate(("cancel_entry", "request_exit")):
+            connection.execute(
+                """
+                INSERT INTO worker_commands(
+                    id, scope_key, action, execution_id, requester,
+                    broker, environment, account, new_risk_lease_id,
+                    reason_code, parameters_json, status, worker_id,
+                    created_at, started_at, finished_at, result_code,
+                    failure_code, result_json
+                )
+                SELECT
+                    ?, ?, ?, ?, requester, broker, environment, account,
+                    '', ?, 'null', 'failed', worker_id, created_at,
+                    started_at, finished_at, result_code, failure_code, 'null'
+                FROM worker_commands
+                WHERE id=?
+                """,
+                (
+                    f"de-risk-{index}",
+                    f"execution:de-risk-{index}",
+                    action,
+                    f"de-risk-{index}",
+                    "manual" if action == "request_exit" else "",
+                    command.id,
+                ),
+            )
+
+    assert len(store.list_commands()) == 3
 
 
 def test_recover_inflight_marks_uncertain_and_never_replays(tmp_path):
@@ -585,6 +1011,168 @@ def test_active_leverage_command_rejects_different_parameters(tmp_path):
     assert store.get_command(first.id).parameters == _leverage_parameters()
 
 
+def test_set_leverage_consumes_lease_and_submit_needs_a_new_lease(tmp_path):
+    store = WorkerStore(tmp_path / "worker.sqlite3")
+    lease = _grant_submit_lease(store)
+    leverage, created = store.enqueue(
+        action=WorkerCommandAction.SET_LEVERAGE,
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+        parameters=_leverage_parameters(),
+    )
+
+    assert created is True
+    assert store.current_new_risk_lease().command_id == leverage.id
+    with pytest.raises(PermissionError, match="已经绑定"):
+        store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id="execution-after-leverage",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+        )
+    assert len(store.list_commands()) == 1
+
+    assert store.revoke_new_risk_lease(lease.lease_id) is True
+    replacement = _grant_submit_lease(store)
+    submit, submit_created = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-after-leverage",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=replacement.lease_id,
+    )
+    assert submit_created is True
+    assert submit.id != leverage.id
+    assert store.current_new_risk_lease().command_id == submit.id
+
+
+def test_v4_to_v5_migration_binds_the_only_existing_consumer(tmp_path):
+    path = tmp_path / "worker.sqlite3"
+    before_rows = _create_v4_worker_database(path, command_count=1)
+    store = WorkerStore(path)
+
+    assert store.schema_version == 4
+    with FileLock(str(tmp_path / "worker.lock")) as worker_lock:
+        store.migrate_to_current(worker_lock=worker_lock)
+
+    with sqlite3.connect(path) as connection:
+        version = connection.execute(
+            "SELECT value FROM worker_meta "
+            "WHERE key='worker_schema_version'"
+        ).fetchone()
+        after_rows = tuple(
+            connection.execute(
+                "SELECT * FROM worker_commands ORDER BY created_at, id"
+            )
+        )
+        lease_command_id = connection.execute(
+            "SELECT command_id FROM worker_new_risk_lease "
+            "WHERE lease_id='legacy-lease'"
+        ).fetchone()
+        unique_index = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='index' "
+            "AND name='idx_worker_commands_one_new_risk_per_lease'"
+        ).fetchone()
+
+    assert store.schema_version == 5
+    assert version == ("5",)
+    assert after_rows == before_rows
+    assert lease_command_id == ("legacy-command-0",)
+    assert unique_index is not None
+    assert "WHERE new_risk_lease_id<>''" in unique_index[0]
+
+
+def test_v4_to_v5_duplicate_consumers_fail_closed_without_rewriting_rows(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    before_rows = _create_v4_worker_database(path, command_count=2)
+    store = WorkerStore(path)
+
+    with (
+        FileLock(str(tmp_path / "worker.lock")) as worker_lock,
+        pytest.raises(RuntimeError, match="同一 NEW_RISK 租约"),
+    ):
+        store.migrate_to_current(worker_lock=worker_lock)
+
+    with sqlite3.connect(path) as connection:
+        version = connection.execute(
+            "SELECT value FROM worker_meta "
+            "WHERE key='worker_schema_version'"
+        ).fetchone()
+        after_rows = tuple(
+            connection.execute(
+                "SELECT * FROM worker_commands ORDER BY created_at, id"
+            )
+        )
+        lease_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(worker_new_risk_lease)"
+            )
+        }
+
+    assert store.schema_version == 4
+    assert version == ("4",)
+    assert after_rows == before_rows
+    assert "command_id" not in lease_columns
+
+
+def test_v4_to_v5_identity_mismatch_fails_closed_without_rewriting_rows(
+    tmp_path,
+):
+    path = tmp_path / "worker.sqlite3"
+    before_rows = _create_v4_worker_database(
+        path,
+        command_count=1,
+        command_requester="different-requester",
+    )
+    store = WorkerStore(path)
+
+    with (
+        FileLock(str(tmp_path / "worker.lock")) as worker_lock,
+        pytest.raises(RuntimeError, match="身份不一致"),
+    ):
+        store.migrate_to_current(worker_lock=worker_lock)
+
+    with sqlite3.connect(path) as connection:
+        version = connection.execute(
+            "SELECT value FROM worker_meta "
+            "WHERE key='worker_schema_version'"
+        ).fetchone()
+        after_rows = tuple(
+            connection.execute(
+                "SELECT * FROM worker_commands ORDER BY created_at, id"
+            )
+        )
+        lease_columns = {
+            row[1]
+            for row in connection.execute(
+                "PRAGMA table_info(worker_new_risk_lease)"
+            )
+        }
+        unique_index = connection.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='index' "
+            "AND name='idx_worker_commands_one_new_risk_per_lease'"
+        ).fetchone()
+
+    assert store.schema_version == 4
+    assert version == ("4",)
+    assert after_rows == before_rows
+    assert "command_id" not in lease_columns
+    assert unique_index is None
+
+
 def test_worker_schema_v1_waits_for_explicit_locked_migration(
     tmp_path,
 ):
@@ -632,8 +1220,8 @@ def test_worker_schema_v1_waits_for_explicit_locked_migration(
             """
         ).fetchone()
 
-    assert store.schema_version == 4
-    assert version == ("4",)
+    assert store.schema_version == 5
+    assert version == ("5",)
     assert resolution_table == ("worker_command_resolutions",)
     assert store.list_commands() == []
 
@@ -829,7 +1417,7 @@ def test_worker_schema_v1_migration_preserves_all_unresolved_without_claim_or_re
         for command in unresolved
     )
     assert {"parameters_json", "result_json"} <= columns
-    assert version == ("4",)
+    assert version == ("5",)
     assert integrity == ("ok",)
     assert resolution_count == (0,)
 
@@ -936,6 +1524,62 @@ def test_new_risk_lease_route_expiry_renew_and_revoke(tmp_path):
         )
 
 
+def test_bound_lease_authorizes_and_renews_only_its_unique_command(tmp_path):
+    clock = _MutableClock(datetime(2026, 7, 20, 1, 0, tzinfo=UTC))
+    store = WorkerStore(tmp_path / "worker.sqlite3", clock=clock)
+    lease = _grant_submit_lease(store)
+    command, _ = store.enqueue(
+        action=WorkerCommandAction.SUBMIT,
+        execution_id="execution-bound",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+        new_risk_lease_id=lease.lease_id,
+    )
+
+    common = {
+        "worker_id": "worker-one",
+        "config_fingerprint": "route-fingerprint",
+        "requester": "gui-session",
+        "broker": "okx",
+        "environment": "demo",
+        "account": "paper-account",
+    }
+    assert not store.is_new_risk_authorized(lease.lease_id, **common)
+    assert not store.is_new_risk_authorized(
+        lease.lease_id,
+        command_id="wrong-command",
+        **common,
+    )
+    assert store.is_new_risk_authorized(
+        lease.lease_id,
+        command_id=command.id,
+        **common,
+    )
+    assert (
+        store.renew_new_risk_lease(
+            lease.lease_id,
+            worker_id="worker-one",
+            config_fingerprint="route-fingerprint",
+            requester="gui-session",
+            command_id="wrong-command",
+            ttl_seconds=90,
+        )
+        is None
+    )
+    renewed = store.renew_new_risk_lease(
+        lease.lease_id,
+        worker_id="worker-one",
+        config_fingerprint="route-fingerprint",
+        requester="gui-session",
+        command_id=command.id,
+        ttl_seconds=90,
+    )
+    assert renewed is not None
+    assert renewed.command_id == command.id
+
+
 def test_expired_lease_fails_pending_submit_before_claim(tmp_path):
     clock = _MutableClock(datetime(2026, 7, 20, 1, 0, tzinfo=UTC))
     store = WorkerStore(tmp_path / "worker.sqlite3", clock=clock)
@@ -966,6 +1610,35 @@ def test_expired_lease_fails_pending_submit_before_claim(tmp_path):
     assert expired.failure_code == "new_risk_expired"
     assert claimed is not None
     assert claimed.id == refresh.id
+
+
+def test_lease_is_not_authorized_at_the_exact_expiry_boundary(tmp_path):
+    clock = _MutableClock(datetime(2026, 7, 20, 1, 0, tzinfo=UTC))
+    store = WorkerStore(tmp_path / "worker.sqlite3", clock=clock)
+    lease = _grant_submit_lease(store)
+
+    clock.advance(seconds=60)
+
+    assert store.current_new_risk_lease() is None
+    assert not store.is_new_risk_authorized(
+        lease.lease_id,
+        worker_id="worker-one",
+        config_fingerprint="route-fingerprint",
+        requester="gui-session",
+        broker="okx",
+        environment="demo",
+        account="paper-account",
+    )
+    with pytest.raises(PermissionError, match="NEW_RISK"):
+        store.enqueue(
+            action=WorkerCommandAction.SUBMIT,
+            execution_id="execution-at-expiry",
+            requester="gui-session",
+            broker="okx",
+            environment="demo",
+            account="paper-account",
+            new_risk_lease_id=lease.lease_id,
+        )
 
 
 def test_heartbeat_preserves_start_tracks_reconcile_and_detects_stale(tmp_path):

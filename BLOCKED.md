@@ -1,9 +1,8 @@
 # PA_Agent 硬阻塞
 
 1. **WO-A 固定代理证据闭环**：`metadata.json` 与实际 `config.json` 没有共同指纹，现有脚本无法检测二者不一致。补齐需要修改 `scripts\probe_okx_fixed_proxy_node.py`，但本轮明确禁止触碰 `scripts`；不能用无关失败测试冒充覆盖。
-2. **WO-D 真实三标的验收**：最后已知服务端结果为 `401004 token invalid`，且共享 `env` 自 2026-07-24 后未更新。只有用户能在长桥后台重签并自行更新 `D:\Desktop\Quant\env`；不得在对话中发送 token，也不得绕过认证。
-3. **WO-E 视觉与真实桌面验收**：浏览器、Stitch 和 ChatGPT Images 路线已由用户终止，不再构成阻塞。后端与无界面连接层已经补齐，最终外部设计合同为 PRD11。当前只等待用户从其他大模型取得视觉样稿；样稿返回后才进入 `pa_agent/gui` 的 PyQt6 实现和同尺寸视觉审计。最终 AAPL.US、700.HK、600519.SH 真实桌面验收仍依赖有效 Longbridge token，并由用户从桌面快捷方式启动。
-4. **运行态尚未加载并验收新代码**：2026-07-28 11:24–11:28 只读复核确认 Worker 与心跳运行、两库健康、活动 execution/命令和有效租约为 0；但 OKX 私有 `/account/balance` 持续连接拒绝并触发风险停止，Campaign 进程不存在且磁盘 `active` 状态已过期。Worker 自 2026-07-26 13:32:11 启动，不可能加载其后的提交。最后本地账户快照在审计时已陈旧约 13.35 小时，Worker 自动私有读取没有成功证据且 Agent 未另行调用，当前仓位、普通挂单和全部算法挂单均未知。任何恢复或重载前仍需重新取得 OKX Demo 私有只读空仓、空普通单、八类算法单为 0、身份一致、风险与 Worker/两库健康等硬门，并取得用户对运行态维护的明确授权；不得拿历史快照代替。
-5. **NEW_RISK 公共层一命令约束**：当前 Campaign 路径已经把每次授权窗口限制在一条 `set_leverage` 或 `submit` 命令；但 `ExecutionController` / `WorkerStore` 的公共租约仍是时效授权，不是全局一次性令牌，同一有效租约可排入多条新增风险命令。若要把“一租约一命令”提升为公共执行层硬不变量，必须修改本轮明确禁止触碰的 `pa_agent/execution`；当前修复不冒充已经提供该全局性质。
-6. **WO-G-4**：`D:\Desktop\Quant\shared` 是否建立独立 Git 仓库必须由用户决定，禁止擅自 `git init`。
-7. **用户侧安全事项**：历史会话曾泄漏 OKX、长桥、模型密钥与交易密码；后台轮换只能由用户本人完成。
+2. **WO-E 视觉与真实桌面验收**：浏览器、Stitch 和 ChatGPT Images 路线已由用户终止，不再构成阻塞。后端与无界面连接层已经补齐，最终外部设计合同为 PRD11。当前只等待用户从其他大模型取得视觉样稿；样稿返回后才进入 `pa_agent/gui` 的 PyQt6 实现和同尺寸视觉审计。`LONGBRIDGE_COMPREHENSIVE` 行情档案已通过服务端只读验证，不再是凭据阻塞；AAPL.US、700.HK、600519.SH 的完整桌面矩阵仍须在后续前端验收中由用户从桌面快捷方式启动。
+3. **运行态尚未加载并验收新代码**：2026-07-29 18:01 只读复核确认 Worker 与心跳运行、两库健康、活动 execution/命令、未解决 UNCERTAIN 和有效租约均为 0；但风险停止仍为 `risk_runtime_BrokerTransportError`，Campaign 无 Python 进程。运行中的 Worker 未加载本轮 schema v5 代码。任何恢复或重载前仍需重新取得 OKX Demo 私有只读空仓、空普通单、八类算法单为 0、身份一致、风险与 Worker/两库健康等硬门，并取得用户对运行态维护的明确授权；不得拿历史快照代替。
+4. **P0-01 目标 SHA 的 CI 尚未完成**：schema v5、数据库/Controller/Worker 三层一次性约束、并发与迁移测试和完整 CI 配置均已完成；对抗审查发现的 Controller 提交/续租与终态续租竞态、真正写入前复核证据和迁移身份不一致回滚也已补齐。用户随后明确授权把无凭据确定性主门与真实数据源健康检查分开：本地确定性主门为 2048 项通过、0 项跳过、0 失败；独立 live 检查为 7 项跳过、0 失败，其中 4 项是 AkShare 公共端点不可达，3 项是未提供 KKAI 测试密钥。Longbridge `COMPREHENSIVE` 档案已另用官方 `QuoteContext` 真实取得沪深报价和 1h/4h/1d K 线。当前只剩精确提交、推送并验证目标 SHA 的 GitHub CI/JUnit/环境证据，绿色前不得宣称 P0 关闭。
+5. **WO-G-4**：`D:\Desktop\Quant\shared` 是否建立独立 Git 仓库必须由用户决定，禁止擅自 `git init`。
+6. **用户侧安全事项**：历史会话曾泄漏 OKX、长桥、模型密钥与交易密码；后台轮换只能由用户本人完成。

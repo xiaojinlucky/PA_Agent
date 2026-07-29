@@ -417,8 +417,8 @@ def test_v1_worker_schema_migrates_only_after_singleton_lock(tmp_path):
                 WHERE key='worker_schema_version'
                 """
             ).fetchone()
-            assert migrated_version == ("4",)
-        assert store.schema_version == 4
+            assert migrated_version == ("5",)
+        assert store.schema_version == 5
     finally:
         worker.close()
 
@@ -460,6 +460,29 @@ def test_execution_route_is_reloaded_and_tampering_is_rejected(tmp_path):
     assert finished.status is WorkerCommandStatus.FAILED
     assert finished.failure_code == "execution_route_mismatch"
     assert not [call for call in service.calls if call[0] == "cancel_entry"]
+
+
+def test_worker_rejects_new_risk_command_with_wrong_bound_command_id(
+    tmp_path,
+):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        command = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.SUBMIT,
+            lease_id=lease.lease_id,
+        )
+        forged = command.model_copy(update={"id": "wrong-command-id"})
+        worker._new_risk_authority.bind(forged)
+        with pytest.raises(RuntimeError, match="new_risk_not_authorized"):
+            worker._dispatch(forged)
+        worker._new_risk_authority.clear()
+    finally:
+        worker.close()
+
+    assert not [call for call in service.calls if call[0] == "submit"]
 
 
 def test_route_only_account_refresh_uses_immutable_command_route(

@@ -140,11 +140,11 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 
 **验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。真实恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e` 完成新的账户与账单读取，`kill_active` 由白名单临时停止合法恢复为 0，高水位未重锚；首根新 K 线完成且零新增 execution/订单/仓位。
 
-### WO-D P1 三标的真实验收（被长桥 token 阻塞）
+### WO-D P1 三标的真实验收（行情凭据已可用，完整验收待后续工单）
 
-**阻塞**：最后一次真实请求返回长桥服务端 `401004 token invalid`；共享 `D:\Desktop\Quant\env` 的修改时间仍为 2026-07-24，错误发生后没有凭据更新证据。本轮没有把旧错误冒充成实时网络复验。**只有用户能在长桥后台重签 token 并更新该 env 的 `LONGBRIDGE_*`/`LONGPORT_*` 三件套**。
+**当前证据**：旧默认档案仍会返回 `401004 token invalid`，但这不代表 Longbridge 不可用。2026-07-29 已在同一共享 `D:\Desktop\Quant\env` 找到完整的 `LONGBRIDGE_COMPREHENSIVE_*` 行情档案，并用官方 `QuoteContext` 真实取得沪深报价和 1h/4h/1d K 线。PA_Agent 通过非机密选择项显式使用该档案，禁止猜测、跨组拼接或输出凭据。当前不再要求用户为 WO-D 重签 token。
 
-**解除后执行**：`.venv\Scripts\python.exe scratch\p1_multimarket_acceptance.py`。2026-07-27 接手审计已离线修正该本机脚本的事件名、成功判定、Longbridge 来源标记和异常释放；仍不得在 token 无效时运行或绕过认证。脚本对 AAPL.US/700.HK/600519.SH 各跑一次真实两阶段分析，10m 主周期 + 1h/4h 高周期背景，记录写 `scratch/p1_acceptance_records`。
+**后续执行**：`.venv\Scripts\python.exe scratch\p1_multimarket_acceptance.py`。2026-07-27 接手审计已离线修正该本机脚本的事件名、成功判定、Longbridge 来源标记和异常释放。脚本对 AAPL.US/700.HK/600519.SH 各跑一次真实两阶段分析，10m 主周期 + 1h/4h 高周期背景，记录写 `scratch/p1_acceptance_records`。本轮 P0-01 只确认行情档案可用，不把这组三标的两阶段验收冒充已完成。
 
 **交接限制**：该验收器按原工单保存在被 Git 忽略的 `scratch/`，当前本机文件存在且可解析，但远端克隆不能仅靠仓库重建它。它不阻塞本机最终验收；若要求跨机器复现，需要另行决定受控入口位置，不能在当前“禁止修改 scripts”边界下擅自迁移。
 
@@ -356,7 +356,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   字段；WO-D 本机验收脚本的成功判定、Longbridge 来源标记和资源释放已离线修正。三路
   独立静态审查无 P0/P1，确认的 5 个 P2 已全部修正。三套件 1880 项、0 失败、0 错误、
   7 项跳过（3 固定 + 4 个 AkShare 条件跳过）；WO-F 因原规格未完整落地改回“部分完成”。
-- [ ] WO-D：**被长桥 token 401004 阻塞，等用户重签**
+- [ ] WO-D：`LONGBRIDGE_COMPREHENSIVE` 行情档案已真实可用；AAPL.US、700.HK、600519.SH 三标的两阶段验收尚未执行，留给后续工单
 - [x] WO-F：全部受管价位、K 线引用、真实 tick、稳定错误码和 Campaign 继续下一根语义完成；离线回归、对抗审查与 OKX Demo 正式入口运行验收通过
 - [x] WO-G-1、WO-G-2、WO-G-3：历史测试失败裁决完成，`CONTEXT.md` 一页化完成
 - [ ] WO-G-4：`D:\Desktop\Quant\shared` 是否建立独立 Git 仓库仍等用户决定
@@ -396,10 +396,17 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   再次授权。下一条新增风险命令重新执行 OKX Demo 私有只读预检并申请新租约，减险命令
   不受影响。定向回归 130 项通过、0 失败；unit/property/integration 1966 项通过、7 项
   跳过、0 失败。
-- [ ] NEW_RISK 公共层一次性约束：对抗审查确认当前 Campaign 调用路径每个授权窗口只有
-  一条新增风险命令，但 `ExecutionController` / `WorkerStore` 的公共租约仍是时效授权，
-  不是全局一次性令牌，同一有效租约可排入多条新增风险命令。提升为执行层硬不变量必须
-  修改本轮明确禁止触碰的 `pa_agent/execution`；当前修复不冒充已提供该全局性质。
+- [ ] NEW_RISK 公共层一次性约束：schema v5 已在本地把租约耐久绑定到唯一
+  `command_id`；`enqueue()` 在同一个 `BEGIN IMMEDIATE` 事务内完成绑定与插入，
+  非空 NEW_RISK 租约另有数据库部分唯一索引。Controller 消费后不再显示可授权，
+  Worker 按命令、路由、申请者和配置指纹复核唯一消费者；v4 历史库若已有同租约多条
+  新增风险命令则原样保留并失败关闭。线程、进程、崩溃、回滚、过期、UNCERTAIN、
+  跨动作复用、Controller 提交/续租与终态续租竞态、真正写入前授权撤销，以及重复消费者/身份
+  不一致迁移均已回归；相关七文件 269 项通过，最终复审无 P0/P1/P2。用户已明确授权把
+  确定性主门与真实数据源健康检查分开，所有测试仍分别运行：确定性主门 2048 项通过、
+  0 项跳过、0 失败；live 检查 7 项跳过、0 失败，并单独保存 JUnit 与运行状态。
+  `LONGBRIDGE_COMPREHENSIVE` 已用官方只读接口真实取得沪深报价和 1h/4h/1d K 线。
+  目标 SHA 的 GitHub CI 与 JUnit/环境产物尚未完成，绿色前本项保持未勾选。
 - [ ] Campaign 新代码运行态激活：2026-07-27 21:33 的历史只读审计当时没有活动
   execution、未解决写命令或有效租约；审计对象是 20:01 启动、早于 `7e6c095` 和租约修复
   的进程，确定未热加载。当前运行态以下一项 2026-07-28 实时复核为准。
@@ -420,13 +427,12 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   execution service 或券商写接口。
 - [x] 2026-07-29 WO-E 外部设计移交：PRD11 成为唯一版前端设计合同。旧 Stitch、
   ChatGPT Images 和浏览器自动化路线降为历史，不再是开发门。
-- [ ] WO-E 视觉生产实现：等待用户从其他大模型取得样稿后实现原生 PyQt6，并在有效
-  Longbridge token 下完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
+- [ ] WO-E 视觉生产实现：等待用户从其他大模型取得样稿后实现原生 PyQt6，并使用已验证的
+  Longbridge 行情档案完成 AAPL.US、700.HK、600519.SH 与 Crypto 的桌面矩阵验收。
 
 ## 6. 用户侧待办（只有用户能做）
 
-1. **长桥 token 重签**（阻塞 WO-D）：长桥后台生成新 access token → 更新 `D:\Desktop\Quant\env`。
-2. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作。本次长桥 401004 很可能就是轮换后 env 未更新所致——轮换后记得同步 env 文件。
-3. WO-E 设计门：Product Design B1/B2、ChatGPT Web B3、Chrome 扩展恢复、五附件显示确认、Stitch 提交和 `D:\Desktop\Quant\前端设计` 规则吸收已完成；Stitch 结果已被用户审美否决。下一步在本机 Chrome 网页版 ChatGPT 按 PRD08 分别生成三张 GPT‑Image‑2 样板，等待用户选择后再做 image-to-code 规格和视觉审计。最终生产实现前还需明确解除本轮 `pa_agent/gui` 禁区；正确关闭 OKX 10m F11 还需仅授权 `pa_agent/execution/okx_client.py` 的只读 `candles(after=None)` 参数。
-4. `shared/` 是否建 Git 仓库的决定。
-5. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。
+1. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作，轮换后记得同步仓库外的 `D:\Desktop\Quant\env`。当前 `LONGBRIDGE_COMPREHENSIVE` 行情档案已真实可用，不要求为本工单重签。
+2. WO-E 设计门：外部视觉设计只认 PRD11；Stitch、ChatGPT Images 和浏览器自动化过程已经降为历史。用户取得外部样稿后，再解除 `pa_agent/gui` 禁区并进入原生 PyQt6 实现与同尺寸视觉审计。
+3. `shared/` 是否建 Git 仓库的决定。
+4. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。

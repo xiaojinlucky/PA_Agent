@@ -933,7 +933,7 @@ def test_worker_schema_v2_migrates_risk_runtime_table_under_worker_lock(tmp_path
     with FileLock(str(tmp_path / "worker.lock")) as worker_lock:
         deferred.migrate_to_current(worker_lock=worker_lock)
 
-    assert deferred.schema_version == 4
+    assert deferred.schema_version == 5
     with sqlite3.connect(path) as connection:
         table = connection.execute(
             "SELECT name FROM sqlite_master "
@@ -1082,7 +1082,7 @@ def test_worker_schema_v3_adds_bill_scan_boundary_under_worker_lock(tmp_path):
     with FileLock(str(tmp_path / "worker-v3.lock")) as worker_lock:
         deferred.migrate_to_current(worker_lock=worker_lock)
 
-    assert deferred.schema_version == 4
+    assert deferred.schema_version == 5
     with sqlite3.connect(path) as connection:
         columns = {
             row[1]

@@ -27,7 +27,7 @@ from pa_agent.execution.worker_protocol import (
 )
 from pa_agent.risk.runtime import RiskRuntimeState
 
-_WORKER_SCHEMA_VERSION = 4
+_WORKER_SCHEMA_VERSION = 5
 _WRITE_ACTION_VALUES = (
     WorkerCommandAction.SUBMIT.value,
     WorkerCommandAction.SET_LEVERAGE.value,
@@ -209,7 +209,7 @@ class WorkerStore:
             parsed_version = int(version["value"])
         except (TypeError, ValueError) as exc:
             raise RuntimeError("worker schema 版本无效") from exc
-        if parsed_version not in {1, 2, 3, _WORKER_SCHEMA_VERSION}:
+        if parsed_version not in {1, 2, 3, 4, _WORKER_SCHEMA_VERSION}:
             raise RuntimeError("不支持的 worker schema 版本")
         return parsed_version
 
@@ -263,7 +263,13 @@ class WorkerStore:
                         parsed_version = int(version["value"])
                     except (TypeError, ValueError) as exc:
                         raise RuntimeError("worker schema 版本无效") from exc
-                    if parsed_version not in {1, 2, 3, _WORKER_SCHEMA_VERSION}:
+                    if parsed_version not in {
+                        1,
+                        2,
+                        3,
+                        4,
+                        _WORKER_SCHEMA_VERSION,
+                    }:
                         raise RuntimeError("不支持的 worker schema 版本")
                     if (
                         parsed_version != _WORKER_SCHEMA_VERSION
@@ -350,6 +356,32 @@ class WorkerStore:
                     WHERE status IN ('pending', 'running')
                     """
                 )
+                if version is not None and parsed_version in {1, 2, 3, 4}:
+                    duplicate_lease = connection.execute(
+                        """
+                        SELECT new_risk_lease_id, COUNT(*) AS consumer_count
+                        FROM worker_commands
+                        WHERE new_risk_lease_id<>''
+                          AND action IN ('submit', 'set_leverage')
+                        GROUP BY new_risk_lease_id
+                        HAVING COUNT(*)>1
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    if duplicate_lease is not None:
+                        raise RuntimeError(
+                            "同一 NEW_RISK 租约已有多条新增风险命令，"
+                            "schema v5 迁移失败关闭"
+                        )
+                connection.execute(
+                    """
+                    CREATE UNIQUE INDEX IF NOT EXISTS
+                        idx_worker_commands_one_new_risk_per_lease
+                    ON worker_commands(new_risk_lease_id)
+                    WHERE new_risk_lease_id<>''
+                      AND action IN ('submit', 'set_leverage')
+                    """
+                )
                 connection.execute(
                     """
                     CREATE INDEX IF NOT EXISTS idx_worker_commands_claim
@@ -396,6 +428,7 @@ class WorkerStore:
                         worker_id TEXT NOT NULL,
                         config_fingerprint TEXT NOT NULL,
                         requester TEXT NOT NULL,
+                        command_id TEXT NOT NULL DEFAULT '',
                         broker TEXT NOT NULL,
                         environment TEXT NOT NULL,
                         account TEXT NOT NULL,
@@ -404,6 +437,52 @@ class WorkerStore:
                     )
                     """
                 )
+                if version is not None and parsed_version in {1, 2, 3, 4}:
+                    lease_columns = {
+                        str(row["name"])
+                        for row in connection.execute(
+                            "PRAGMA table_info(worker_new_risk_lease)"
+                        ).fetchall()
+                    }
+                    if "command_id" not in lease_columns:
+                        connection.execute(
+                            "ALTER TABLE worker_new_risk_lease "
+                            "ADD COLUMN command_id TEXT NOT NULL DEFAULT ''"
+                        )
+                    lease_rows = connection.execute(
+                        "SELECT * FROM worker_new_risk_lease"
+                    ).fetchall()
+                    for lease_row in lease_rows:
+                        consumer = connection.execute(
+                            """
+                            SELECT id, requester, broker, environment, account
+                            FROM worker_commands
+                            WHERE new_risk_lease_id=?
+                              AND action IN ('submit', 'set_leverage')
+                            """,
+                            (lease_row["lease_id"],),
+                        ).fetchone()
+                        if consumer is None:
+                            continue
+                        if (
+                            consumer["requester"] != lease_row["requester"]
+                            or consumer["broker"] != lease_row["broker"]
+                            or consumer["environment"]
+                            != lease_row["environment"]
+                            or consumer["account"] != lease_row["account"]
+                        ):
+                            raise RuntimeError(
+                                "NEW_RISK 租约与历史命令身份不一致，"
+                                "schema v5 迁移失败关闭"
+                            )
+                        connection.execute(
+                            """
+                            UPDATE worker_new_risk_lease
+                            SET command_id=?
+                            WHERE lease_id=? AND command_id=''
+                            """,
+                            (consumer["id"], lease_row["lease_id"]),
+                        )
                 connection.execute(
                     """
                     CREATE TABLE IF NOT EXISTS worker_heartbeats (
@@ -458,7 +537,7 @@ class WorkerStore:
                         "ALTER TABLE risk_runtime_state "
                         "ADD COLUMN last_bill_scan_at TEXT"
                     )
-                if version is not None and parsed_version in {1, 2, 3}:
+                if version is not None and parsed_version in {1, 2, 3, 4}:
                     connection.execute(
                         """
                         UPDATE worker_meta
@@ -545,11 +624,13 @@ class WorkerStore:
     def _row_to_lease(row: sqlite3.Row | None) -> NewRiskLease | None:
         if row is None:
             return None
+        columns = set(row.keys())
         return NewRiskLease(
             lease_id=row["lease_id"],
             worker_id=row["worker_id"],
             config_fingerprint=row["config_fingerprint"],
             requester=row["requester"],
+            command_id=row["command_id"] if "command_id" in columns else "",
             broker=row["broker"],
             environment=row["environment"],
             account=row["account"],
@@ -975,6 +1056,10 @@ class WorkerStore:
             environment=candidate.environment,
             account=candidate.account,
         )
+        is_new_risk_action = candidate.action in {
+            WorkerCommandAction.SUBMIT,
+            WorkerCommandAction.SET_LEVERAGE,
+        }
         with self._lock, self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             try:
@@ -1023,21 +1108,58 @@ class WorkerStore:
                             "同一路由已有不同类型的风险停止处置命令, "
                             "禁止静默复用"
                         )
+                    if is_new_risk_action:
+                        if (
+                            existing_command.requester
+                            != candidate.requester
+                            or existing_command.broker != candidate.broker
+                            or existing_command.environment
+                            != candidate.environment
+                            or existing_command.account != candidate.account
+                            or existing_command.new_risk_lease_id
+                            != candidate.new_risk_lease_id
+                        ):
+                            raise PermissionError(
+                                "活动新增风险命令与当前 NEW_RISK "
+                                "租约身份不一致"
+                            )
+                        bound_lease = connection.execute(
+                            """
+                            SELECT 1 FROM worker_new_risk_lease
+                            WHERE slot='NEW_RISK' AND lease_id=?
+                              AND command_id=? AND requester=?
+                              AND broker=? AND environment=? AND account=?
+                              AND expires_at>?
+                            """,
+                            (
+                                candidate.new_risk_lease_id,
+                                existing_command.id,
+                                candidate.requester,
+                                candidate.broker,
+                                candidate.environment,
+                                candidate.account,
+                                self._iso(now),
+                            ),
+                        ).fetchone()
+                        if bound_lease is None:
+                            raise PermissionError(
+                                "NEW_RISK 租约没有绑定该活动命令"
+                            )
                     connection.execute("COMMIT")
                     return existing_command, False
-                if candidate.action in {
-                    WorkerCommandAction.SUBMIT,
-                    WorkerCommandAction.SET_LEVERAGE,
-                }:
-                    lease = connection.execute(
+                if is_new_risk_action:
+                    bound = connection.execute(
                         """
-                        SELECT * FROM worker_new_risk_lease
+                        UPDATE worker_new_risk_lease
+                        SET command_id=?
                         WHERE slot='NEW_RISK' AND lease_id=?
                           AND requester=?
                           AND broker=? AND environment=? AND account=?
+                          AND command_id=''
                           AND expires_at>?
                         """,
                         (
+                            candidate.id,
                             candidate.new_risk_lease_id,
                             candidate.requester,
                             candidate.broker,
@@ -1045,8 +1167,28 @@ class WorkerStore:
                             candidate.account,
                             self._iso(now),
                         ),
-                    ).fetchone()
-                    if lease is None:
+                    )
+                    if bound.rowcount != 1:
+                        lease = connection.execute(
+                            """
+                            SELECT command_id
+                            FROM worker_new_risk_lease
+                            WHERE slot='NEW_RISK' AND lease_id=?
+                              AND requester=?
+                              AND broker=? AND environment=? AND account=?
+                            """,
+                            (
+                                candidate.new_risk_lease_id,
+                                candidate.requester,
+                                candidate.broker,
+                                candidate.environment,
+                                candidate.account,
+                            ),
+                        ).fetchone()
+                        if lease is not None and lease["command_id"]:
+                            raise PermissionError(
+                                "NEW_RISK 租约已经绑定一条新增风险命令"
+                            )
                         raise PermissionError(
                             "新增风险命令缺少当前路由的有效 NEW_RISK 租约"
                         )
@@ -1101,6 +1243,7 @@ class WorkerStore:
                   SELECT 1 FROM worker_new_risk_lease lease
                   WHERE lease.slot='NEW_RISK'
                     AND lease.lease_id=worker_commands.new_risk_lease_id
+                    AND lease.command_id=worker_commands.id
                     AND lease.worker_id=?
                     AND lease.requester=worker_commands.requester
                     AND lease.broker=worker_commands.broker
@@ -1600,9 +1743,9 @@ class WorkerStore:
                     """
                     INSERT INTO worker_new_risk_lease(
                         slot, lease_id, worker_id, config_fingerprint,
-                        requester, broker, environment,
+                        requester, command_id, broker, environment,
                         account, granted_at, expires_at
-                    ) VALUES ('NEW_RISK', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES ('NEW_RISK', ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
                     """,
                     (
                         lease.lease_id,
@@ -1629,6 +1772,7 @@ class WorkerStore:
         worker_id: str,
         config_fingerprint: str,
         requester: str,
+        command_id: str = "",
         ttl_seconds: int,
     ) -> NewRiskLease | None:
         now = self._now()
@@ -1644,7 +1788,18 @@ class WorkerStore:
                     SET expires_at=?
                     WHERE slot='NEW_RISK' AND lease_id=?
                       AND worker_id=? AND config_fingerprint=?
-                      AND requester=? AND expires_at>?
+                      AND requester=? AND command_id=? AND expires_at>?
+                      AND (
+                        command_id=''
+                        OR EXISTS (
+                          SELECT 1 FROM worker_commands command
+                          WHERE command.id=worker_new_risk_lease.command_id
+                            AND command.new_risk_lease_id=
+                                worker_new_risk_lease.lease_id
+                            AND command.action IN ('submit', 'set_leverage')
+                            AND command.status IN ('pending', 'running')
+                        )
+                      )
                     """,
                     (
                         self._iso(expires_at),
@@ -1652,6 +1807,7 @@ class WorkerStore:
                         worker_id.strip(),
                         config_fingerprint.strip(),
                         requester.strip(),
+                        command_id.strip(),
                         self._iso(now),
                     ),
                 )
@@ -1759,6 +1915,7 @@ class WorkerStore:
         worker_id: str,
         config_fingerprint: str,
         requester: str,
+        command_id: str = "",
         broker: str,
         environment: str,
         account: str,
@@ -1770,15 +1927,44 @@ class WorkerStore:
                 SELECT 1 FROM worker_new_risk_lease
                 WHERE slot='NEW_RISK' AND lease_id=?
                   AND worker_id=? AND config_fingerprint=?
-                  AND requester=?
+                  AND requester=? AND command_id=?
                   AND broker=? AND environment=? AND account=?
                   AND expires_at>?
+                  AND (
+                    (
+                      command_id=''
+                      AND NOT EXISTS (
+                        SELECT 1 FROM worker_commands command
+                        WHERE command.new_risk_lease_id=
+                            worker_new_risk_lease.lease_id
+                          AND command.action IN ('submit', 'set_leverage')
+                      )
+                    )
+                    OR (
+                      command_id<>''
+                      AND EXISTS (
+                        SELECT 1 FROM worker_commands command
+                        WHERE command.id=worker_new_risk_lease.command_id
+                          AND command.new_risk_lease_id=
+                              worker_new_risk_lease.lease_id
+                          AND command.requester=
+                              worker_new_risk_lease.requester
+                          AND command.broker=worker_new_risk_lease.broker
+                          AND command.environment=
+                              worker_new_risk_lease.environment
+                          AND command.account=worker_new_risk_lease.account
+                          AND command.action IN ('submit', 'set_leverage')
+                          AND command.status IN ('pending', 'running')
+                      )
+                    )
+                  )
                 """,
                 (
                     lease_id.strip(),
                     worker_id.strip(),
                     config_fingerprint.strip(),
                     requester.strip(),
+                    command_id.strip(),
                     broker.strip().lower(),
                     environment.strip().lower(),
                     account.strip(),

@@ -146,6 +146,7 @@ class WorkerNewRiskAuthority:
             return False
         lease_valid = self._store.is_new_risk_authorized(
             command.new_risk_lease_id,
+            command_id=command.id,
             worker_id=self._worker_id,
             config_fingerprint=plan.config_fingerprint,
             requester=command.requester,
@@ -605,6 +606,7 @@ class ExecutionWorker:
         )
         authorized = self.store.is_new_risk_authorized(
             command.new_risk_lease_id,
+            command_id=command.id,
             **kwargs,
         )
         if not authorized:

@@ -576,6 +576,7 @@ class NewRiskLease(BaseModel):
     worker_id: str = Field(min_length=1, max_length=128)
     config_fingerprint: str = Field(min_length=1, max_length=256)
     requester: str = Field(min_length=1, max_length=128)
+    command_id: str = Field(default="", max_length=128)
     broker: BrokerName
     environment: ExecutionEnvironment
     account: str = Field(min_length=1, max_length=256)
@@ -587,6 +588,7 @@ class NewRiskLease(BaseModel):
         "worker_id",
         "config_fingerprint",
         "requester",
+        "command_id",
         "account",
         mode="before",
     )

@@ -9,14 +9,15 @@
 - 声明校验最终失败会耐久保存 `claim_validation:<code>` 证据，Campaign 记录 `blocked:claim_validation:<code>` 并继续下一根已收盘 K 线，不创建 execution 或券商写命令。
 - 2026-07-27 OKX Demo 已通过正式 `run` 入口加载 WO-F 并完成实盘式运行验收；20:01 又在完整空现场硬门后安全重载同一 Campaign，以加载记录文件名分钟修复。这是模拟账户生产链路验收，不是 OKX Live 实盘或策略收益证明。
 - 完成证据复审与 Campaign 异常收口已由 `7e6c095` 推送；Campaign 的 NEW_RISK 最小权限修复已完成并发布。WO-E 的 Stitch 与浏览器图像生成路线已由用户终止，不再是前端开发门。后端与无界面连接层已补齐：不可变报价、行情新鲜度、K 线证据、批量自选、generation/请求序号门禁、Longbridge/OKX 批量报价、OKX 10m 三页聚合和独立只分析结果投影均已落地。最终前端唯一 PRD 为 `docs/prd/11_多市场看盘前端最终PRD_外部设计交付版.md`；用户将交给其他大模型做视觉设计，当前仍未修改 `pa_agent/gui`，PyQt6 视觉实现未开始。
+- P0-01 公共执行层一次性授权已在本地实现：Worker schema v5 把每个 NEW_RISK 租约耐久绑定到唯一命令，数据库、Controller 和 Worker 共同拒绝第二个消费者；对抗审查发现的 Controller 提交/续租与终态续租竞态和证据缺口已补齐。用户已授权把确定性主门与真实数据源健康检查分开；确定性主门 2048 项通过、0 项跳过、0 失败，独立 live 检查 7 项跳过、0 失败。目标 SHA CI 尚未开始，运行中的旧 Worker 未重载，因此仍不能说 P0 已关闭或运行态已生效。
 
 ## 上次停在哪
 
 - WO-F 开工基线为 `HEAD=4e13c7f`。最终 unit/property/integration 三套件为 1926 项通过、7 项跳过、0 失败；GUI E2E 为 4 项通过、0 失败。
 - 2026-07-28 NEW_RISK 修复后的 unit/property/integration 为 1966 项通过、7 项跳过、0 失败；Campaign 与离线 Controller/Worker 定向回归为 130 项通过、0 失败。全仓 Ruff 当前基线仍为 293 项，其中 249 项带自动修复建议，本轮没有批量修复历史债。
-- 2026-07-28 11:24–11:28 的本轮只读审计显示：Worker 服务和心跳仍运行，两库 `quick_check` 均为 `ok`，活动 execution、pending/running 命令和有效 `NEW_RISK` 租约均为 0；但 OKX 私有 `/account/balance` 持续返回连接拒绝并触发风险停止，Campaign 进程不存在，磁盘 `active` 状态已过期，不能冒充实际运行。
+- 2026-07-29 18:01 的只读复核显示：Worker 服务和心跳运行，两库 `quick_check=ok`，活动 execution、pending/running 命令、未解决 UNCERTAIN 和有效 NEW_RISK 租约均为 0；风险停止仍为 `risk_runtime_BrokerTransportError`，Campaign 无 Python 进程，两个正式配置文件哈希与开工基线一致。只允许离线整改，本轮没有重启进程、解除风险停止、修改生产数据库或调用券商。
 - 最近耐久完成的是 2026-07-27 21:50–22:00 已收盘 10m K 线：Stage1/Stage2 均存在，终点 `wait`、trade confidence 38、结果 `blocked:no_order`。Worker 自 2026-07-26 13:32:11 启动，不可能加载其后的提交。最后本地账户快照在审计时已陈旧约 13.35 小时；Worker 自动私有读取持续失败，Agent 未另行调用，因此当前券商仓位、普通挂单和全部算法挂单均为实时真相阻断。未经新的 OKX Demo 私有只读硬门和用户运行态授权不得恢复 Campaign 或重载。
-- 长桥最后已知结果仍是服务端 `401004 token invalid`；共享 `env` 自 2026-07-24 后未更新。本轮没有把旧错误冒充实时网络复验，AAPL.US、700.HK、600519.SH 的真实两阶段验收继续阻塞。
+- 长桥旧默认档案仍会被服务端拒绝，但已在 `Quant\env` 找到完整的 `COMPREHENSIVE` 行情档案并用官方 `QuoteContext` 真实验证：沪深两只股票报价为正，1h/4h/1d K 线结构有效。PA_Agent 现在通过非机密选择项显式使用该档案，不猜测、不跨组拼接凭据；完整三标的桌面矩阵留给后续前端验收。
 - WO-A 仍有一个真实 P2：固定代理 metadata 与实际 `config.json` 没有共同指纹，无法检测二者不一致；本轮明确禁止修改 `scripts`，因此不能用假测试冒充完成。
 - WO-E 已核实 Longbridge 官方批量报价单次 500 个标的，当前 100 项自选无需循环订阅；OKX 可按 SPOT/SWAP 最多两个串行全量 ticker 快照后严格筛选。OKX 10m 最坏需 602 根 5m、最多三页；现有只读客户端缺 `after`，正确修复需要极窄解除 `pa_agent/execution/okx_client.py` 禁区。
 - 2026-07-29 用户授权先快速补强后端与前后端连接，再把前端视觉交给其他大模型。只读 `OkxRestClient.candles(after)`、SPOT/SWAP 批量 ticker、10m 最多三页分页、Longbridge 单次批量 quote、类型化认证失败、页面 generation/sequence 门禁、K 线证据与独立只分析结果投影已完成；未调用交易准备或券商写接口。全仓共收集 2033 项，2030 项通过、3 项跳过、0 失败。
@@ -28,7 +29,7 @@
 - 成交量摘要只使用已收盘 K 线。最新一根与此前最多 20 根形成基线；不足 6 根、参与计算的成交量无效或基准中位数为零时返回空结果，不猜值。
 - 多市场前端首版固定 `analysis_timeframe=10m`，`display_timeframe` 只控制 10m/1h/4h 图表；报价与展示周期无关。页面异步结果统一绑定 generation 和请求族序号。Longbridge 报价接口不声明真实最小跳动时允许只读显示，但不得从小数位或市场默认值猜 tick，更不得据此生成可执行价格。PRD11 取代旧 Stitch/ImageGen 流程，外部模型只负责高保真设计和组件规格；生产实现仍必须使用原生 PyQt6/QWidget/QSS/pyqtgraph。
 - Campaign 的每个 NEW_RISK 授权窗口只包住一条新增风险 Worker 命令：`set_leverage`、正常 `submit` 和 READY 恢复 `submit` 在命令创建前失败时释放；只有等待函数返回 `SUCCEEDED`、`FAILED` 或 `UNCERTAIN` 耐久终态后才释放。等待超时、命令读取异常或非终态结果不会由业务方法提前释放，进程收口仍会显式撤销租约；RUNNING 命令保持未解决并阻止再次授权。下一条新增风险命令重新执行 OKX Demo 私有只读预检并申请新租约；撤单和离场等减险命令不依赖该租约。
-- 上述是 Campaign 调用路径的不变量，不是 `ExecutionController` / `WorkerStore` 的全局一次性令牌保证；公共层目前允许同一有效租约排入多条新增风险命令。把该性质提升为执行层硬约束需要修改本轮禁止触碰的 `pa_agent/execution`，已在 `BLOCKED.md` 如实登记。
+- 公共执行层现已把 NEW_RISK 租约升级为 schema v5 一次性令牌：租约与唯一 `command_id` 在同一 SQLite 事务中绑定并插入命令；线程、进程、调用者崩溃、插入回滚、过期边界、UNCERTAIN、跨动作复用、Controller 提交/续租与终态续租竞态、真正写入前授权撤销，以及 v4→v5 重复消费者和身份不一致迁移都有直接回归。绑定后 Controller 不再显示可授权，Worker 还会按命令、路由、申请者和配置指纹做最终核验。该结论目前只适用于本地源代码与测试，待合格全量结果和目标 SHA 的 CI 绿色后发布；运行中的 schema v4 Worker 未重载。
 - 市场切换分为跨数据源事务与 Longbridge 内市场事务；US、HK、CN 路由到 Longbridge，Crypto 路由到 OKX。认证失败、标的或来源不一致、行情或已收盘 K 线陈旧时失败关闭；日历未知只关闭市场时钟事实，不猜阶段，但完整且新鲜的已收盘 K 线仍可分析；不静默换源。
 - 自选列表只写本地 `GeneralSettings`，不写长桥云端 watchlist。
 - 市场时钟读取 `market_calendar.session_state` 的开市、午休、闭市、半日市与下一变化时间；加密显示连续交易，不伪造股票会话。
