@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from pa_agent.data.base import DataSourceTransientError
+from pa_agent.data.base import DataSourceTransientError, KlineBar
 from pa_agent.data.market_workspace import (
     WatchlistRequestToken,
 )
@@ -13,7 +13,24 @@ from pa_agent.data.okx_source import (
     normalize_okx_instrument,
     okx_instrument_type,
 )
-from pa_agent.execution.errors import BrokerTransportError
+from pa_agent.data.okx_public_client import OkxPublicTransportError
+
+
+def test_okx_closed_bar_end_uses_declared_fixed_interval() -> None:
+    bar = KlineBar(
+        seq=1,
+        ts_open=1_700_000_000_000,
+        open=100,
+        high=101,
+        low=99,
+        close=100,
+        volume=1,
+        closed=True,
+    )
+
+    assert OkxSource.closed_bar_end_utc_ms(bar, "10m") == (
+        1_700_000_600_000
+    )
 
 
 class _FakeOkxClient:
@@ -131,10 +148,7 @@ def test_okx_source_failed_switch_preserves_previous_subscription():
 def test_okx_source_translates_transport_errors_without_exposing_credentials():
     class _FailingClient(_FakeOkxClient):
         def public_instruments(self, inst_type, *, instrument=None):
-            raise BrokerTransportError(
-                "temporary",
-                write_may_have_reached=False,
-            )
+            raise OkxPublicTransportError("temporary")
 
     source = OkxSource(client=_FailingClient())
     source.connect()

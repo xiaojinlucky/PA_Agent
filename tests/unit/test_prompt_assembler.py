@@ -133,6 +133,8 @@ def test_stage1_records_volume_shadow_without_injecting_prompt(
     assert "relative_volume" not in rendered_prompt
     assert "baseline_volume" not in rendered_prompt
     assert "latest_volume" not in rendered_prompt
+    assert "成交量" not in rendered_prompt
+    assert "| 1000      |" not in rendered_prompt
 
 
 def test_stage1_reports_shadow_write_failure_without_stopping_analysis(

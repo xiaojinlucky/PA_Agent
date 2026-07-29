@@ -1,2 +1,3 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+pa_agent/build_info.py export-subst

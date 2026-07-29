@@ -289,9 +289,15 @@ def _selected_quote_profile(
 
 def load_longbridge_credentials(env_file: Path | None = None) -> LongbridgeCredentials:
     """按显式行情档案先读进程环境，再读 Quant 根目录共享 ``env``。"""
-    from pa_agent.execution.credentials import shared_env_path
+    from pa_agent.config.paths import PROJECT_ROOT
 
-    shared_env = env_file or shared_env_path()
+    test_override = str(
+        os.environ.get("_PA_AGENT_TEST_SHARED_ENV_PATH") or ""
+    ).strip()
+    shared_env = (
+        env_file
+        or (Path(test_override) if test_override else PROJECT_ROOT.parent / "env")
+    )
     file_values = _read_env_file(shared_env)
     profile = _selected_quote_profile(os.environ, file_values)
     prefixes = _QUOTE_PROFILE_PREFIXES[profile]
@@ -976,7 +982,6 @@ class LongbridgeSource(DataSource):
     ) -> bool:
         if self._market is None or self._market_timezone is None:
             raise DataSourceTransientError("Longbridge 未订阅市场")
-        market_open = _timestamp_in_market_timezone(timestamp, self._market_timezone)
         market_now = (
             datetime.fromtimestamp(
                 analysis_as_of_utc_ms / 1000,
@@ -985,22 +990,62 @@ class LongbridgeSource(DataSource):
             if analysis_as_of_utc_ms is not None
             else _now_in_market_timezone(self._market_timezone)
         )
+        close_at = self._bar_close_at(
+            timestamp,
+            duration_s,
+            timeframe,
+        )
+        return market_now < close_at
 
+    def _bar_close_at(
+        self,
+        timestamp: datetime,
+        duration_s: int | None,
+        timeframe: str,
+    ) -> datetime:
+        if self._market is None or self._market_timezone is None:
+            raise DataSourceTransientError("Longbridge 未订阅市场")
+        market_open = _timestamp_in_market_timezone(
+            timestamp,
+            self._market_timezone,
+        )
         if timeframe == "1d":
-            close_at = self._actual_session_close(market_open.date())
-            return market_now < close_at
+            return self._actual_session_close(market_open.date())
         if timeframe == "1w":
             week_start = market_open.date() - timedelta(days=market_open.weekday())
             last_trading_day = self._last_trading_day_of_week(week_start)
-            close_at = self._actual_session_close(last_trading_day)
-            return market_now < close_at
+            return self._actual_session_close(last_trading_day)
         if duration_s is None:
-            return False
+            raise DataSourceTransientError(
+                f"Longbridge 无法确定 {timeframe} 的 K 线结束时间"
+            )
         close_at = market_open + timedelta(seconds=duration_s)
         market_close_at = self._session_close_for_bar(market_open)
         if market_close_at is not None:
             close_at = min(close_at, market_close_at)
-        return market_now < close_at
+        return close_at
+
+    def closed_bar_end_utc_ms(
+        self,
+        bar: KlineBar,
+        timeframe: str,
+    ) -> int:
+        """返回源端日历证明的真实收盘时刻，不把开盘时刻冒充收盘。"""
+
+        if not bar.closed:
+            raise ValueError("只能查询已收盘 K 线的结束时间")
+        duration_s = timeframe_to_seconds(timeframe)
+        timestamp = datetime.fromtimestamp(
+            int(bar.ts_open) / 1_000,
+            tz=UTC,
+        )
+        return datetime_to_ts_ms(
+            self._bar_close_at(
+                timestamp,
+                duration_s,
+                timeframe,
+            )
+        )
 
     def _actual_session_close(self, session_date: date) -> datetime:
         if self._market_timezone is None:

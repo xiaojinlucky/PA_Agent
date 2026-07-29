@@ -8,6 +8,7 @@ Tasks 14.2 + 14.5:
 from __future__ import annotations
 
 import math
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import numpy as np
@@ -35,6 +36,45 @@ _AXIS_RESIZE_MIN_WIDTH = 40
 _AXIS_RESIZE_EDGE_PX = 8
 
 
+class MarketTimeAxisItem(pg.AxisItem):
+    """把图表索引转换为冻结 K 线的 UTC 时间。"""
+
+    def __init__(self) -> None:
+        super().__init__(orientation="bottom")
+        self._timestamps_utc_ms: tuple[int, ...] = ()
+
+    def set_frame(self, frame: "KlineFrame") -> None:
+        self._timestamps_utc_ms = tuple(
+            int(bar.ts_open) for bar in reversed(frame.bars)
+        )
+        self.picture = None
+        self.update()
+
+    def tickStrings(
+        self,
+        values: list[float],
+        scale: float,
+        spacing: float,
+    ) -> list[str]:
+        del scale, spacing
+        rendered: list[str] = []
+        for value in values:
+            index = int(round(value))
+            if (
+                index < 0
+                or index >= len(self._timestamps_utc_ms)
+                or abs(value - index) > 0.25
+            ):
+                rendered.append("")
+                continue
+            moment = datetime.fromtimestamp(
+                self._timestamps_utc_ms[index] / 1000,
+                tz=UTC,
+            )
+            rendered.append(moment.strftime("%m-%d %H:%M"))
+        return rendered
+
+
 class ChartWidget(pg.PlotWidget):
     """Interactive K-line chart widget.
 
@@ -44,13 +84,45 @@ class ChartWidget(pg.PlotWidget):
         Optional Qt parent widget.
     """
 
-    def __init__(self, parent=None) -> None:
-        super().__init__(parent=parent)
+    def __init__(
+        self,
+        parent=None,
+        *,
+        market_read_only: bool = False,
+    ) -> None:
+        self._market_read_only = bool(market_read_only)
+        self._market_time_axis = (
+            MarketTimeAxisItem() if self._market_read_only else None
+        )
+        axis_items = (
+            {"bottom": self._market_time_axis}
+            if self._market_time_axis is not None
+            else None
+        )
+        super().__init__(parent=parent, axisItems=axis_items)
 
         # Configure plot appearance
-        self.setBackground("#0d1117")
+        self.setBackground(
+            "#090B10" if self._market_read_only else "#0d1117"
+        )
         self.showGrid(x=False, y=True, alpha=0.3)
-        self.getPlotItem().setLabel("left", "Price")
+        self._show_ema = not self._market_read_only
+        self._show_sequence_labels = not self._market_read_only
+        self._up_color = (
+            "#E5484D" if self._market_read_only else "#00D084"
+        )
+        self._down_color = (
+            "#2EBD85" if self._market_read_only else "#FF4757"
+        )
+        plot = self.getPlotItem()
+        if self._market_read_only:
+            plot.hideAxis("left")
+            plot.showAxis("right")
+            plot.setLabel("right", "价格")
+            plot.getAxis("right").setTextPen("#9AA3B2")
+            plot.getAxis("bottom").setTextPen("#9AA3B2")
+        else:
+            plot.setLabel("left", "Price")
 
         # Internal state
         self._latest_frame: KlineFrame | None = None
@@ -152,6 +224,9 @@ class ChartWidget(pg.PlotWidget):
 
     def set_decision(self, decision: dict) -> None:
         """Draw or clear entry/TP/SL lines and direction marker from the AI decision."""
+        if self._market_read_only:
+            self.clear_decision_overlay()
+            return
         order_type = decision.get("order_type", _NO_ORDER_TEXT)
         overlay_active = bool(decision.get("chart_overlay_active"))
 
@@ -200,6 +275,8 @@ class ChartWidget(pg.PlotWidget):
             List of ``StructureLevel`` objects (from ``pa_agent.gui.support_resistance``).
             Supports are drawn in green, resistances in red/amber.
         """
+        if self._market_read_only:
+            return
         plot = self.getPlotItem()
         for item in self._sr_items:
             plot.removeItem(item)
@@ -390,12 +467,22 @@ class ChartWidget(pg.PlotWidget):
             forming = not bar.closed
 
             # Candle (forming bar: semi-transparent dashed outline)
-            candle = CandleItem(bar, x_pos, forming=forming)
+            candle = CandleItem(
+                bar,
+                x_pos,
+                forming=forming,
+                up_color=self._up_color,
+                down_color=self._down_color,
+            )
             self.addItem(candle)
             self._candle_items.append(candle)
 
             # Sequence label — odd seq only; skip forming bar (seq=0)
-            if bar.seq > 0 and bar.seq % 2 == 1:
+            if (
+                self._show_sequence_labels
+                and bar.seq > 0
+                and bar.seq % 2 == 1
+            ):
                 label_y = bar.high
                 seq_label = SeqLabelItem(
                     bar.seq,
@@ -414,7 +501,7 @@ class ChartWidget(pg.PlotWidget):
                 ema_y.append(ema_val)
 
         # EMA20 line (slightly dimmed through forming bar)
-        if ema_x:
+        if self._show_ema and ema_x:
             newest_forming = len(bars) > 0 and not bars[0].closed
             ema_color: tuple[int, ...] = _EMA_COLOR
             if newest_forming:
@@ -425,6 +512,9 @@ class ChartWidget(pg.PlotWidget):
                 pen=pg.mkPen(color=ema_color, width=1),
             )
             self.addItem(self._ema_line)
+
+        if self._market_time_axis is not None:
+            self._market_time_axis.set_frame(frame)
 
         self._update_direction_marker()
 

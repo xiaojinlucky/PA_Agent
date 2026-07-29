@@ -16,9 +16,14 @@ from pa_agent.data.market_workspace import (
     QuoteSnapshot,
     RequestFamily,
     WatchlistQuoteSet,
+    MarketClockView,
+    MarketTimeframePayload,
+    MarketWorkspaceRenderPayload,
     evaluate_quote_freshness,
 )
+from pa_agent.data.base import IndicatorBundle, KlineBar, KlineFrame
 from pa_agent.data.market_workspace_controller import (
+    AnalysisFailureStage,
     AnalysisState,
     MarketWorkspaceController,
     SelectionState,
@@ -120,6 +125,72 @@ def _bundle(
     )
 
 
+def _render_payload(request: object) -> MarketWorkspaceRenderPayload:
+    identity = request.identity
+    as_of = request.analysis_as_of_utc_ms
+    if as_of is None:
+        raise ValueError("测试请求必须先冻结 analysis_as_of")
+
+    def frame(timeframe: str) -> KlineFrame:
+        interval = {
+            "10m": 10 * 60_000,
+            "1h": 60 * 60_000,
+            "4h": 4 * 60 * 60_000,
+        }[timeframe]
+        bars = tuple(
+            KlineBar(
+                seq=index + 1,
+                ts_open=as_of - interval * (index + 1),
+                open=100,
+                high=102,
+                low=99,
+                close=101,
+                volume=10,
+                amount=1_000,
+                closed=True,
+                price_tick="0.01",
+            )
+            for index in range(request.required_closed_bars)
+        )
+        return KlineFrame(
+            symbol=identity.symbol,
+            timeframe=timeframe,
+            bars=bars,
+            indicators=IndicatorBundle(
+                ema20=tuple(
+                    101.0 for _ in range(request.required_closed_bars)
+                ),
+                atr14=tuple(
+                    1.0 for _ in range(request.required_closed_bars)
+                ),
+            ),
+            snapshot_ts_local_ms=as_of,
+            price_tick="0.01",
+        )
+
+    return MarketWorkspaceRenderPayload(
+        token=request.kline_token,
+        analysis_as_of_utc_ms=as_of,
+        timeframes=tuple(
+            MarketTimeframePayload(
+                timeframe=timeframe,
+                display=frame(timeframe),
+                analysis=frame(timeframe),
+            )
+            for timeframe in ("10m", "1h", "4h")
+        ),
+        market_clock=MarketClockView(
+            market=identity.market,
+            phase=("continuous" if identity.market == "Crypto" else "open"),
+            is_half_day=False,
+            as_of_utc_ms=as_of,
+            next_change_utc_ms=None,
+            timezone_name=("UTC" if identity.market == "Crypto" else "America/New_York"),
+        ),
+        loaded_at_utc_ms=as_of,
+    )
+
+
 def _saved_settings(save_request: object, *, revision: int) -> Settings:
     saved = Settings()
     saved.market_workspace = save_request.workspace.model_copy(deep=True)
@@ -198,6 +269,7 @@ def _commit(
             last=last,
             price_tick=price_tick,
         ),
+        _render_payload(request),
     )
     assert result.accepted is True
     return request, result.save_request
@@ -289,7 +361,11 @@ def test_controller_clock_rechecks_bundle_at_completion_and_analysis_time() -> N
     bound = controller.freeze_analysis_as_of(request)
     bundle = _bundle(bound)
     now[0] = 100_600
-    assert controller.complete_market_data(bound, bundle).accepted
+    assert controller.complete_market_data(
+        bound,
+        bundle,
+        _render_payload(bound),
+    ).accepted
 
     now[0] = 102_001
     with pytest.raises(ValueError, match="不可分析"):
@@ -344,7 +420,11 @@ def test_current_transport_failure_keeps_display_but_blocks_analysis_until_refre
 
     recovered = controller.refresh_current()
     recovered = controller.freeze_analysis_as_of(recovered)
-    assert controller.complete_market_data(recovered, _bundle(recovered)).accepted
+    assert controller.complete_market_data(
+        recovered,
+        _bundle(recovered),
+        _render_payload(recovered),
+    ).accepted
     assert controller.view.bundle_current is True
     assert controller.begin_analysis().bundle == controller.view.bundle
 
@@ -855,12 +935,14 @@ def test_analysis_switch_freezes_input_and_late_result_goes_to_history_only() ->
     analysis = controller.begin_analysis()
     assert analysis.bundle.analysis_as_of_utc_ms == 100_500
     assert controller.view.analysis_state is AnalysisState.RUNNING
+    assert controller.view.active_analysis_token == analysis.token
 
     next_selection = controller.begin_selection(
         market="US",
         symbol="AAPL.US",
         display_timeframe="10m",
     )
+    assert controller.view.active_analysis_token is None
     next_selection = controller.freeze_analysis_as_of(next_selection)
     controller.complete_market_data(
         next_selection,
@@ -886,6 +968,10 @@ def test_running_analysis_cannot_start_twice_and_projection_error_is_terminal() 
 
     assert controller.view.analysis_state is AnalysisState.FAILED
     assert controller.view.analysis_failure is not None
+    assert (
+        controller.view.analysis_failure_stage
+        is AnalysisFailureStage.RESULT_VALIDATION
+    )
 
 
 def test_worker_analysis_failure_has_stable_terminal_state() -> None:
@@ -893,9 +979,17 @@ def test_worker_analysis_failure_has_stable_terminal_state() -> None:
     _commit(controller, "Crypto", "BTC-USDT")
     analysis = controller.begin_analysis()
 
-    assert controller.fail_analysis(analysis, "worker_failed")
+    assert controller.fail_analysis(
+        analysis,
+        "worker_failed",
+        stage=AnalysisFailureStage.DECISION_GENERATION,
+    )
     assert controller.view.analysis_state is AnalysisState.FAILED
     assert controller.view.analysis_failure == "worker_failed"
+    assert (
+        controller.view.analysis_failure_stage
+        is AnalysisFailureStage.DECISION_GENERATION
+    )
     assert controller.fail_analysis(analysis, "worker_failed") is False
 
 
@@ -909,6 +1003,10 @@ def test_unknown_analysis_failure_is_terminal_before_error_is_raised() -> None:
 
     assert controller.view.analysis_state is AnalysisState.FAILED
     assert controller.view.analysis_failure == "invalid_result"
+    assert (
+        controller.view.analysis_failure_stage
+        is AnalysisFailureStage.RESULT_VALIDATION
+    )
     assert controller.fail_analysis(analysis, "worker_failed") is False
 
 
@@ -1152,6 +1250,7 @@ def test_more_than_thirty_two_late_analysis_results_remain_auditable() -> None:
         assert controller.complete_market_data(
             refresh,
             _bundle(refresh),
+            _render_payload(refresh),
         ).accepted
 
     oldest = requests[0]

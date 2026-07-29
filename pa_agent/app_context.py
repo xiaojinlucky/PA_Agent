@@ -17,6 +17,16 @@ def build_market_workspace_controller(settings: Any) -> Any:
     return MarketWorkspaceController(settings)
 
 
+def build_market_workspace_runtime() -> Any:
+    """构造新多市场页的独立双源只读运行层；此时不连接网络。"""
+
+    from pa_agent.data.market_workspace_runtime import (
+        MarketWorkspaceRuntime,
+    )
+
+    return MarketWorkspaceRuntime()
+
+
 @dataclass(slots=True)
 class AppContext:
     """Carries shared resources to GUI widgets and orchestrators."""
@@ -29,6 +39,7 @@ class AppContext:
     # Data layer
     data_source: Any = None       # DataSource implementation
     market_workspace_controller: Any = None  # 新多市场只读页状态控制器
+    market_workspace_runtime: Any = None  # 新多市场页独立双源只读运行层
 
     # AI / orchestration layer
     client: Any = None            # DeepSeekClient
@@ -92,6 +103,7 @@ class AppContext:
         market_workspace_controller = build_market_workspace_controller(
             settings
         )
+        market_workspace_runtime = build_market_workspace_runtime()
 
         # Subscribe to the last-used symbol/timeframe from settings
         try:
@@ -177,6 +189,7 @@ class AppContext:
             event_bus=event_bus,
             data_source=data_source,
             market_workspace_controller=market_workspace_controller,
+            market_workspace_runtime=market_workspace_runtime,
             client=client,
             assembler=assembler,
             router=router,

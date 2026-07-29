@@ -22,6 +22,7 @@ from pa_agent.data.base import (
     DataSourceError,
     DataSourcePermissionError,
     DataSourceTransientError,
+    KlineBar,
 )
 from pa_agent.data.longbridge_source import (
     LONGBRIDGE_TOKEN_EXPIRING_THRESHOLD,
@@ -1394,6 +1395,53 @@ def test_intraday_head_bar_is_capped_at_regular_market_close(
     )
 
     assert is_forming is False
+
+
+def test_closed_bar_end_uses_real_market_session_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    _clear_credentials(monkeypatch)
+    env_file = tmp_path / "env"
+    _write_env(env_file)
+    sdk, _ = _fake_sdk()
+    _install_fake_sdk(monkeypatch, sdk)
+    source = LongbridgeSource(env_file=env_file)
+    source.connect()
+    source.subscribe("AAPL.US", "4h")
+    market_timezone = ZoneInfo("America/New_York")
+    opened_at = datetime(
+        2026,
+        7,
+        15,
+        15,
+        0,
+        tzinfo=market_timezone,
+    )
+    bar = KlineBar(
+        seq=1,
+        ts_open=opened_at.timestamp() * 1_000,
+        open=100,
+        high=101,
+        low=99,
+        close=100,
+        volume=1,
+        closed=True,
+    )
+
+    closed_at = source.closed_bar_end_utc_ms(bar, "4h")
+
+    assert closed_at == int(
+        datetime(
+            2026,
+            7,
+            15,
+            16,
+            0,
+            tzinfo=market_timezone,
+        ).timestamp()
+        * 1_000
+    )
 
 
 @pytest.mark.parametrize(

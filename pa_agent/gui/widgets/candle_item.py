@@ -34,11 +34,23 @@ class CandleItem(pg.GraphicsObject):
         When True, draw the unclosed bar as a hollow ghost candle (live chart only).
     """
 
-    def __init__(self, bar: "KlineBar", x_pos: int, *, forming: bool = False) -> None:
+    def __init__(
+        self,
+        bar: "KlineBar",
+        x_pos: int,
+        *,
+        forming: bool = False,
+        up_color: QColor | str | None = None,
+        down_color: QColor | str | None = None,
+    ) -> None:
         super().__init__()
         self._bar = bar
         self._x = x_pos
         self._forming = forming
+        self._up_color = QColor(up_color) if up_color is not None else QColor(_COLOR_UP)
+        self._down_color = (
+            QColor(down_color) if down_color is not None else QColor(_COLOR_DOWN)
+        )
         self._generate_picture()
 
     # ── pyqtgraph interface ───────────────────────────────────────────────────
@@ -82,7 +94,7 @@ class CandleItem(pg.GraphicsObject):
         p.end()
 
     def _paint_closed(self, p: QPainter, bar: "KlineBar", x: float) -> None:
-        color = _COLOR_UP if bar.close >= bar.open else _COLOR_DOWN
+        color = self._up_color if bar.close >= bar.open else self._down_color
         p.setPen(QPen(color, 0))
         p.setBrush(color)
         half = _BODY_WIDTH / 2.0
@@ -92,7 +104,7 @@ class CandleItem(pg.GraphicsObject):
         self._paint_wicks(p, bar, x, body_top, body_bottom, QPen(color, 0))
 
     def _paint_forming(self, p: QPainter, bar: "KlineBar", x: float) -> None:
-        base = _COLOR_UP if bar.close >= bar.open else _COLOR_DOWN
+        base = self._up_color if bar.close >= bar.open else self._down_color
         outline = QColor(base.red(), base.green(), base.blue(), 255)
         fill = QColor(base.red(), base.green(), base.blue(), 70)
         wick_pen = QPen(outline, 1)

@@ -4,9 +4,14 @@ import ast
 import inspect
 import textwrap
 
-from pa_agent.app_context import AppContext, build_market_workspace_controller
+from pa_agent.app_context import (
+    AppContext,
+    build_market_workspace_controller,
+    build_market_workspace_runtime,
+)
 from pa_agent.config.settings import Settings
 from pa_agent.data.market_workspace_controller import MarketWorkspaceController
+from pa_agent.data.market_workspace_runtime import MarketWorkspaceRuntime
 
 
 def test_app_context_exposes_independent_market_workspace_controller() -> None:
@@ -24,6 +29,15 @@ def test_app_context_exposes_independent_market_workspace_controller() -> None:
     assert context.market_workspace_controller.settings_snapshot.general == settings.general
 
 
+def test_app_context_exposes_lazy_read_only_market_runtime() -> None:
+    runtime = build_market_workspace_runtime()
+    context = AppContext(market_workspace_runtime=runtime)
+
+    assert isinstance(context.market_workspace_runtime, MarketWorkspaceRuntime)
+    assert context.market_workspace_runtime is not context.execution_service
+    runtime.close()
+
+
 def test_bootstrap_returns_controller_without_passing_it_to_legacy_read_model() -> None:
     tree = ast.parse(textwrap.dedent(inspect.getsource(AppContext.bootstrap)))
     cls_calls = [
@@ -36,7 +50,10 @@ def test_bootstrap_returns_controller_without_passing_it_to_legacy_read_model() 
     assert len(cls_calls) == 1
     assert {
         keyword.arg for keyword in cls_calls[0].keywords
-    } >= {"market_workspace_controller"}
+    } >= {
+        "market_workspace_controller",
+        "market_workspace_runtime",
+    }
 
     legacy_calls = [
         node

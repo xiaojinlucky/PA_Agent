@@ -15,9 +15,18 @@ from decimal import Decimal, InvalidOperation
 from enum import StrEnum
 from typing import Any, Literal
 
+from pa_agent.data.base import KlineFrame
+
 MarketCode = Literal["US", "HK", "CN", "Crypto"]
 QuoteSource = Literal["longbridge", "okx"]
 QuoteMode = Literal["realtime", "delayed"]
+MarketClockPhase = Literal[
+    "open",
+    "break",
+    "closed",
+    "continuous",
+    "unknown",
+]
 
 _MARKET_SOURCES: dict[str, str] = {
     "US": "longbridge",
@@ -950,6 +959,139 @@ class MarketDataBundle:
     @property
     def analysis_allowed(self) -> bool:
         return self.analysis_state is AnalysisCapabilityState.READY
+
+
+@dataclass(frozen=True, slots=True)
+class MarketClockView:
+    """绑定一次冻结数据包的市场时钟；日历未知不伪装成闭市。"""
+
+    market: MarketCode
+    phase: MarketClockPhase
+    is_half_day: bool
+    as_of_utc_ms: int
+    next_change_utc_ms: int | None
+    timezone_name: str
+
+    def __post_init__(self) -> None:
+        if self.market not in _MARKET_SOURCES:
+            raise ValueError(f"不支持的市场：{self.market}")
+        if self.phase not in {
+            "open",
+            "break",
+            "closed",
+            "continuous",
+            "unknown",
+        }:
+            raise ValueError(f"不支持的市场时钟状态：{self.phase}")
+        if self.as_of_utc_ms < 0:
+            raise ValueError("市场时钟 as_of 不能为负数")
+        if (
+            self.next_change_utc_ms is not None
+            and self.next_change_utc_ms < self.as_of_utc_ms
+        ):
+            raise ValueError("下一状态变化时间不能早于市场时钟 as_of")
+        timezone_name = str(self.timezone_name or "").strip()
+        if not timezone_name:
+            raise ValueError("市场时钟必须声明时区名称")
+        if self.market == "Crypto":
+            if self.phase != "continuous" or self.is_half_day:
+                raise ValueError("Crypto 市场时钟必须是连续交易且不能是半日市")
+            if timezone_name != "UTC":
+                raise ValueError("Crypto 市场时钟必须使用 UTC")
+            if self.next_change_utc_ms is not None:
+                raise ValueError("Crypto 连续交易不能声明下一状态变化")
+        elif self.phase == "continuous":
+            raise ValueError("股票市场不能声明连续交易")
+        object.__setattr__(self, "timezone_name", timezone_name)
+
+
+@dataclass(frozen=True, slots=True)
+class MarketTimeframePayload:
+    """一个展示周期的真实图表帧与冻结分析帧。"""
+
+    timeframe: str
+    display: KlineFrame | None
+    analysis: KlineFrame | None
+
+    def __post_init__(self) -> None:
+        if self.timeframe not in _DISPLAY_TIMEFRAMES:
+            raise ValueError("图表载荷周期只支持 10m、1h、4h")
+        for label, frame in (
+            ("display", self.display),
+            ("analysis", self.analysis),
+        ):
+            if frame is None:
+                continue
+            if frame.timeframe != self.timeframe:
+                raise ValueError(f"{label} K 线帧周期与载荷周期不一致")
+        if self.analysis is not None and any(
+            not bar.closed for bar in self.analysis.bars
+        ):
+            raise ValueError("分析帧只能包含已收盘 K 线")
+
+
+@dataclass(frozen=True, slots=True)
+class MarketWorkspaceRenderPayload:
+    """Controller 接受后，页面和 AI 共用的不可变真实载荷。"""
+
+    token: RequestToken
+    analysis_as_of_utc_ms: int
+    timeframes: tuple[MarketTimeframePayload, ...]
+    market_clock: MarketClockView
+    loaded_at_utc_ms: int
+
+    def __post_init__(self) -> None:
+        if self.token.family is not RequestFamily.KLINE:
+            raise ValueError("图表载荷只接受 KLINE 请求 token")
+        if self.analysis_as_of_utc_ms < 0 or self.loaded_at_utc_ms < 0:
+            raise ValueError("图表载荷时间不能为负数")
+        if self.loaded_at_utc_ms < self.analysis_as_of_utc_ms:
+            raise ValueError("图表载荷完成时间不能早于 analysis_as_of")
+        if self.market_clock.market != self.token.identity.market:
+            raise ValueError("市场时钟与图表载荷市场不一致")
+        if self.market_clock.as_of_utc_ms != self.analysis_as_of_utc_ms:
+            raise ValueError("市场时钟与图表载荷 analysis_as_of 不一致")
+        if tuple(item.timeframe for item in self.timeframes) != (
+            "10m",
+            "1h",
+            "4h",
+        ):
+            raise ValueError("图表载荷必须按 10m、1h、4h 各提供一项")
+        identity = self.token.identity
+        for item in self.timeframes:
+            for frame in (item.display, item.analysis):
+                if frame is None:
+                    continue
+                if frame.symbol != identity.symbol:
+                    raise ValueError("图表载荷标的与请求 identity 不一致")
+                if frame.timeframe != item.timeframe:
+                    raise ValueError("图表载荷 K 线帧周期不一致")
+        if self.analysis_frame("10m") is None:
+            raise ValueError("图表载荷必须包含冻结的 10m 分析帧")
+
+    def display_frame(self, timeframe: str) -> KlineFrame | None:
+        """返回指定展示周期的帧；调用者不得自行替换周期。"""
+
+        return next(
+            (
+                item.display
+                for item in self.timeframes
+                if item.timeframe == timeframe
+            ),
+            None,
+        )
+
+    def analysis_frame(self, timeframe: str) -> KlineFrame | None:
+        """返回指定周期、仅含已收盘 K 线的冻结分析帧。"""
+
+        return next(
+            (
+                item.analysis
+                for item in self.timeframes
+                if item.timeframe == timeframe
+            ),
+            None,
+        )
 
 
 def _optional_text(value: object) -> str | None:

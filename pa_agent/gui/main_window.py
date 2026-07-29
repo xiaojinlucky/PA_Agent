@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QCloseEvent, QShowEvent
+from PyQt6.QtGui import QAction, QCloseEvent, QColor, QPalette, QShowEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -441,7 +441,104 @@ class MainWindow(QMainWindow):
         self._analysis_workbench = self._build_workbench()
         self._central = QTabWidget()
         self._central.setObjectName("primaryWorkspaceTabs")
-        self._central.addTab(self._analysis_workbench, "分析工作台")
+        central_palette = self._central.palette()
+        central_palette.setColor(
+            QPalette.ColorRole.Window,
+            QColor("#0D1016"),
+        )
+        self._central.setPalette(central_palette)
+        self._central.setAutoFillBackground(True)
+        self._central.setAttribute(
+            Qt.WidgetAttribute.WA_StyledBackground,
+            True,
+        )
+        self._central.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Ignored,
+        )
+        self._central.tabBar().setFixedHeight(32)
+        self._central.tabBar().setExpanding(False)
+        self._central.setStyleSheet(
+            """
+            QTabWidget#primaryWorkspaceTabs {
+                background: #0D1016;
+            }
+            QTabWidget#primaryWorkspaceTabs::pane {
+                border: none;
+            }
+            QTabWidget#primaryWorkspaceTabs QTabBar::tab {
+                min-height: 30px;
+                padding: 0 16px;
+                color: #9AA3B2;
+                background: #0D1016;
+                border: none;
+                border-bottom: 2px solid transparent;
+                font-size: 14px;
+            }
+            QTabWidget#primaryWorkspaceTabs QTabBar::tab:selected {
+                color: #E7ECF4;
+                border-bottom-color: #2F8DFF;
+            }
+            """
+        )
+        self._market_workspace_bridge = None
+        self._market_workspace_tab_index = None
+        self._analysis_history_tab_index = None
+        market_controller = getattr(
+            self._ctx,
+            "market_workspace_controller",
+            None,
+        )
+        market_runtime = getattr(
+            self._ctx,
+            "market_workspace_runtime",
+            None,
+        )
+        if market_controller is not None and market_runtime is not None:
+            from pa_agent.build_info import runtime_sha
+            from pa_agent.gui.market_workspace_bridge import (
+                MarketWorkspaceQtBridge,
+            )
+            from pa_agent.gui.multi_market_workbench import (
+                AnalysisHistoryWorkbench,
+                MultiMarketWorkbench,
+            )
+
+            self._market_workspace_bridge = MarketWorkspaceQtBridge(
+                controller=market_controller,
+                runtime=market_runtime,
+                settings_path=getattr(
+                    self._ctx,
+                    "settings_path",
+                    None,
+                ),
+                orchestrator_factory=self._build_orchestrator,
+                parent=self,
+            )
+            self._market_workspace = MultiMarketWorkbench(
+                controller=market_controller,
+                bridge=self._market_workspace_bridge,
+                runtime_sha=runtime_sha(),
+                parent=self,
+            )
+            self._analysis_history_workspace = (
+                AnalysisHistoryWorkbench(
+                    bridge=self._market_workspace_bridge,
+                    parent=self,
+                )
+            )
+            self._market_workspace_tab_index = self._central.addTab(
+                self._market_workspace,
+                "多市场看盘",
+            )
+            self._analysis_history_tab_index = self._central.addTab(
+                self._analysis_history_workspace,
+                "分析记录",
+            )
+        self._analysis_tab_index = self._central.addTab(
+            self._analysis_workbench,
+            "分析工作台",
+        )
         service = getattr(self._ctx, "execution_service", None)
         settings = getattr(self._ctx, "settings", None)
         if service is not None and settings is not None:
@@ -489,37 +586,69 @@ class MainWindow(QMainWindow):
             self._sync_workspace_status_bar
         )
         self._sync_workspace_status_bar(self._central.currentIndex())
+        if self._market_workspace_bridge is not None:
+            QTimer.singleShot(
+                0,
+                self._market_workspace_bridge.start_initial_load,
+            )
 
-        # ── Menu bar ─── 顶层直接触发按钮 + 演示模式下拉 ────────────────────
+        # ── Menu bar ─────────────────────────────────────────────────────────
         menu_bar: QMenuBar = self.menuBar()  # type: ignore[assignment]
+        menu_bar.setNativeMenuBar(False)
+        menu_bar.setFixedHeight(28)
+        menu_bar.setStyleSheet(
+            """
+            QMenuBar {
+                color: #E7ECF4;
+                background: #0D1016;
+                border-bottom: 1px solid #252B36;
+                font-size: 14px;
+            }
+            QMenuBar::item {
+                min-height: 28px;
+                padding: 0 10px;
+                background: transparent;
+            }
+            QMenuBar::item:selected {
+                background: #18283D;
+            }
+            """
+        )
 
-        # 1. AI 模型设置 — 点击直接弹对话框（无下拉）
-        _ai_model_action = QAction("AI 模型设置", self)
-        _ai_model_action.triggered.connect(self._open_ai_model_settings_dialog)
-        menu_bar.addAction(_ai_model_action)
+        file_menu = menu_bar.addMenu("文件")
+        exit_action = QAction("退出", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
 
-        # 2. 飞书发送通知设置 — 点击直接弹对话框（无下拉）
-        _feishu_action = QAction("飞书发送通知设置", self)
-        _feishu_action.triggered.connect(self._open_feishu_settings_dialog)
-        menu_bar.addAction(_feishu_action)
+        view_menu = menu_bar.addMenu("视图")
+        for label, index in (
+            ("多市场看盘", self._market_workspace_tab_index),
+            ("分析记录", self._analysis_history_tab_index),
+            ("分析工作台", self._analysis_tab_index),
+        ):
+            if index is None:
+                continue
+            action = QAction(label, self)
+            action.triggered.connect(
+                lambda _checked=False, target=index: (
+                    self._central.setCurrentIndex(target)
+                )
+            )
+            view_menu.addAction(action)
+        trading_action = QAction("实盘交易", self)
+        trading_action.triggered.connect(self._open_trading_dialog)
+        view_menu.addAction(trading_action)
 
-        # 3. 其他通用设置 — 点击直接弹对话框（无下拉）
-        _general_action = QAction("其他通用设置", self)
-        _general_action.triggered.connect(self._open_general_settings_dialog)
-        menu_bar.addAction(_general_action)
-
-        # 4. 实盘交易 — 功能配置、账户/盈亏和生命周期操作
-        _trading_action = QAction("实盘交易", self)
-        _trading_action.triggered.connect(self._open_trading_dialog)
-        menu_bar.addAction(_trading_action)
-
-        # 5. 演示模式 — 保留下拉菜单
-        demo_menu = menu_bar.addMenu("演示模式")
+        demo_menu = view_menu.addMenu("演示模式")
         self._demo_manual_action = QAction("手动选择记录…", self)
-        self._demo_manual_action.triggered.connect(lambda: self._on_demo_menu_action("manual"))
+        self._demo_manual_action.triggered.connect(
+            lambda: self._on_demo_menu_action("manual")
+        )
         demo_menu.addAction(self._demo_manual_action)
         self._demo_auto_action = QAction("自动随机记录", self)
-        self._demo_auto_action.triggered.connect(lambda: self._on_demo_menu_action("auto"))
+        self._demo_auto_action.triggered.connect(
+            lambda: self._on_demo_menu_action("auto")
+        )
         demo_menu.addAction(self._demo_auto_action)
         demo_menu.addSeparator()
         self._demo_exit_action = QAction("退出演示模式", self)
@@ -527,9 +656,50 @@ class MainWindow(QMainWindow):
         self._demo_exit_action.setEnabled(False)
         demo_menu.addAction(self._demo_exit_action)
 
+        settings_menu = menu_bar.addMenu("设置")
+        _ai_model_action = QAction("AI 模型设置", self)
+        _ai_model_action.triggered.connect(self._open_ai_model_settings_dialog)
+        settings_menu.addAction(_ai_model_action)
+
+        _feishu_action = QAction("飞书发送通知设置", self)
+        _feishu_action.triggered.connect(self._open_feishu_settings_dialog)
+        settings_menu.addAction(_feishu_action)
+
+        _general_action = QAction("其他通用设置", self)
+        _general_action.triggered.connect(self._open_general_settings_dialog)
+        settings_menu.addAction(_general_action)
+
+        help_menu = menu_bar.addMenu("帮助")
+        about_action = QAction("关于 PA_Agent", self)
+        about_action.triggered.connect(
+            lambda: QMessageBox.information(
+                self,
+                "关于 PA_Agent",
+                f"PA_Agent {__version__}\n只读分析与安全交易工作台",
+            )
+        )
+        help_menu.addAction(about_action)
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        central = getattr(self, "_central", None)
+        if central is not None:
+            # QTabWidget 默认只给 QTabBar 分配标签本身的宽度，剩余区域
+            # 会露出平台底色。标签不拉伸，但标签栏背景必须覆盖整个窗口。
+            central.tabBar().setFixedWidth(central.width())
+
     def _sync_workspace_status_bar(self, index: int) -> None:
-        """交易工作台已有完整状态区，不再重复显示底部微小状态栏。"""
-        self._status_bar.setVisible(index != self._trading_tab_index)
+        """带独立 24px 状态区的工作台不显示旧交易状态栏。"""
+        hidden_indices = {
+            value
+            for value in (
+                self._trading_tab_index,
+                self._market_workspace_tab_index,
+                self._analysis_history_tab_index,
+            )
+            if value is not None
+        }
+        self._status_bar.setVisible(index not in hidden_indices)
 
     def _build_workbench(self) -> QWidget:
         """Build chart + AI sidebar workbench."""
@@ -4715,6 +4885,13 @@ class MainWindow(QMainWindow):
             execution_service = getattr(self._ctx, "execution_service", None)
             if execution_service is not None:
                 execution_service.stop_monitoring()
+            market_bridge = getattr(
+                self,
+                "_market_workspace_bridge",
+                None,
+            )
+            if market_bridge is not None:
+                market_bridge.close()
         except RuntimeError as exc:
             logger.debug("Shutdown cleanup skipped: %s", exc)
         super().closeEvent(event)

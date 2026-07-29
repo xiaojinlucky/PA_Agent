@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 
 from pa_agent.app_context import AppContext
 from pa_agent.config.settings import Settings
+from pa_agent.data.market_workspace_controller import MarketWorkspaceController
 from pa_agent.gui.main_window import MainWindow
 
 
@@ -123,11 +124,73 @@ def test_live_trading_is_built_as_a_top_level_workspace() -> None:
     source = inspect.getsource(MainWindow._setup_ui)
 
     assert 'self._central = QTabWidget()' in source
-    assert 'self._central.addTab(self._analysis_workbench, "分析工作台")' in source
+    assert 'self._analysis_tab_index = self._central.addTab(' in source
+    assert '"分析工作台",' in source
     assert '"实盘交易",' in source
     assert "TradingDialog" not in inspect.getsource(
         MainWindow._open_trading_dialog
     )
+
+
+def test_multi_market_workspaces_are_added_without_replacing_legacy_tabs(
+    qtbot,
+) -> None:
+    settings = Settings()
+    source = MagicMock()
+    source._connected = False
+    source.list_symbols.return_value = []
+    source.supported_timeframes.return_value = ["15m"]
+    controller = MarketWorkspaceController(settings)
+    runtime = MagicMock()
+    window = MainWindow(
+        AppContext(
+            settings=settings,
+            data_source=source,
+            market_workspace_controller=controller,
+            market_workspace_runtime=runtime,
+        )
+    )
+    qtbot.addWidget(window)
+
+    labels = [
+        window._central.tabText(index)
+        for index in range(window._central.count())
+    ]
+    assert labels == [
+        "多市场看盘",
+        "分析记录",
+        "分析工作台",
+        "实盘交易",
+    ]
+    assert window._central.currentIndex() == window._market_workspace_tab_index
+    assert window._status_bar.isHidden() is True
+    assert window.menuBar().height() == 28
+    assert window._central.tabBar().height() == 32
+    assert [
+        action.text()
+        for action in window.menuBar().actions()
+    ] == ["文件", "视图", "设置", "帮助"]
+
+    # 延迟首读在本测试中不应触发任何行情调用；这里只验证真实主窗口几何。
+    window._market_workspace_bridge.close()
+    window._startup_ai_auth_check_done = True
+    window._startup_tv_connectivity_check_done = True
+    for width, height, center, right, chart, analysis, body in (
+        (1440, 900, 860, 340, 432, 264, 768),
+        (1920, 1080, 1320, 360, 560, 316, 948),
+    ):
+        window.resize(width, height)
+        window.show()
+        qtbot.wait(1)
+        assert window.size().width() == width
+        assert window.size().height() == height
+        assert window._market_workspace.height() == height - 28 - 32
+        assert window._market_workspace._body.height() == body
+        assert window._market_workspace._left_panel.width() == 240
+        assert window._market_workspace._center_panel.width() == center
+        assert window._market_workspace._right_panel.width() == right
+        assert window._market_workspace._chart_panel.height() == chart
+        assert window._market_workspace._analysis_panel.height() == analysis
 
 
 def test_trading_workspace_hides_redundant_status_bar(qtbot) -> None:

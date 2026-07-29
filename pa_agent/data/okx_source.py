@@ -2,13 +2,17 @@
 from __future__ import annotations
 
 import re
+import time
 from decimal import Decimal, InvalidOperation
+from typing import Any
 
 from pa_agent.data.base import DataSource, DataSourceTransientError, KlineBar
+from pa_agent.data.bar_close_wait import timeframe_to_seconds
 from pa_agent.data.market_workspace import QuoteSnapshot, WatchlistRequestToken
-from pa_agent.execution.credentials import OkxCredentials
-from pa_agent.execution.errors import BrokerApiError, BrokerTransportError
-from pa_agent.execution.okx_client import OkxRestClient
+from pa_agent.data.okx_public_client import (
+    OkxPublicClient,
+    OkxPublicError,
+)
 
 _TIMEFRAME_TO_OKX_BAR: dict[str, str] = {
     "1m": "1m",
@@ -145,12 +149,8 @@ def okx_instrument_type(symbol: str) -> str:
 class OkxSource(DataSource):
     """从 OKX 公共接口读取任意可交易现货或永续合约的 K 线。"""
 
-    def __init__(self, client: OkxRestClient | None = None) -> None:
-        self._client = client or OkxRestClient(
-            OkxCredentials(api_key="", secret_key="", passphrase=""),
-            base_url="https://www.okx.com",
-            simulated=False,
-        )
+    def __init__(self, client: Any | None = None) -> None:
+        self._client = client or OkxPublicClient()
         self._connected = False
         self._symbol = ""
         self._timeframe = ""
@@ -172,6 +172,20 @@ class OkxSource(DataSource):
     def supported_timeframes(self) -> list[str]:
         return list(_TIMEFRAME_TO_OKX_BAR)
 
+    @staticmethod
+    def closed_bar_end_utc_ms(
+        bar: KlineBar,
+        timeframe: str,
+    ) -> int:
+        """OKX UTC 固定周期 K 线的真实结束时刻。"""
+
+        if not bar.closed:
+            raise ValueError("只能查询已收盘 K 线的结束时间")
+        duration_s = timeframe_to_seconds(timeframe)
+        if duration_s is None:
+            raise ValueError(f"OKX 无法确定 {timeframe} 的 K 线结束时间")
+        return int(bar.ts_open) + duration_s * 1_000
+
     def subscribe(self, symbol: str, timeframe: str) -> None:
         if not self._connected:
             raise DataSourceTransientError("OKX 公共行情源尚未连接")
@@ -186,7 +200,7 @@ class OkxSource(DataSource):
                 instrument_type,
                 instrument=normalized,
             )
-        except (BrokerApiError, BrokerTransportError) as exc:
+        except OkxPublicError as exc:
             raise DataSourceTransientError(f"OKX 无法验证品种：{exc}") from exc
         instrument = next(
             (
@@ -233,7 +247,7 @@ class OkxSource(DataSource):
         self,
         token: WatchlistRequestToken,
         *,
-        received_at_utc_ms: int,
+        received_at_utc_ms: int | None = None,
     ) -> tuple[QuoteSnapshot, ...]:
         """按产品类型批量读取报价；不改变当前主图订阅。"""
         if not self._connected:
@@ -254,6 +268,11 @@ class OkxSource(DataSource):
             for instrument_type, requested in requested_by_type.items():
                 ticker_rows = self._client.tickers(instrument_type)
                 instrument_rows = self._client.public_instruments(instrument_type)
+                response_received_at_utc_ms = (
+                    int(received_at_utc_ms)
+                    if received_at_utc_ms is not None
+                    else int(time.time() * 1000)
+                )
                 tick_by_symbol = {
                     str(row.get("instId") or "").strip().upper(): row.get("tickSz")
                     for row in instrument_rows
@@ -273,24 +292,22 @@ class OkxSource(DataSource):
                     parts = symbol.split("-")
                     quote_currency = parts[-2] if parts[-1] == "SWAP" else parts[-1]
                     snapshots_by_symbol[symbol] = QuoteSnapshot.from_prices(
-                            selection_generation=(
-                                token.selection_generation
-                            ),
-                            request_sequence=token.watchlist_refresh_sequence,
-                            symbol=symbol,
-                            market="Crypto",
-                            source="okx",
-                            name=symbol,
-                            currency=quote_currency,
-                            last=row.get("last"),
-                            # OKX tickers 没有“上一交易日收盘价”字段；
-                            # 禁止用 24 小时开盘价伪装。
-                            prev_close=None,
-                            price_tick=price_tick,
-                            quote_ts_utc_ms=int(str(row.get("ts") or "")),
-                            received_at_utc_ms=received_at_utc_ms,
+                        selection_generation=token.selection_generation,
+                        request_sequence=token.watchlist_refresh_sequence,
+                        symbol=symbol,
+                        market="Crypto",
+                        source="okx",
+                        name=symbol,
+                        currency=quote_currency,
+                        last=row.get("last"),
+                        # OKX tickers 没有“上一交易日收盘价”字段；
+                        # 禁止用 24 小时开盘价伪装。
+                        prev_close=None,
+                        price_tick=price_tick,
+                        quote_ts_utc_ms=int(str(row.get("ts") or "")),
+                        received_at_utc_ms=response_received_at_utc_ms,
                     )
-        except (BrokerApiError, BrokerTransportError) as exc:
+        except OkxPublicError as exc:
             raise DataSourceTransientError(f"OKX 批量报价暂时不可用：{exc}") from exc
         except (InvalidOperation, TypeError, ValueError) as exc:
             raise DataSourceTransientError("OKX 批量报价字段无法解析") from exc
@@ -310,6 +327,8 @@ class OkxSource(DataSource):
         self,
         timeframe: str,
         n: int,
+        *,
+        analysis_as_of_utc_ms: int | None = None,
     ) -> list[KlineBar]:
         """读取同一已订阅 OKX 品种的另一个周期，不改变主图订阅。"""
         if not self._connected:
@@ -320,12 +339,18 @@ class OkxSource(DataSource):
             raise ValueError(
                 f"OKX 不支持周期 {timeframe!r}；可用周期：{list(_TIMEFRAME_TO_OKX_BAR)}"
             )
-        return self._latest_snapshot_for_timeframe(timeframe, n)
+        return self._latest_snapshot_for_timeframe(
+            timeframe,
+            n,
+            analysis_as_of_utc_ms=analysis_as_of_utc_ms,
+        )
 
     def _latest_snapshot_for_timeframe(
         self,
         timeframe: str,
         n: int,
+        *,
+        analysis_as_of_utc_ms: int | None = None,
     ) -> list[KlineBar]:
         if n < 1:
             return []
@@ -343,7 +368,7 @@ class OkxSource(DataSource):
                 timeframe=timeframe,
                 required_rows=raw_limit,
             )
-        except (BrokerApiError, BrokerTransportError) as exc:
+        except OkxPublicError as exc:
             raise DataSourceTransientError(f"OKX K 线暂时不可用：{exc}") from exc
         if not rows:
             raise DataSourceTransientError(
@@ -351,6 +376,33 @@ class OkxSource(DataSource):
             )
         if timeframe == "10m":
             rows = aggregate_okx_five_minute_rows(rows, limit=n)
+        if analysis_as_of_utc_ms is not None:
+            if analysis_as_of_utc_ms < 0:
+                raise ValueError("analysis_as_of_utc_ms 不能为负数")
+            interval_ms = timeframe_to_seconds(timeframe) * 1_000
+            frozen_rows: list[list[str]] = []
+            for row in rows:
+                try:
+                    timestamp = int(row[0])
+                except (IndexError, TypeError, ValueError) as exc:
+                    raise DataSourceTransientError(
+                        "OKX K 线统一截止时间字段无法解析"
+                    ) from exc
+                if timestamp > analysis_as_of_utc_ms:
+                    continue
+                frozen = list(row)
+                frozen[8] = (
+                    "1"
+                    if timestamp + interval_ms
+                    <= analysis_as_of_utc_ms
+                    else "0"
+                )
+                frozen_rows.append(frozen)
+            rows = frozen_rows
+            if not rows:
+                raise DataSourceTransientError(
+                    f"OKX {self._symbol} {timeframe} 在统一分析截止时间前没有 K 线"
+                )
 
         bars: list[KlineBar] = []
         previous_ts: int | None = None

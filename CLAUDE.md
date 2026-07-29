@@ -21,7 +21,7 @@
 
 1. 任何新页面、重大改版、布局变化、组件层级变化、交互变化或新增用户配置，必须先调用项目级 `$frontend-design` Skill，并以 `D:\Desktop\Quant\前端设计\DESIGN.md`、当前代码、真实接口、`CONTEXT.md`、`lessons.md` 和最新 PRD 为真值；旧截图和旧 PRD 只能作为历史输入。
 2. 禁止任何副标题和注释性小字：不得出现 eyebrow、tagline、标题下解释、灰色辅助小字、括号注释、营销口号、重复说明或小号页脚。字段标签、单位、时间、状态、错误和风险阻断原因可以保留，但必须用正常可读字号与清晰对比度呈现。
-3. 写生产代码前必须完成：页面功能/字段/状态/交互合同、Product Design 三种高保真方向、用户审美确认、网页版 ChatGPT 的完整 PRD、脱敏材料与 PRD 的 Stitch 设计、GPT-Image-2 或可用 ImageGen 界面的至少三轮精修，以及项目级 `$design-taste-frontend` 的真实视觉审计。工具未实际调用时不得声称已经完成对应阶段。
+3. 默认在写生产代码前完成页面合同、三种高保真方向、用户审美确认、网页版 ChatGPT PRD、Stitch、至少三轮图像精修和项目级 `$design-taste-frontend` 视觉审计。**WO-E 新多市场页例外**：用户已在 v0.1.0 工单中明确以 PRD11 取代旧 Stitch、ImageGen 和外部样稿硬门；该页在 B2 Controller 的提交级 CI 通过后直接实现原生 PyQt6，并执行 Taste 审计、离屏尺寸/缩放矩阵与最终真实桌面验收。历史工具结果不得冒充本轮使用记录。
 4. PA_Agent 是 `PyQt6 + QWidget + QSS + pyqtgraph` 原生桌面程序。Stitch 和图片生成稿只提供视觉、布局与状态参考；必须人工转换为 Qt 原生实现。禁止为使用 GSAP 引入 WebView、JavaScript 运行时或第二套前端；必要动效只用 Qt 原生动画，并在风险阻断、陈旧数据、错误和执行复核状态停止装饰性动效。
 5. 视觉实现必须接通真实 `WorkbenchReadModel`、`ExecutionController`、设置持久化与状态响应；只改静态外观、使用假按钮、写死数值或让 GUI 与后端实际语义不同均不算完成。
 6. 视觉截图夹具只允许 Fake Service、Fake ReadModel、内存或临时 SQLite。禁止调用 `AppContext.bootstrap()`、默认生产路径的 `ExecutionController`、Worker、Campaign、真实行情或券商网络；最终桌面可见验收仍由用户从 `D:\Desktop\PA_Agent.lnk` 启动并提供截图。

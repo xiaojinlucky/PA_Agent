@@ -1015,8 +1015,8 @@ class PromptAssembler:
         tz_name = timezone_name_for_symbol(frame.symbol)
         tz_label = timezone_label_for_symbol(frame.symbol)
         lines = [
-            f"序号 | 时间（{tz_label}）      | 开盘价    | 最高价    | 最低价    | 收盘价    | 阳阴 | 成交量    | EMA20     | ATR14",
-            "-----+--------------------+----------+----------+----------+----------+------+----------+-----------+----------",
+            f"序号 | 时间（{tz_label}）      | 开盘价    | 最高价    | 最低价    | 收盘价    | 阳阴 | EMA20     | ATR14",
+            "-----+--------------------+----------+----------+----------+----------+------+-----------+----------",
         ]
         bars = frame.bars[:limit] if limit is not None else frame.bars
         for i, bar in enumerate(bars):
@@ -1028,7 +1028,7 @@ class PromptAssembler:
             dt = format_epoch_for_display(bar.ts_open, short=True, tz_name=tz_name)
             lines.append(
                 f"{bar.seq:<4} | {dt:<19} | {bar.open:<9.4f} | {bar.high:<9.4f} | "
-                f"{bar.low:<9.4f} | {bar.close:<9.4f} | {yang_yin:<4} | {bar.volume:<9.0f} | "
+                f"{bar.low:<9.4f} | {bar.close:<9.4f} | {yang_yin:<4} | "
                 f"{ema_str:<10} | {atr_str}"
             )
         lines.append(_KLINE_INDICATOR_NOTE)

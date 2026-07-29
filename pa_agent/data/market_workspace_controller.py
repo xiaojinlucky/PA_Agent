@@ -22,6 +22,7 @@ from pa_agent.data.market_workspace import (
     EvidenceState,
     MarketCode,
     MarketDataBundle,
+    MarketWorkspaceRenderPayload,
     QuoteFailureKind,
     QuoteFreshness,
     RequestFamily,
@@ -67,6 +68,14 @@ class AnalysisState(StrEnum):
 class AnalysisFailureKind(StrEnum):
     INVALID_RESULT = "invalid_result"
     WORKER_FAILED = "worker_failed"
+
+
+class AnalysisFailureStage(StrEnum):
+    SERVICE_INITIALIZATION = "service_initialization"
+    INPUT_FREEZE = "input_freeze"
+    MARKET_DIAGNOSIS = "market_diagnosis"
+    DECISION_GENERATION = "decision_generation"
+    RESULT_VALIDATION = "result_validation"
 
 
 class SourceAuthState(StrEnum):
@@ -153,12 +162,20 @@ class WorkspaceSaveRequest:
 class AnalysisRequest:
     token: RequestToken
     bundle: MarketDataBundle
+    render_payload: MarketWorkspaceRenderPayload
 
     def __post_init__(self) -> None:
         if self.token.family is not RequestFamily.ANALYSIS:
             raise ValueError("分析 token 必须属于 ANALYSIS 请求")
         if self.bundle.token.identity != self.token.identity:
             raise ValueError("分析请求与冻结数据包 identity 不一致")
+        if self.render_payload.token.identity != self.token.identity:
+            raise ValueError("分析请求与冻结图表载荷 identity 不一致")
+        if (
+            self.render_payload.analysis_as_of_utc_ms
+            != self.bundle.analysis_as_of_utc_ms
+        ):
+            raise ValueError("分析请求的数据包与图表载荷 as_of 不一致")
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +191,7 @@ class WorkspaceViewState:
     staged_identity: SelectionIdentity | None
     failed_identity: SelectionIdentity | None
     bundle: MarketDataBundle | None
+    render_payload: MarketWorkspaceRenderPayload | None
     bundle_current: bool
     watchlist: WatchlistQuoteSet | None
     last_market_failure: QuoteFailureKind | None
@@ -182,7 +200,9 @@ class WorkspaceViewState:
     settings_save_state: SettingsSaveState
     settings_save_failure: SettingsSaveFailureKind | None
     analysis_state: AnalysisState
+    active_analysis_token: RequestToken | None
     analysis_failure: AnalysisFailureKind | None
+    analysis_failure_stage: AnalysisFailureStage | None
     analysis_result: AnalysisResultView | None
     analysis_history: tuple[AnalysisResultView, ...]
 
@@ -232,6 +252,7 @@ class MarketWorkspaceController:
         self._selection_state = SelectionState.UNINITIALIZED
         self._failed_identity: SelectionIdentity | None = None
         self._bundle: MarketDataBundle | None = None
+        self._render_payload: MarketWorkspaceRenderPayload | None = None
         self._bundle_contract: MarketDataRequest | None = None
         self._bundle_current = False
         self._watchlist: WatchlistQuoteSet | None = None
@@ -257,6 +278,7 @@ class MarketWorkspaceController:
 
         self._analysis_state = AnalysisState.IDLE
         self._analysis_failure: AnalysisFailureKind | None = None
+        self._analysis_failure_stage: AnalysisFailureStage | None = None
         self._analysis_result: AnalysisResultView | None = None
         self._analysis_history: list[AnalysisResultView] = []
         self._active_analysis: AnalysisRequest | None = None
@@ -270,6 +292,7 @@ class MarketWorkspaceController:
             staged_identity=self._gate.staged,
             failed_identity=self._failed_identity,
             bundle=self._bundle,
+            render_payload=self._render_payload,
             bundle_current=self._bundle_current,
             watchlist=self._watchlist,
             last_market_failure=self._last_market_failure,
@@ -278,7 +301,13 @@ class MarketWorkspaceController:
             settings_save_state=self._settings_save_state,
             settings_save_failure=self._settings_save_failure,
             analysis_state=self._analysis_state,
+            active_analysis_token=(
+                self._active_analysis.token
+                if self._active_analysis is not None
+                else None
+            ),
             analysis_failure=self._analysis_failure,
+            analysis_failure_stage=self._analysis_failure_stage,
             analysis_result=self._analysis_result,
             analysis_history=tuple(self._analysis_history),
         )
@@ -404,6 +433,7 @@ class MarketWorkspaceController:
         self,
         request: MarketDataRequest,
         bundle: MarketDataBundle,
+        render_payload: MarketWorkspaceRenderPayload | None = None,
     ) -> MarketDataApplyResult:
         issued = self._issued_market.get(request.kline_token)
         if issued is None:
@@ -418,6 +448,12 @@ class MarketWorkspaceController:
 
         try:
             self._validate_bundle_for_request(request, bundle)
+            if render_payload is not None:
+                self._validate_render_payload_for_request(
+                    request,
+                    bundle,
+                    render_payload,
+                )
             self._assert_bundle_fresh(request, bundle)
         except ValueError:
             self._issued_market.pop(request.kline_token, None)
@@ -439,6 +475,7 @@ class MarketWorkspaceController:
             return MarketDataApplyResult(False)
 
         self._bundle = bundle
+        self._render_payload = render_payload
         self._bundle_contract = request
         self._bundle_current = True
         self._watchlist = None if was_staged else self._watchlist
@@ -447,6 +484,7 @@ class MarketWorkspaceController:
         self._last_market_failure = None
         self._analysis_state = AnalysisState.IDLE
         self._analysis_failure = None
+        self._analysis_failure_stage = None
         self._analysis_result = None
 
         save_request = (
@@ -455,6 +493,40 @@ class MarketWorkspaceController:
             else None
         )
         return MarketDataApplyResult(True, save_request)
+
+    @staticmethod
+    def _validate_render_payload_for_request(
+        request: MarketDataRequest,
+        bundle: MarketDataBundle,
+        render_payload: MarketWorkspaceRenderPayload,
+    ) -> None:
+        if render_payload.token != request.kline_token:
+            raise ValueError("图表载荷请求 token 与控制器请求不一致")
+        if (
+            render_payload.analysis_as_of_utc_ms
+            != request.analysis_as_of_utc_ms
+            or render_payload.analysis_as_of_utc_ms
+            != bundle.analysis_as_of_utc_ms
+        ):
+            raise ValueError("图表载荷 analysis_as_of 与控制器请求不一致")
+        analysis_frame = render_payload.analysis_frame("10m")
+        if analysis_frame is None:
+            raise ValueError("图表载荷缺少冻结的 10m 分析帧")
+        if len(analysis_frame.bars) < request.required_closed_bars:
+            raise ValueError("冻结的 10m 分析帧根数不足")
+        if any(not bar.closed for bar in analysis_frame.bars):
+            raise ValueError("冻结的 10m 分析帧包含未收盘 K 线")
+        if bundle.analysis_allowed:
+            ticks = {
+                value
+                for value in (
+                    bundle.ten_minute.price_tick,
+                    analysis_frame.price_tick,
+                )
+                if value is not None
+            }
+            if len(ticks) != 1:
+                raise ValueError("冻结分析帧与分析能力门的 price_tick 不一致")
 
     def _validate_bundle_for_request(
         self,
@@ -612,6 +684,7 @@ class MarketWorkspaceController:
             QuoteFailureKind.INVALID_RESPONSE,
         }:
             self._bundle = None
+            self._render_payload = None
             self._bundle_contract = None
             self._watchlist = None
             self._watchlist_gate.invalidate()
@@ -695,6 +768,7 @@ class MarketWorkspaceController:
             self._last_market_failure = QuoteFailureKind.AUTH_FAILED
         if committed_affected:
             self._bundle = None
+            self._render_payload = None
             self._bundle_contract = None
             self._bundle_current = False
             self._watchlist = None
@@ -925,10 +999,12 @@ class MarketWorkspaceController:
             raise ValueError("切换尚未完成，当前页面不可分析")
         identity = self._gate.committed
         bundle = self._bundle
+        render_payload = self._render_payload
         market_request = self._bundle_contract
         if (
             identity is None
             or bundle is None
+            or render_payload is None
             or market_request is None
             or not self._bundle_current
             or not bundle.analysis_allowed
@@ -941,11 +1017,16 @@ class MarketWorkspaceController:
             raise ValueError("当前行情或 10m K 线已经过期，不可分析") from exc
 
         token = self._gate.issue(identity, RequestFamily.ANALYSIS)
-        request = AnalysisRequest(token=token, bundle=bundle)
+        request = AnalysisRequest(
+            token=token,
+            bundle=bundle,
+            render_payload=render_payload,
+        )
         self._issued_analysis[token] = request
         self._active_analysis = request
         self._analysis_state = AnalysisState.RUNNING
         self._analysis_failure = None
+        self._analysis_failure_stage = None
         self._analysis_result = None
         return request
 
@@ -970,6 +1051,9 @@ class MarketWorkspaceController:
                 self._active_analysis = None
                 self._analysis_state = AnalysisState.FAILED
                 self._analysis_failure = AnalysisFailureKind.INVALID_RESULT
+                self._analysis_failure_stage = (
+                    AnalysisFailureStage.RESULT_VALIDATION
+                )
                 self._analysis_result = None
             raise
 
@@ -987,6 +1071,7 @@ class MarketWorkspaceController:
             self._active_analysis = None
             self._analysis_result = result
             self._analysis_failure = None
+            self._analysis_failure_stage = None
             self._analysis_state = (
                 AnalysisState.SUCCEEDED
                 if result.state is AnalysisResultState.SUCCEEDED
@@ -1000,6 +1085,8 @@ class MarketWorkspaceController:
         self,
         request: AnalysisRequest,
         failure: AnalysisFailureKind | str,
+        *,
+        stage: AnalysisFailureStage | str | None = None,
     ) -> bool:
         issued = self._issued_analysis.get(request.token)
         if issued is None:
@@ -1014,14 +1101,38 @@ class MarketWorkspaceController:
                 self._active_analysis = None
                 self._analysis_state = AnalysisState.FAILED
                 self._analysis_failure = AnalysisFailureKind.INVALID_RESULT
+                self._analysis_failure_stage = (
+                    AnalysisFailureStage.RESULT_VALIDATION
+                )
                 self._analysis_result = None
             raise ValueError("不支持的分析失败类别") from exc
+        if stage is None:
+            failure_stage = (
+                AnalysisFailureStage.RESULT_VALIDATION
+                if failure_kind is AnalysisFailureKind.INVALID_RESULT
+                else AnalysisFailureStage.MARKET_DIAGNOSIS
+            )
+        else:
+            try:
+                failure_stage = AnalysisFailureStage(str(stage))
+            except ValueError as exc:
+                self._issued_analysis.pop(request.token, None)
+                if self._active_analysis == request:
+                    self._active_analysis = None
+                    self._analysis_state = AnalysisState.FAILED
+                    self._analysis_failure = AnalysisFailureKind.INVALID_RESULT
+                    self._analysis_failure_stage = (
+                        AnalysisFailureStage.RESULT_VALIDATION
+                    )
+                    self._analysis_result = None
+                raise ValueError("不支持的分析失败阶段") from exc
         self._issued_analysis.pop(request.token, None)
         if self._active_analysis != request:
             return False
         self._active_analysis = None
         self._analysis_state = AnalysisState.FAILED
         self._analysis_failure = failure_kind
+        self._analysis_failure_stage = failure_stage
         self._analysis_result = None
         return True
 
@@ -1030,6 +1141,7 @@ class MarketWorkspaceController:
             self._active_analysis = None
             self._analysis_state = AnalysisState.CANCELED
             self._analysis_failure = None
+            self._analysis_failure_stage = None
 
     def _invalidate_analysis_for_data_change(self) -> None:
         had_active_request = self._active_analysis is not None
@@ -1037,4 +1149,5 @@ class MarketWorkspaceController:
         if not had_active_request:
             self._analysis_state = AnalysisState.IDLE
             self._analysis_failure = None
+            self._analysis_failure_stage = None
         self._analysis_result = None
