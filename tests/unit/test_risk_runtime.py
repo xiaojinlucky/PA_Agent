@@ -351,6 +351,7 @@ def test_clear_rejects_non_drawdown_kill_reason(tmp_path):
         "risk_runtime_BrokerApiError",
         "risk_runtime_BrokerTransportError",
         "risk_runtime_IncompleteRead",
+        "risk_runtime_50001",
         "risk_runtime_50004",
     ],
 )
@@ -379,8 +380,16 @@ def test_manual_clear_rejects_transient_broker_read_failure(
     assert persisted.adjusted_high_water_usd == Decimal("1000")
 
 
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "risk_runtime_BrokerTransportError",
+        "risk_runtime_50001",
+    ],
+)
 def test_transient_read_failure_recovery_requires_fresh_read_and_preserves_high_water(
     tmp_path,
+    reason,
 ):
     store, runtime, clock = _runtime(tmp_path)
     trusted = _refresh(runtime, equity="1000")
@@ -389,7 +398,7 @@ def test_transient_read_failure_recovery_requires_fresh_read_and_preserves_high_
         environment="demo",
         account="okx",
         account_identity=trusted.account_identity,
-        reason="risk_runtime_BrokerTransportError",
+        reason=reason,
     )
 
     with pytest.raises(RiskRuntimeBlocked) as exc_info:
@@ -399,7 +408,7 @@ def test_transient_read_failure_recovery_requires_fresh_read_and_preserves_high_
     clock.advance(minutes=1)
     refreshed = _refresh(runtime, equity="900")
     assert refreshed.kill_active is True
-    assert refreshed.kill_reason == "risk_runtime_BrokerTransportError"
+    assert refreshed.kill_reason == reason
     assert refreshed.adjusted_high_water_usd == Decimal("1000")
     assert refreshed.last_total_equity_usd == Decimal("900")
     assert refreshed.drawdown_fraction == Decimal("0.1")
@@ -593,6 +602,7 @@ def test_transient_failure_cannot_downgrade_existing_integrity_stop(tmp_path):
     [
         "risk_runtime_BrokerApiError",
         "risk_runtime_BrokerTransportError",
+        "risk_runtime_50001",
         "risk_runtime_50004",
     ],
 )
