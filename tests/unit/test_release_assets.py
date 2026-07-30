@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -59,8 +61,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2229' in ci_workflow_text
-    assert '$tests -lt 2229' in release_workflow_text
+    assert '$tests -lt 2230' in ci_workflow_text
+    assert '$tests -lt 2230' in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'
@@ -240,6 +242,90 @@ def test_install_refuses_machine_without_git(tmp_path: Path) -> None:
 
     assert result.returncode != 0
     assert "Git for Windows" in (result.stdout + result.stderr)
+    assert not (source / ".venv").exists()
+
+
+def test_install_selects_one_git_executable_when_path_has_duplicates(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "PA_Agent-v0.1.0"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "pa-agent"\n',
+        encoding="utf-8",
+    )
+    first_bin = tmp_path / "first-bin"
+    second_bin = tmp_path / "second-bin"
+    first_bin.mkdir()
+    second_bin.mkdir()
+    (first_bin / "git.cmd").write_text(
+        "@echo off\r\necho git version 2.99.1\r\n",
+        encoding="ascii",
+    )
+    (second_bin / "git.cmd").write_text(
+        "@echo off\r\nexit /b 9\r\n",
+        encoding="ascii",
+    )
+    powershell = shutil.which("powershell")
+    assert powershell is not None
+    env = os.environ.copy()
+    env["PATH"] = os.pathsep.join((str(first_bin), str(second_bin)))
+    discovered = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-Command",
+            (
+                "$commands = @(Get-Command git -CommandType Application); "
+                "Write-Output $commands.Count; "
+                "Write-Output $commands[0].Source"
+            ),
+        ],
+        cwd=_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    discovered_lines = discovered.stdout.splitlines()
+    assert discovered.returncode == 0, discovered.stdout + discovered.stderr
+    assert discovered_lines[0] == "2"
+    assert discovered_lines[1].casefold() == str(
+        first_bin / "git.cmd"
+    ).casefold()
+
+    result = subprocess.run(
+        [
+            powershell,
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_ROOT / "scripts" / "install_windows.ps1"),
+            "-SourcePath",
+            str(source),
+            "-PythonCommand",
+            sys.executable,
+            "-GitCommand",
+            "git",
+            "-ShortcutPath",
+            str(tmp_path / "PA_Agent.lnk"),
+            "-WhatIf",
+        ],
+        cwd=_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
     assert not (source / ".venv").exists()
 
 

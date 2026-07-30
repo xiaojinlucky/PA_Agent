@@ -22,7 +22,10 @@ $pythonVersion = (& $PythonCommand -c "import sys; print(f'{sys.version_info.maj
 if ($LASTEXITCODE -ne 0 -or $pythonVersion -ne "3.12") {
     throw "PA_Agent v0.1.0 只接受 Python 3.12；当前为 $pythonVersion"
 }
-$gitExecutable = Get-Command $GitCommand -CommandType Application -ErrorAction SilentlyContinue
+$gitExecutable = Get-Command $GitCommand `
+    -CommandType Application `
+    -ErrorAction SilentlyContinue |
+    Select-Object -First 1
 if ($null -eq $gitExecutable) {
     throw "Git for Windows is required because a dependency is pinned to a Git commit"
 }
