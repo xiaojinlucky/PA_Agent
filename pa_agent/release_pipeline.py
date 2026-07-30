@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import subprocess
+import tempfile
 import tomllib
+import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterable
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -156,6 +160,7 @@ _PRIVATE_PATH_RE = re.compile(
     r"|(?i:/(?:home|users)/[^/\s]+/)"
     r")"
 )
+_REDACTED_PRIVATE_PATH = "[REDACTED_PRIVATE_PATH]"
 _DESKTOP_SCENARIOS = (
     "normal",
     "loading",
@@ -361,6 +366,77 @@ def scan_release_tree(
         "private_paths_rejected": reject_private_paths,
         "result": "pass",
     }
+
+
+def sanitize_junit_report(
+    report_path: Path | str,
+) -> dict[str, Any]:
+    """只脱敏 JUnit 中的本机绝对路径，并保留测试结果合同。"""
+
+    path = Path(report_path).resolve()
+    if not path.is_file():
+        raise ReleaseValidationError("JUnit 报告不存在")
+    if path.stat().st_size > _MAX_TEXT_SCAN_BYTES:
+        raise ReleaseValidationError("JUnit 报告过大，无法安全脱敏")
+    try:
+        tree = ET.parse(path)
+    except (OSError, ET.ParseError) as exc:
+        raise ReleaseValidationError("JUnit 报告不是有效 XML") from exc
+    root = tree.getroot()
+    root_tag = root.tag.rsplit("}", 1)[-1]
+    if root_tag not in {"testsuite", "testsuites"}:
+        raise ReleaseValidationError("JUnit 报告根节点无效")
+
+    paths_redacted = 0
+    for element in root.iter():
+        for key, value in tuple(element.attrib.items()):
+            redacted, count = _PRIVATE_PATH_RE.subn(
+                _REDACTED_PRIVATE_PATH,
+                value,
+            )
+            element.attrib[key] = redacted
+            paths_redacted += count
+        if element.text is not None:
+            element.text, count = _PRIVATE_PATH_RE.subn(
+                _REDACTED_PRIVATE_PATH,
+                element.text,
+            )
+            paths_redacted += count
+        if element.tail is not None:
+            element.tail, count = _PRIVATE_PATH_RE.subn(
+                _REDACTED_PRIVATE_PATH,
+                element.tail,
+            )
+            paths_redacted += count
+
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as handle:
+            temp_path = Path(handle.name)
+            tree.write(handle, encoding="utf-8", xml_declaration=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        sanitized_text = temp_path.read_text(encoding="utf-8")
+        if _PRIVATE_PATH_RE.search(sanitized_text):
+            raise ReleaseValidationError("JUnit 私有路径脱敏不完整")
+        os.replace(temp_path, path)
+    except ReleaseValidationError:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise ReleaseValidationError("无法安全写回 JUnit 报告") from exc
+    return {"paths_redacted": paths_redacted, "result": "pass"}
 
 
 def validate_source_archive(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import xml.etree.ElementTree as ET
 import zipfile
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -10,6 +11,7 @@ from pathlib import Path, PurePosixPath
 
 import pytest
 
+import pa_agent.release_pipeline as release_pipeline
 from pa_agent.release_contract import (
     EXPECTED_PROMPT_RESOURCE_PATHS,
     EXPECTED_REQUIRED_SOURCE_FILES,
@@ -691,6 +693,58 @@ def test_release_evidence_tree_accepts_pinned_https_vcs_dependency(
 
     assert result["files_scanned"] == 1
     assert result["text_files_scanned"] == 1
+
+
+def test_sanitize_junit_report_redacts_private_skip_path_and_preserves_counts(
+    tmp_path: Path,
+) -> None:
+    report = tmp_path / "report.xml"
+    report.write_text(
+        """<?xml version="1.0" encoding="utf-8"?>
+<testsuites tests="1" failures="0" errors="0" skipped="1">
+  <testsuite name="pytest" tests="1" failures="0" errors="0" skipped="1">
+    <testcase classname="tests.unit.test_datetime_ts"
+              name="test_naive_local_to_utc_uses_host_offset">
+      <skipped message="host is UTC">D:\\a\\PA_Agent\\tests\\unit\\test_datetime_ts.py:23: host is UTC</skipped>
+    </testcase>
+  </testsuite>
+</testsuites>
+""",
+        encoding="utf-8",
+    )
+    with pytest.raises(ReleaseValidationError, match="本机绝对路径"):
+        scan_release_tree(tmp_path, reject_private_paths=True)
+
+    result = release_pipeline.sanitize_junit_report(report)
+
+    root = ET.parse(report).getroot()
+    assert root.attrib == {
+        "tests": "1",
+        "failures": "0",
+        "errors": "0",
+        "skipped": "1",
+    }
+    suite = root.find("testsuite")
+    assert suite is not None
+    assert suite.attrib == {
+        "name": "pytest",
+        "tests": "1",
+        "failures": "0",
+        "errors": "0",
+        "skipped": "1",
+    }
+    case = suite.find("testcase")
+    assert case is not None
+    assert case.attrib == {
+        "classname": "tests.unit.test_datetime_ts",
+        "name": "test_naive_local_to_utc_uses_host_offset",
+    }
+    skipped = case.find("skipped")
+    assert skipped is not None
+    assert skipped.attrib["message"] == "host is UTC"
+    assert skipped.text == "[REDACTED_PRIVATE_PATH]"
+    assert result == {"paths_redacted": 1, "result": "pass"}
+    scan_release_tree(tmp_path, reject_private_paths=True)
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,7 @@ from pa_agent.release_pipeline import (
     ReleaseValidationError,
     archive_source,
     build_release_manifest,
+    sanitize_junit_report,
     scan_release_tree,
     validate_capability_index,
     validate_desktop_evidence,
@@ -78,6 +79,9 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
     )
 
+    sanitize = subparsers.add_parser("sanitize-junit")
+    sanitize.add_argument("report", type=Path)
+
     manifest = subparsers.add_parser("manifest")
     manifest.add_argument("--source", type=Path, required=True)
     manifest.add_argument("--evidence", type=Path, required=True)
@@ -134,6 +138,8 @@ def main(argv: list[str] | None = None) -> int:
                 args.directory,
                 reject_private_paths=args.reject_private_paths,
             )
+        elif args.command == "sanitize-junit":
+            result = sanitize_junit_report(args.report)
         else:
             output_dir = args.output_dir.resolve()
             output_dir.mkdir(parents=True, exist_ok=True)
