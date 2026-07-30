@@ -5,9 +5,12 @@ import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from threading import Event, Thread, current_thread
 
 import pytest
+from filelock import FileLock
 
+import pa_agent.execution.database_fence as database_fence_module
 from pa_agent.execution.database_fence import (
     DatabaseFenceError,
     DatabaseWriteFence,
@@ -330,6 +333,256 @@ def test_wal_only_v5_receipt_blocks_fence_generation_downgrade(tmp_path):
     finally:
         maintenance.release()
         writer.close()
+
+
+@pytest.mark.parametrize("downgrade_state", (False, True))
+def test_completed_v5_fails_closed_when_cutover_receipt_is_deleted(
+    tmp_path,
+    downgrade_state,
+):
+    control_path, worker_store, _execution_store = _stores(tmp_path)
+    fence = DatabaseWriteFence(control_path)
+    fence.install_protocol(deployed_sha=_DEPLOYED_SHA)
+    maintenance = fence.begin_maintenance(
+        operation_id="deleted-cutover-receipt",
+        deployed_sha=_DEPLOYED_SHA,
+    )
+    try:
+        with sqlite3.connect(control_path) as connection:
+            connection.execute(
+                "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+                (
+                    "worker_safe_cutover:deleted-cutover-receipt",
+                    json.dumps({"fence_generation": maintenance.state.generation}),
+                ),
+            )
+            connection.commit()
+        maintenance.finish()
+    finally:
+        maintenance.release()
+
+    with sqlite3.connect(control_path) as connection:
+        connection.execute("DELETE FROM worker_meta WHERE key LIKE 'worker_safe_cutover:%'")
+        connection.commit()
+    if downgrade_state:
+        state_payload = json.loads(fence.state_path.read_text(encoding="utf-8"))
+        state_payload["generation"] = 0
+        fence.state_path.write_text(
+            json.dumps(state_payload) + "\n",
+            encoding="utf-8",
+        )
+
+    with pytest.raises(DatabaseFenceError, match="安全切换回执"):
+        worker_store.record_heartbeat(
+            worker_id="missing-cutover-receipt-worker",
+            pid=1,
+            state=WorkerState.STARTING,
+        )
+
+
+@pytest.mark.parametrize(
+    "receipt_key",
+    (
+        "Worker_safe_cutover:case-variant-cutover",
+        "workerXsafeYcutover:wildcard-variant-cutover",
+    ),
+)
+def test_cutover_finish_rejects_noncanonical_receipt_key(
+    tmp_path,
+    receipt_key,
+):
+    control_path, _worker_store, _execution_store = _stores(tmp_path)
+    fence = DatabaseWriteFence(control_path)
+    fence.install_protocol(deployed_sha=_DEPLOYED_SHA)
+    maintenance = fence.begin_maintenance(
+        operation_id="noncanonical-cutover",
+        deployed_sha=_DEPLOYED_SHA,
+    )
+    try:
+        with sqlite3.connect(control_path) as connection:
+            connection.execute(
+                "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+                (
+                    receipt_key,
+                    json.dumps({"fence_generation": maintenance.state.generation}),
+                ),
+            )
+            connection.commit()
+
+        with pytest.raises(DatabaseFenceError, match="安全切换回执"):
+            maintenance.finish()
+        assert fence.state().active is True
+    finally:
+        maintenance.release()
+
+
+def test_resume_after_protocol_floor_committed_before_state_completion(tmp_path):
+    control_path, worker_store, _execution_store = _stores(tmp_path)
+    fence = DatabaseWriteFence(control_path)
+    fence.install_protocol(deployed_sha=_DEPLOYED_SHA)
+    operation_id = "protocol-floor-crash"
+    maintenance = fence.begin_maintenance(
+        operation_id=operation_id,
+        deployed_sha=_DEPLOYED_SHA,
+    )
+    generation = maintenance.state.generation
+    with sqlite3.connect(control_path) as connection:
+        connection.execute(
+            "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+            (
+                f"worker_safe_cutover:{operation_id}",
+                json.dumps({"fence_generation": generation}),
+            ),
+        )
+        protocol_payload = json.loads(
+            connection.execute(
+                "SELECT value FROM worker_meta " "WHERE key='worker_database_fence_protocol'"
+            ).fetchone()[0]
+        )
+        protocol_payload["minimum_generation"] = generation
+        connection.execute(
+            "UPDATE worker_meta SET value=? " "WHERE key='worker_database_fence_protocol'",
+            (json.dumps(protocol_payload),),
+        )
+        connection.commit()
+    maintenance.release()
+
+    assert fence.state().active is True
+    with pytest.raises(DatabaseFenceError, match="正在维护"):
+        worker_store.record_heartbeat(
+            worker_id="blocked-during-resume",
+            pid=1,
+            state=WorkerState.STARTING,
+        )
+
+    resumed = fence.resume_maintenance(
+        operation_id=operation_id,
+        deployed_sha=_DEPLOYED_SHA,
+    )
+    try:
+        resumed.finish()
+    finally:
+        resumed.release()
+
+    assert fence.state().active is False
+    heartbeat = worker_store.record_heartbeat(
+        worker_id="after-safe-resume",
+        pid=2,
+        state=WorkerState.STARTING,
+    )
+    assert heartbeat.worker_id == "after-safe-resume"
+
+
+def test_writer_started_before_completed_maintenance_is_rejected(
+    tmp_path,
+    monkeypatch,
+):
+    control_path, worker_store, _execution_store = _stores(tmp_path)
+    fence = DatabaseWriteFence(control_path)
+    fence.install_protocol(deployed_sha=_DEPLOYED_SHA)
+    original_read_state = database_fence_module._read_state
+    stale_state_read = Event()
+    maintenance_finished = Event()
+    writer_name = "stale-fence-writer"
+
+    def pause_after_real_state_read(path):
+        state = original_read_state(path)
+        if current_thread().name == writer_name and not stale_state_read.is_set():
+            stale_state_read.set()
+            if not maintenance_finished.wait(timeout=10):
+                raise AssertionError("维护完成前等待超时")
+        return state
+
+    monkeypatch.setattr(
+        database_fence_module,
+        "_read_state",
+        pause_after_real_state_read,
+    )
+    errors: list[Exception] = []
+
+    def write_heartbeat() -> None:
+        try:
+            worker_store.record_heartbeat(
+                worker_id="stale-writer",
+                pid=1,
+                state=WorkerState.STARTING,
+            )
+        except Exception as exc:
+            errors.append(exc)
+
+    writer = Thread(target=write_heartbeat, name=writer_name, daemon=True)
+    writer.start()
+    try:
+        assert stale_state_read.wait(timeout=5)
+        maintenance = fence.begin_maintenance(
+            operation_id="complete-before-stale-writer",
+            deployed_sha=_DEPLOYED_SHA,
+        )
+        try:
+            with sqlite3.connect(control_path) as connection:
+                connection.execute(
+                    "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+                    (
+                        "worker_safe_cutover:complete-before-stale-writer",
+                        json.dumps({"fence_generation": maintenance.state.generation}),
+                    ),
+                )
+                connection.commit()
+            maintenance.finish()
+        finally:
+            maintenance.release()
+    finally:
+        maintenance_finished.set()
+        writer.join(timeout=10)
+
+    assert writer.is_alive() is False
+    assert len(errors) == 1
+    assert isinstance(errors[0], DatabaseFenceError)
+    assert "维护代际已变化" in str(errors[0])
+    assert worker_store.get_heartbeat("stale-writer") is None
+
+
+def test_lock_timeout_revalidates_downgraded_completed_state(tmp_path):
+    control_path, worker_store, _execution_store = _stores(tmp_path)
+    fence = DatabaseWriteFence(control_path)
+    fence.install_protocol(deployed_sha=_DEPLOYED_SHA)
+    maintenance = fence.begin_maintenance(
+        operation_id="timeout-downgrade",
+        deployed_sha=_DEPLOYED_SHA,
+    )
+    try:
+        with sqlite3.connect(control_path) as connection:
+            connection.execute(
+                "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
+                (
+                    "worker_safe_cutover:timeout-downgrade",
+                    json.dumps({"fence_generation": maintenance.state.generation}),
+                ),
+            )
+            connection.commit()
+        maintenance.finish()
+    finally:
+        maintenance.release()
+
+    state_payload = json.loads(fence.state_path.read_text(encoding="utf-8"))
+    state_payload["generation"] = 0
+    fence.state_path.write_text(
+        json.dumps(state_payload) + "\n",
+        encoding="utf-8",
+    )
+    lock = FileLock(str(fence.lock_path))
+    lock.acquire(timeout=0)
+    try:
+        with pytest.raises(DatabaseFenceError, match="代际低于"):
+            worker_store.record_heartbeat(
+                worker_id="timeout-downgrade-writer",
+                pid=1,
+                state=WorkerState.STARTING,
+            )
+    finally:
+        lock.release()
+
+    assert worker_store.get_heartbeat("timeout-downgrade-writer") is None
 
 
 def test_v5_receipt_prevents_missing_or_downgraded_fence_state(tmp_path):

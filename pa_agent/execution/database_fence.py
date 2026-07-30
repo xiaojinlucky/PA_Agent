@@ -66,6 +66,7 @@ class DatabaseFenceProtocolReceipt:
     protocol_sha: str
     protocol_installed_at: str
     protocol_instance_id: str
+    minimum_generation: int
 
 
 def _now_iso() -> str:
@@ -258,17 +259,22 @@ def _parse_protocol_receipt(value: object) -> DatabaseFenceProtocolReceipt:
         "protocol_sha",
         "protocol_installed_at",
         "protocol_instance_id",
+        "minimum_generation",
     }:
         raise DatabaseFenceError("控制库中的正式栅栏协议回执合同无效")
     protocol_sha = payload.get("protocol_sha")
     protocol_instance_id = payload.get("protocol_instance_id")
+    minimum_generation = payload.get("minimum_generation")
     if (
-        payload.get("version") != 1
+        payload.get("version") != 2
         or not isinstance(protocol_sha, str)
         or not _is_full_git_sha(protocol_sha)
         or not isinstance(protocol_instance_id, str)
         or len(protocol_instance_id) != 32
         or any(character not in "0123456789abcdef" for character in protocol_instance_id)
+        or isinstance(minimum_generation, bool)
+        or not isinstance(minimum_generation, int)
+        or minimum_generation < 0
     ):
         raise DatabaseFenceError("控制库中的正式栅栏协议回执字段无效")
     return DatabaseFenceProtocolReceipt(
@@ -278,15 +284,16 @@ def _parse_protocol_receipt(value: object) -> DatabaseFenceProtocolReceipt:
             field_name="协议回执安装时间",
         ),
         protocol_instance_id=protocol_instance_id,
+        minimum_generation=minimum_generation,
     )
 
 
-def _read_database_protocol_receipt(
+def _read_database_fence_metadata(
     database_path: Path,
-) -> DatabaseFenceProtocolReceipt | None:
+) -> tuple[DatabaseFenceProtocolReceipt | None, int | None]:
     candidate = _protocol_database_path(database_path)
     if not candidate.is_file() or candidate.stat().st_size == 0:
-        return None
+        return None, None
     uri = f"{candidate.resolve().as_uri()}?mode=ro"
     try:
         connection = sqlite3.connect(uri, uri=True, timeout=5.0)
@@ -295,16 +302,36 @@ def _read_database_protocol_receipt(
                 "SELECT 1 FROM sqlite_master " "WHERE type='table' AND name='worker_meta'"
             ).fetchone()
             if meta_exists is None:
-                return None
-            row = connection.execute(
-                "SELECT value FROM worker_meta WHERE key=?",
+                return None, None
+            rows = connection.execute(
+                "SELECT key, value FROM worker_meta "
+                "WHERE key=? OR key GLOB 'worker_safe_cutover:*'",
                 (_PROTOCOL_META_KEY,),
-            ).fetchone()
+            ).fetchall()
         finally:
             connection.close()
     except sqlite3.Error as exc:
-        raise DatabaseFenceError("无法核对控制库中的正式栅栏协议回执") from exc
-    return None if row is None else _parse_protocol_receipt(row[0])
+        raise DatabaseFenceError("无法核对控制库中的执行数据库栅栏元数据") from exc
+
+    protocol_rows = [row for row in rows if str(row[0]) == _PROTOCOL_META_KEY]
+    cutover_rows = [row for row in rows if str(row[0]).startswith("worker_safe_cutover:")]
+    if len(protocol_rows) > 1:
+        raise DatabaseFenceError("控制库中的正式栅栏协议回执数量不正确")
+    protocol_receipt = None if not protocol_rows else _parse_protocol_receipt(protocol_rows[0][1])
+    if not cutover_rows:
+        return protocol_receipt, None
+    if len(cutover_rows) != 1:
+        raise DatabaseFenceError("活动控制库的安全切换回执数量不正确")
+    try:
+        cutover_receipt = json.loads(str(cutover_rows[0][1]))
+    except (TypeError, ValueError) as exc:
+        raise DatabaseFenceError("活动控制库的安全切换回执无效") from exc
+    generation = (
+        cutover_receipt.get("fence_generation") if isinstance(cutover_receipt, dict) else None
+    )
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise DatabaseFenceError("活动控制库没有绑定有效栅栏代际")
+    return protocol_receipt, generation
 
 
 def _write_database_protocol_receipt(
@@ -316,10 +343,11 @@ def _write_database_protocol_receipt(
         raise DatabaseFenceError("正式控制数据库不存在，无法安装栅栏协议回执")
     payload = json.dumps(
         {
-            "version": 1,
+            "version": 2,
             "protocol_sha": receipt.protocol_sha,
             "protocol_installed_at": receipt.protocol_installed_at,
             "protocol_instance_id": receipt.protocol_instance_id,
+            "minimum_generation": receipt.minimum_generation,
         },
         ensure_ascii=False,
         sort_keys=True,
@@ -345,8 +373,21 @@ def _write_database_protocol_receipt(
                     "INSERT INTO worker_meta(key, value) VALUES (?, ?)",
                     (_PROTOCOL_META_KEY, payload),
                 )
-            elif _parse_protocol_receipt(existing[0]) != receipt:
-                raise DatabaseFenceError("控制库已经绑定另一个正式栅栏协议")
+            else:
+                existing_receipt = _parse_protocol_receipt(existing[0])
+                if (
+                    existing_receipt.protocol_sha != receipt.protocol_sha
+                    or existing_receipt.protocol_installed_at != receipt.protocol_installed_at
+                    or existing_receipt.protocol_instance_id != receipt.protocol_instance_id
+                ):
+                    raise DatabaseFenceError("控制库已经绑定另一个正式栅栏协议")
+                if receipt.minimum_generation < existing_receipt.minimum_generation:
+                    raise DatabaseFenceError("禁止降低正式栅栏协议的最低代际")
+                if receipt.minimum_generation > existing_receipt.minimum_generation:
+                    connection.execute(
+                        "UPDATE worker_meta SET value=? WHERE key=?",
+                        (payload, _PROTOCOL_META_KEY),
+                    )
             connection.execute("COMMIT")
         except Exception:
             connection.execute("ROLLBACK")
@@ -355,46 +396,6 @@ def _write_database_protocol_receipt(
         raise DatabaseFenceError("正式栅栏协议回执写入控制数据库失败") from exc
     finally:
         connection.close()
-
-
-def _safe_cutover_generation(database_path: Path) -> int | None:
-    """读取活动控制库回执绑定的最低栅栏代际。"""
-
-    directory = Path(database_path).resolve(strict=False).parent
-    official_control = directory / "execution_control.sqlite3"
-    candidate = (
-        official_control if official_control.exists() else Path(database_path).resolve(strict=False)
-    )
-    if not candidate.is_file() or candidate.stat().st_size == 0:
-        return None
-    uri = f"{candidate.resolve().as_uri()}?mode=ro"
-    try:
-        connection = sqlite3.connect(uri, uri=True, timeout=5.0)
-        try:
-            meta_exists = connection.execute(
-                "SELECT 1 FROM sqlite_master " "WHERE type='table' AND name='worker_meta'"
-            ).fetchone()
-            if meta_exists is None:
-                return None
-            rows = connection.execute(
-                "SELECT key, value FROM worker_meta " "WHERE key LIKE 'worker_safe_cutover:%'"
-            ).fetchall()
-        finally:
-            connection.close()
-    except sqlite3.Error as exc:
-        raise DatabaseFenceError("无法核对执行数据库与维护栅栏的代际绑定") from exc
-    if not rows:
-        return None
-    if len(rows) != 1:
-        raise DatabaseFenceError("活动控制库的安全切换回执数量不正确")
-    try:
-        receipt = json.loads(str(rows[0][1]))
-    except (TypeError, ValueError) as exc:
-        raise DatabaseFenceError("活动控制库的安全切换回执无效") from exc
-    generation = receipt.get("fence_generation") if isinstance(receipt, dict) else None
-    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
-        raise DatabaseFenceError("活动控制库没有绑定有效栅栏代际")
-    return generation
 
 
 def _run_git(
@@ -596,9 +597,27 @@ class DatabaseMaintenanceLease:
         current = _read_state(self._state_path)
         if current != self.state:
             raise DatabaseFenceError("执行数据库维护栅栏在切换期间被改写")
-        required_generation = _safe_cutover_generation(self._database_path)
-        if required_generation is not None and self.state.generation < required_generation:
-            raise DatabaseFenceError("执行数据库维护栅栏代际低于活动 v5 回执")
+        protocol_receipt, required_generation = _read_database_fence_metadata(self._database_path)
+        if required_generation is None:
+            raise DatabaseFenceError("完成数据库维护缺少精确的安全切换回执")
+        if required_generation != self.state.generation:
+            raise DatabaseFenceError("安全切换回执代际与当前维护代际不一致")
+        if (
+            protocol_receipt is None
+            or protocol_receipt.protocol_sha != self.state.protocol_sha
+            or protocol_receipt.protocol_installed_at != self.state.protocol_installed_at
+            or protocol_receipt.protocol_instance_id != self.state.protocol_instance_id
+        ):
+            raise DatabaseFenceError("正式栅栏状态与控制库协议回执不一致")
+        _write_database_protocol_receipt(
+            self._database_path,
+            DatabaseFenceProtocolReceipt(
+                protocol_sha=protocol_receipt.protocol_sha,
+                protocol_installed_at=protocol_receipt.protocol_installed_at,
+                protocol_instance_id=protocol_receipt.protocol_instance_id,
+                minimum_generation=self.state.generation,
+            ),
+        )
         _write_state(
             self._state_path,
             DatabaseFenceState(
@@ -637,8 +656,7 @@ class DatabaseWriteFence:
     def _validated_state(self) -> DatabaseFenceState:
         state = _read_state(self.state_path)
         marker_instance_id = _read_marker(self.marker_path)
-        protocol_receipt = _read_database_protocol_receipt(self.database_path)
-        required_generation = _safe_cutover_generation(self.database_path)
+        protocol_receipt, required_generation = _read_database_fence_metadata(self.database_path)
         if state is None:
             if required_generation is not None:
                 raise DatabaseFenceError("活动 v5 的维护栅栏文件缺失，禁止重新初始化")
@@ -654,16 +672,31 @@ class DatabaseWriteFence:
         if state.protocol_sha == _AUTO_PROTOCOL:
             if protocol_receipt is not None:
                 raise DatabaseFenceError("自动栅栏状态与正式协议回执冲突")
-        elif protocol_receipt != DatabaseFenceProtocolReceipt(
-            protocol_sha=state.protocol_sha,
-            protocol_installed_at=state.protocol_installed_at,
-            protocol_instance_id=state.protocol_instance_id,
-        ):
-            raise DatabaseFenceError("正式栅栏状态与控制库协议回执不一致")
+        else:
+            if (
+                protocol_receipt is None
+                or protocol_receipt.protocol_sha != state.protocol_sha
+                or protocol_receipt.protocol_installed_at != state.protocol_installed_at
+                or protocol_receipt.protocol_instance_id != state.protocol_instance_id
+            ):
+                raise DatabaseFenceError("正式栅栏状态与控制库协议回执不一致")
+            if state.generation < protocol_receipt.minimum_generation:
+                raise DatabaseFenceError("执行数据库维护栅栏代际低于正式协议与安全切换回执")
         if required_generation is not None and (
             state.generation < required_generation or not _is_full_git_sha(state.protocol_sha)
         ):
             raise DatabaseFenceError("执行数据库维护栅栏代际低于活动 v5 回执")
+        if (
+            not state.active
+            and state.generation >= 1
+            and (
+                protocol_receipt is None
+                or protocol_receipt.minimum_generation != state.generation
+                or required_generation is None
+                or required_generation != state.generation
+            )
+        ):
+            raise DatabaseFenceError("已完成 v5 的安全切换回执缺失或代际不一致")
         return state
 
     def _bootstrap_automatic_protocol(self) -> DatabaseFenceState:
@@ -671,8 +704,7 @@ class DatabaseWriteFence:
         if existing is not None:
             return self._validated_state()
         marker_instance_id = _read_marker(self.marker_path)
-        protocol_receipt = _read_database_protocol_receipt(self.database_path)
-        required_generation = _safe_cutover_generation(self.database_path)
+        protocol_receipt, required_generation = _read_database_fence_metadata(self.database_path)
         if required_generation is not None:
             raise DatabaseFenceError("活动 v5 的维护栅栏文件缺失，禁止重新初始化")
         if protocol_receipt is not None:
@@ -689,7 +721,11 @@ class DatabaseWriteFence:
             if existing is not None:
                 return self._validated_state()
             marker_instance_id = _read_marker(self.marker_path)
-            protocol_receipt = _read_database_protocol_receipt(self.database_path)
+            protocol_receipt, required_generation = _read_database_fence_metadata(
+                self.database_path
+            )
+            if required_generation is not None:
+                raise DatabaseFenceError("活动 v5 的维护栅栏文件缺失，禁止重新初始化")
             if protocol_receipt is not None:
                 raise DatabaseFenceError("正式协议仍在控制库中，禁止自动重建栅栏")
             if marker_instance_id is not None:
@@ -732,8 +768,9 @@ class DatabaseWriteFence:
         try:
             state = _read_state(self.state_path)
             marker_instance_id = _read_marker(self.marker_path)
-            protocol_receipt = _read_database_protocol_receipt(self.database_path)
-            required_generation = _safe_cutover_generation(self.database_path)
+            protocol_receipt, required_generation = _read_database_fence_metadata(
+                self.database_path
+            )
             if state is None:
                 if required_generation is not None or protocol_receipt is not None:
                     raise DatabaseFenceError("执行数据库维护栅栏状态异常缺失，禁止安装协议")
@@ -761,6 +798,7 @@ class DatabaseWriteFence:
                         protocol_sha=state.protocol_sha,
                         protocol_installed_at=state.protocol_installed_at,
                         protocol_instance_id=state.protocol_instance_id,
+                        minimum_generation=state.generation,
                     ),
                 )
                 return self._validated_state()
@@ -777,6 +815,7 @@ class DatabaseWriteFence:
                     protocol_sha=state.protocol_sha,
                     protocol_installed_at=state.protocol_installed_at,
                     protocol_instance_id=state.protocol_instance_id,
+                    minimum_generation=state.generation,
                 )
                 if protocol_receipt is None:
                     _write_database_protocol_receipt(
@@ -807,6 +846,7 @@ class DatabaseWriteFence:
                     protocol_sha=upgraded.protocol_sha,
                     protocol_installed_at=upgraded.protocol_installed_at,
                     protocol_instance_id=upgraded.protocol_instance_id,
+                    minimum_generation=upgraded.generation,
                 ),
             )
             return self._validated_state()
@@ -824,11 +864,8 @@ class DatabaseWriteFence:
 
     @contextmanager
     def write(self) -> Iterator[None]:
-        try:
-            before = self._validated_state()
-        except DatabaseFenceError as exc:
-            if "协议尚未安装" not in str(exc):
-                raise
+        before = _read_state(self.state_path)
+        if before is None:
             before = self._bootstrap_automatic_protocol()
         if before.active:
             raise DatabaseFenceError("执行数据库正在维护，禁止写入")
@@ -836,10 +873,11 @@ class DatabaseWriteFence:
         try:
             lock.acquire(timeout=_WRITE_TIMEOUT_SECONDS)
         except Timeout as exc:
+            self._validated_state()
             raise DatabaseFenceError("执行数据库写入栅栏获取超时") from exc
         try:
             after = self._validated_state()
-            if after.active or after.generation != before.generation:
+            if after.active or after != before:
                 raise DatabaseFenceError("执行数据库维护代际已变化，拒绝维护前开始的写入")
             yield
         finally:
