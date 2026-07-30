@@ -74,7 +74,7 @@ _CANDIDATE_RELEASE_EVIDENCE = (
     ("fresh-install/pa-agent-self-check.json", "fresh-install"),
     ("fresh-install/worker-self-check.json", "fresh-install"),
 )
-_CANDIDATE_MINIMUM_TESTS = 2343
+_CANDIDATE_MINIMUM_TESTS = 2363
 _CANDIDATE_MAXIMUM_SKIPS = 3
 _CANDIDATE_SELF_CHECKS = frozenset(
     {

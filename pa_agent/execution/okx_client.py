@@ -42,6 +42,36 @@ OKX_FIXED_PROXY_METADATA_PATH = (
 )
 _OKX_PROXY_URL_ENV = "PA_AGENT_OKX_PROXY_URL"
 _OKX_PROXY_LABEL_ENV = "PA_AGENT_OKX_PROXY_LABEL"
+_OKX_ORDER_IDENTIFIER_FIELDS = (
+    "ordId",
+    "clOrdId",
+    "algoId",
+    "algoClOrdId",
+)
+
+
+def _okx_item_code(item: object) -> str:
+    if not isinstance(item, dict):
+        return ""
+    raw_code = item.get("sCode")
+    return "" if raw_code is None else str(raw_code).strip()
+
+
+def _redact_order_identifiers(message: object, *sources: object) -> str:
+    text = str(message)
+    identifiers: set[str] = set()
+    for source in sources:
+        items = source if isinstance(source, list) else [source]
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            for field in _OKX_ORDER_IDENTIFIER_FIELDS:
+                identifier = str(item.get(field) or "").strip()
+                if identifier:
+                    identifiers.add(identifier)
+    for identifier in sorted(identifiers, key=len, reverse=True):
+        text = text.replace(identifier, "[订单标识已脱敏]")
+    return text
 
 
 @dataclass(frozen=True)
@@ -355,7 +385,64 @@ class OkxRestClient:
                 write_may_have_reached=True,
             )
         if response.status < 200 or response.status >= 300 or code != "0":
-            raise BrokerApiError(code or str(response.status), str(payload.get("msg") or "请求失败"))
+            if (
+                method != "GET"
+                and 200 <= response.status < 300
+                and code == "2"
+            ):
+                raise BrokerTransportError(
+                    "OKX 写响应报告部分成功，必须逐项对账",
+                    write_may_have_reached=True,
+                )
+            data = payload.get("data")
+            if (
+                method != "GET"
+                and 200 <= response.status < 300
+                and isinstance(data, list)
+                and data
+            ):
+                if any(_okx_item_code(item) == "0" for item in data):
+                    raise BrokerTransportError(
+                        "OKX 写响应包含部分成功项，必须逐项对账",
+                        write_may_have_reached=True,
+                    )
+                item_results: list[tuple[str, str]] = []
+                for item in data:
+                    if not isinstance(item, dict):
+                        item_results = []
+                        break
+                    item_code = _okx_item_code(item)
+                    if not item_code:
+                        item_results = []
+                        break
+                    item_results.append(
+                        (
+                            item_code,
+                            _redact_order_identifiers(
+                                item.get("sMsg") or "订单请求失败",
+                                data,
+                                body,
+                                params,
+                            ),
+                        )
+                    )
+                failed_items = {
+                    (item_code, item_message)
+                    for item_code, item_message in item_results
+                    if item_code and item_code != "0"
+                }
+                if code == "1" and len(failed_items) == 1:
+                    item_code, item_message = next(iter(failed_items))
+                    raise BrokerApiError(item_code, item_message)
+            raise BrokerApiError(
+                code or str(response.status),
+                _redact_order_identifiers(
+                    payload.get("msg") or "请求失败",
+                    data if isinstance(data, list) else [],
+                    body,
+                    params,
+                ),
+            )
         data = payload.get("data")
         if data is not None and not isinstance(data, list):
             raise BrokerTransportError(
@@ -365,7 +452,11 @@ class OkxRestClient:
         return payload
 
     @staticmethod
-    def require_item_success(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    def require_item_success(
+        payload: dict[str, Any],
+        *,
+        request_context: object = None,
+    ) -> list[dict[str, Any]]:
         data = payload.get("data") or []
         for item in data:
             if not isinstance(item, dict):
@@ -373,9 +464,24 @@ class OkxRestClient:
                     "OKX data 项不是对象",
                     write_may_have_reached=True,
                 )
-            code = str(item.get("sCode", "0"))
+            if "sCode" not in item:
+                code = "0"
+            else:
+                code = _okx_item_code(item)
+                if not code:
+                    raise BrokerTransportError(
+                        "OKX data 项缺少有效 sCode",
+                        write_may_have_reached=True,
+                    )
             if code != "0":
-                raise BrokerApiError(code, str(item.get("sMsg") or "订单请求失败"))
+                raise BrokerApiError(
+                    code,
+                    _redact_order_identifiers(
+                        item.get("sMsg") or "订单请求失败",
+                        data,
+                        request_context,
+                    ),
+                )
         return data
 
     def sync_server_time(self) -> int:
@@ -528,17 +634,21 @@ class OkxRestClient:
         margin_mode: str,
         leverage: str,
     ) -> dict[str, Any]:
+        request_body = {
+            "instId": instrument,
+            "lever": leverage,
+            "mgnMode": margin_mode,
+        }
         payload = self._request(
             "POST",
             "/api/v5/account/set-leverage",
-            body={
-                "instId": instrument,
-                "lever": leverage,
-                "mgnMode": margin_mode,
-            },
+            body=request_body,
             private=True,
         )
-        data = self.require_item_success(payload)
+        data = self.require_item_success(
+            payload,
+            request_context=request_body,
+        )
         return dict(data[0]) if data else {}
 
     def balance(self) -> list[dict[str, Any]]:
@@ -680,7 +790,7 @@ class OkxRestClient:
 
     def place_order(self, body: dict[str, Any]) -> dict[str, Any]:
         payload = self._request("POST", "/api/v5/trade/order", body=body, private=True)
-        data = self.require_item_success(payload)
+        data = self.require_item_success(payload, request_context=body)
         return dict(data[0]) if data else {}
 
     def get_order(
@@ -710,16 +820,20 @@ class OkxRestClient:
         order_id: str = "",
         client_order_id: str = "",
     ) -> dict[str, Any]:
+        request_body = {
+            "instId": instrument,
+            **({"ordId": order_id} if order_id else {"clOrdId": client_order_id}),
+        }
         payload = self._request(
             "POST",
             "/api/v5/trade/cancel-order",
-            body={
-                "instId": instrument,
-                **({"ordId": order_id} if order_id else {"clOrdId": client_order_id}),
-            },
+            body=request_body,
             private=True,
         )
-        data = self.require_item_success(payload)
+        data = self.require_item_success(
+            payload,
+            request_context=request_body,
+        )
         return dict(data[0]) if data else {}
 
     def place_algo_order(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -729,7 +843,7 @@ class OkxRestClient:
             body=body,
             private=True,
         )
-        data = self.require_item_success(payload)
+        data = self.require_item_success(payload, request_context=body)
         return dict(data[0]) if data else {}
 
     def get_algo_order(
@@ -846,7 +960,7 @@ class OkxRestClient:
             body=orders,
             private=True,
         )
-        return self.require_item_success(payload)
+        return self.require_item_success(payload, request_context=orders)
 
     def fills(
         self,

@@ -372,6 +372,383 @@ def test_top_level_and_item_errors_are_both_rejected():
     assert item.value.code == "51000"
 
 
+def test_all_failed_trade_response_preserves_item_rejection_reason():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [
+                        {
+                            "clOrdId": "private-client-order-id",
+                            "ordId": "",
+                            "sCode": "51008",
+                            "sMsg": "insufficient available balance",
+                        }
+                    ],
+                    "msg": "All operations failed",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.code == "51008"
+    assert caught.value.message == "insufficient available balance"
+    assert "private-client-order-id" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "top_code",
+    [
+        pytest.param("0", id="top-level-success"),
+        pytest.param("1", id="top-level-all-failed"),
+    ],
+)
+def test_item_rejection_redacts_order_identifiers_echoed_in_message(top_code):
+    private_ids = (
+        "private-regular-order-id",
+        "private-regular-client-id",
+        "private-algo-order-id",
+        "private-algo-client-id",
+    )
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": top_code,
+                    "data": [
+                        {
+                            "ordId": private_ids[0],
+                            "clOrdId": private_ids[1],
+                            "algoId": private_ids[2],
+                            "algoClOrdId": private_ids[3],
+                            "sCode": "51008",
+                            "sMsg": " ".join(("rejected", *private_ids)),
+                        }
+                    ],
+                    "msg": "All operations failed" if top_code == "1" else "",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.code == "51008"
+    assert "[订单标识已脱敏]" in caught.value.message
+    assert all(private_id not in str(caught.value) for private_id in private_ids)
+
+
+def test_whitespace_padded_success_code_still_requires_reconciliation():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [{"sCode": " 0 ", "sMsg": ""}],
+                    "msg": "All operations failed",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
+
+
+def test_null_item_code_falls_back_to_top_level_rejection():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [{"sCode": None, "sMsg": "unknown item result"}],
+                    "msg": "All operations failed",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.code == "1"
+    assert caught.value.message == "All operations failed"
+
+
+def test_numeric_zero_item_code_still_requires_reconciliation():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [{"sCode": 0, "sMsg": ""}],
+                    "msg": "All operations failed",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
+
+
+def test_top_level_error_redacts_identifier_known_only_from_request_body():
+    private_id = "private-request-client-id"
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [],
+                    "msg": f"Order {private_id} rejected",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).place_order(
+            {"instId": "BTC-USDT", "clOrdId": private_id}
+        )
+
+    assert "[订单标识已脱敏]" in caught.value.message
+    assert private_id not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "top_code",
+    [
+        pytest.param("0", id="top-level-success"),
+        pytest.param("1", id="top-level-all-failed"),
+    ],
+)
+def test_item_error_redacts_identifier_known_only_from_request_body(top_code):
+    private_id = "private-request-client-id"
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": top_code,
+                    "data": [
+                        {
+                            "sCode": "51008",
+                            "sMsg": f"Order {private_id} rejected",
+                        }
+                    ],
+                    "msg": "All operations failed" if top_code == "1" else "",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).place_order(
+            {"instId": "BTC-USDT", "clOrdId": private_id}
+        )
+
+    assert "[订单标识已脱敏]" in caught.value.message
+    assert private_id not in str(caught.value)
+
+
+def test_read_error_redacts_identifier_known_only_from_query_params():
+    private_id = "private-query-order-id"
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": [],
+                    "msg": f"Order {private_id} was not found",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerApiError) as caught:
+        _client(transport).get_order(
+            instrument="BTC-USDT",
+            order_id=private_id,
+        )
+
+    assert "[订单标识已脱敏]" in caught.value.message
+    assert private_id not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("method", "status", "payload", "expected_code"),
+    [
+        pytest.param(
+            "POST",
+            200,
+            {
+                "code": "1",
+                "data": [
+                    {"sCode": "51008", "sMsg": "same reason"},
+                    {"sCode": "51008", "sMsg": "same reason"},
+                ],
+                "msg": "All operations failed",
+            },
+            "51008",
+            id="same-item-reason",
+        ),
+        pytest.param(
+            "POST",
+            200,
+            {
+                "code": "1",
+                "data": [
+                    {"sCode": "51008", "sMsg": "first reason"},
+                    {"sCode": "51009", "sMsg": "second reason"},
+                ],
+                "msg": "All operations failed",
+            },
+            "1",
+            id="different-item-reasons",
+        ),
+        pytest.param(
+            "POST",
+            200,
+            {"code": "1", "data": [], "msg": "All operations failed"},
+            "1",
+            id="empty-items",
+        ),
+        pytest.param(
+            "GET",
+            200,
+            {"code": "2", "data": [], "msg": "read failed"},
+            "2",
+            id="read-code-two",
+        ),
+        pytest.param(
+            "POST",
+            400,
+            {"code": "2", "data": [], "msg": "write rejected"},
+            "2",
+            id="http-four-hundred-write",
+        ),
+    ],
+)
+def test_error_response_scope_matrix(method, status, payload, expected_code):
+    transport = FakeTransport([_response(payload, status=status)])
+
+    with pytest.raises(BrokerApiError) as caught:
+        if method == "GET":
+            _client(transport).balance()
+        else:
+            _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.code == expected_code
+
+
+def test_partially_successful_trade_response_requires_reconciliation():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "2",
+                    "data": [
+                        {
+                            "ordId": "private-broker-order-id",
+                            "sCode": "0",
+                            "sMsg": "",
+                        },
+                        {
+                            "ordId": "",
+                            "sCode": "51008",
+                            "sMsg": "insufficient available balance",
+                        },
+                    ],
+                    "msg": "Partial success",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
+    assert "部分成功" in str(caught.value)
+    assert "private-broker-order-id" not in str(caught.value)
+
+
+def test_partial_success_code_requires_reconciliation_when_items_are_incomplete():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "2",
+                    "data": [],
+                    "msg": "Partial success",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
+    assert "部分成功" in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    "items",
+    [
+        pytest.param(
+            [
+                {
+                    "ordId": "private-broker-order-id",
+                    "sCode": "0",
+                    "sMsg": "",
+                },
+                {"unexpected": "shape"},
+            ],
+            id="success-before-malformed",
+        ),
+        pytest.param(
+            [
+                {"unexpected": "shape"},
+                {
+                    "ordId": "private-broker-order-id",
+                    "sCode": "0",
+                    "sMsg": "",
+                },
+            ],
+            id="success-after-malformed",
+        ),
+    ],
+)
+def test_write_response_never_loses_success_evidence_from_malformed_peer(items):
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "1",
+                    "data": items,
+                    "msg": "All operations failed",
+                }
+            )
+        ]
+    )
+
+    with pytest.raises(BrokerTransportError) as caught:
+        _client(transport).place_order({"instId": "BTC-USDT"})
+
+    assert caught.value.write_may_have_reached is True
+    assert "部分成功" in str(caught.value)
+    assert "private-broker-order-id" not in str(caught.value)
+
+
 @pytest.mark.parametrize("status", [408, 429, 500, 503])
 def test_post_uncertain_http_status_is_never_treated_as_definite_rejection(
     status,
@@ -664,6 +1041,35 @@ def test_set_leverage_uses_private_post_with_exact_cross_net_body():
         "mgnMode": "cross",
     }
     assert call["headers"]["x-simulated-trading"] == "1"
+
+
+def test_set_leverage_accepts_official_success_item_without_scode():
+    transport = FakeTransport(
+        [
+            _response(
+                {
+                    "code": "0",
+                    "data": [
+                        {
+                            "instId": "XAU-USDT-SWAP",
+                            "lever": "25",
+                            "mgnMode": "cross",
+                            "posSide": "",
+                        }
+                    ],
+                    "msg": "",
+                }
+            )
+        ]
+    )
+
+    row = _client(transport, simulated=True).set_leverage(
+        instrument="XAU-USDT-SWAP",
+        margin_mode="cross",
+        leverage="25",
+    )
+
+    assert row["lever"] == "25"
 
 
 def test_pending_orders_use_official_current_orders_endpoint():
