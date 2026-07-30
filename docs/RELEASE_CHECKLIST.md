@@ -31,13 +31,14 @@
 - [ ] 正式快捷方式完成 AAPL.US、700.HK、600519.SH 和 Crypto 桌面矩阵
 - [ ] 100%/125%/150% 缩放与 1440×900/1920×1080 均通过
 - [ ] 离屏证据字体覆盖核心中文与全部界面必需符号，16 张下载图逐张确认无方框、裁切或重叠
+- [ ] 离屏证据使用 `synchronous-widget-render-v1` 同步渲染当前控件树；每张 PNG 的 SHA-256 与同名元数据一致
 - [ ] 股票无权威 tick 时保持“仅展示，价格分析不可用”
 
 ## 发布证据
 
 - [ ] 目标代码 SHA 已先固定并推送；稳定证据随后生成在 `scratch/release/evidence/` 或仓库外，不写回该 Git 提交
 - [ ] 候选 `capability-index.json` 位于证据根部并绑定候选完整 SHA；源码发布 code/tests/runtime 三层只在最终 JUnit 与两个全新安装自检通过后标记为 `verified`
-- [ ] 候选证据 ZIP 压缩后执行 `validate-candidate-archive`，确认 ZIP 文件集合、唯一索引、声明哈希、2245 项测试门和完整安装合同逐字节一致
+- [ ] 候选证据 ZIP 压缩后执行 `validate-candidate-archive`，确认 ZIP 文件集合、唯一索引、声明哈希、完整 16 图合同、2248 项测试门和完整安装合同逐字节一致
 - [ ] 外部 `capability-index.json` 的 `as_of_git_sha` 等于目标代码 SHA，五层状态全部为 `verified` 或 `not_applicable`
 - [ ] 外部证据中的运行态、行情、正式快捷方式和源码部署 JSON 都绑定同一目标代码 SHA，并有真实 SHA-256
 - [ ] 使用目标 SHA 执行下列稳定门，结果通过：

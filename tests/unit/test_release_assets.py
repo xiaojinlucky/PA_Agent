@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2245' in ci_workflow_text
-    assert '$tests -lt 2245' in release_workflow_text
+    assert '$tests -lt 2248' in ci_workflow_text
+    assert '$tests -lt 2248' in release_workflow_text
     assert ci_workflow_text.count("sanitize-junit") == 2
     assert "scan-tree scratch/ci-evidence" in ci_workflow_text
     assert "id: evidence_guard" in ci_workflow_text
@@ -120,6 +120,21 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     ).read_text(encoding="utf-8")
     assert "_CJK_SAMPLE + _REQUIRED_UI_GLYPHS" in visual_script_text
     assert '"required_ui_glyphs_supported": True' in visual_script_text
+    assert "render_widget_synchronously(window)" in visual_script_text
+    assert '"synchronous-widget-render-v1"' in visual_script_text
+    assert "window.grab()" not in visual_script_text
+    focus_order_capture = (
+        "focus_order = _focus_order(window._market_workspace)"
+    )
+    assert focus_order_capture in visual_script_text
+    assert visual_script_text.index(
+        focus_order_capture
+    ) < visual_script_text.index("image = render_widget_synchronously(window)")
+    metadata_body = visual_script_text.split(
+        "def _metadata(",
+        maxsplit=1,
+    )[1].split("def main()", maxsplit=1)[0]
+    assert "_focus_order(" not in metadata_body
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

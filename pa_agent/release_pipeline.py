@@ -74,7 +74,7 @@ _CANDIDATE_RELEASE_EVIDENCE = (
     ("fresh-install/pa-agent-self-check.json", "fresh-install"),
     ("fresh-install/worker-self-check.json", "fresh-install"),
 )
-_CANDIDATE_MINIMUM_TESTS = 2245
+_CANDIDATE_MINIMUM_TESTS = 2248
 _CANDIDATE_MAXIMUM_SKIPS = 3
 _CANDIDATE_SELF_CHECKS = frozenset(
     {
@@ -200,6 +200,7 @@ _DESKTOP_SCENARIOS = (
     "analysis_running",
     "analysis_failed",
 )
+_DESKTOP_CAPTURE_CONTRACT = "synchronous-widget-render-v1"
 _TRADING_BUTTON_WORDS = (
     "买入",
     "卖出",
@@ -1210,6 +1211,10 @@ def validate_candidate_evidence_archive(
         )
 
     scan_release_tree(evidence_base, reject_private_paths=True)
+    desktop_result = validate_desktop_evidence(
+        evidence_base / "desktop",
+        expected_sha=normalized_sha,
+    )
     expected_archive_entries: dict[str, str] = {}
     for path in sorted(evidence_base.rglob("*")):
         if not path.is_file():
@@ -1290,6 +1295,7 @@ def validate_candidate_evidence_archive(
         "files": len(expected_archive_entries),
         "tests": counts["tests"],
         "skipped": counts["skipped"],
+        "desktop_evidence_count": desktop_result["evidence_count"],
         "blocked_layers": index_result["blocked_layers"],
         "result": "pass",
     }
@@ -1973,6 +1979,25 @@ def _desktop_evidence_contract() -> dict[str, tuple[str, int, int, float]]:
     return contract
 
 
+def render_widget_synchronously(widget: Any) -> Any:
+    """直接绘制当前控件状态，不读取可能陈旧的窗口缓存。"""
+
+    try:
+        from PyQt6.QtGui import QColor, QImage
+    except ImportError as exc:
+        raise ReleaseValidationError("无法加载 Qt 同步渲染器") from exc
+    pixel_ratio = float(widget.devicePixelRatioF())
+    image = QImage(
+        round(widget.width() * pixel_ratio),
+        round(widget.height() * pixel_ratio),
+        QImage.Format.Format_ARGB32_Premultiplied,
+    )
+    image.setDevicePixelRatio(pixel_ratio)
+    image.fill(QColor(0, 0, 0, 0))
+    widget.render(image)
+    return image
+
+
 def _decoded_png_size(path: Path) -> tuple[int, int]:
     if path.stat().st_size >= _MAX_ARCHIVE_ENTRY_BYTES:
         raise ReleaseValidationError(f"桌面证据图片过大：{path.name}")
@@ -2022,6 +2047,7 @@ def validate_desktop_evidence(
 
     for stem, (scenario, width, height, scale) in contract.items():
         metadata_path = root / f"{stem}.json"
+        png_path = root / f"{stem}.png"
         try:
             metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
@@ -2041,6 +2067,12 @@ def validate_desktop_evidence(
             == expected_physical,
             "requested_scale": metadata.get("requested_scale") == scale,
             "device_pixel_ratio": metadata.get("device_pixel_ratio") == scale,
+            "capture_contract": metadata.get("capture_contract")
+            == _DESKTOP_CAPTURE_CONTRACT,
+            "image_sha256": str(
+                metadata.get("image_sha256") or ""
+            ).lower()
+            == sha256_file(png_path),
             "runtime_reads": metadata.get("ui_runtime_read_calls") == 0,
             "cjk_font_family": bool(
                 str(metadata.get("font", {}).get("family") or "").strip()
@@ -2067,7 +2099,7 @@ def validate_desktop_evidence(
         checks["no_trading_buttons"] = not any(
             word in button_text for word in _TRADING_BUTTON_WORDS
         )
-        decoded_size = _decoded_png_size(root / f"{stem}.png")
+        decoded_size = _decoded_png_size(png_path)
         checks["decoded_size"] = list(decoded_size) == expected_physical
         failed = sorted(name for name, passed in checks.items() if not passed)
         if failed:

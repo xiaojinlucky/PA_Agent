@@ -140,6 +140,10 @@ def _desktop_evidence(root: Path) -> None:
             "physical_image": physical,
             "device_pixel_ratio": scale,
             "requested_scale": scale,
+            "capture_contract": "synchronous-widget-render-v1",
+            "image_sha256": hashlib.sha256(
+                (root / f"{stem}.png").read_bytes()
+            ).hexdigest(),
             "font": {
                 "family": "Microsoft YaHei UI",
                 "cjk_sample_supported": True,
@@ -954,7 +958,7 @@ def _write_candidate_release_evidence(
     evidence_root: Path,
     *,
     sha: str = _FULL_SHA,
-    tests: int = 2245,
+    tests: int = 2248,
     skipped: int = 1,
 ) -> None:
     fresh_install = evidence_root / "fresh-install"
@@ -1085,7 +1089,7 @@ def test_candidate_index_snapshot_rejects_weak_junit_gate(
 ) -> None:
     for name, tests, skipped in (
         ("too-few", 1, 0),
-        ("too-many-skips", 2245, 4),
+        ("too-many-skips", 2248, 4),
     ):
         evidence_root = tmp_path / name
         _write_candidate_release_evidence(
@@ -1109,14 +1113,14 @@ def test_candidate_index_snapshot_rejects_invalid_junit_structure(
     tmp_path: Path,
 ) -> None:
     invalid_reports = (
-        '<not-junit><testsuite tests="2245" failures="0" '
+        '<not-junit><testsuite tests="2248" failures="0" '
         'errors="0" skipped="0"/></not-junit>\n',
-        '<testsuites><testsuite tests="2245" failures="0" '
+        '<testsuites><testsuite tests="2248" failures="0" '
         'errors="0" skipped="-1"/></testsuites>\n',
     )
     for index, report in enumerate(invalid_reports):
         evidence_root = tmp_path / f"case-{index}"
-        _write_candidate_release_evidence(evidence_root, tests=2245)
+        _write_candidate_release_evidence(evidence_root, tests=2248)
         (
             evidence_root / "pytest-deterministic-junit.xml"
         ).write_text(report, encoding="utf-8")
@@ -1168,6 +1172,7 @@ def test_candidate_archive_rechecks_final_hashed_evidence(
 ) -> None:
     evidence_root = tmp_path / "evidence"
     _write_candidate_release_evidence(evidence_root)
+    _desktop_evidence(evidence_root / "desktop")
     index_path = evidence_root / "capability-index.json"
     release_pipeline.build_candidate_capability_index(
         _ROOT / "docs" / "evidence" / "capability-index.json",
@@ -1200,6 +1205,39 @@ def test_candidate_archive_rechecks_final_hashed_evidence(
         repo_root=_ROOT,
     )
     assert result["result"] == "pass"
+    assert result["desktop_evidence_count"] == 16
+
+    desktop_metadata_path = (
+        evidence_root / "desktop" / "1440x900-calendar_unknown.json"
+    )
+    desktop_metadata = json.loads(
+        desktop_metadata_path.read_text(encoding="utf-8")
+    )
+    invalid_desktop_metadata = dict(desktop_metadata)
+    invalid_desktop_metadata["capture_contract"] = "backing-store-grab-v0"
+    desktop_metadata_path.write_text(
+        json.dumps(invalid_desktop_metadata) + "\n",
+        encoding="utf-8",
+    )
+    invalid_desktop_archive = tmp_path / "invalid-desktop-evidence.zip"
+    write_archive(invalid_desktop_archive)
+    with pytest.raises(
+        ReleaseValidationError,
+        match="capture_contract",
+    ):
+        release_pipeline.validate_candidate_evidence_archive(
+            invalid_desktop_archive,
+            capability_index=index_path,
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+    desktop_metadata_path.write_text(
+        json.dumps(desktop_metadata) + "\n",
+        encoding="utf-8",
+    )
 
     (evidence_root / "pytest-deterministic-junit.xml").write_text(
         '<testsuites><testsuite tests="1" failures="0" '
@@ -1224,7 +1262,7 @@ def test_candidate_archive_requires_one_internal_index(
     tmp_path: Path,
 ) -> None:
     evidence_root = tmp_path / "evidence"
-    _write_candidate_release_evidence(evidence_root, tests=2245)
+    _write_candidate_release_evidence(evidence_root, tests=2248)
     index_path = evidence_root / "capability-index.json"
     release_pipeline.build_candidate_capability_index(
         _ROOT / "docs" / "evidence" / "capability-index.json",
@@ -1635,3 +1673,73 @@ def test_desktop_evidence_rejects_missing_required_ui_glyph_coverage(
             evidence,
             expected_sha=_FULL_SHA,
         )
+
+
+def test_desktop_evidence_rejects_asynchronous_capture_contract(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "desktop"
+    _desktop_evidence(evidence)
+    metadata_path = evidence / "1440x900-calendar_unknown.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["capture_contract"] = "backing-store-grab-v0"
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseValidationError,
+        match=r"capture_contract",
+    ):
+        validate_desktop_evidence(
+            evidence,
+            expected_sha=_FULL_SHA,
+        )
+
+
+def test_desktop_evidence_rejects_unbound_png_hash(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "desktop"
+    _desktop_evidence(evidence)
+    metadata_path = evidence / "1440x900-calendar_unknown.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["image_sha256"] = "0" * 64
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseValidationError,
+        match=r"image_sha256",
+    ):
+        validate_desktop_evidence(
+            evidence,
+            expected_sha=_FULL_SHA,
+        )
+
+
+def test_synchronous_widget_render_uses_current_paint_state() -> None:
+    from PyQt6.QtGui import QColor, QPainter
+    from PyQt6.QtWidgets import QApplication, QWidget
+
+    class StateWidget(QWidget):
+        def __init__(self) -> None:
+            super().__init__()
+            self.colour = QColor("#d7263d")
+
+        def paintEvent(self, _event: object) -> None:
+            painter = QPainter(self)
+            painter.fillRect(self.rect(), self.colour)
+            painter.end()
+
+    app = QApplication.instance() or QApplication([])
+    widget = StateWidget()
+    widget.resize(32, 32)
+    widget.show()
+    app.processEvents()
+    widget.colour = QColor("#1b998b")
+
+    image = release_pipeline.render_widget_synchronously(widget)
+
+    assert image.pixelColor(
+        image.width() // 2,
+        image.height() // 2,
+    ) == QColor("#1b998b")
+    widget.close()

@@ -7,6 +7,7 @@ AppContext.bootstrap，不访问网络、数据库或 execution，也不会写�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -80,6 +81,9 @@ from pa_agent.gui.main_window import MainWindow  # noqa: E402
 from pa_agent.gui.multi_market_workbench import (  # noqa: E402
     _REQUIRED_UI_GLYPHS,
 )
+from pa_agent.release_pipeline import (  # noqa: E402
+    render_widget_synchronously,
+)
 
 _AS_OF = int(
     datetime(2026, 7, 29, 14, 30, tzinfo=UTC).timestamp() * 1_000
@@ -91,6 +95,7 @@ _INTERVALS = {
 }
 _CJK_SAMPLE = "多市场看盘分析工作台美股港股A股加密开始刷新失败加载过期"
 _FONT_COVERAGE_SAMPLE = _CJK_SAMPLE + _REQUIRED_UI_GLYPHS
+_CAPTURE_CONTRACT = "synchronous-widget-render-v1"
 
 
 def _configure_cjk_font(app: QApplication) -> str:
@@ -415,6 +420,7 @@ def _metadata(
     runtime: _NeverRuntime,
     *,
     cjk_font_family: str,
+    focus_order: list[str],
 ) -> dict[str, Any]:
     page = window._market_workspace
     symbol_font = QFontInfo(page._symbol_label.font())
@@ -462,7 +468,7 @@ def _metadata(
             "body_pixel_size": body_font.pixelSize(),
             "body_height": QFontMetrics(page._name_label.font()).height(),
         },
-        "focus_order": _focus_order(page),
+        "focus_order": focus_order,
         "button_texts": button_texts,
         "ui_runtime_read_calls": runtime.calls,
         "selection_state": page._bridge.snapshot().selection_state.value,
@@ -509,7 +515,14 @@ def main() -> int:
     window._market_workspace.render()
     for _ in range(3):
         app.processEvents()
-    image = window.grab()
+    window.ensurePolished()
+    window.update()
+    app.sendPostedEvents()
+    app.processEvents()
+    focus_order = _focus_order(window._market_workspace)
+    app.sendPostedEvents()
+    app.processEvents()
+    image = render_widget_synchronously(window)
 
     ARGS.output.parent.mkdir(parents=True, exist_ok=True)
     if not image.save(str(ARGS.output)):
@@ -519,7 +532,12 @@ def main() -> int:
         image,
         runtime,
         cjk_font_family=cjk_font_family,
+        focus_order=focus_order,
     )
+    metadata["capture_contract"] = _CAPTURE_CONTRACT
+    metadata["image_sha256"] = hashlib.sha256(
+        ARGS.output.read_bytes()
+    ).hexdigest()
     metadata_path = ARGS.output.with_suffix(".json")
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",
