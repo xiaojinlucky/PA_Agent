@@ -958,7 +958,7 @@ def _write_candidate_release_evidence(
     evidence_root: Path,
     *,
     sha: str = _FULL_SHA,
-    tests: int = 2340,
+    tests: int = 2343,
     skipped: int = 1,
 ) -> None:
     fresh_install = evidence_root / "fresh-install"
@@ -1089,7 +1089,7 @@ def test_candidate_index_snapshot_rejects_weak_junit_gate(
 ) -> None:
     for name, tests, skipped in (
         ("too-few", 1, 0),
-        ("too-many-skips", 2340, 4),
+        ("too-many-skips", 2343, 4),
     ):
         evidence_root = tmp_path / name
         _write_candidate_release_evidence(
@@ -1113,14 +1113,14 @@ def test_candidate_index_snapshot_rejects_invalid_junit_structure(
     tmp_path: Path,
 ) -> None:
     invalid_reports = (
-        '<not-junit><testsuite tests="2340" failures="0" '
+        '<not-junit><testsuite tests="2343" failures="0" '
         'errors="0" skipped="0"/></not-junit>\n',
-        '<testsuites><testsuite tests="2340" failures="0" '
+        '<testsuites><testsuite tests="2343" failures="0" '
         'errors="0" skipped="-1"/></testsuites>\n',
     )
     for index, report in enumerate(invalid_reports):
         evidence_root = tmp_path / f"case-{index}"
-        _write_candidate_release_evidence(evidence_root, tests=2340)
+        _write_candidate_release_evidence(evidence_root, tests=2343)
         (
             evidence_root / "pytest-deterministic-junit.xml"
         ).write_text(report, encoding="utf-8")
@@ -1262,7 +1262,7 @@ def test_candidate_archive_requires_one_internal_index(
     tmp_path: Path,
 ) -> None:
     evidence_root = tmp_path / "evidence"
-    _write_candidate_release_evidence(evidence_root, tests=2340)
+    _write_candidate_release_evidence(evidence_root, tests=2343)
     index_path = evidence_root / "capability-index.json"
     release_pipeline.build_candidate_capability_index(
         _ROOT / "docs" / "evidence" / "capability-index.json",

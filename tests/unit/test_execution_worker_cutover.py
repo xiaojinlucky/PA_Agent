@@ -40,6 +40,8 @@ from pa_agent.execution.worker_cutover import (
     verify_cutover_archive,
 )
 from pa_agent.execution.worker_protocol import (
+    SetLeverageParameters,
+    SetLeverageResult,
     WorkerCommandResolutionEvidence,
     WorkerState,
 )
@@ -398,7 +400,7 @@ def _fixture_paths(tmp_path: Path) -> CutoverPaths:
                 "okx",
                 "demo",
                 "paper",
-                "resolved-lease",
+                "reused-lease-b",
                 "",
                 "null",
                 "uncertain",
@@ -739,10 +741,143 @@ def test_safe_cutover_audit_is_read_only_and_reports_required_exception(tmp_path
     assert audit.risk_state_count == 1
     assert audit.history_command_count == 7
     assert audit.history_resolution_count == 1
+    assert audit.duplicate_lease_command_count == 7
     assert audit.duplicate_lease_group_count == 2
+    assert audit.duplicate_lease_group_sizes == (3, 4)
     assert audit.risk_stop_active is True
     assert paths.control_db.read_bytes() == before
     assert _schema_version(paths.control_db) == 4
+
+
+def test_safe_cutover_allows_unrelated_terminal_history(tmp_path):
+    paths = _fixture_paths(tmp_path)
+    execution_store = ExecutionStore(paths.execution_db)
+    record, created = execution_store.create(
+        _plan("execution-single-use", 8)
+    )
+    assert created is True
+    execution_store.save(
+        record.model_copy(update={"state": ExecutionState.CANCELED}),
+        event_kind="ready_expired",
+    )
+    _checkpoint(paths.execution_db)
+
+    connection = sqlite3.connect(paths.control_db)
+    try:
+        connection.executemany(
+            """
+            INSERT INTO worker_commands(
+                id, scope_key, action, execution_id, requester,
+                broker, environment, account, new_risk_lease_id,
+                reason_code, parameters_json, status, worker_id,
+                created_at, started_at, finished_at, result_code,
+                failure_code, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    "command-single-use",
+                    "execution:execution-single-use",
+                    "submit",
+                    "execution-single-use",
+                    "campaign",
+                    "okx",
+                    "demo",
+                    "paper",
+                    "single-use-lease",
+                    "",
+                    "null",
+                    "succeeded",
+                    "old-worker",
+                    "2026-07-30T02:08:00+00:00",
+                    "2026-07-30T02:08:01+00:00",
+                    "2026-07-30T02:08:02+00:00",
+                    "submit_completed",
+                    "",
+                    "null",
+                ),
+                (
+                    "command-refresh",
+                    "route:okx:demo:paper",
+                    "refresh_account",
+                    "",
+                    "campaign",
+                    "okx",
+                    "demo",
+                    "paper",
+                    "",
+                    "",
+                    "null",
+                    "succeeded",
+                    "old-worker",
+                    "2026-07-30T02:09:00+00:00",
+                    "2026-07-30T02:09:01+00:00",
+                    "2026-07-30T02:09:02+00:00",
+                    "account_refreshed",
+                    "",
+                    "null",
+                ),
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+    _checkpoint(paths.control_db)
+
+    audit = audit_safe_v4_to_v5_cutover(paths)
+
+    assert audit.history_command_count == 9
+    assert audit.duplicate_lease_command_count == 7
+    assert audit.duplicate_lease_group_count == 2
+    assert audit.duplicate_lease_group_sizes == (3, 4)
+    result = perform_safe_v4_to_v5_cutover(
+        replace(
+            paths,
+            expected_plan_sha256=audit.plan_sha256,
+        ),
+        confirmation=SAFE_CUTOVER_CONFIRMATION,
+    )
+    try:
+        verification = verify_cutover_archive(
+            result.archive_directory
+        )
+        assert verification.valid is True
+        assert _schema_version(paths.control_db) == 5
+        with sqlite3.connect(paths.control_db) as connection:
+            assert {
+                table: int(
+                    connection.execute(
+                        f"SELECT COUNT(*) FROM {table}"
+                    ).fetchone()[0]
+                )
+                for table in (
+                    "worker_commands",
+                    "worker_command_resolutions",
+                    "worker_new_risk_lease",
+                    "worker_heartbeats",
+                )
+            } == {
+                "worker_commands": 0,
+                "worker_command_resolutions": 0,
+                "worker_new_risk_lease": 0,
+                "worker_heartbeats": 0,
+            }
+        archived_control = (
+            result.archive_directory
+            / "source"
+            / "execution_control.sqlite3"
+        )
+        with sqlite3.connect(
+            f"{archived_control.resolve().as_uri()}?mode=ro&immutable=1",
+            uri=True,
+        ) as connection:
+            assert int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM worker_commands"
+                ).fetchone()[0]
+            ) == 9
+    finally:
+        _make_archive_writable(result.archive_directory)
 
 
 @pytest.mark.parametrize(
@@ -753,10 +888,18 @@ def test_safe_cutover_audit_is_read_only_and_reports_required_exception(tmp_path
             "已授权的 7 条",
         ),
         (
-            "UPDATE worker_commands "
-            "SET new_risk_lease_id='single-use-lease' "
-            "WHERE id='command-six'",
+            "UPDATE worker_commands SET new_risk_lease_id = CASE id "
+            "WHEN 'command-six' THEN 'single-use-lease-six' "
+            "WHEN 'command-resolved' THEN 'single-use-lease-resolved' "
+            "ELSE new_risk_lease_id END "
+            "WHERE id IN ('command-six', 'command-resolved')",
             "已授权的 2 组",
+        ),
+        (
+            "UPDATE worker_commands "
+            "SET new_risk_lease_id='reused-lease-b' "
+            "WHERE id IN ('command-three', 'command-four')",
+            "已授权的 3 条和 4 条",
         ),
     ),
 )
@@ -769,6 +912,73 @@ def test_safe_cutover_rejects_history_outside_exact_authorization(
     _mutate_control(paths, mutation)
 
     with pytest.raises(CutoverError, match=message):
+        audit_safe_v4_to_v5_cutover(paths)
+
+    assert _schema_version(paths.control_db) == 4
+    assert DatabaseWriteFence(paths.control_db).state().active is False
+
+
+def test_safe_cutover_rejects_set_leverage_in_duplicate_exception(
+    tmp_path,
+):
+    paths = _fixture_paths(tmp_path)
+    parameters = SetLeverageParameters(
+        analysis_digest="b" * 64,
+        analysis_record_path="records/pending/analysis.json",
+        config_fingerprint="route-fingerprint",
+        instrument="XAU-USDT-SWAP",
+        direction="long",
+        margin_mode="cross",
+        position_mode="net_mode",
+        current_leverage="1",
+        target_leverage="2",
+        current_capacity="1",
+        target_capacity="2",
+        maximum_leverage="2",
+        maximum_capacity="2",
+        planning_method="bounded_sequential_policy_grid_v1",
+        policy_grid_step="1",
+        verified_grid=(
+            {"leverage": "1", "capacity": "1"},
+            {"leverage": "2", "capacity": "2"},
+        ),
+        required_quantity="2",
+        entry_price="4000",
+        expected_account_identity="a" * 64,
+        okx_api_base_url="https://www.okx.com",
+        supervisor_record_id="supervisor-record",
+        supervisor_record_path="records/supervisor/decision.json",
+        supervisor_record_digest="d" * 64,
+    )
+    result = SetLeverageResult(
+        instrument="XAU-USDT-SWAP",
+        confirmed_leverage="2",
+        confirmed_max_size="2",
+        broker_position_count=0,
+        broker_pending_order_count=0,
+        broker_pending_algo_order_count=0,
+        account_identity="a" * 64,
+        confirmed_at=datetime(2026, 7, 30, 2, 1, tzinfo=UTC),
+    )
+    with sqlite3.connect(paths.control_db) as connection:
+        connection.execute(
+            """
+            UPDATE worker_commands
+            SET action='set_leverage',
+                execution_id='',
+                parameters_json=?,
+                result_json=?,
+                result_code='set_leverage_completed'
+            WHERE id='command-one'
+            """,
+            (
+                parameters.model_dump_json(),
+                result.model_dump_json(),
+            ),
+        )
+    _checkpoint(paths.control_db)
+
+    with pytest.raises(CutoverError, match="已授权的 submit"):
         audit_safe_v4_to_v5_cutover(paths)
 
     assert _schema_version(paths.control_db) == 4

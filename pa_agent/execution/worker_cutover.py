@@ -54,10 +54,11 @@ SAFE_CUTOVER_RECOVERY_CONFIRMATION = "RECOVER_INTERRUPTED_V4_TO_V5_CUTOVER"
 
 _SOURCE_SCHEMA_VERSION = 4
 _TARGET_SCHEMA_VERSION = 5
-_ARCHIVE_SCHEMA_VERSION = 2
-_INTENT_SCHEMA_VERSION = 1
-_AUTHORIZED_HISTORY_COMMAND_COUNT = 7
+_ARCHIVE_SCHEMA_VERSION = 3
+_INTENT_SCHEMA_VERSION = 2
+_AUTHORIZED_DUPLICATE_LEASE_COMMAND_COUNT = 7
 _AUTHORIZED_DUPLICATE_LEASE_GROUP_COUNT = 2
+_AUTHORIZED_DUPLICATE_LEASE_GROUP_SIZES = (3, 4)
 _CANONICAL_V5_SCHEMA_SHA256 = (
     "8d4eb8bbf6bcd8db12b234a7ef5ac7dc0f32ae815b056fed3bea3120af843edf"
 )
@@ -157,7 +158,9 @@ class CutoverAudit:
     risk_state_count: int
     history_command_count: int
     history_resolution_count: int
+    duplicate_lease_command_count: int
     duplicate_lease_group_count: int
+    duplicate_lease_group_sizes: tuple[int, ...]
     risk_stop_active: bool
     source_database_sha256: str
     source_execution_sha256: str
@@ -190,7 +193,9 @@ class CutoverIntent:
     history_command_count: int
     history_resolution_count: int
     heartbeat_count: int
+    duplicate_lease_command_count: int
     duplicate_lease_group_count: int
+    duplicate_lease_group_sizes: tuple[int, ...]
     risk_state_sha256: str
     risk_metadata_sha256: str
     plan_sha256: str
@@ -220,7 +225,9 @@ class _SourceSnapshot:
     command_count: int
     resolution_count: int
     heartbeat_count: int
+    duplicate_lease_command_count: int
     duplicate_lease_group_count: int
+    duplicate_lease_group_sizes: tuple[int, ...]
     commands: tuple[WorkerCommand, ...]
     resolutions: tuple[WorkerCommandResolution, ...]
     protocol_receipt: DatabaseFenceProtocolReceipt
@@ -403,7 +410,13 @@ def _intent_payload(intent: CutoverIntent) -> dict[str, object]:
         "history_command_count": intent.history_command_count,
         "history_resolution_count": intent.history_resolution_count,
         "heartbeat_count": intent.heartbeat_count,
+        "duplicate_lease_command_count": (
+            intent.duplicate_lease_command_count
+        ),
         "duplicate_lease_group_count": intent.duplicate_lease_group_count,
+        "duplicate_lease_group_sizes": list(
+            intent.duplicate_lease_group_sizes
+        ),
         "risk_state_sha256": intent.risk_state_sha256,
         "risk_metadata_sha256": intent.risk_metadata_sha256,
         "plan_sha256": intent.plan_sha256,
@@ -438,7 +451,9 @@ def _parse_cutover_intent(payload: object) -> CutoverIntent:
         "history_command_count",
         "history_resolution_count",
         "heartbeat_count",
+        "duplicate_lease_command_count",
         "duplicate_lease_group_count",
+        "duplicate_lease_group_sizes",
         "risk_state_sha256",
         "risk_metadata_sha256",
         "plan_sha256",
@@ -471,7 +486,11 @@ def _parse_cutover_intent(payload: object) -> CutoverIntent:
         payload.get("history_command_count"),
         payload.get("history_resolution_count"),
         payload.get("heartbeat_count"),
+        payload.get("duplicate_lease_command_count"),
         payload.get("duplicate_lease_group_count"),
+    )
+    duplicate_group_sizes = payload.get(
+        "duplicate_lease_group_sizes"
     )
     if (
         not isinstance(cutover_id, str)
@@ -507,10 +526,21 @@ def _parse_cutover_intent(payload: object) -> CutoverIntent:
             )
             for digest in hashes
         )
-        or payload.get("history_command_count")
-        != _AUTHORIZED_HISTORY_COMMAND_COUNT
+        or payload.get("duplicate_lease_command_count")
+        != _AUTHORIZED_DUPLICATE_LEASE_COMMAND_COUNT
         or payload.get("duplicate_lease_group_count")
         != _AUTHORIZED_DUPLICATE_LEASE_GROUP_COUNT
+        or not isinstance(duplicate_group_sizes, list)
+        or any(
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size < 2
+            for size in duplicate_group_sizes
+        )
+        or tuple(duplicate_group_sizes)
+        != _AUTHORIZED_DUPLICATE_LEASE_GROUP_SIZES
+        or payload.get("history_command_count")
+        < _AUTHORIZED_DUPLICATE_LEASE_COMMAND_COUNT
     ):
         raise CutoverError("切换意图字段无效")
     for field_name in ("created_at", "protocol_installed_at"):
@@ -549,8 +579,14 @@ def _parse_cutover_intent(payload: object) -> CutoverIntent:
             payload["history_resolution_count"]
         ),
         heartbeat_count=int(payload["heartbeat_count"]),
+        duplicate_lease_command_count=int(
+            payload["duplicate_lease_command_count"]
+        ),
         duplicate_lease_group_count=int(
             payload["duplicate_lease_group_count"]
+        ),
+        duplicate_lease_group_sizes=tuple(
+            int(size) for size in duplicate_group_sizes
         ),
         risk_state_sha256=str(payload["risk_state_sha256"]),
         risk_metadata_sha256=str(payload["risk_metadata_sha256"]),
@@ -940,6 +976,49 @@ def _validated_commands_and_resolutions(
     return commands, resolutions
 
 
+def _validated_duplicate_lease_exception(
+    connection: sqlite3.Connection,
+) -> tuple[int, tuple[int, ...]]:
+    rows = connection.execute(
+        """
+        SELECT
+            new_risk_lease_id,
+            COUNT(*) AS command_count,
+            SUM(CASE WHEN action='submit' THEN 1 ELSE 0 END)
+                AS submit_count
+        FROM worker_commands
+        WHERE new_risk_lease_id<>''
+        GROUP BY new_risk_lease_id
+        HAVING COUNT(*)>1
+        ORDER BY new_risk_lease_id
+        """
+    ).fetchall()
+    group_sizes = tuple(
+        sorted(int(row["command_count"]) for row in rows)
+    )
+    command_count = sum(group_sizes)
+    if len(rows) != _AUTHORIZED_DUPLICATE_LEASE_GROUP_COUNT:
+        raise CutoverError(
+            "v4 控制库历史授权复用组数不是已授权的 2 组"
+        )
+    if command_count != _AUTHORIZED_DUPLICATE_LEASE_COMMAND_COUNT:
+        raise CutoverError(
+            "v4 控制库历史授权复用命令数不是已授权的 7 条"
+        )
+    if group_sizes != _AUTHORIZED_DUPLICATE_LEASE_GROUP_SIZES:
+        raise CutoverError(
+            "v4 控制库历史授权复用组大小不是已授权的 3 条和 4 条"
+        )
+    if any(
+        int(row["submit_count"]) != int(row["command_count"])
+        for row in rows
+    ):
+        raise CutoverError(
+            "v4 控制库历史授权复用异常不是已授权的 submit 命令"
+        )
+    return command_count, group_sizes
+
+
 def _read_control_snapshot(
     paths: CutoverPaths,
     *,
@@ -952,6 +1031,8 @@ def _read_control_snapshot(
     int,
     int,
     int,
+    int,
+    tuple[int, ...],
     tuple[WorkerCommand, ...],
     tuple[WorkerCommandResolution, ...],
     DatabaseFenceProtocolReceipt,
@@ -977,10 +1058,6 @@ def _read_control_snapshot(
             raise CutoverError("安全切换只接受完整的 schema v4 控制库")
 
         commands, resolutions = _validated_commands_and_resolutions(connection)
-        if len(commands) != _AUTHORIZED_HISTORY_COMMAND_COUNT:
-            raise CutoverError(
-                "v4 控制库历史命令数不是已授权的 7 条"
-            )
         if any(command.status.value not in _TERMINAL_COMMAND_STATES for command in commands):
             raise CutoverError("v4 控制库仍有待执行或正在执行的命令")
         if connection.execute(
@@ -994,20 +1071,10 @@ def _read_control_snapshot(
         )
         if lease_count:
             raise CutoverError("v4 控制库仍有 NEW_RISK 租约")
-        duplicate_groups = int(connection.execute("""
-                SELECT COUNT(*) FROM (
-                    SELECT new_risk_lease_id
-                    FROM worker_commands
-                    WHERE new_risk_lease_id<>''
-                      AND action IN ('submit', 'set_leverage')
-                    GROUP BY new_risk_lease_id
-                    HAVING COUNT(*)>1
-                )
-                """).fetchone()[0])
-        if duplicate_groups != _AUTHORIZED_DUPLICATE_LEASE_GROUP_COUNT:
-            raise CutoverError(
-                "v4 控制库历史授权复用组数不是已授权的 2 组"
-            )
+        duplicate_command_count, duplicate_group_sizes = (
+            _validated_duplicate_lease_exception(connection)
+        )
+        duplicate_groups = len(duplicate_group_sizes)
         raw_risk_rows = tuple(
             connection.execute("SELECT * FROM risk_runtime_state ORDER BY route_key").fetchall()
         )
@@ -1054,7 +1121,9 @@ def _read_control_snapshot(
         len(commands),
         resolution_count,
         heartbeat_count,
+        duplicate_command_count,
         duplicate_groups,
+        duplicate_group_sizes,
         commands,
         resolutions,
         protocol_receipt,
@@ -1230,7 +1299,9 @@ def _capture_source_snapshot(
         command_count,
         resolution_count,
         heartbeat_count,
+        duplicate_command_count,
         duplicate_groups,
+        duplicate_group_sizes,
         commands,
         resolutions,
         protocol_receipt,
@@ -1263,7 +1334,9 @@ def _capture_source_snapshot(
         command_count=command_count,
         resolution_count=resolution_count,
         heartbeat_count=heartbeat_count,
+        duplicate_lease_command_count=duplicate_command_count,
         duplicate_lease_group_count=duplicate_groups,
+        duplicate_lease_group_sizes=duplicate_group_sizes,
         commands=commands,
         resolutions=resolutions,
         protocol_receipt=protocol_receipt,
@@ -1308,7 +1381,7 @@ def _cutover_plan_payload(
 ) -> dict[str, object]:
     execution_source = _execution_source_file(snapshot)
     return {
-        "version": 1,
+        "version": 2,
         "kind": "pa_agent_worker_v4_to_v5_cutover_plan",
         "deployed_sha": paths.deployed_sha,
         "fence_protocol_sha": paths.fence_protocol_sha,
@@ -1324,8 +1397,14 @@ def _cutover_plan_payload(
         "history_command_count": snapshot.command_count,
         "history_resolution_count": snapshot.resolution_count,
         "heartbeat_count": snapshot.heartbeat_count,
+        "duplicate_lease_command_count": (
+            snapshot.duplicate_lease_command_count
+        ),
         "duplicate_lease_group_count": (
             snapshot.duplicate_lease_group_count
+        ),
+        "duplicate_lease_group_sizes": list(
+            snapshot.duplicate_lease_group_sizes
         ),
         "risk_state_sha256": _canonical_rows_sha256(
             snapshot.risk_rows
@@ -1373,8 +1452,12 @@ def _validate_snapshot_against_intent(
         or snapshot.resolution_count
         != intent.history_resolution_count
         or snapshot.heartbeat_count != intent.heartbeat_count
+        or snapshot.duplicate_lease_command_count
+        != intent.duplicate_lease_command_count
         or snapshot.duplicate_lease_group_count
         != intent.duplicate_lease_group_count
+        or snapshot.duplicate_lease_group_sizes
+        != intent.duplicate_lease_group_sizes
         or _canonical_rows_sha256(snapshot.risk_rows)
         != intent.risk_state_sha256
         or _risk_metadata_sha256(snapshot.risk_metadata)
@@ -1477,8 +1560,14 @@ def _copy_source_archive(
             "command_count": snapshot.command_count,
             "resolution_count": snapshot.resolution_count,
             "heartbeat_count": snapshot.heartbeat_count,
+            "duplicate_lease_command_count": (
+                snapshot.duplicate_lease_command_count
+            ),
             "duplicate_lease_group_count": (
                 snapshot.duplicate_lease_group_count
+            ),
+            "duplicate_lease_group_sizes": list(
+                snapshot.duplicate_lease_group_sizes
             ),
         },
         "copied_operational_state": {
@@ -1584,6 +1673,15 @@ def _insert_target_state(
                 "archived_command_count": snapshot.command_count,
                 "archived_resolution_count": snapshot.resolution_count,
                 "archived_heartbeat_count": snapshot.heartbeat_count,
+                "duplicate_lease_command_count": (
+                    snapshot.duplicate_lease_command_count
+                ),
+                "duplicate_lease_group_count": (
+                    snapshot.duplicate_lease_group_count
+                ),
+                "duplicate_lease_group_sizes": list(
+                    snapshot.duplicate_lease_group_sizes
+                ),
                 "active_queue_started_empty": True,
                 "risk_stop_preserved": True,
             }
@@ -1728,6 +1826,12 @@ def _validate_prepared_target(
             or receipt_payload.get("copied_risk_metadata_count") != len(snapshot.risk_metadata)
             or receipt_payload.get("archived_command_count") != snapshot.command_count
             or receipt_payload.get("archived_resolution_count") != snapshot.resolution_count
+            or receipt_payload.get("duplicate_lease_command_count")
+            != snapshot.duplicate_lease_command_count
+            or receipt_payload.get("duplicate_lease_group_count")
+            != snapshot.duplicate_lease_group_count
+            or receipt_payload.get("duplicate_lease_group_sizes")
+            != list(snapshot.duplicate_lease_group_sizes)
             or receipt_payload.get("risk_stop_preserved") is not True
             or receipt_payload.get("active_queue_started_empty") is not True
         ):
@@ -2140,8 +2244,12 @@ def verify_cutover_archive(
         != intent.history_resolution_count
         or retained.get("heartbeat_count")
         != intent.heartbeat_count
+        or retained.get("duplicate_lease_command_count")
+        != intent.duplicate_lease_command_count
         or retained.get("duplicate_lease_group_count")
         != intent.duplicate_lease_group_count
+        or retained.get("duplicate_lease_group_sizes")
+        != list(intent.duplicate_lease_group_sizes)
         or copied.get("risk_state_count")
         != intent.risk_state_count
         or copied.get("risk_metadata_count")
@@ -2205,26 +2313,24 @@ def verify_cutover_archive(
             ).fetchone()[0]
         ):
             raise CutoverError("归档 v4 仍有 NEW_RISK 租约")
-        archived_duplicate_groups = int(
-            source_connection.execute(
-                """
-                SELECT COUNT(*) FROM (
-                    SELECT new_risk_lease_id
-                    FROM worker_commands
-                    WHERE new_risk_lease_id<>''
-                      AND action IN ('submit', 'set_leverage')
-                    GROUP BY new_risk_lease_id
-                    HAVING COUNT(*)>1
-                )
-                """
-            ).fetchone()[0]
+        (
+            archived_duplicate_commands,
+            archived_duplicate_group_sizes,
+        ) = _validated_duplicate_lease_exception(
+            source_connection
+        )
+        archived_duplicate_groups = len(
+            archived_duplicate_group_sizes
         )
         if (
             archived_duplicate_groups
             != intent.duplicate_lease_group_count
-            or archived_duplicate_groups < 1
+            or archived_duplicate_commands
+            != intent.duplicate_lease_command_count
+            or archived_duplicate_group_sizes
+            != intent.duplicate_lease_group_sizes
         ):
-            raise CutoverError("归档 v4 历史授权复用组数不一致")
+            raise CutoverError("归档 v4 历史授权复用例外不一致")
         raw_archived_risk = tuple(
             source_connection.execute(
                 "SELECT * FROM risk_runtime_state ORDER BY route_key"
@@ -2314,7 +2420,13 @@ def verify_cutover_archive(
         command_count=len(archived_commands),
         resolution_count=len(archived_resolutions),
         heartbeat_count=int(retained["heartbeat_count"]),
+        duplicate_lease_command_count=(
+            archived_duplicate_commands
+        ),
         duplicate_lease_group_count=archived_duplicate_groups,
+        duplicate_lease_group_sizes=(
+            archived_duplicate_group_sizes
+        ),
         commands=archived_commands,
         resolutions=archived_resolutions,
         protocol_receipt=source_protocol,
@@ -2395,6 +2507,12 @@ def verify_cutover_archive(
             or receipt.get("source_manifest_sha256") != manifest_sha256
             or receipt.get("archived_command_count") != retained.get("command_count")
             or receipt.get("archived_resolution_count") != retained.get("resolution_count")
+            or receipt.get("duplicate_lease_command_count")
+            != retained.get("duplicate_lease_command_count")
+            or receipt.get("duplicate_lease_group_count")
+            != retained.get("duplicate_lease_group_count")
+            or receipt.get("duplicate_lease_group_sizes")
+            != retained.get("duplicate_lease_group_sizes")
             or receipt.get("copied_risk_state_count") != copied.get("risk_state_count")
             or receipt.get("active_queue_started_empty") is not True
             or receipt.get("risk_stop_preserved") is not True
@@ -2735,8 +2853,14 @@ def _new_cutover_intent(
         history_command_count=snapshot.command_count,
         history_resolution_count=snapshot.resolution_count,
         heartbeat_count=snapshot.heartbeat_count,
+        duplicate_lease_command_count=(
+            snapshot.duplicate_lease_command_count
+        ),
         duplicate_lease_group_count=(
             snapshot.duplicate_lease_group_count
+        ),
+        duplicate_lease_group_sizes=(
+            snapshot.duplicate_lease_group_sizes
         ),
         risk_state_sha256=_canonical_rows_sha256(snapshot.risk_rows),
         risk_metadata_sha256=_risk_metadata_sha256(
@@ -3411,7 +3535,13 @@ def audit_safe_v4_to_v5_cutover(paths: CutoverPaths) -> CutoverAudit:
         risk_state_count=len(snapshot.risk_rows),
         history_command_count=snapshot.command_count,
         history_resolution_count=snapshot.resolution_count,
+        duplicate_lease_command_count=(
+            snapshot.duplicate_lease_command_count
+        ),
         duplicate_lease_group_count=snapshot.duplicate_lease_group_count,
+        duplicate_lease_group_sizes=(
+            snapshot.duplicate_lease_group_sizes
+        ),
         risk_stop_active=True,
         source_database_sha256=snapshot.control_database.sha256,
         source_execution_sha256=(
@@ -3856,7 +3986,11 @@ def main(argv: list[str] | None = None) -> int:
             f"schema={audit.source_schema_version} "
             f"risk_states={audit.risk_state_count} "
             f"archived_commands={audit.history_command_count} "
+            "duplicate_commands="
+            f"{audit.duplicate_lease_command_count} "
             f"duplicate_groups={audit.duplicate_lease_group_count} "
+            "duplicate_group_sizes="
+            f"{','.join(str(size) for size in audit.duplicate_lease_group_sizes)} "
             f"plan_sha256={audit.plan_sha256} "
             "risk_stop_active=true"
         )

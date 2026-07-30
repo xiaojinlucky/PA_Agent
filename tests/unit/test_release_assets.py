@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2340' in ci_workflow_text
-    assert '$tests -lt 2340' in release_workflow_text
+    assert '$tests -lt 2343' in ci_workflow_text
+    assert '$tests -lt 2343' in release_workflow_text
     assert ci_workflow_text.count("sanitize-junit") == 2
     assert "scan-tree scratch/ci-evidence" in ci_workflow_text
     assert "id: evidence_guard" in ci_workflow_text
