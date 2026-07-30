@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2235' in ci_workflow_text
-    assert '$tests -lt 2235' in release_workflow_text
+    assert '$tests -lt 2237' in ci_workflow_text
+    assert '$tests -lt 2237' in release_workflow_text
     assert ci_workflow_text.count("sanitize-junit") == 2
     assert "scan-tree scratch/ci-evidence" in ci_workflow_text
     assert "id: evidence_guard" in ci_workflow_text
@@ -92,6 +92,11 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     )
     assert "$expectedBytes = 16437364" in release_workflow_text
     assert "PA_AGENT_VISUAL_FONT_PATH=" in release_workflow_text
+    visual_script_text = (
+        _ROOT / "tests" / "visual" / "generate_market_workspace_screenshot.py"
+    ).read_text(encoding="utf-8")
+    assert "_CJK_SAMPLE + _REQUIRED_UI_GLYPHS" in visual_script_text
+    assert '"required_ui_glyphs_supported": True' in visual_script_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

@@ -68,11 +68,12 @@ _EVIDENCE_LABELS = {
     EvidenceState.STALE: "已过期",
     EvidenceState.UNAVAILABLE: "不可用",
 }
+_REQUIRED_UI_GLYPHS = "✓⚠×…—•·，：；、“”。"
 _STATUS_ICONS = {
     "ready": "✓",
     "warning": "⚠",
     "error": "×",
-    "loading": "↻",
+    "loading": "…",
     "muted": "—",
 }
 _ANALYSIS_FAILURE_LABELS = {

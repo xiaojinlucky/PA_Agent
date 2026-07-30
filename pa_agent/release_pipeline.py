@@ -1599,6 +1599,12 @@ def validate_desktop_evidence(
             "cjk_sample_supported": (
                 metadata.get("font", {}).get("cjk_sample_supported") is True
             ),
+            "required_ui_glyphs_supported": (
+                metadata.get("font", {}).get(
+                    "required_ui_glyphs_supported"
+                )
+                is True
+            ),
             "body_font": int(metadata.get("font", {}).get("body_pixel_size", 0))
             >= 14,
             "symbol_font": int(

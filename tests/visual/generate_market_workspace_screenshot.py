@@ -77,6 +77,9 @@ from pa_agent.data.market_workspace_runtime import (  # noqa: E402
     MarketWorkspaceRuntime,
 )
 from pa_agent.gui.main_window import MainWindow  # noqa: E402
+from pa_agent.gui.multi_market_workbench import (  # noqa: E402
+    _REQUIRED_UI_GLYPHS,
+)
 
 _AS_OF = int(
     datetime(2026, 7, 29, 14, 30, tzinfo=UTC).timestamp() * 1_000
@@ -87,6 +90,7 @@ _INTERVALS = {
     "4h": 4 * 60 * 60_000,
 }
 _CJK_SAMPLE = "多市场看盘分析工作台美股港股A股加密开始刷新失败加载过期"
+_FONT_COVERAGE_SAMPLE = _CJK_SAMPLE + _REQUIRED_UI_GLYPHS
 
 
 def _configure_cjk_font(app: QApplication) -> str:
@@ -119,11 +123,11 @@ def _configure_cjk_font(app: QApplication) -> str:
         raw_font = QRawFont.fromFont(font)
         if raw_font.isValid() and all(
             raw_font.supportsCharacter(character)
-            for character in _CJK_SAMPLE
+            for character in _FONT_COVERAGE_SAMPLE
         ):
             app.setFont(font)
             return QFontInfo(font).family()
-    raise RuntimeError("离屏证据环境没有覆盖核心中文字符的字体")
+    raise RuntimeError("离屏证据环境没有覆盖核心中文和界面符号的字体")
 
 
 def _unavailable_calendar(_market: str, _as_of_utc_ms: int) -> Any:
@@ -452,6 +456,7 @@ def _metadata(
         "font": {
             "family": cjk_font_family,
             "cjk_sample_supported": True,
+            "required_ui_glyphs_supported": True,
             "symbol_pixel_size": symbol_font.pixelSize(),
             "symbol_height": QFontMetrics(page._symbol_label.font()).height(),
             "body_pixel_size": body_font.pixelSize(),

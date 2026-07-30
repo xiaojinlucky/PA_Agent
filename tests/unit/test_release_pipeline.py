@@ -142,6 +142,7 @@ def _desktop_evidence(root: Path) -> None:
             "font": {
                 "family": "Microsoft YaHei UI",
                 "cjk_sample_supported": True,
+                "required_ui_glyphs_supported": True,
                 "symbol_pixel_size": 22,
                 "body_pixel_size": 14,
             },
@@ -1263,6 +1264,26 @@ def test_desktop_evidence_rejects_missing_cjk_font_coverage(
     with pytest.raises(
         ReleaseValidationError,
         match=r"cjk_font_family|cjk_sample_supported",
+    ):
+        validate_desktop_evidence(
+            evidence,
+            expected_sha=_FULL_SHA,
+        )
+
+
+def test_desktop_evidence_rejects_missing_required_ui_glyph_coverage(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "desktop"
+    _desktop_evidence(evidence)
+    metadata_path = evidence / "1440x900-normal.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["font"]["required_ui_glyphs_supported"] = False
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseValidationError,
+        match=r"required_ui_glyphs_supported",
     ):
         validate_desktop_evidence(
             evidence,

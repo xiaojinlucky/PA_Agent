@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from PyQt6.QtCore import QObject, Qt, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QPushButton
@@ -13,9 +15,26 @@ from pa_agent.data.market_workspace_controller import (
     MarketWorkspaceController,
 )
 from pa_agent.data.market_workspace_runtime import MarketWorkspaceRuntime
+from pa_agent.gui import multi_market_workbench as workbench_module
 from pa_agent.gui.multi_market_workbench import MultiMarketWorkbench
 
 _AS_OF = 1_700_000_600_000
+
+
+def test_status_icons_are_covered_by_evidence_font_contract() -> None:
+    required_glyphs = set(workbench_module._REQUIRED_UI_GLYPHS)
+    source = Path(workbench_module.__file__).read_text(encoding="utf-8")
+    non_cjk_unicode = {
+        character
+        for character in source
+        if ord(character) > 127
+        and not 0x3400 <= ord(character) <= 0x9FFF
+    }
+
+    assert set(workbench_module._STATUS_ICONS.values()) <= required_glyphs
+    assert non_cjk_unicode <= required_glyphs
+    assert {"•", "·"} <= required_glyphs
+    assert "↻" not in workbench_module._STATUS_ICONS.values()
 
 
 @pytest.fixture(scope="module")
