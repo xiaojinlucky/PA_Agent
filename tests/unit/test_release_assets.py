@@ -13,7 +13,9 @@ _ROOT = Path(__file__).resolve().parents[2]
 def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     install_path = _ROOT / "scripts" / "install_windows.ps1"
     uninstall_path = _ROOT / "scripts" / "uninstall_windows.ps1"
+    attributes_path = _ROOT / ".gitattributes"
     required = [
+        attributes_path,
         _ROOT / "CHANGELOG.md",
         _ROOT / "docs" / "RELEASE_CHECKLIST.md",
         _ROOT / "docs" / "SOURCE_INSTALL_WINDOWS.md",
@@ -31,6 +33,9 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     ]
     assert [str(path.relative_to(_ROOT)) for path in required if not path.is_file()] == []
 
+    release_attributes = set(
+        attributes_path.read_text(encoding="utf-8").splitlines()
+    )
     install_text = install_path.read_text(encoding="utf-8")
     uninstall_text = uninstall_path.read_text(encoding="utf-8")
     release_workflow_text = (
@@ -48,8 +53,14 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     assert "ConfirmUninstall" in uninstall_text
     assert "Remove-Item" in uninstall_text
     assert "D:\\Desktop" not in install_text
-    assert '$tests -lt 2227' in ci_workflow_text
-    assert '$tests -lt 2227' in release_workflow_text
+    assert {
+        "/experience export-ignore",
+        "/logs export-ignore",
+        "/records export-ignore",
+        "/trade_records export-ignore",
+    } <= release_attributes
+    assert '$tests -lt 2229' in ci_workflow_text
+    assert '$tests -lt 2229' in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

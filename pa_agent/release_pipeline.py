@@ -228,7 +228,7 @@ def _entry_error(name: str, *, expected_prefix: str) -> str | None:
         return "runtime_configuration"
     if PurePosixPath(file_name).suffix.lower() in _FORBIDDEN_SUFFIXES:
         return "forbidden_file_type"
-    if lowered[0] in _RUNTIME_DIRS and file_name != ".gitkeep":
+    if lowered[0] in _RUNTIME_DIRS:
         return "runtime_data"
     return None
 

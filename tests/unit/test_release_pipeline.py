@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import subprocess
 import zipfile
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -24,6 +25,18 @@ from pa_agent.release_pipeline import (
 )
 
 _FULL_SHA = "a" * 40
+_ROOT = Path(__file__).resolve().parents[2]
+_RECORD_SOURCE_PATHS = frozenset(
+    {
+        "pa_agent/records/__init__.py",
+        "pa_agent/records/analysis_history.py",
+        "pa_agent/records/experience_reader.py",
+        "pa_agent/records/pending_writer.py",
+        "pa_agent/records/schema.py",
+        "pa_agent/records/supervisor_writer.py",
+        "pa_agent/records/trade_logger.py",
+    }
+)
 _SCHEMA_ROOT = (
     Path(__file__).resolve().parents[2]
     / "docs"
@@ -472,6 +485,72 @@ def test_source_archive_contract_accepts_only_complete_clean_source(
     assert result["git_sha"] == _FULL_SHA
 
 
+def test_repository_archive_excludes_only_root_runtime_directories(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "PA_Agent-v0.1.0-source.zip"
+    sha_result = subprocess.run(
+        ["git", "-C", str(_ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert sha_result.returncode == 0, sha_result.stderr
+    git_sha = sha_result.stdout.strip()
+    archive_result = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(_ROOT),
+            "archive",
+            "--worktree-attributes",
+            "--format=zip",
+            "--prefix=PA_Agent-v0.1.0/",
+            "--output",
+            str(archive_path),
+            "HEAD",
+        ],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=120,
+        check=False,
+    )
+    assert archive_result.returncode == 0, archive_result.stderr
+
+    with zipfile.ZipFile(archive_path) as archive:
+        names = {
+            info.filename
+            for info in archive.infolist()
+            if not info.is_dir()
+        }
+    assert not any(
+        name.startswith(
+            (
+                "PA_Agent-v0.1.0/experience/",
+                "PA_Agent-v0.1.0/logs/",
+                "PA_Agent-v0.1.0/records/",
+                "PA_Agent-v0.1.0/trade_records/",
+            )
+        )
+        for name in names
+    )
+    assert {
+        f"PA_Agent-v0.1.0/{relative}"
+        for relative in _RECORD_SOURCE_PATHS
+    } <= names
+    result = validate_source_archive(
+        archive_path,
+        expected_version="0.1.0",
+        expected_sha=git_sha,
+    )
+    assert result["forbidden_entries"] == []
+
+
 def test_source_archive_rejects_missing_runtime_entrypoint_module(
     tmp_path: Path,
 ) -> None:
@@ -533,6 +612,25 @@ def test_source_archive_rejects_runtime_secret_and_binary_entries(
             expected_version="0.1.0",
             expected_sha=_FULL_SHA,
         )
+
+
+def test_source_archive_rejects_runtime_gitkeep_placeholders(
+    tmp_path: Path,
+) -> None:
+    for runtime_dir in ("experience", "logs", "records", "trade_records"):
+        archive_path = tmp_path / f"unsafe-{runtime_dir}.zip"
+        _valid_archive(
+            archive_path,
+            extra={
+                f"PA_Agent-v0.1.0/{runtime_dir}/.gitkeep": b"",
+            },
+        )
+        with pytest.raises(ReleaseValidationError, match="runtime_data"):
+            validate_source_archive(
+                archive_path,
+                expected_version="0.1.0",
+                expected_sha=_FULL_SHA,
+            )
 
 
 @pytest.mark.parametrize(

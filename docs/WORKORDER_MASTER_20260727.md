@@ -440,7 +440,12 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   推送；Qt 生命周期修复 `ed8c52ee61fa2ff379b561f554774c3ac4da619e` 的 CI 已跑完整套件，
   不再发生 Qt 底层崩溃，但又暴露 Windows PowerShell 5.1 误读无 BOM 中文发布脚本的
   3 项失败。三份脚本补齐 UTF-8 BOM 后，双 PowerShell 解析、61 项定向和 2227 项非 live
-  回归均通过。仍待编码修复对应新 SHA 的 CI 与候选 workflow、提交后 `git archive` 和全新
+  回归均通过；提交 `3221fe88769a844bb4a2c0a55681f98ed2446122` 的 CI run
+  `30506024918` 已全绿。候选 run `30506362460` 随后正确拒绝由 `.gitkeep` 带入源码 ZIP
+  的四个根运行态目录；首轮无锚规则又被对抗审查证明会误删 `pa_agent/records`，已撤回。
+  最终根锚规则保留全部 7 个记录模块，扫描器拒绝运行态 `.gitkeep`；63 项定向和 2229 项
+  非 live 全量均通过，工作流数量门同步为 2229。仍待归档
+  修复对应新 SHA 的 CI 与候选 workflow、提交后 `git archive` 和全新
   Python 3.12 源码安装。阶段 A 私有真相和正式快捷方式桌面矩阵未通过前，
   禁止创建稳定 `v0.1.0` tag 或 GitHub Release。
 
