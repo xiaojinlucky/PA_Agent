@@ -5,9 +5,12 @@ import hashlib
 import json
 import sqlite3
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Literal
 
+from pa_agent.execution.database_fence import database_write_guard
 from pa_agent.execution.models import (
     ACTIVE_EXECUTION_STATES,
     AccountSnapshot,
@@ -69,17 +72,21 @@ class ExecutionStore:
     def path(self) -> Path:
         return self._path
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(
             self._path,
             timeout=5.0,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA synchronous = FULL")
+            yield connection
+        finally:
+            connection.close()
 
     def _read_schema_version(self) -> int:
         with self._lock, self._connect() as connection:
@@ -103,7 +110,11 @@ class ExecutionStore:
 
     def _initialise(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("PRAGMA journal_mode = WAL")
             connection.execute(
                 """
@@ -209,7 +220,11 @@ class ExecutionStore:
             kind="plan_created",
             payload={"state": record.state.value},
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing = connection.execute(
@@ -282,7 +297,11 @@ class ExecutionStore:
             kind=event_kind,
             payload=event_payload or {},
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
@@ -325,7 +344,11 @@ class ExecutionStore:
             kind=kind,
             payload=payload or {},
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute(
                 """
                 INSERT INTO execution_events(execution_id, kind, created_at, payload_json)
@@ -421,7 +444,11 @@ class ExecutionStore:
             instrument=record.plan.instrument,
         )
         now = utc_now_iso()
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing_by_execution = connection.execute(
@@ -552,7 +579,11 @@ class ExecutionStore:
         ]
 
     def save_account_snapshot(self, snapshot: AccountSnapshot) -> None:
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute(
                 """
                 INSERT INTO account_snapshots(

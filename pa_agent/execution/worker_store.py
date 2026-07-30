@@ -7,11 +7,13 @@ import re
 import sqlite3
 import threading
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from pa_agent.execution.database_fence import database_write_guard
 from pa_agent.execution.worker_protocol import (
     NewRiskLease,
     SetLeverageParameters,
@@ -123,17 +125,21 @@ class WorkerStore:
     def _parse_time(value: str | None) -> datetime | None:
         return datetime.fromisoformat(value).astimezone(UTC) if value else None
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         connection = sqlite3.connect(
             self._path,
             timeout=5.0,
             isolation_level=None,
         )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 5000")
-        connection.execute("PRAGMA synchronous = FULL")
-        return connection
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys = ON")
+            connection.execute("PRAGMA busy_timeout = 5000")
+            connection.execute("PRAGMA synchronous = FULL")
+            yield connection
+        finally:
+            connection.close()
 
     @staticmethod
     def _validated_safe_code(value: str, *, field_name: str) -> str:
@@ -172,7 +178,8 @@ class WorkerStore:
 
         uri = f"file:{self._path.resolve().as_posix()}?mode=ro"
         try:
-            with sqlite3.connect(uri, uri=True, timeout=5.0) as connection:
+            connection = sqlite3.connect(uri, uri=True, timeout=5.0)
+            try:
                 connection.row_factory = sqlite3.Row
                 meta_exists = connection.execute(
                     """
@@ -201,6 +208,8 @@ class WorkerStore:
                     WHERE key='worker_schema_version'
                     """
                 ).fetchone()
+            finally:
+                connection.close()
         except sqlite3.Error as exc:
             raise RuntimeError("无法只读探测 worker schema 版本") from exc
         if version is None:
@@ -220,7 +229,11 @@ class WorkerStore:
                 self._schema_version = existing_version
                 return
         self._path.parent.mkdir(parents=True, exist_ok=True)
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
@@ -738,7 +751,11 @@ class WorkerStore:
     ) -> RiskRuntimeState:
         if self._schema_version != _WORKER_SCHEMA_VERSION:
             raise RuntimeError("worker schema 尚未迁移，不能保存 risk runtime")
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 connection.execute(
@@ -914,7 +931,11 @@ class WorkerStore:
                 )
         recorded_at = self._iso(self._now())
         created = 0
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 rows = connection.execute(
@@ -1060,7 +1081,11 @@ class WorkerStore:
             WorkerCommandAction.SUBMIT,
             WorkerCommandAction.SET_LEVERAGE,
         }
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing = connection.execute(
@@ -1261,7 +1286,11 @@ class WorkerStore:
         if not clean_worker_id:
             raise ValueError("worker_id 不能为空")
         now = self._now()
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 self._fail_unauthorized_submits(
@@ -1327,7 +1356,11 @@ class WorkerStore:
             result.model_dump_json() if result is not None else "null"
         )
         now = self._now()
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
@@ -1372,7 +1405,11 @@ class WorkerStore:
             field_name="failure_code",
         )
         now = self._now()
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 retryable = connection.execute(
@@ -1487,7 +1524,11 @@ class WorkerStore:
             resolved_by=resolved_by,
             resolved_at=now,
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 command = connection.execute(
@@ -1690,7 +1731,11 @@ class WorkerStore:
             granted_at=now,
             expires_at=now + timedelta(seconds=self._validate_ttl(ttl_seconds)),
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 unresolved = connection.execute(
@@ -1779,7 +1824,11 @@ class WorkerStore:
         expires_at = now + timedelta(
             seconds=self._validate_ttl(ttl_seconds)
         )
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 cursor = connection.execute(
@@ -1864,7 +1913,11 @@ class WorkerStore:
             field_name="failure_code",
         )
         now = self._now()
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 lease = connection.execute(
@@ -1987,7 +2040,11 @@ class WorkerStore:
         clean_worker_id = worker_id.strip()
         if not clean_worker_id:
             raise ValueError("worker_id 不能为空")
-        with self._lock, self._connect() as connection:
+        with (
+            database_write_guard(self._path),
+            self._lock,
+            self._connect() as connection,
+        ):
             connection.execute("BEGIN IMMEDIATE")
             try:
                 existing = connection.execute(
