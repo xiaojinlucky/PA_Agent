@@ -121,6 +121,16 @@ def test_evidence_index_and_samples_match_published_schemas() -> None:
 
 
 def test_windows_install_and_uninstall_scripts_parse() -> None:
+    script_paths = [
+        _ROOT / "scripts" / "install_windows.ps1",
+        _ROOT / "scripts" / "uninstall_windows.ps1",
+        _ROOT / "scripts" / "publish_release.ps1",
+    ]
+    for script_path in script_paths:
+        assert script_path.read_bytes().startswith(b"\xef\xbb\xbf"), (
+            f"{script_path.name} must use UTF-8 BOM for Windows PowerShell 5.1"
+        )
+
     command = r"""
 $paths = @(
   'scripts/install_windows.ps1',

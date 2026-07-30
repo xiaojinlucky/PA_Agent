@@ -437,8 +437,10 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [ ] WO-E 真实桌面矩阵：使用已验证的 Longbridge 行情档案完成 AAPL.US、700.HK、
   600519.SH 与 Crypto 的正式快捷方式验收；无权威 tick 的股票只展示、不运行价格分析。
 - [ ] v0.1.0 阶段 D 发布链：主体已由 `4c9d16fe29611a2c35eaa725e2e843d2e745885b`
-  推送，但该 SHA 的 CI 因 Qt 图表销毁竞态变红；本地修复后 2227 项非 live 回归已通过，
-  失败/错误/跳过均为 0。仍待修复提交、新 SHA 的 CI 与候选 workflow、提交后 `git archive` 和全新
+  推送；Qt 生命周期修复 `ed8c52ee61fa2ff379b561f554774c3ac4da619e` 的 CI 已跑完整套件，
+  不再发生 Qt 底层崩溃，但又暴露 Windows PowerShell 5.1 误读无 BOM 中文发布脚本的
+  3 项失败。三份脚本补齐 UTF-8 BOM 后，双 PowerShell 解析、61 项定向和 2227 项非 live
+  回归均通过。仍待编码修复对应新 SHA 的 CI 与候选 workflow、提交后 `git archive` 和全新
   Python 3.12 源码安装。阶段 A 私有真相和正式快捷方式桌面矩阵未通过前，
   禁止创建稳定 `v0.1.0` tag 或 GitHub Release。
 
