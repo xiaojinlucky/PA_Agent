@@ -233,6 +233,39 @@ def _strict_script_parameters(
     )
 
 
+@pytest.mark.parametrize(
+    ("broker", "environment", "confirmation"),
+    [
+        ("okx", "live", "启用实盘交易"),
+        ("longbridge", "live", "启用实盘交易"),
+        ("longbridge", "demo", "启用模拟交易"),
+    ],
+)
+def test_v010_controller_rejects_unsupported_new_risk_routes(
+    tmp_path,
+    monkeypatch,
+    broker,
+    environment,
+    confirmation,
+):
+    controller, _store, settings, _record_value = _controller(
+        tmp_path,
+        monkeypatch,
+    )
+    settings.execution.selected_broker = broker
+    if broker == "okx":
+        settings.execution.okx.simulated = environment == "demo"
+    else:
+        settings.execution.longbridge.preferred_account = (
+            "paper" if environment == "demo" else "comprehensive"
+        )
+
+    with pytest.raises(LiveTradingDisabled, match="只允许 OKX Demo"):
+        controller.arm(confirmation)
+
+    assert controller.is_armed is False
+
+
 def test_fixed_quantity_leverage_policy_ignores_hidden_risk_percent(
     tmp_path,
 ):

@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PA_Agent 源码部署验收",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "sample",
+    "git_sha",
+    "python_version",
+    "editable_install",
+    "prompt_resources",
+    "entrypoints",
+    "shortcut",
+    "default_trading",
+    "sensitive_file_scan",
+    "source_archive_sha256",
+    "result"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sample": {
+      "type": "boolean"
+    },
+    "git_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "python_version": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "editable_install": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    },
+    "prompt_resources": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "entrypoints": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "pa-agent",
+          "pa-execution-worker"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "shortcut": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    },
+    "default_trading": {
+      "enum": [
+        "off",
+        "blocked",
+        "example_only"
+      ]
+    },
+    "sensitive_file_scan": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    },
+    "source_archive_sha256": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    }
+  }
+}

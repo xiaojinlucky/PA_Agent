@@ -64,6 +64,7 @@ from pa_agent.risk.runtime import (
     route_key,
 )
 from pa_agent.risk.sizing import RiskCalculationFailure
+from pa_agent.safety_defaults import new_risk_route_supported
 
 _ARM_CONFIRMATION = "启用实盘交易"
 _PAPER_ARM_CONFIRMATION = "启用模拟交易"
@@ -894,6 +895,14 @@ class ExecutionService:
                 not self._risk_reducing_writes_blocked
                 and self._hard_plan_gate_enabled(plan)
             )
+        if (
+            self._new_risk_authorizer is not None
+            and not new_risk_route_supported(
+                plan.broker,
+                plan.environment,
+            )
+        ):
+            return False
         if self._new_risk_authorizer is not None:
             if not self._hard_plan_gate_enabled(plan):
                 return False
@@ -936,6 +945,17 @@ class ExecutionService:
                 )
             self._require_hard_plan_gate(plan)
             return
+        if (
+            self._new_risk_authorizer is not None
+            and not new_risk_route_supported(
+                plan.broker,
+                plan.environment,
+            )
+        ):
+            raise LiveTradingDisabled(
+                "PA_Agent v0.1.0 只允许 OKX Demo 新增风险；"
+                "OKX Live 和 Longbridge 交易不在本版本范围内"
+            )
         if self._new_risk_authorizer is not None:
             self._require_hard_plan_gate(plan)
             try:

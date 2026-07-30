@@ -31,6 +31,7 @@ def _service(tmp_path, monkeypatch, *, settings, adapter):
             settings.execution.selected_broker: lambda _plan: adapter
         },
         gate_checker=lambda: True,
+        paper_gate_checker=lambda: True,
         okx_live_gate_checker=lambda: True,
     )
     return service, analysis
@@ -71,7 +72,8 @@ def test_okx_analysis_to_entry_protection_pnl_and_active_exit(
         adapter=adapter,
     )
     execution = service.prepare_analysis(analysis)
-    service.arm("启用实盘交易")
+    assert service.arm_confirmation_text() == "启用模拟交易"
+    service.arm("启用模拟交易")
     execution = service.submit(execution.id)
     client.orders[execution.broker_order_id].update(
         {"state": "filled", "accFillSz": "2", "avgPx": "100"}
@@ -157,7 +159,8 @@ def test_okx_spot_analysis_to_oco_monitoring_and_active_exit(
         adapter=adapter,
     )
     execution = service.prepare_analysis(analysis)
-    service.arm("启用实盘交易")
+    assert service.arm_confirmation_text() == "启用模拟交易"
+    service.arm("启用模拟交易")
     execution = service.submit(execution.id)
     client.orders[execution.broker_order_id].update(
         {"state": "filled", "accFillSz": "2", "avgPx": "100"}

@@ -50,6 +50,7 @@ from pa_agent.execution.worker_protocol import (
     WorkerState,
 )
 from pa_agent.execution.worker_store import WorkerStore
+from pa_agent.safety_defaults import new_risk_route_supported
 
 _ARM_CONFIRMATION = "启用实盘交易"
 _PAPER_ARM_CONFIRMATION = "启用模拟交易"
@@ -162,6 +163,11 @@ class ExecutionController:
         )
 
     def _require_environment_gate(self, broker: str, environment: str) -> None:
+        if not new_risk_route_supported(broker, environment):
+            raise LiveTradingDisabled(
+                "PA_Agent v0.1.0 只允许 OKX Demo 新增风险；"
+                "OKX Live 和 Longbridge 交易不在本版本范围内"
+            )
         if environment == "demo":
             if not self._paper_gate_checker():
                 raise LiveTradingDisabled(

@@ -1,0 +1,249 @@
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from jsonschema import Draft202012Validator
+
+_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
+    install_path = _ROOT / "scripts" / "install_windows.ps1"
+    uninstall_path = _ROOT / "scripts" / "uninstall_windows.ps1"
+    required = [
+        _ROOT / "CHANGELOG.md",
+        _ROOT / "docs" / "RELEASE_CHECKLIST.md",
+        _ROOT / "docs" / "SOURCE_INSTALL_WINDOWS.md",
+        _ROOT / "docs" / "evidence" / "capability-index.json",
+        _ROOT / "docs" / "evidence" / "schemas" / "capability-index.schema.json",
+        _ROOT / "docs" / "evidence" / "schemas" / "runtime-snapshot.schema.json",
+        _ROOT / "docs" / "evidence" / "schemas" / "market-acceptance.schema.json",
+        _ROOT / "docs" / "evidence" / "schemas" / "desktop-acceptance.schema.json",
+        _ROOT / "docs" / "evidence" / "schemas" / "release-acceptance.schema.json",
+        install_path,
+        uninstall_path,
+        _ROOT / "scripts" / "release_pipeline.py",
+        _ROOT / "scripts" / "publish_release.ps1",
+        _ROOT / ".github" / "workflows" / "release.yml",
+    ]
+    assert [str(path.relative_to(_ROOT)) for path in required if not path.is_file()] == []
+
+    install_text = install_path.read_text(encoding="utf-8")
+    uninstall_text = uninstall_path.read_text(encoding="utf-8")
+    release_workflow_text = (
+        _ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    ci_workflow_text = (
+        _ROOT / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+    publish_text = (
+        _ROOT / "scripts" / "publish_release.ps1"
+    ).read_text(encoding="utf-8")
+    assert "3.12" in install_text
+    assert "Git for Windows" in install_text
+    assert "PA_Agent.lnk" in install_text
+    assert "ConfirmUninstall" in uninstall_text
+    assert "Remove-Item" in uninstall_text
+    assert "D:\\Desktop" not in install_text
+    assert '$tests -lt 2224' in ci_workflow_text
+    assert '$tests -lt 2224' in release_workflow_text
+    assert (
+        '$venvPython = Join-Path $sourceRoot.FullName '
+        '".venv\\Scripts\\python.exe"'
+    ) in release_workflow_text
+    assert "-Confirm:$false" in release_workflow_text
+    assert '$Repository = "xiaojinlucky/PA_Agent"' in publish_text
+    assert 'Get-GreenWorkflowRun "ci.yml"' in publish_text
+    assert 'Get-GreenWorkflowRun "release.yml"' in publish_text
+    assert "--require-fresh-now" in publish_text
+    assert "--draft" in publish_text
+    assert "--draft=false" in publish_text
+    assert "downloaded asset hash mismatch" in publish_text
+    assert "origin/main moved before draft publication" in publish_text
+    assert "upload-scan" in publish_text
+    assert "scan-tree $uploadScanRoot --reject-private-paths" in publish_text
+    assert publish_text.count("Confirm-ReleaseAssets") >= 3
+    assert "Published Release asset verification failed" in publish_text
+
+
+def test_capability_index_has_exact_five_layers_and_honest_blockers() -> None:
+    path = _ROOT / "docs" / "evidence" / "capability-index.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+
+    assert payload["release_version"] == "0.1.0"
+    expected_layers = {"code", "tests", "external", "gui", "runtime"}
+    by_id = {
+        item["capability_id"]: item
+        for item in payload["capabilities"]
+    }
+    assert by_id
+    assert all(set(item["layers"]) == expected_layers for item in by_id.values())
+    assert by_id["worker-v5-runtime"]["layers"]["runtime"] == "blocked"
+    assert by_id["multi-market-workspace"]["layers"]["gui"] == "blocked"
+    assert payload["stable_release_ready"] is False
+
+
+def test_evidence_index_and_samples_match_published_schemas() -> None:
+    evidence_root = _ROOT / "docs" / "evidence"
+    index_schema = json.loads(
+        (evidence_root / "schemas" / "capability-index.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    index = json.loads(
+        (evidence_root / "capability-index.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator(index_schema).validate(index)
+
+    pairs = [
+        ("runtime-snapshot", "runtime-snapshot.example.json"),
+        ("market-acceptance", "market-acceptance.example.json"),
+        ("desktop-acceptance", "desktop-acceptance.example.json"),
+        ("release-acceptance", "release-acceptance.example.json"),
+    ]
+    for schema_stem, sample_name in pairs:
+        schema = json.loads(
+            (
+                evidence_root
+                / "schemas"
+                / f"{schema_stem}.schema.json"
+            ).read_text(encoding="utf-8")
+        )
+        sample = json.loads(
+            (evidence_root / "samples" / sample_name).read_text(
+                encoding="utf-8"
+            )
+        )
+        Draft202012Validator(schema).validate(sample)
+
+
+def test_windows_install_and_uninstall_scripts_parse() -> None:
+    command = r"""
+$paths = @(
+  'scripts/install_windows.ps1',
+  'scripts/uninstall_windows.ps1',
+  'scripts/publish_release.ps1'
+)
+foreach ($path in $paths) {
+  $tokens = $null
+  $errors = $null
+  [System.Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path $path), [ref]$tokens, [ref]$errors
+  ) | Out-Null
+  if ($errors.Count -ne 0) {
+    $errors | ForEach-Object { Write-Error $_.Message }
+    exit 1
+  }
+}
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_uninstall_rejects_unrelated_shortcut(tmp_path: Path) -> None:
+    source = tmp_path / "PA_Agent-v0.1.0"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "pa-agent"\n',
+        encoding="utf-8",
+    )
+    shortcut = tmp_path / "PA_Agent.lnk"
+    command = rf"""
+$shell = New-Object -ComObject WScript.Shell
+$link = $shell.CreateShortcut('{shortcut}')
+$link.TargetPath = "$env:SystemRoot\System32\notepad.exe"
+$link.Save()
+& '{_ROOT / "scripts" / "uninstall_windows.ps1"}' `
+  -SourcePath '{source}' `
+  -ShortcutPath '{shortcut}' `
+  -ConfirmUninstall
+"""
+    result = subprocess.run(
+        ["powershell", "-NoProfile", "-Command", command],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert shortcut.is_file()
+    assert "does not belong" in (result.stdout + result.stderr)
+
+
+def test_install_refuses_machine_without_git(tmp_path: Path) -> None:
+    source = tmp_path / "PA_Agent-v0.1.0"
+    source.mkdir()
+    (source / "pyproject.toml").write_text(
+        '[project]\nname = "pa-agent"\n',
+        encoding="utf-8",
+    )
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_ROOT / "scripts" / "install_windows.ps1"),
+            "-SourcePath",
+            str(source),
+            "-PythonCommand",
+            sys.executable,
+            "-GitCommand",
+            str(tmp_path / "missing-git.exe"),
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Git for Windows" in (result.stdout + result.stderr)
+    assert not (source / ".venv").exists()
+
+
+def test_publish_script_requires_explicit_stable_release_confirmation(
+    tmp_path: Path,
+) -> None:
+    result = subprocess.run(
+        [
+            "powershell",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            str(_ROOT / "scripts" / "publish_release.ps1"),
+            "-ReleaseRoot",
+            str(tmp_path),
+        ],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "-ConfirmStableRelease" in (result.stdout + result.stderr)

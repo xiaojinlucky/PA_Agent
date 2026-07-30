@@ -24,6 +24,10 @@ from pa_agent.ai.provider_capabilities import (
     fixed_model_context_window,
     resolve_provider_capability,
 )
+from pa_agent.safety_defaults import (
+    DEFAULT_AUTO_EXECUTE,
+    DEFAULT_EXECUTION_ENABLED,
+)
 
 DecisionStance = Literal["conservative", "balanced", "aggressive", "extreme_aggressive"]
 DataSourceKind = Literal[
@@ -477,7 +481,7 @@ class OkxExecutionSettings(BaseModel):
     risk_capital_cap_usdt: Decimal = Field(default=Decimal("0"), ge=0)
     risk_percent: Decimal = Field(default=Decimal("0.10"), gt=0, le=1)
     maximum_leverage: Decimal = Field(default=Decimal("20"), ge=1, le=125)
-    simulated: bool = False
+    simulated: bool = True
     api_base_url: str = "https://www.okx.com"
 
     @field_validator("api_base_url", mode="before")
@@ -494,9 +498,9 @@ class ExecutionSettings(BaseModel):
 
     model_config = ConfigDict(extra="ignore", validate_assignment=True)
 
-    enabled: bool = False
-    auto_execute: bool = False
-    selected_broker: ExecutionBroker = "longbridge"
+    enabled: bool = DEFAULT_EXECUTION_ENABLED
+    auto_execute: bool = DEFAULT_AUTO_EXECUTE
+    selected_broker: ExecutionBroker = "okx"
     min_trade_confidence: int = Field(default=70, ge=0, le=100)
     poll_interval_seconds: float = Field(default=2.0, ge=1.0, le=30.0)
     entry_timeout_seconds: int = Field(default=120, ge=10, le=86_400)

@@ -1,0 +1,15 @@
+{
+  "$schema": "../schemas/release-acceptance.schema.json",
+  "schema_version": 1,
+  "sample": true,
+  "git_sha": null,
+  "python_version": null,
+  "editable_install": "example_only",
+  "prompt_resources": null,
+  "entrypoints": [],
+  "shortcut": "example_only",
+  "default_trading": "example_only",
+  "sensitive_file_scan": "example_only",
+  "source_archive_sha256": null,
+  "result": "example_only"
+}

@@ -1,0 +1,138 @@
+{
+  "$schema": "schemas/capability-index.schema.json",
+  "schema_version": 1,
+  "release_version": "0.1.0",
+  "as_of_git_sha": "2506e2f365ab1af9cf1ffd42c0e70cb3ddb59368",
+  "collected_at": "2026-07-30T05:34:00+08:00",
+  "stable_release_ready": false,
+  "blockers": [
+    "worker-v5-runtime.external",
+    "worker-v5-runtime.runtime",
+    "multi-market-workspace.gui",
+    "release-source-deployment.code",
+    "release-source-deployment.tests",
+    "release-source-deployment.runtime"
+  ],
+  "capabilities": [
+    {
+      "evidence_id": "E-P0-NEW-RISK-V5",
+      "capability_id": "new-risk-one-shot-token",
+      "capability": "一次授权最多绑定一条新增风险命令",
+      "git_sha": "c932e0113e9c4e33771d1cc5afc1f16beda46421",
+      "layers": {
+        "code": "verified",
+        "tests": "verified",
+        "external": "not_applicable",
+        "gui": "not_applicable",
+        "runtime": "not_applicable"
+      },
+      "evidence": [
+        {
+          "path": "docs/VALIDATION_EVIDENCE.md",
+          "sha256": null,
+          "kind": "historical-ledger"
+        }
+      ],
+      "superseded_by": null
+    },
+    {
+      "evidence_id": "E-RUNTIME-V5",
+      "capability_id": "worker-v5-runtime",
+      "capability": "运行 Worker 加载 schema v5 和完整构建 SHA",
+      "git_sha": "c932e0113e9c4e33771d1cc5afc1f16beda46421",
+      "layers": {
+        "code": "verified",
+        "tests": "verified",
+        "external": "blocked",
+        "gui": "not_applicable",
+        "runtime": "blocked"
+      },
+      "evidence": [
+        {
+          "path": "BLOCKED.md",
+          "sha256": null,
+          "kind": "current-blocker"
+        }
+      ],
+      "superseded_by": null
+    },
+    {
+      "evidence_id": "E-LONGBRIDGE-B1",
+      "capability_id": "longbridge-readonly-contract",
+      "capability": "美股、港股、A股只读行情与统一时间合同",
+      "git_sha": "1b0f6c9eacd54326975fd11ba8cb86e78a4b1daf",
+      "layers": {
+        "code": "verified",
+        "tests": "verified",
+        "external": "verified",
+        "gui": "not_applicable",
+        "runtime": "not_applicable"
+      },
+      "evidence": [
+        {
+          "path": "docs/VALIDATION_EVIDENCE.md",
+          "sha256": null,
+          "kind": "redacted-market-summary"
+        }
+      ],
+      "superseded_by": null
+    },
+    {
+      "evidence_id": "E-MARKET-CONTROLLER-B2",
+      "capability_id": "market-workspace-controller",
+      "capability": "无 Qt 多市场状态、并发和设置唯一所有者",
+      "git_sha": "18951dc53a5d2b075bda0759676a68dd62dca172",
+      "layers": {
+        "code": "verified",
+        "tests": "verified",
+        "external": "not_applicable",
+        "gui": "verified",
+        "runtime": "not_applicable"
+      },
+      "evidence": [
+        {
+          "path": "docs/VALIDATION_EVIDENCE.md",
+          "sha256": null,
+          "kind": "ci-summary"
+        }
+      ],
+      "superseded_by": null
+    },
+    {
+      "evidence_id": "E-MARKET-WORKSPACE-C",
+      "capability_id": "multi-market-workspace",
+      "capability": "原生 PyQt6 四市场只读页面",
+      "git_sha": "91715ee2c8af0e6e829031b5a4f375d18f71cf52",
+      "layers": {
+        "code": "verified",
+        "tests": "verified",
+        "external": "verified",
+        "gui": "blocked",
+        "runtime": "not_applicable"
+      },
+      "evidence": [
+        {
+          "path": "docs/VALIDATION_EVIDENCE.md",
+          "sha256": null,
+          "kind": "offscreen-and-ci-summary"
+        }
+      ],
+      "superseded_by": null
+    },
+    {
+      "evidence_id": "E-RELEASE-D",
+      "capability_id": "release-source-deployment",
+      "capability": "Windows + Python 3.12 源码部署与发布证据",
+      "git_sha": "2506e2f365ab1af9cf1ffd42c0e70cb3ddb59368",
+      "layers": {
+        "code": "implemented",
+        "tests": "implemented",
+        "external": "not_applicable",
+        "gui": "not_applicable",
+        "runtime": "not_started"
+      },
+      "evidence": [],
+      "superseded_by": null
+    }
+  ]
+}

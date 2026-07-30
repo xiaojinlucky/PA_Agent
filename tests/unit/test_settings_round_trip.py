@@ -274,11 +274,11 @@ def test_api_key_present_on_disk(tmp_path):
     """The saved JSON contains the plaintext API key."""
     p = tmp_path / "settings.json"
     s = Settings()
-    s.provider.api_key = "sk-super-secret-key"
+    s.provider.api_key = "sk-test-super-secret-key"
     save_settings(s, p)
     raw = p.read_text(encoding="utf-8")
     data = json.loads(raw)
-    assert data["provider"]["api_key"] == "sk-super-secret-key"
+    assert data["provider"]["api_key"] == "sk-test-super-secret-key"
 
 
 def test_corrupt_json_returns_defaults(tmp_path):

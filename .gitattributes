@@ -1,3 +1,13 @@
 # Auto detect text files and perform LF normalization
 * text=auto
 pa_agent/build_info.py export-subst
+docs/archive export-ignore
+docs/CLAUDE_HANDOFF_20260726.md export-ignore
+docs/CODEX_HANDOFF.md export-ignore
+docs/LOCAL_EXECUTION_CONTEXT.md export-ignore
+CONTEXT.md export-ignore
+PROGRESS.md export-ignore
+BLOCKED.md export-ignore
+docs/WORKORDER_MASTER_20260727.md export-ignore
+docs/VALIDATION_EVIDENCE.md export-ignore
+docs/prd export-ignore

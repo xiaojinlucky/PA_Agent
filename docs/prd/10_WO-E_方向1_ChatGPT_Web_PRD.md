@@ -3,7 +3,7 @@
 ## 外部证据
 
 - 生成时间：2026-07-28 12:01（北京时间）。
-- 会话 URL：https://chatgpt.com/c/6a68252f-1580-83e8-9c84-1dcbffc8246b
+- 会话地址已从 PUBLIC 当前文档移除；本地回答正文与内容指纹足以复核本文件。
 - 方向：Product Design 显示顺序 1，`Scan Rail Workbench`。
 - 提交提示词：`docs/prd/08_WO-E_方向1_外部设计门证据.md` 第 2.4 节，DOM 可见文本 SHA-256 为 `A6105448ECC1485E6B23E0A0F86AEB71600BB86628A8D615221141CF3D74ABDE`。
 - 完整回答：20713 个 JavaScript 字符，浏览器 DOM `innerText` SHA-256 为 `25733531DCC7351BBD114826D5737E98F58E164C9AA9629E9F5A7209C0C661E7`。

@@ -55,6 +55,7 @@ from PyQt6.QtGui import QFontInfo, QFontMetrics  # noqa: E402
 from PyQt6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from pa_agent.app_context import AppContext  # noqa: E402
+from pa_agent.build_info import runtime_sha  # noqa: E402
 from pa_agent.config.settings import Settings  # noqa: E402
 from pa_agent.data.base import KlineBar  # noqa: E402
 from pa_agent.data.market_workspace import (  # noqa: E402
@@ -373,6 +374,7 @@ def _metadata(
         for button in page.findChildren(QPushButton)
     )
     return {
+        "git_sha": runtime_sha(),
         "scenario": ARGS.scenario,
         "logical_window": [window.width(), window.height()],
         "physical_image": [image.width(), image.height()],

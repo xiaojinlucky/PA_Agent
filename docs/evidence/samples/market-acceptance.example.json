@@ -1,0 +1,25 @@
+{
+  "$schema": "../schemas/market-acceptance.schema.json",
+  "schema_version": 1,
+  "sample": true,
+  "git_sha": null,
+  "market": "US",
+  "symbol": "AAPL.US",
+  "source": "longbridge",
+  "analysis_as_of_utc_ms": null,
+  "permission": "unknown",
+  "permission_derivation": null,
+  "server_quote_level": null,
+  "server_packages": [],
+  "price_tick_authoritative": null,
+  "timeframes": [
+    {
+      "timeframe": "10m",
+      "bar_count": 0,
+      "first_utc_ms": null,
+      "last_closed_utc_ms": null,
+      "missing_bars": null
+    }
+  ],
+  "result": "example_only"
+}

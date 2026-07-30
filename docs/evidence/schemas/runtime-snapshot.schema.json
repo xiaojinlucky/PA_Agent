@@ -1,0 +1,315 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PA_Agent 脱敏运行态快照",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample",
+    "collected_at",
+    "git_sha",
+    "broker",
+    "environment",
+    "worker_schema_version",
+    "target_commit_at",
+    "worker_started_at",
+    "config_fingerprint",
+    "last_reconciled_at",
+    "migration_preserved_risk_stop",
+    "risk_stop",
+    "database_quick_check",
+    "control_database_quick_check",
+    "active_execution_count",
+    "unresolved_command_count",
+    "active_new_risk_lease_count",
+    "broker_position_count",
+    "broker_pending_order_count",
+    "broker_pending_algo_order_count",
+    "campaign_state",
+    "controlled_reproducible",
+    "result"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sample": {
+      "type": "boolean"
+    },
+    "collected_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "git_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "broker": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "okx",
+        null
+      ]
+    },
+    "environment": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "demo",
+        null
+      ]
+    },
+    "worker_schema_version": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "worker_started_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "target_commit_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "config_fingerprint": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9A-Fa-f]{64}$"
+    },
+    "last_reconciled_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "risk_stop": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "active",
+        "reason_code"
+      ],
+      "properties": {
+        "active": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "reason_code": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "database_quick_check": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        null
+      ]
+    },
+    "control_database_quick_check": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "ok",
+        null
+      ]
+    },
+    "active_execution_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "unresolved_command_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "active_new_risk_lease_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "broker_position_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "broker_pending_order_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "broker_pending_algo_order_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "campaign_state": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "stopped",
+        "needs_attention",
+        null
+      ]
+    },
+    "controlled_reproducible": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entry_submitted",
+        "entry_filled",
+        "new_risk_command_count",
+        "new_risk_lease_count",
+        "lease_command_binding_unique",
+        "worker_route_verified",
+        "worker_requester_verified",
+        "worker_config_fingerprint_verified",
+        "native_protection_count",
+        "active_exit_requested",
+        "closed",
+        "final_reconciliation"
+      ],
+      "properties": {
+        "entry_submitted": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "entry_filled": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "new_risk_command_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "new_risk_lease_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "lease_command_binding_unique": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "worker_route_verified": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "worker_requester_verified": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "worker_config_fingerprint_verified": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "native_protection_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "active_exit_requested": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "closed": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "final_reconciliation": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
+      }
+    },
+    "migration_preserved_risk_stop": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    }
+  }
+}

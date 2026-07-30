@@ -58,14 +58,23 @@ jobs:
             } else {
               $pythonVersion |
                 Set-Content -Encoding utf8 scratch/ci-evidence/python-version.txt
-              $pipFreeze = @(python -m pip freeze 2>&1)
+              $packageVersion = (
+                python -c "import pa_agent; print(pa_agent.__version__)" 2>&1 |
+                  Out-String
+              ).Trim()
+              $packageVersionExitCode = $LASTEXITCODE
+              $pipFreeze = @(python -m pip freeze --exclude-editable 2>&1)
               $pipExitCode = $LASTEXITCODE
-              if ($pipExitCode -ne 0) {
+              if (
+                $packageVersionExitCode -ne 0 -or
+                $pipExitCode -ne 0
+              ) {
                 "unavailable: pip freeze failed" |
                   Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
                 $captureErrors += "pip_freeze"
               } else {
-                $pipFreeze |
+                $sanitizedFreeze = @("pa-agent==$packageVersion") + $pipFreeze
+                $sanitizedFreeze |
                   Set-Content -Encoding utf8 scratch/ci-evidence/pip-freeze.txt
               }
             }
@@ -89,7 +98,7 @@ jobs:
           $failures = [int]$suite.failures
           $errors = [int]$suite.errors
           $skipped = [int]$suite.skipped
-          if ($tests -lt 2164 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+          if ($tests -lt 2224 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
             throw "pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
           }
 

@@ -25,7 +25,7 @@ from pa_agent.util.mask_secret import mask_secret
 
 # A realistic-looking API key long enough that mask_secret produces a meaningful
 # masked form (all but last 4 chars become '*').
-API_KEY = "sk-plaintext123456789abcdef"
+API_KEY = "sk-test-plaintext123456789abcdef"
 
 
 def _make_record_with_key(api_key: str) -> AnalysisRecord:

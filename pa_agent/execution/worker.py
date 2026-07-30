@@ -36,6 +36,7 @@ from pa_agent.execution.worker_protocol import (
 )
 from pa_agent.execution.worker_store import WorkerStore
 from pa_agent.risk.runtime import RiskRuntimeBlocked
+from pa_agent.safety_defaults import new_risk_route_supported
 
 _WRITE_ACTIONS = frozenset(
     {
@@ -595,6 +596,11 @@ class ExecutionWorker:
         *,
         config_fingerprint: str,
     ) -> None:
+        if not new_risk_route_supported(
+            command.broker,
+            command.environment,
+        ):
+            raise _CommandRejected("new_risk_route_unsupported_v010")
         kwargs = self._supported_kwargs(
             self.store.is_new_risk_authorized,
             broker=command.broker,

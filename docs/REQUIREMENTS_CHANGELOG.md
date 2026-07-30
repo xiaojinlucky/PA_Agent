@@ -1,6 +1,6 @@
 # PA_Agent — 问题、需求、修改意见与完成记录
 
-> 当前交接说明（2026-07-23）：本文件保留历史问题和修改记录；当前代码能力、配置边界和未完成事项以 `docs/CODEX_HANDOFF.md`、`CONTEXT.md`、`docs/ROADMAP.md`、`docs/SAFETY_INVARIANTS.md` 及最新测试/运行证据为准。历史段落中的账户开关、品种、运行态和测试数量不得脱离时间位置直接当作当前事实。
+> **历史记录，不是支持说明。** 本文件保留旧问题和修改轨迹。v0.1.0 当前范围以 README、SECURITY、`docs/LIVE_TRADING_DESIGN.md` 和能力索引为准：只允许 OKX Demo 新增风险，明确排除 OKX Live 与全部 Longbridge 交易。下文旧账户开关、路由、运行态和测试数量不得当作当前可用能力。
 
 ## 1. 用户目标
 

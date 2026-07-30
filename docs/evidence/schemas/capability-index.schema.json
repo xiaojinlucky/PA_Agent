@@ -1,0 +1,165 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaojinlucky/PA_Agent/docs/evidence/schemas/capability-index.schema.json",
+  "title": "PA_Agent 五层能力证据索引",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_version",
+    "as_of_git_sha",
+    "collected_at",
+    "stable_release_ready",
+    "blockers",
+    "capabilities"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "release_version": {
+      "const": "0.1.0"
+    },
+    "as_of_git_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "collected_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "stable_release_ready": {
+      "type": "boolean"
+    },
+    "blockers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "capabilities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/capability"
+      }
+    }
+  },
+  "$defs": {
+    "status": {
+      "enum": [
+        "not_started",
+        "implemented",
+        "verified",
+        "blocked",
+        "not_applicable",
+        "superseded"
+      ]
+    },
+    "layers": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code",
+        "tests",
+        "external",
+        "gui",
+        "runtime"
+      ],
+      "properties": {
+        "code": {
+          "$ref": "#/$defs/status"
+        },
+        "tests": {
+          "$ref": "#/$defs/status"
+        },
+        "external": {
+          "$ref": "#/$defs/status"
+        },
+        "gui": {
+          "$ref": "#/$defs/status"
+        },
+        "runtime": {
+          "$ref": "#/$defs/status"
+        }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256",
+        "kind"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9A-Fa-f]{64}$"
+        },
+        "kind": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "evidence_id",
+        "capability_id",
+        "capability",
+        "git_sha",
+        "layers",
+        "evidence",
+        "superseded_by"
+      ],
+      "properties": {
+        "evidence_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "capability_id": {
+          "type": "string",
+          "pattern": "^[a-z0-9-]+$"
+        },
+        "capability": {
+          "type": "string",
+          "minLength": 1
+        },
+        "git_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "layers": {
+          "$ref": "#/$defs/layers"
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/evidence"
+          }
+        },
+        "superseded_by": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    }
+  }
+}

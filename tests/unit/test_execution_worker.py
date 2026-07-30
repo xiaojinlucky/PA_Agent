@@ -485,6 +485,40 @@ def test_worker_rejects_new_risk_command_with_wrong_bound_command_id(
     assert not [call for call in service.calls if call[0] == "submit"]
 
 
+def test_worker_rejects_unsupported_v010_new_risk_route_before_lease_check(
+    tmp_path,
+):
+    worker, store, service = _runtime(tmp_path)
+    worker.start()
+    try:
+        lease = _grant_submit(worker, store)
+        command = _enqueue_execution(
+            store,
+            action=WorkerCommandAction.SUBMIT,
+            lease_id=lease.lease_id,
+        )
+        unsupported = command.model_copy(
+            update={
+                "broker": "longbridge",
+                "environment": "live",
+                "account": "comprehensive",
+            }
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match="new_risk_route_unsupported_v010",
+        ):
+            worker._require_new_risk_lease(
+                unsupported,
+                config_fingerprint="fingerprint-execution-one",
+            )
+    finally:
+        worker.close()
+
+    assert not [call for call in service.calls if call[0] == "submit"]
+
+
 def test_route_only_account_refresh_uses_immutable_command_route(
     tmp_path,
 ):

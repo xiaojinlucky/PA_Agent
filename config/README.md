@@ -41,38 +41,15 @@
    LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=...
    ```
 
-   选择项只允许 `DEFAULT`、`COMPREHENSIVE` 或 `INTRADAY`。程序优先读取进程环境中的选择项和同组凭据，其次读取该共享文件；凭据不会复制到 `settings.json`。Longbridge **行情数据源**仍只创建官方 `QuoteContext`；只有单独启用下述交易执行模块时，才会按所选账户创建交易上下文。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
+   选择项只允许 `DEFAULT`、`COMPREHENSIVE` 或 `INTRADAY`。程序优先读取进程环境中的选择项和同组凭据，其次读取该共享文件；凭据不会复制到 `settings.json`。v0.1.0 的 Longbridge 只创建官方 `QuoteContext` 读取行情，不创建交易上下文。主界面会显示 Token 的本地到期判断：7 天内到期会预警，已到期会在连接前阻断；无法解析 `exp` 时显示“到期日未知”，服务端撤销仍以真实连接结果为准。
 
-6. 如需使用交易执行，在同一 `Quant\env` 中配置（不要写入仓库）：
+6. 如需使用 v0.1.0 唯一支持的 OKX Demo 交易执行，在同一共享环境文件中配置（不要写入仓库）：
 
    ```text
-   # Longbridge 模拟账户
-   LONGBRIDGE_PAPER_APP_KEY=...
-   LONGBRIDGE_PAPER_APP_SECRET=...
-   LONGBRIDGE_PAPER_ACCESS_TOKEN=...
-   LONGBRIDGE_PAPER_ACCOUNT_ID=...
-
-   # Longbridge 综合账户
-   LONGBRIDGE_COMPREHENSIVE_APP_KEY=...
-   LONGBRIDGE_COMPREHENSIVE_APP_SECRET=...
-   LONGBRIDGE_COMPREHENSIVE_ACCESS_TOKEN=...
-   LONGBRIDGE_COMPREHENSIVE_ACCOUNT_ID=...
-
-   # Longbridge 日内融资子账户
-   LONGBRIDGE_INTRADAY_APP_KEY=...
-   LONGBRIDGE_INTRADAY_APP_SECRET=...
-   LONGBRIDGE_INTRADAY_ACCESS_TOKEN=...
-   LONGBRIDGE_INTRADAY_ACCOUNT_ID=...
-
    # OKX 模拟账户
    OKX_DEMO_API_KEY=...
    OKX_DEMO_SECRET_KEY=...
    OKX_DEMO_PASSPHRASE=...
-
-   # OKX 实盘账户（必须与模拟账户分开）
-   OKX_LIVE_API_KEY=...
-   OKX_LIVE_SECRET_KEY=...
-   OKX_LIVE_PASSPHRASE=...
 
    # 旧变量只作为 OKX 模拟账户的兼容输入，绝不会回退给实盘
    OKX_API_KEY=...
@@ -82,14 +59,14 @@
    # 所有真实写操作的总开关
    PA_AGENT_LIVE_TRADING_ENABLED=false
 
-   # Longbridge 模拟账户写操作的独立开关
+   # OKX Demo 写操作的独立开关
    PA_AGENT_PAPER_TRADING_ENABLED=false
 
    # OKX Live 的独立第二道开关
    OKX_LIVE_ENABLED=false
    ```
 
-   真实写开关默认保持 `false`。Longbridge 模拟账户和 OKX Demo 只读取 `PA_AGENT_PAPER_TRADING_ENABLED`，不要求也不会开启实盘总开关；每次重启后仍需输入 `启用模拟交易`。综合账户、日内账户及 OKX Live 仍要求输入 `启用实盘交易`，会话状态只存在内存中。OKX 模拟交易由 `execution.okx.simulated` 控制，不需要开启 `OKX_LIVE_ENABLED`。Demo 与 Live 按执行计划的环境选择独立凭据；Live 缺少 `OKX_LIVE_*` 时直接阻断，不会误用 Demo Key。OKX Key 应仅保留读取与交易权限，移除提币权限，并建议配置 IP 白名单。
+   三个开关默认保持 `false`。v0.1.0 只读取 `PA_AGENT_PAPER_TRADING_ENABLED` 来启用 OKX Demo，会话每次重启后仍需输入 `启用模拟交易`。`PA_AGENT_LIVE_TRADING_ENABLED` 和 `OKX_LIVE_ENABLED` 必须继续为 `false`；本版本不会用它们开放 OKX Live。Longbridge 交易也不在支持范围内。OKX Demo Key 应只保留读取与模拟交易权限，移除提币权限。
 
 ## `settings.json` 字段说明
 
@@ -191,13 +168,13 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `validation.retry_max_semantic` | int | `1` | 语义错误（category c）最大重试次数（0–3） |
 | `validation.retry_stage2` | bool | `true` | 阶段二校验失败时是否重试 |
 
-### execution — 交易执行（默认关闭）
+### execution — OKX Demo 交易执行（默认关闭）
 
 | 字段 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | `execution.enabled` | bool | `false` | 是否允许完整分析记录生成执行计划；关闭时不能启用会话或提交既有计划 |
 | `execution.auto_execute` | bool | `false` | 会话已启用时自动提交新计划；建议先保持关闭并人工确认 |
-| `execution.selected_broker` | string | `"longbridge"` | 当前写操作只允许 `longbridge` 或 `okx` 之一 |
+| `execution.selected_broker` | string | `"okx"` | v0.1.0 新增风险只允许 `okx`；旧 Longbridge 值会被 Controller 和 Worker 阻断 |
 | `execution.min_trade_confidence` | int | `70` | 独立于提示弹窗的执行置信度门槛 |
 | `execution.poll_interval_seconds` | float | `2.0` | 活动订单/保护/盈亏轮询间隔 |
 | `execution.entry_timeout_seconds` | int | `120` | 未成交入场超时后先落盘撤单意图，再撤销未成交数量；当前 10 分钟 OKX Demo 运行器固定覆盖为 `270` |
@@ -205,12 +182,7 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.exit_order_mode` | string | `"market"` | 主动离场方式：`limit`、`limit_with_slippage` 或 `market`；原生止盈止损保护单不受此字段改写 |
 | `execution.entry_slippage_atr_multiple` | decimal | `0.50` | 入场限价+滑点使用分析时主周期 ATR14 的倍数；只在对应模式下生效 |
 | `execution.exit_slippage_atr_multiple` | decimal | `0.50` | 主动离场限价+滑点使用该执行计划捕获的 ATR14 倍数；只在对应模式下生效 |
-| `execution.longbridge.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
-| `execution.longbridge.instrument` | string | `""` | Longbridge 精确证券代码，如 `GLD.US` |
-| `execution.longbridge.quantity` | string | `""` | 下单数量；按券商实时 lot size 校验 |
-| `execution.longbridge.preferred_account` | string | `"comprehensive"` | `paper`、`comprehensive` 或 `intraday`；切换并保存后会停用当前写会话 |
-| `execution.longbridge.allow_comprehensive_fallback` | bool | `true` | 仅日内账户在提交前明确数量不足时回退综合账户；认证、网络、超时和未知状态绝不回退 |
-| `execution.longbridge.allow_outside_rth` | bool | `false` | 美股是否允许盘前/盘后 |
+| `execution.longbridge.*` | object | 兼容读取 | 历史配置兼容字段；v0.1.0 不允许 Longbridge 新增风险，不能作为启用说明 |
 | `execution.okx.source_symbol` | string | `""` | 必须与本次 PA 分析品种完全一致 |
 | `execution.okx.instrument` | string | `""` | OKX 精确 `instId`，不限制黄金，如 `XAUT-USDT`、`BTC-USDT-SWAP` |
 | `execution.okx.sizing_mode` | string | `"risk_budget"` | `risk_budget` 为按资金和风险比例自动算张数；`fixed_quantity` 为用户固定张数并由系统反算风险 |
@@ -220,14 +192,14 @@ DeepSeek、Kimi 与 Codex 都会先加载无需联网的基础模型目录。点
 | `execution.okx.risk_capital_cap_usdt` | decimal | `0` | 用户设置的风险资本上限。有效定仓资金取该值与最新 USDT 权益中较小者；`0` 表示未设置并禁止新增风险 |
 | `execution.okx.risk_percent` | decimal | `0.10` | 单笔最坏止损风险占有效定仓资金的比例，范围 `(0, 1]` |
 | `execution.okx.maximum_leverage` | decimal | `20` | 用户允许的最大杠杆，范围 `[1, 125]`；程序只在该上限内选择经过容量回读的最低可行候选 |
-| `execution.okx.simulated` | bool | `false` | 是否发送 OKX 模拟交易标头 |
+| `execution.okx.simulated` | bool | `true` | v0.1.0 必须为 `true`；`false` 会被 Controller 和 Worker 阻断 |
 | `execution.okx.api_base_url` | string | `"https://www.okx.com"` | 必须使用 HTTPS |
 
 风险预算模式由资金上限、风险比例和止损距离确定张数；固定张数模式由张数确定最坏损失金额和风险比例。杠杆只影响保证金与券商容量，不直接改变止损价差损失。保存路由后，旧 READY 计划的配置指纹会失效，不能按旧券商/品种/数量继续提交。已经开始执行的记录只使用计划中持久化的账户、环境、API 地址、保证金模式、盘外交易开关和超时，不会被当前设置改道。账户接口没有可靠提供的总盈亏或已实现/未实现拆分会保持空值，不跨币种推算。
 
 执行窗口按选中的持久化记录显示成交/剩余数量、入场单号、保护与离场状态、直接错误、事件流以及该记录所属账户的最新资金快照。刷新历史记录时以选中记录的券商、环境和账户为准，不会改读当前配置中的另一个账户。
 
-Longbridge 三个档案的 Token 完全隔离。每个 `*_ACCOUNT_ID` 绑定 Legacy Token 的账户身份；程序会在创建券商会话前同时核对 Token 的模拟/实盘类型与账户 ID，无法解析或错放时直接阻断。`paper` 不会回退到任何实盘账户，也不允许美股盘前/盘后；只有 `intraday` 能在提交前因明确数量不足回退 `comprehensive`。路由控件修改后旧会话立即停用，保存前不能启用或操作订单；保存后还必须重新完成相应的模拟/实盘会话确认。
+Longbridge 交易字段仅用于读取旧配置和保护历史记录，v0.1.0 不把它们变成可用写路线。保存 OKX Demo 工作台配置会明确写入 `execution.selected_broker="okx"` 和 `execution.okx.simulated=true`。
 
 ### OKX Demo 黄金 10 分钟自动循环
 

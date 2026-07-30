@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pa-agent"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Price Action AI assistant: MT5 kline data, two-stage LLM analysis (AGPL-3.0)"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12,<3.13"
 license = { text = "AGPL-3.0-or-later" }
 authors = [{ name = "PA Agent Team" }]
 dependencies = [
@@ -21,7 +21,7 @@ dependencies = [
     "pydantic>=2.7",
     "filelock>=3.15",
     "MetaTrader5>=5.0; sys_platform == 'win32'",
-    "tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git",
+    "tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git@e6f6aaa7de439ac6e454d9b26d2760ded8dc4923",
     "cryptography>=42",
     "pywin32>=306; sys_platform == 'win32'",
     "akshare>=1.14",
@@ -47,7 +47,10 @@ plot = ["matplotlib>=3.8"]
 
 [project.scripts]
 pa-agent = "pa_agent.main:main"
-pa-execution-worker = "pa_agent.execution.worker:main"
+pa-execution-worker = "pa_agent.execution.worker_cli:main"
+
+[tool.setuptools.dynamic]
+version = {attr = "pa_agent.__version__"}
 
 [tool.setuptools.packages.find]
 include = ["pa_agent*"]

@@ -4,12 +4,17 @@ from __future__ import annotations
 import logging
 import sys
 
-from PyQt6.QtWidgets import QApplication
-
 logger = logging.getLogger(__name__)
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = list(sys.argv if argv is None else argv)
+    from pa_agent.release_contract import handle_offline_info_args
+
+    info_result = handle_offline_info_args(argv, program="pa-agent")
+    if info_result is not None:
+        return info_result
+
     # Early diagnostics before Qt / heavy imports: crash dumps + file logging.
     from pa_agent.util.crash_diagnostics import enable_crash_diagnostics, log_startup_diagnostics
     from pa_agent.util.logging import configure_logging
@@ -18,7 +23,8 @@ def main(argv: list[str] | None = None) -> int:
     configure_logging()
     log_startup_diagnostics()
 
-    argv = list(sys.argv if argv is None else argv)
+    from PyQt6.QtWidgets import QApplication
+
     app = QApplication(argv)
     app.setApplicationName("PA Agent")
 

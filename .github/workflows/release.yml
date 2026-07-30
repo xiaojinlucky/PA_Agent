@@ -1,0 +1,231 @@
+name: Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v0.1.0"
+
+permissions:
+  contents: read
+
+jobs:
+  source-release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify tag is current origin main
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          git fetch --no-tags origin main
+          $mainSha = (git rev-parse origin/main).Trim()
+          if ($mainSha -ne $env:GITHUB_SHA) {
+            throw "tag SHA is not current origin/main"
+          }
+
+      - name: Install and run secret scanner before dependency install
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          choco install gitleaks --version=8.30.1 --no-progress -y
+          gitleaks dir . --no-banner --redact
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install verification dependencies
+        run: python -m pip install -e ".[dev]"
+
+      - name: Verify offline entrypoints
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          pa-agent --version
+          pa-agent --self-check
+          pa-execution-worker --version
+          pa-execution-worker --self-check
+
+      - name: Run deterministic release test suite
+        run: >-
+          python -m pytest -p no:cacheprovider -m "not live"
+          --junitxml=scratch/release-junit.xml
+
+      - name: Enforce release test gate
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $report = [xml](Get-Content -Raw scratch/release-junit.xml)
+          $suite = $report.testsuites.testsuite
+          $tests = [int]$suite.tests
+          $failures = [int]$suite.failures
+          $errors = [int]$suite.errors
+          $skipped = [int]$suite.skipped
+          if ($tests -lt 2224 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+            throw "release pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
+          }
+
+      - name: Validate evidence index
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/release_pipeline.py validate-index
+          if ($env:GITHUB_REF_TYPE -eq "tag") {
+            $version = python -c 'import pa_agent; print(pa_agent.__version__)'
+            $expectedTag = "v$($version.Trim())"
+            if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+              throw "tag/version mismatch: $env:GITHUB_REF_NAME != $expectedTag"
+            }
+          }
+
+      - name: Build and verify git archive source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          New-Item -ItemType Directory -Force scratch/release | Out-Null
+          python scripts/release_pipeline.py build-source `
+            --repo-root . `
+            --output-dir scratch/release `
+            --ref $env:GITHUB_SHA
+          $sourceZip = Get-ChildItem scratch/release/*-source.zip | Select-Object -First 1
+          Expand-Archive -LiteralPath $sourceZip.FullName -DestinationPath scratch/release/extracted
+          python scripts/release_pipeline.py scan-tree scratch/release/extracted
+          gitleaks dir scratch/release/extracted --no-banner --redact
+
+      - name: Fresh Python 3.12 editable install and shortcut check
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $sourceRoot = Get-ChildItem scratch/release/extracted -Directory | Select-Object -First 1
+          $venvPython = Join-Path $sourceRoot.FullName ".venv\Scripts\python.exe"
+          $shortcut = Join-Path (Resolve-Path scratch/release) "PA_Agent.lnk"
+          $installScript = Join-Path $sourceRoot.FullName "scripts\install_windows.ps1"
+          $uninstallScript = Join-Path $sourceRoot.FullName "scripts\uninstall_windows.ps1"
+          & $installScript `
+            -SourcePath $sourceRoot.FullName `
+            -PythonCommand python `
+            -ShortcutPath $shortcut
+          $paAgent = Join-Path $sourceRoot.FullName ".venv\Scripts\pa-agent.exe"
+          $worker = Join-Path $sourceRoot.FullName ".venv\Scripts\pa-execution-worker.exe"
+          & $paAgent --version
+          & $paAgent --self-check
+          & $worker --version
+          & $worker --self-check
+          if (-not (Test-Path -LiteralPath $shortcut -PathType Leaf)) {
+            throw "shortcut was not created"
+          }
+          $freshEvidence = "scratch/release/evidence/fresh-install"
+          New-Item -ItemType Directory -Force $freshEvidence | Out-Null
+          & $venvPython --version 2>&1 |
+            Set-Content -Encoding utf8 "$freshEvidence/python-version.txt"
+          & $venvPython -m pip freeze --exclude-editable |
+            Set-Content -Encoding utf8 "$freshEvidence/pip-freeze.txt"
+          & $paAgent --version |
+            Set-Content -Encoding utf8 "$freshEvidence/pa-agent-version.txt"
+          & $paAgent --self-check |
+            Set-Content -Encoding utf8 "$freshEvidence/pa-agent-self-check.json"
+          & $worker --version |
+            Set-Content -Encoding utf8 "$freshEvidence/worker-version.txt"
+          & $worker --self-check |
+            Set-Content -Encoding utf8 "$freshEvidence/worker-self-check.json"
+
+      - name: Generate redacted offscreen desktop evidence
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $sourceRoot = Get-ChildItem scratch/release/extracted -Directory | Select-Object -First 1
+          $venvPython = Join-Path $sourceRoot.FullName ".venv\Scripts\python.exe"
+          $output = "scratch/release/evidence/desktop"
+          New-Item -ItemType Directory -Force $output | Out-Null
+          $script = Join-Path $sourceRoot.FullName "tests\visual\generate_market_workspace_screenshot.py"
+          $scenarios = @(
+            "normal", "loading", "empty", "stale", "auth_failed",
+            "calendar_unknown", "switch_failed", "analysis_running",
+            "analysis_failed"
+          )
+          foreach ($scenario in $scenarios) {
+            & $venvPython $script --scenario $scenario --width 1440 --height 900 `
+              --scale 1 --output "$output/1440x900-$scenario.png"
+          }
+          & $venvPython $script --scenario normal --width 1920 --height 1080 `
+            --scale 1 --output "$output/1920x1080-normal.png"
+          foreach ($scale in @("1", "1.25", "1.5")) {
+            $name = $scale.Replace(".", "p")
+            foreach ($size in @(@(1440, 900), @(1920, 1080))) {
+              & $venvPython $script --scenario normal --width $size[0] --height $size[1] `
+                --scale $scale --output "$output/scale-$name-$($size[0])x$($size[1]).png"
+            }
+          }
+          $pngCount = @(Get-ChildItem $output -Filter *.png).Count
+          $jsonCount = @(Get-ChildItem $output -Filter *.json).Count
+          if ($pngCount -ne 16 -or $jsonCount -ne 16) {
+            throw "desktop evidence count mismatch: png=$pngCount json=$jsonCount"
+          }
+          & $venvPython (Join-Path $sourceRoot.FullName "scripts\release_pipeline.py") `
+            validate-desktop $output `
+            --sha $env:GITHUB_SHA
+          $shortcut = Join-Path (Resolve-Path scratch/release) "PA_Agent.lnk"
+          & (Join-Path $sourceRoot.FullName "scripts\uninstall_windows.ps1") `
+            -SourcePath $sourceRoot.FullName `
+            -ShortcutPath $shortcut `
+            -ConfirmUninstall `
+            -Confirm:$false
+
+      - name: Assemble durable redacted evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $evidence = "scratch/release/evidence"
+          Copy-Item scratch/release-junit.xml "$evidence/pytest-deterministic-junit.xml"
+          git rev-parse HEAD | Set-Content -Encoding utf8 "$evidence/full-git-sha.txt"
+          python --version 2>&1 |
+            Set-Content -Encoding utf8 "$evidence/build-environment-python-version.txt"
+          $version = python -c "import pa_agent; print(pa_agent.__version__)"
+          "pa-agent==$version" |
+            Set-Content -Encoding utf8 "$evidence/build-environment-pip-freeze.txt"
+          python -m pip freeze --exclude-editable |
+            Add-Content -Encoding utf8 "$evidence/build-environment-pip-freeze.txt"
+          Copy-Item docs/evidence/capability-index.json "$evidence/capability-index.json"
+          Copy-Item docs/evidence/schemas "$evidence/schemas" -Recurse
+          Copy-Item docs/evidence/samples "$evidence/samples" -Recurse
+          python scripts/release_pipeline.py scan-tree $evidence `
+            --reject-private-paths
+          gitleaks dir $evidence --no-banner --redact
+          Compress-Archive -Path "$evidence/*" `
+            -DestinationPath "scratch/release/PA_Agent-v0.1.0-evidence.zip"
+          $source = Get-ChildItem scratch/release/*-source.zip | Select-Object -First 1
+          python scripts/release_pipeline.py manifest `
+            --source $source.FullName `
+            --evidence scratch/release/PA_Agent-v0.1.0-evidence.zip `
+            --output-dir scratch/release `
+            --sha $env:GITHUB_SHA
+
+      - name: Upload release candidate
+        uses: actions/upload-artifact@v4
+        with:
+          name: pa-agent-v0.1.0-${{ github.sha }}
+          path: |
+            scratch/release/PA_Agent-v0.1.0-source.zip
+            scratch/release/PA_Agent-v0.1.0-evidence.zip
+            scratch/release/release-manifest.json
+            scratch/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90

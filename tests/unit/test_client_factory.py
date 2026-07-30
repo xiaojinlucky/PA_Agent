@@ -77,19 +77,19 @@ def test_client_factory_log_removes_url_credentials_and_query_tokens() -> None:
 
 
 def test_masking_formatter_keeps_previous_profile_keys_masked() -> None:
-    formatter = MaskingFormatter("%(message)s", api_key="sk-first-secret-key")
-    formatter.set_api_key("sk-second-secret-key")
+    formatter = MaskingFormatter("%(message)s", api_key="sk-test-first-secret-key")
+    formatter.set_api_key("sk-test-second-secret-key")
     record = logging.LogRecord(
         name="test",
         level=logging.INFO,
         pathname=__file__,
         lineno=1,
-        msg="sk-first-secret-key sk-second-secret-key",
+        msg="sk-test-first-secret-key sk-test-second-secret-key",
         args=(),
         exc_info=None,
     )
 
     output = formatter.format(record)
 
-    assert "sk-first-secret-key" not in output
-    assert "sk-second-secret-key" not in output
+    assert "sk-test-first-secret-key" not in output
+    assert "sk-test-second-secret-key" not in output

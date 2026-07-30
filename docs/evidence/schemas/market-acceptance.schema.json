@@ -1,0 +1,154 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PA_Agent 脱敏行情验收",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample",
+    "git_sha",
+    "market",
+    "symbol",
+    "source",
+    "analysis_as_of_utc_ms",
+    "permission",
+    "permission_derivation",
+    "server_quote_level",
+    "server_packages",
+    "price_tick_authoritative",
+    "timeframes",
+    "result"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sample": {
+      "type": "boolean"
+    },
+    "git_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "market": {
+      "enum": [
+        "US",
+        "HK",
+        "CN",
+        "Crypto"
+      ]
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 1
+    },
+    "source": {
+      "enum": [
+        "longbridge",
+        "okx"
+      ]
+    },
+    "analysis_as_of_utc_ms": {
+      "type": [
+        "integer",
+        "null"
+      ]
+    },
+    "permission": {
+      "enum": [
+        "realtime",
+        "delayed",
+        "unknown",
+        "not_applicable"
+      ]
+    },
+    "permission_derivation": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "longbridge_server_quote_level_package",
+        null
+      ]
+    },
+    "server_quote_level": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "server_packages": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "uniqueItems": true
+    },
+    "price_tick_authoritative": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "timeframes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "timeframe",
+          "bar_count",
+          "first_utc_ms",
+          "last_closed_utc_ms",
+          "missing_bars"
+        ],
+        "properties": {
+          "timeframe": {
+            "enum": [
+              "10m",
+              "1h",
+              "4h"
+            ]
+          },
+          "bar_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "first_utc_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "last_closed_utc_ms": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "missing_bars": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      }
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "display_only",
+        "blocked",
+        "example_only"
+      ]
+    }
+  }
+}

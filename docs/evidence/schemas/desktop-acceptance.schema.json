@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PA_Agent 脱敏桌面验收",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "sample",
+    "git_sha",
+    "launch",
+    "logical_size",
+    "scale_percent",
+    "scenario",
+    "markets",
+    "logical_sizes_checked",
+    "scales_checked",
+    "symbols_checked",
+    "scenarios_checked",
+    "user_accepted",
+    "full_git_sha_visible",
+    "no_trading_controls",
+    "execution_access_count",
+    "contains_sensitive_data",
+    "result"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "sample": {
+      "type": "boolean"
+    },
+    "git_sha": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "launch": {
+      "enum": [
+        "offscreen_fixture",
+        "official_shortcut"
+      ]
+    },
+    "logical_size": {
+      "type": "array",
+      "prefixItems": [
+        {
+          "type": "integer",
+          "minimum": 1
+        },
+        {
+          "type": "integer",
+          "minimum": 1
+        }
+      ],
+      "minItems": 2,
+      "maxItems": 2
+    },
+    "scale_percent": {
+      "enum": [
+        100,
+        125,
+        150
+      ]
+    },
+    "scenario": {
+      "type": "string",
+      "minLength": 1
+    },
+    "markets": {
+      "type": "array",
+      "items": {
+        "enum": [
+          "US",
+          "HK",
+          "CN",
+          "Crypto"
+        ]
+      },
+      "uniqueItems": true
+    },
+    "logical_sizes_checked": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "prefixItems": [
+          {
+            "type": "integer",
+            "minimum": 1
+          },
+          {
+            "type": "integer",
+            "minimum": 1
+          }
+        ],
+        "minItems": 2,
+        "maxItems": 2
+      },
+      "uniqueItems": true
+    },
+    "scales_checked": {
+      "type": "array",
+      "items": {
+        "enum": [
+          100,
+          125,
+          150
+        ]
+      },
+      "uniqueItems": true
+    },
+    "symbols_checked": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "scenarios_checked": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "uniqueItems": true
+    },
+    "user_accepted": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "full_git_sha_visible": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "no_trading_controls": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "execution_access_count": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "contains_sensitive_data": {
+      "const": false
+    },
+    "result": {
+      "enum": [
+        "pass",
+        "blocked",
+        "example_only"
+      ]
+    }
+  }
+}

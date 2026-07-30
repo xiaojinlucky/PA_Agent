@@ -1,0 +1,43 @@
+{
+  "$schema": "../schemas/runtime-snapshot.schema.json",
+  "schema_version": 1,
+  "sample": true,
+  "collected_at": null,
+  "git_sha": null,
+  "broker": null,
+  "environment": null,
+  "worker_schema_version": null,
+  "target_commit_at": null,
+  "worker_started_at": null,
+  "config_fingerprint": null,
+  "last_reconciled_at": null,
+  "migration_preserved_risk_stop": null,
+  "risk_stop": {
+    "active": null,
+    "reason_code": null
+  },
+  "database_quick_check": null,
+  "control_database_quick_check": null,
+  "active_execution_count": null,
+  "unresolved_command_count": null,
+  "active_new_risk_lease_count": null,
+  "broker_position_count": null,
+  "broker_pending_order_count": null,
+  "broker_pending_algo_order_count": null,
+  "campaign_state": null,
+  "controlled_reproducible": {
+    "entry_submitted": null,
+    "entry_filled": null,
+    "new_risk_command_count": null,
+    "new_risk_lease_count": null,
+    "lease_command_binding_unique": null,
+    "worker_route_verified": null,
+    "worker_requester_verified": null,
+    "worker_config_fingerprint_verified": null,
+    "native_protection_count": null,
+    "active_exit_requested": null,
+    "closed": null,
+    "final_reconciliation": null
+  },
+  "result": "example_only"
+}

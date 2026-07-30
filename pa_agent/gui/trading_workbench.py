@@ -1058,7 +1058,10 @@ class TradingWorkbench(QWidget):
 
     def _candidate_settings(self):
         candidate = self._settings.model_copy(deep=True)
+        # v0.1.0 只允许 OKX 模拟盘新增风险；保存旧配置时一并修正路由。
+        candidate.execution.selected_broker = "okx"
         okx = candidate.execution.okx
+        okx.simulated = True
         okx.sizing_mode = self._sizing_mode.currentData()
         okx.risk_capital_cap_usdt = Decimal(str(self._capital_cap.value()))
         okx.maximum_leverage = Decimal(str(self._maximum_leverage.value()))

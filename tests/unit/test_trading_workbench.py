@@ -281,6 +281,17 @@ def test_risk_budget_mode_keeps_quantity_read_only_and_updates_risk(qtbot):
     assert widget._save_button.isEnabled() is True
 
 
+def test_saving_workbench_repairs_legacy_route_to_okx_demo(qtbot):
+    widget, settings, _service = _widget(qtbot)
+    settings.execution.selected_broker = "longbridge"
+    settings.execution.okx.simulated = False
+
+    candidate = widget._candidate_settings()
+
+    assert candidate.execution.selected_broker == "okx"
+    assert candidate.execution.okx.simulated is True
+
+
 def test_backend_failure_codes_are_not_exposed_in_primary_result_text():
     record = SimpleNamespace(
         last_error="submit_failed_before_worker_claim_pending_health_race",

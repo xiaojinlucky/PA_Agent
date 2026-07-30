@@ -98,7 +98,7 @@
 | 2 | `call_k9L9xogRNh3TcHyI7SBEcUOG` | `docs/prd/assets/wo_e_product_design/option-2-evidence-gate-workbench.png` | 1586×992 | `82237489288608AE47BE985F7E477CB6BE97A04B381D332883360A24599A18FC` |
 | 3 | `call_pfTivuMttYF0EheXnoPKm9IF` | `docs/prd/assets/wo_e_product_design/option-3-market-compass-workbench.png` | 1586×992 | `1FCBB3BEA0E67AD29221272C9D826461BBC85EC0ECA7B37F0BF0456091858EFD` |
 
-三张原图同时保留在 ImageGen 会话目录 `019fa1e7-bdbf-7343-88fa-a9a67661e7be`；项目文件是字节一致的副本。
+三张原图曾保留在本地 ImageGen 会话目录；会话编号已从 PUBLIC 当前文档移除，项目文件是字节一致的副本。
 
 ### 6.3 主 Agent 人工视觉复核
 

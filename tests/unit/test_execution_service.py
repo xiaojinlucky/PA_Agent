@@ -309,6 +309,8 @@ def _settings():
     settings.execution.okx.risk_capital_cap_usdt = Decimal("20000")
     settings.execution.okx.risk_percent = Decimal("0.10")
     settings.execution.okx.maximum_leverage = Decimal("20")
+    # 本文件大部分用例专门覆盖旧 Live 路由的底层失败关闭语义。
+    settings.execution.okx.simulated = False
     return settings
 
 
@@ -369,7 +371,14 @@ def test_worker_lease_is_the_new_risk_authority_after_plan_creation(
     monkeypatch,
 ):
     adapter = FakeAdapter()
-    service, record = _service(tmp_path, monkeypatch, adapter)
+    settings = _settings()
+    settings.execution.okx.simulated = True
+    service, record = _service(
+        tmp_path,
+        monkeypatch,
+        adapter,
+        settings=settings,
+    )
     execution = service.prepare_analysis(record)
     service._new_risk_authorizer = lambda _plan, _account: True
     # GUI/实验脚本签发短租约前已经检查 execution.enabled。Worker 可能读取到
@@ -379,6 +388,21 @@ def test_worker_lease_is_the_new_risk_authority_after_plan_creation(
     submitted = service.submit(execution.id)
 
     assert submitted.state is ExecutionState.ENTRY_PENDING
+
+
+def test_worker_service_rejects_okx_live_even_with_valid_lease(
+    tmp_path,
+    monkeypatch,
+):
+    adapter = FakeAdapter()
+    service, record = _service(tmp_path, monkeypatch, adapter)
+    execution = service.prepare_analysis(record)
+    service._new_risk_authorizer = lambda _plan, _account: True
+
+    with pytest.raises(LiveTradingDisabled, match="只允许 OKX Demo"):
+        service.submit(execution.id)
+
+    assert not [call for call in adapter.calls if call[0] == "submit_entry"]
 
 
 def test_monitor_fails_when_expected_account_snapshot_cannot_refresh(
@@ -396,7 +420,7 @@ def test_monitor_fails_when_expected_account_snapshot_cannot_refresh(
         service.monitor_once()
 
 
-def test_fallback_account_reaches_the_final_broker_write_authorizer(
+def test_worker_service_rejects_longbridge_before_write_authorizer(
     tmp_path,
     monkeypatch,
 ):
@@ -423,12 +447,11 @@ def test_fallback_account_reaches_the_final_broker_write_authorizer(
 
     service._new_risk_authorizer = _authorize
 
-    submitted = service.submit(execution.id)
+    with pytest.raises(LiveTradingDisabled, match="只允许 OKX Demo"):
+        service.submit(execution.id)
 
-    assert submitted.state is ExecutionState.ENTRY_PENDING
-    assert authorized_accounts[0] == "intraday"
-    assert authorized_accounts[-1] == "comprehensive"
-    assert [call for call in adapter.calls if call[0] == "submit_entry"]
+    assert authorized_accounts == []
+    assert not [call for call in adapter.calls if call[0] == "submit_entry"]
 
 
 def test_okx_live_requires_its_independent_hard_gate(tmp_path, monkeypatch):

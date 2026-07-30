@@ -30,12 +30,12 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 |---|---|
 | 风险高水位 `adjusted_high_water_usd` | 已从 PUBLIC 文档脱敏；任何“恢复”都不得重锚，以本地风险账本为准 |
 | OKX Demo 账户身份摘要 | 已从 PUBLIC 文档脱敏；每次操作前以实时私有只读硬门逐字符核对 |
-| 历史 UNCERTAIN 命令 `686b6d0e-5c85-4430-a2d9-b9e069b76934` | 已处置 `confirmed_not_written_schema_validation`，禁止重放 |
+| 历史 UNCERTAIN 命令 | 已有耐久处置证据，禁止重放；具体编号只保留在本地账本和 Git 历史 |
 | 固定风险参数 | `20000 USDT 上限 / 10% / 20x / risk_budget` |
 
 ### 0.4 行为红线
 
-- 代理失败必须闭锁新增风险（fail-closed）；**永不**回退直连、系统代理或用户主 v2rayN(10808)。OKX 流量只走 `127.0.0.1:10981`。
+- 固定代理失败必须闭锁新增风险（fail-closed）；**永不**回退直连、系统代理或用户日常代理。OKX 流量只走项目专用的固定本机代理通道。
 - 每根已收盘 10m K 线必须真实两阶段分析；停机期间的中间 K 线**不补跑、不冒充**。
 - Campaign 重启必须用 `restart` 语义继承 `last_completed_bar_ms`。
 - 禁止 `git add .` / `git add -A` / 强推 / 改写历史 / 擅自开分支或 worktree / 提交 scratch、数据库、日志、凭据。
@@ -46,7 +46,7 @@ GUI/Campaign → ExecutionController → records/execution_control.sqlite3
 
 ### 0.5 运行态证据口径
 
-- 本文后文记录的 PID、Campaign ID、账户和订单状态都是带时间戳的历史证据，不能当成当前事实。
+- 本文后文记录的旧进程、Campaign、账户和订单状态都是历史证据，不能当成当前事实。
 - 最新已登记证据以 `CONTEXT.md` 和 `docs/VALIDATION_EVIDENCE.md` 最后一节为准。2026-07-27 20:13 的历史回查证明 WO-F 安全重载后 Campaign active、Worker/两库/风险态健康且券商空仓空单；这仍不能替代下一次操作前的实时只读硬门。
 - “不操作交易运行态”是 WO-H 接手批次的当轮边界。后续 WO-C2、WO-F 已在另行核验完整硬门后完成授权范围内的恢复与验收；不得把旧禁止扩大成历史未发生，也不得把后续验收扩大成新的运行态操作授权。
 
@@ -138,7 +138,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - `UNKNOWN/ERROR`、非终态 `needs_attention`、记录丢失和非法状态继续硬阻断。监控错误不得覆盖本根既有 `blocked:no_order`、风险阻断等结果。
 - `close_out()` 在剩余窗口内重试临时只读对账；撤单/离场命令逐条等待耐久终态，同一 execution 的同一种写动作最多一次。状态存储可写时，命令失败、结果不明、等待超时或真实不安全状态会耐久写 `needs_attention` 并退出；补写失败时磁盘可能保留 `stopping`，但 `stopping / needs_attention` 都硬阻断自动恢复，人工中断不会二次收口。
 
-**验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。真实恢复命令 `27613f47-f27a-44c7-ba44-5dc378e7ee4e` 完成新的账户与账单读取，`kill_active` 由白名单临时停止合法恢复为 0，高水位未重锚；首根新 K 线完成且零新增 execution/订单/仓位。
+**验证**：Campaign 定向 86 项通过、0 失败；三套件 1886 项通过、0 失败。两轮独立对抗审查最终 PASS。受控恢复完成新的账户与账单读取，临时风险停止按白名单原因合法恢复，高水位未重锚；首根新 K 线完成且零新增 execution、订单或仓位。
 
 ### WO-D P1 三标的真实验收（行情凭据已可用，完整验收待后续工单）
 
@@ -309,15 +309,13 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   `a5d2e19`（P1 多市场后端，17 文件）→ `b539cb5`（文档+总控工单，5 文件）；
   每个 commit staged gitleaks 零泄漏；push 后 origin/main == 本地 HEAD == `b539cb5`；
   工作区已净（仅剩 scratch/ 等忽略项）。
-- [x] 2026-07-27 07:30 前后 8 小时无人值守运行证据（23:10–07:25）：Campaign `ab245e48`
-  完成 **50 根自然 K 线、0 失败**，一根不落；北京 05:31 自然信号真实提交
-  execution `ed7711be-93f7-52eb-a544-adf9969f19bb`（submit 命令 `9dc7eafb` succeeded，
-  真实 OKX Demo 限价单），270 秒未成交后按规则正常撤销（canceled，未切市价）——
-  完整自然交易生命周期实证。当时同时发现 P2：该笔交易的 NEW_RISK 租约 `4cf57283`
-  由 Campaign 的 Controller 在交易终态后仍滚动续期约 2 小时；根因与修复见本账本后续
+- [x] 2026-07-27 无人值守运行证据：Campaign 完成 **50 根自然 K 线、0 失败**；
+  一次自然信号经 Worker 提交真实 OKX Demo 限价单，等待窗口内未成交后按规则正常撤销，
+  没有切换成市价单，形成完整自然交易生命周期实证。当时同时发现 P2：
+  该笔交易的 NEW_RISK 租约在交易终态后仍被 Controller 续期；根因与修复见本账本后续
   “NEW_RISK 最小权限收口”条目。
-- [x] 2026-07-27 07:43 WO-C 完成：硬门核验后停旧树、租约自然过期、07:33 restart 语义重启，
-  新 Campaign `6cba8d3e` 继承 `last_completed_bar_ms` 正确、首根自然 K 线完成（no_order，0 失败）；
+- [x] 2026-07-27 WO-C 完成：硬门核验后停旧树、租约自然过期并按 restart 语义重启，
+  新 Campaign 正确继承 `last_completed_bar_ms`，首根自然 K 线完成（no_order，0 失败）；
   **新代码生效实证**：最新耐久分析记录（records/pending/2026-07-27_07-07-36_...json）包含
   `市场制度规则块 · 加密货币`、`时间（UTC）` 表头与资金费率条款。
 - [x] 2026-07-27 08:25 WO-F 第一批严格化与 entry/stop grounding 落地（Claude 主循环）：
@@ -367,7 +365,7 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
 - [x] WO-E 前置设计合同：`docs/prd/05_多市场看盘前端设计包.md` 已冻结读模型、设置、并发、跨源、脱敏和四市场验收矩阵
 - [x] WO-E Product Design 阶段 2：`ideate` 正式入口、三个独立方向、完整提示词、产物标识、文件指纹、人工视觉复核和用户按本轮实际显示顺序选择 `1` 均已登记；B1、B2 通过
 - [x] WO-E ChatGPT Web 阶段 3：四个脱敏附件与完整提示词已真实提交；会话 URL、完整回答、内容指纹和 F01–F22 本地裁决已登记，B3 通过
-- [x] 2026-07-28 WO-E Chrome 官方恢复、附件与参考规则核查：用户授权后打开新的 Profile 1 窗口，扩展单次重试恢复，登录态 Stitch 已进入 `Web` 模式；五个附件存在且指纹核对通过，用户已确认附件显示。`D:\Desktop\Quant\前端设计` 的 Longbridge-first 结构、令牌、密度和负面约束已进入 PRD08 冻结提示词；用户已手动提交冻结提示词，本机 Chrome 标签页元数据确认 Stitch 项目 `8039115259020616674` 已创建（`https://stitch.withgoogle.com/projects/8039115259020616674`，标题 `Stitch - Projects`）。用户已直接审美否决该结果，Stitch 稿作废且不进入实现。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
+- [x] 2026-07-28 WO-E 外部视觉探索：用户完成附件提交并直接否决 Stitch 结果，该稿已作废且不进入实现；后续 v0.1.0 工单明确以 PRD11 为最终规格。官方合同确认 Longbridge 批量报价单次最多 500 个标的；OKX 自选可按 SPOT/SWAP 最多两个串行 ticker 快照。10m 最坏 602 根 5m 需要最多三页，现有客户端缺 `after`；正确修复需极窄解除 `pa_agent/execution/okx_client.py` 禁区，未用削减窗口或私有调用绕过
 - [x] WO-E 原生 PyQt6 离线实现：`91715ee2c8af0e6e829031b5a4f375d18f71cf52`
   已发布且 CI 全绿；16 张离屏状态/尺寸/缩放图逐张复核通过
 - [ ] WO-E 真实桌面验收：从正式快捷方式完成 Longbridge 三市场、Crypto、快速切换与缩放矩阵
@@ -438,10 +436,14 @@ C:\Users\Administrator\.codex-shared\tools\gitleaks\v8.30.1\gitleaks.exe git --s
   `30492305516` 全绿；16 张离屏状态/尺寸/缩放图和对抗审查均通过。
 - [ ] WO-E 真实桌面矩阵：使用已验证的 Longbridge 行情档案完成 AAPL.US、700.HK、
   600519.SH 与 Crypto 的正式快捷方式验收；无权威 tick 的股票只展示、不运行价格分析。
+- [ ] v0.1.0 阶段 D 发布链：本地实现和 2224 项非 live 回归已通过，失败/错误/跳过均为 0；
+  仍待精确提交、目标 SHA 的 CI 与候选 workflow、提交后 `git archive` 和全新
+  Python 3.12 源码安装。阶段 A 私有真相和正式快捷方式桌面矩阵未通过前，
+  禁止创建稳定 `v0.1.0` tag 或 GitHub Release。
 
 ## 6. 用户侧待办（只有用户能做）
 
-1. **密钥轮换（长期提醒，未完成）**：Codex 会话日志（`C:\Users\Administrator\.codex\sessions\`）曾明文泄漏 OKX/长桥/模型密钥与交易密码；OKX 与长桥后台轮换只能由用户本人操作，轮换后记得同步仓库外的 `D:\Desktop\Quant\env`。当前 `LONGBRIDGE_COMPREHENSIVE` 行情档案已真实可用，不要求为本工单重签。
+1. **密钥轮换（长期提醒，未完成）**：历史本地会话材料曾包含券商和模型凭据；服务端轮换只能由用户本人操作，轮换后同步仓库外的共享凭据文件。当前 Longbridge 综合行情档案已真实可用，不要求为本工单重签。
 2. WO-E 真实桌面终验：生产实现只认 PRD11，不等待外部样稿。Agent 先完成 PyQt6 与离屏矩阵；用户最后从 `D:\Desktop\PA_Agent.lnk` 启动并完成真实 Longbridge/Crypto 快速切换与缩放验收。
 3. `shared/` 是否建 Git 仓库的决定。
 4. 是否解除本轮 `scripts` 禁止修改边界，以便给固定代理 metadata/config 增加共同指纹并完成 WO-A 最后一项 P2。

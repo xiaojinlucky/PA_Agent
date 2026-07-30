@@ -544,7 +544,7 @@ def test_chat_cancel_token_raises():
 def test_chat_no_plaintext_key_in_logs(caplog):
     """API key must not appear in log output."""
     import logging
-    settings = _make_settings(api_key="sk-super-secret-9999")
+    settings = _make_settings(api_key="sk-test-super-secret-9999")
     client = DeepSeekClient(settings)
 
     mock_resp = _make_mock_response()
@@ -556,7 +556,7 @@ def test_chat_no_plaintext_key_in_logs(caplog):
             client.chat([{"role": "user", "content": "hi"}])
 
     for record in caplog.records:
-        assert "sk-super-secret-9999" not in record.getMessage(), (
+        assert "sk-test-super-secret-9999" not in record.getMessage(), (
             f"Plaintext API key found in log: {record.getMessage()}"
         )
 

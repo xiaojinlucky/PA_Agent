@@ -1,0 +1,36 @@
+{
+  "$schema": "../schemas/desktop-acceptance.schema.json",
+  "schema_version": 1,
+  "sample": true,
+  "git_sha": null,
+  "launch": "official_shortcut",
+  "logical_size": [
+    1440,
+    900
+  ],
+  "scale_percent": 100,
+  "scenario": "normal",
+  "markets": [
+    "US",
+    "HK",
+    "CN",
+    "Crypto"
+  ],
+  "logical_sizes_checked": [
+    [
+      1440,
+      900
+    ]
+  ],
+  "scales_checked": [
+    100
+  ],
+  "symbols_checked": [],
+  "scenarios_checked": [],
+  "user_accepted": null,
+  "full_git_sha_visible": null,
+  "no_trading_controls": null,
+  "execution_access_count": null,
+  "contains_sensitive_data": false,
+  "result": "example_only"
+}
