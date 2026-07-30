@@ -91,7 +91,7 @@ _WORKBENCH_QSS = """
 QWidget#multiMarketWorkbench {
     background: #090B10;
     color: #E7ECF4;
-    font-family: "Segoe UI", "Microsoft YaHei UI", sans-serif;
+    font-family: "Noto Sans CJK SC", "Microsoft YaHei UI", "Segoe UI", sans-serif;
     font-size: 14px;
 }
 QWidget#multiMarketWorkbench QLabel {

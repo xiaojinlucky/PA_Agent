@@ -140,6 +140,8 @@ def _desktop_evidence(root: Path) -> None:
             "device_pixel_ratio": scale,
             "requested_scale": scale,
             "font": {
+                "family": "Microsoft YaHei UI",
+                "cjk_sample_supported": True,
                 "symbol_pixel_size": 22,
                 "body_pixel_size": 14,
             },
@@ -485,6 +487,31 @@ def test_source_archive_contract_accepts_only_complete_clean_source(
     assert result["entrypoints"] == ["pa-agent", "pa-execution-worker"]
     assert result["forbidden_entries"] == []
     assert result["git_sha"] == _FULL_SHA
+
+
+def test_archive_source_is_byte_identical_across_host_timezones(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("TZ", "UTC")
+    utc_archive = release_pipeline.archive_source(
+        repo_root=_ROOT,
+        output_dir=tmp_path / "utc",
+        ref="HEAD",
+        version="0.1.0",
+    )
+    monkeypatch.setenv("TZ", "Asia/Shanghai")
+    shanghai_archive = release_pipeline.archive_source(
+        repo_root=_ROOT,
+        output_dir=tmp_path / "shanghai",
+        ref="HEAD",
+        version="0.1.0",
+    )
+
+    assert (
+        hashlib.sha256(utc_archive.read_bytes()).hexdigest()
+        == hashlib.sha256(shanghai_archive.read_bytes()).hexdigest()
+    )
 
 
 def test_repository_archive_excludes_only_root_runtime_directories(
@@ -1215,6 +1242,27 @@ def test_desktop_evidence_rejects_trading_control_and_wrong_build(
     with pytest.raises(
         ReleaseValidationError,
         match=r"git_sha|no_trading_buttons",
+    ):
+        validate_desktop_evidence(
+            evidence,
+            expected_sha=_FULL_SHA,
+        )
+
+
+def test_desktop_evidence_rejects_missing_cjk_font_coverage(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "desktop"
+    _desktop_evidence(evidence)
+    metadata_path = evidence / "1440x900-normal.json"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["font"]["family"] = "Segoe UI"
+    metadata["font"]["cjk_sample_supported"] = False
+    metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+    with pytest.raises(
+        ReleaseValidationError,
+        match=r"cjk_font_family|cjk_sample_supported",
     ):
         validate_desktop_evidence(
             evidence,

@@ -51,7 +51,13 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from PyQt6.QtGui import QFontInfo, QFontMetrics  # noqa: E402
+from PyQt6.QtGui import (  # noqa: E402
+    QFont,
+    QFontDatabase,
+    QFontInfo,
+    QFontMetrics,
+    QRawFont,
+)
 from PyQt6.QtWidgets import QApplication, QPushButton  # noqa: E402
 
 from pa_agent.app_context import AppContext  # noqa: E402
@@ -80,6 +86,44 @@ _INTERVALS = {
     "1h": 60 * 60_000,
     "4h": 4 * 60 * 60_000,
 }
+_CJK_SAMPLE = "多市场看盘分析工作台美股港股A股加密开始刷新失败加载过期"
+
+
+def _configure_cjk_font(app: QApplication) -> str:
+    candidates: list[str] = []
+    font_path_text = os.environ.get("PA_AGENT_VISUAL_FONT_PATH", "").strip()
+    if font_path_text:
+        font_path = Path(font_path_text).resolve()
+        if not font_path.is_file():
+            raise RuntimeError("离屏证据中文字体文件不存在")
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        if font_id < 0:
+            raise RuntimeError("离屏证据中文字体加载失败")
+        candidates.extend(QFontDatabase.applicationFontFamilies(font_id))
+    candidates.extend(
+        (
+            "Microsoft YaHei UI",
+            "Microsoft YaHei",
+            "Noto Sans CJK SC",
+            "SimHei",
+            "SimSun",
+        )
+    )
+    available_families = set(QFontDatabase.families())
+    seen: set[str] = set()
+    for family in candidates:
+        if family in seen or family not in available_families:
+            continue
+        seen.add(family)
+        font = QFont(family)
+        raw_font = QRawFont.fromFont(font)
+        if raw_font.isValid() and all(
+            raw_font.supportsCharacter(character)
+            for character in _CJK_SAMPLE
+        ):
+            app.setFont(font)
+            return QFontInfo(font).family()
+    raise RuntimeError("离屏证据环境没有覆盖核心中文字符的字体")
 
 
 def _unavailable_calendar(_market: str, _as_of_utc_ms: int) -> Any:
@@ -365,6 +409,8 @@ def _metadata(
     window: MainWindow,
     image: Any,
     runtime: _NeverRuntime,
+    *,
+    cjk_font_family: str,
 ) -> dict[str, Any]:
     page = window._market_workspace
     symbol_font = QFontInfo(page._symbol_label.font())
@@ -404,6 +450,8 @@ def _metadata(
             ],
         },
         "font": {
+            "family": cjk_font_family,
+            "cjk_sample_supported": True,
             "symbol_pixel_size": symbol_font.pixelSize(),
             "symbol_height": QFontMetrics(page._symbol_label.font()).height(),
             "body_pixel_size": body_font.pixelSize(),
@@ -426,6 +474,7 @@ def _metadata(
 
 def main() -> int:
     app = QApplication.instance() or QApplication([])
+    cjk_font_family = _configure_cjk_font(app)
     settings, controller = _scenario()
     runtime = _NeverRuntime()
     window = MainWindow(
@@ -460,7 +509,12 @@ def main() -> int:
     ARGS.output.parent.mkdir(parents=True, exist_ok=True)
     if not image.save(str(ARGS.output)):
         raise RuntimeError("离屏截图保存失败")
-    metadata = _metadata(window, image, runtime)
+    metadata = _metadata(
+        window,
+        image,
+        runtime,
+        cjk_font_family=cjk_font_family,
+    )
     metadata_path = ARGS.output.with_suffix(".json")
     metadata_path.write_text(
         json.dumps(metadata, ensure_ascii=False, indent=2) + "\n",

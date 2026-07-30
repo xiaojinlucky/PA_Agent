@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2233' in ci_workflow_text
-    assert '$tests -lt 2233' in release_workflow_text
+    assert '$tests -lt 2235' in ci_workflow_text
+    assert '$tests -lt 2235' in release_workflow_text
     assert ci_workflow_text.count("sanitize-junit") == 2
     assert "scan-tree scratch/ci-evidence" in ci_workflow_text
     assert "id: evidence_guard" in ci_workflow_text
@@ -80,6 +80,18 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     )
     assert "sanitize-junit" in release_workflow_text
     assert "scratch/release-junit.xml" in release_workflow_text
+    assert (
+        "notofonts/noto-cjk/"
+        "523d033d6cb47f4a80c58a35753646f5c3608a78/"
+        in release_workflow_text
+    )
+    assert (
+        "2c76254f6fc379fddfce0a7e84fb5385"
+        "bb135d3e399294f6eeb6680d0365b74b"
+        in release_workflow_text
+    )
+    assert "$expectedBytes = 16437364" in release_workflow_text
+    assert "PA_AGENT_VISUAL_FONT_PATH=" in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

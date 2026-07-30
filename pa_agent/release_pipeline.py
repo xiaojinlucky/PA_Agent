@@ -1593,6 +1593,12 @@ def validate_desktop_evidence(
             "requested_scale": metadata.get("requested_scale") == scale,
             "device_pixel_ratio": metadata.get("device_pixel_ratio") == scale,
             "runtime_reads": metadata.get("ui_runtime_read_calls") == 0,
+            "cjk_font_family": bool(
+                str(metadata.get("font", {}).get("family") or "").strip()
+            ),
+            "cjk_sample_supported": (
+                metadata.get("font", {}).get("cjk_sample_supported") is True
+            ),
             "body_font": int(metadata.get("font", {}).get("body_pixel_size", 0))
             >= 14,
             "symbol_font": int(
@@ -1638,6 +1644,8 @@ def archive_source(
     archive_path = destination / f"PA_Agent-v{version}-source.zip"
     if archive_path.exists():
         raise ReleaseValidationError(f"拒绝覆盖已有文件：{archive_path}")
+    archive_env = os.environ.copy()
+    archive_env["TZ"] = "UTC"
     completed = subprocess.run(
         [
             "git",
@@ -1656,6 +1664,7 @@ def archive_source(
         errors="replace",
         timeout=120,
         check=False,
+        env=archive_env,
     )
     if completed.returncode != 0:
         raise ReleaseValidationError(

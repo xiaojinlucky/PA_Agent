@@ -72,7 +72,7 @@ jobs:
           $failures = [int]$suite.failures
           $errors = [int]$suite.errors
           $skipped = [int]$suite.skipped
-          if ($tests -lt 2233 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+          if ($tests -lt 2235 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
             throw "release pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
           }
 
@@ -148,6 +148,32 @@ jobs:
             Set-Content -Encoding utf8 "$freshEvidence/worker-version.txt"
           & $worker --self-check |
             Set-Content -Encoding utf8 "$freshEvidence/worker-self-check.json"
+
+      - name: Fetch pinned CJK font for offscreen evidence
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $PSNativeCommandUseErrorActionPreference = $true
+          $fontPath = Join-Path (
+            Resolve-Path scratch/release
+          ) "NotoSansCJKsc-Regular.otf"
+          $fontUrl = "https://raw.githubusercontent.com/notofonts/noto-cjk/523d033d6cb47f4a80c58a35753646f5c3608a78/Sans/OTF/SimplifiedChinese/NotoSansCJKsc-Regular.otf"
+          Invoke-WebRequest -UseBasicParsing -TimeoutSec 120 `
+            -Uri $fontUrl -OutFile $fontPath
+          $expectedBytes = 16437364
+          $expectedHash = "2c76254f6fc379fddfce0a7e84fb5385bb135d3e399294f6eeb6680d0365b74b"
+          $actualBytes = (Get-Item -LiteralPath $fontPath).Length
+          $actualHash = (
+            Get-FileHash -Algorithm SHA256 -LiteralPath $fontPath
+          ).Hash.ToLowerInvariant()
+          if (
+            $actualBytes -ne $expectedBytes -or
+            $actualHash -ne $expectedHash
+          ) {
+            throw "Pinned CJK font identity mismatch"
+          }
+          "PA_AGENT_VISUAL_FONT_PATH=$fontPath" |
+            Add-Content -Encoding utf8 $env:GITHUB_ENV
 
       - name: Generate redacted offscreen desktop evidence
         shell: pwsh
