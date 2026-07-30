@@ -15,7 +15,7 @@ from PyQt6.QtCore import (
     Qt,
     pyqtSignal,
 )
-from PyQt6.QtGui import QBrush, QColor, QFontDatabase
+from PyQt6.QtGui import QBrush, QCloseEvent, QColor, QFontDatabase
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QButtonGroup,
@@ -404,6 +404,7 @@ class MultiMarketWorkbench(QWidget):
         self._bridge = bridge
         self._runtime_sha = str(runtime_sha or "unavailable")
         self._build_ui()
+        self.destroyed.connect(self._chart.close)
         bridge.state_changed.connect(self.render)
         bridge.status_changed.connect(self._on_status_changed)
         bridge.analysis_phase_changed.connect(
@@ -698,6 +699,7 @@ class MultiMarketWorkbench(QWidget):
             container,
             market_read_only=True,
         )
+        container.destroyed.connect(self._chart.close)
         # 只读图表没有键盘操作，避免 Tab 焦点落到没有可执行动作的画布。
         self._chart.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         container_layout.addWidget(self._chart)
@@ -713,6 +715,11 @@ class MultiMarketWorkbench(QWidget):
         layout.addWidget(container, 1)
         self._chart_container = container
         return panel
+
+    def closeEvent(self, event: QCloseEvent | None) -> None:
+        """Stop chart rendering before Qt destroys child axes."""
+        self._chart.close()
+        super().closeEvent(event)
 
     def _analysis_column(
         self,

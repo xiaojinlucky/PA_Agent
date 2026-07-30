@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 from typing import Any
+from weakref import ReferenceType, ref
 
 from PyQt6.QtCore import QObject, Qt, QThread, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QCloseEvent, QColor, QPalette, QShowEvent
@@ -35,8 +36,19 @@ from pa_agent.gui.validation_debug_dialog import show_validation_debug_dialog
 
 logger = logging.getLogger(__name__)
 
+_LIVE_MAIN_WINDOWS: set[QMainWindow] = set()
+
 # Zombie timeout in milliseconds (5 seconds)
 _WORKER_JOIN_TIMEOUT_MS = 5000
+
+
+def _release_main_window(
+    window_ref: ReferenceType[QMainWindow],
+) -> None:
+    """Drop the strong lifetime anchor after Qt has begun final destruction."""
+    window = window_ref()
+    if window is not None:
+        _LIVE_MAIN_WINDOWS.discard(window)
 
 
 def _qobject_alive(obj: QObject | None) -> bool:
@@ -400,12 +412,30 @@ class MainWindow(QMainWindow):
         self._status_bar: QStatusBar = QStatusBar()
         self.setStatusBar(self._status_bar)
         self._setup_ui()
+        self.destroyed.connect(self._chart_widget.close)
+        market_chart = getattr(
+            getattr(self, "_market_workspace", None),
+            "_chart",
+            None,
+        )
+        if market_chart is not None:
+            self.destroyed.connect(market_chart.close)
         self._connect_event_bus()
         self._update_ai_mode_label()
         self._sync_submit_button_state()
         execution_service = getattr(self._ctx, "execution_service", None)
         if execution_service is not None:
             execution_service.start_monitoring()
+        # A parentless top-level QWidget needs a Python owner until its real
+        # close event.  Otherwise refcount teardown can begin while queued
+        # paint events still target its child charts.
+        _LIVE_MAIN_WINDOWS.add(self)
+        window_ref = ref(self)
+        self.destroyed.connect(
+            lambda _destroyed=None, anchor=window_ref: (
+                _release_main_window(anchor)
+            )
+        )
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -1015,6 +1045,7 @@ class MainWindow(QMainWindow):
         )
         self._apply_chart_display_settings()
         workbench.addWidget(self._chart_widget)
+        workbench.destroyed.connect(self._chart_widget.close)
 
         self._ai_sidebar.setMinimumWidth(400)
         workbench.addWidget(self._ai_sidebar)
@@ -4894,7 +4925,22 @@ class MainWindow(QMainWindow):
                 market_bridge.close()
         except RuntimeError as exc:
             logger.debug("Shutdown cleanup skipped: %s", exc)
+        try:
+            charts = [
+                getattr(self, "_chart_widget", None),
+                getattr(
+                    getattr(self, "_market_workspace", None),
+                    "_chart",
+                    None,
+                ),
+            ]
+            for chart in charts:
+                if chart is not None:
+                    chart.close()
+        except RuntimeError as exc:
+            logger.debug("Chart shutdown skipped: %s", exc)
         super().closeEvent(event)
+        _LIVE_MAIN_WINDOWS.discard(self)
 
     def showEvent(self, event: QShowEvent | None) -> None:
         """On first show, prompt when the active model has no usable auth path."""

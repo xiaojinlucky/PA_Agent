@@ -48,8 +48,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     assert "ConfirmUninstall" in uninstall_text
     assert "Remove-Item" in uninstall_text
     assert "D:\\Desktop" not in install_text
-    assert '$tests -lt 2224' in ci_workflow_text
-    assert '$tests -lt 2224' in release_workflow_text
+    assert '$tests -lt 2227' in ci_workflow_text
+    assert '$tests -lt 2227' in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

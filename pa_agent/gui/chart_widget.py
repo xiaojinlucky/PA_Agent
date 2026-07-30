@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 import pyqtgraph as pg
 from PyQt6.QtCore import QEvent, Qt, QTimer
+from PyQt6.QtWidgets import QWidget
 
 from pa_agent.gui.widgets.candle_item import CandleItem
 from pa_agent.gui.widgets.overlay_lines import OverlayLines
@@ -90,6 +91,11 @@ class ChartWidget(pg.PlotWidget):
         *,
         market_read_only: bool = False,
     ) -> None:
+        # Qt can still deliver queued paint events while a parent window is
+        # closing.  Set lifecycle flags before constructing QGraphicsView so
+        # every event handler can fail closed during teardown.
+        self._shutting_down = False
+        self._close_started = False
         self._market_read_only = bool(market_read_only)
         self._market_time_axis = (
             MarketTimeAxisItem() if self._market_read_only else None
@@ -153,6 +159,28 @@ class ChartWidget(pg.PlotWidget):
         self._timer.start()
 
     # ── Public API ────────────────────────────────────────────────────────────
+
+    def shutdown(self) -> None:
+        """Stop redraw work before pyqtgraph destroys its scene and axes."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self._dirty = False
+        self._timer.stop()
+        self.setUpdatesEnabled(False)
+        self.viewport().setUpdatesEnabled(False)
+
+    def close(self) -> bool:
+        """Stop rendering and close without detaching from the Qt owner."""
+        if self._close_started:
+            return True
+        self._close_started = True
+        self.shutdown()
+        # PlotWidget.close() tears down axes and detaches the widget from its
+        # owner immediately.  A queued viewport paint can then outlive those
+        # axes.  QWidget.close() keeps ownership intact; the owner or
+        # deleteLater() performs final destruction after pending events drain.
+        return QWidget.close(self)
 
     def set_seq_label_font_pt(self, point_size: int) -> None:
         """Set K-line sequence label font size and refresh the chart if needed."""
@@ -386,6 +414,9 @@ class ChartWidget(pg.PlotWidget):
         Otherwise we delegate to the superclass so normal pan/zoom/drag
         on the ViewBox works as usual.
         """
+        if self._shutting_down:
+            ev.accept()
+            return True
         et = ev.type()
 
         if et == QEvent.Type.MouseMove:
@@ -422,6 +453,13 @@ class ChartWidget(pg.PlotWidget):
 
         return super().viewportEvent(ev)
 
+    def paintEvent(self, ev):
+        """Ignore paint requests queued before the chart began closing."""
+        if self._shutting_down:
+            ev.accept()
+            return
+        super().paintEvent(ev)
+
     def reset(self) -> None:
         """Clear all chart items (candles, labels, EMA, overlay lines)."""
         self.clear_decision_overlay()
@@ -438,7 +476,11 @@ class ChartWidget(pg.PlotWidget):
 
     def _on_timer(self) -> None:
         """Called every ~33 ms; redraws only when a new frame is available."""
-        if not self._dirty or self._latest_frame is None:
+        if (
+            self._shutting_down
+            or not self._dirty
+            or self._latest_frame is None
+        ):
             return
         self._dirty = False
         self._render_frame(self._latest_frame)
