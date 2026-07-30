@@ -5,9 +5,12 @@ import os
 import shutil
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
 
 from jsonschema import Draft202012Validator
+
+from pa_agent.release_pipeline import _desktop_evidence_contract
 
 _ROOT = Path(__file__).resolve().parents[2]
 
@@ -61,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2230' in ci_workflow_text
-    assert '$tests -lt 2230' in release_workflow_text
+    assert '$tests -lt 2231' in ci_workflow_text
+    assert '$tests -lt 2231' in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'
@@ -80,6 +83,50 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     assert "scan-tree $uploadScanRoot --reject-private-paths" in publish_text
     assert publish_text.count("Confirm-ReleaseAssets") >= 3
     assert "Published Release asset verification failed" in publish_text
+
+
+def test_release_workflow_uses_desktop_validator_scale_names(
+    tmp_path: Path,
+) -> None:
+    release_workflow_text = (
+        _ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+    start = release_workflow_text.index("          $scaleCases = @(")
+    end = release_workflow_text.index("          $pngCount =", start)
+    workflow_block = textwrap.dedent(release_workflow_text[start:end])
+    capture = tmp_path / "capture.cmd"
+    capture.write_text("@echo off\r\necho %*\r\n", encoding="ascii")
+    capture_path = str(capture).replace("'", "''")
+    command = (
+        f"$venvPython = '{capture_path}'\n"
+        "$script = 'fixture.py'\n"
+        "$output = 'evidence'\n"
+        f"{workflow_block}"
+    )
+    powershell = shutil.which("powershell")
+    assert powershell is not None
+    result = subprocess.run(
+        [powershell, "-NoProfile", "-Command", command],
+        cwd=_ROOT,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    actual_stems = sorted(
+        Path(line.rsplit("--output ", 1)[1].strip('"')).stem
+        for line in result.stdout.splitlines()
+        if "--output " in line
+    )
+    expected_stems = sorted(
+        stem
+        for stem in _desktop_evidence_contract()
+        if stem.startswith("scale-")
+    )
+    assert actual_stems == expected_stems
 
 
 def test_capability_index_has_exact_five_layers_and_honest_blockers() -> None:

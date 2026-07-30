@@ -72,7 +72,7 @@ jobs:
           $failures = [int]$suite.failures
           $errors = [int]$suite.errors
           $skipped = [int]$suite.skipped
-          if ($tests -lt 2230 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+          if ($tests -lt 2231 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
             throw "release pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
           }
 
@@ -166,8 +166,14 @@ jobs:
           }
           & $venvPython $script --scenario normal --width 1920 --height 1080 `
             --scale 1 --output "$output/1920x1080-normal.png"
-          foreach ($scale in @("1", "1.25", "1.5")) {
-            $name = $scale.Replace(".", "p")
+          $scaleCases = @(
+            @{ Value = "1"; Name = "1p0" },
+            @{ Value = "1.25"; Name = "1p25" },
+            @{ Value = "1.5"; Name = "1p5" }
+          )
+          foreach ($scaleCase in $scaleCases) {
+            $scale = $scaleCase.Value
+            $name = $scaleCase.Name
             foreach ($size in @(@(1440, 900), @(1920, 1080))) {
               & $venvPython $script --scenario normal --width $size[0] --height $size[1] `
                 --scale $scale --output "$output/scale-$name-$($size[0])x$($size[1]).png"
