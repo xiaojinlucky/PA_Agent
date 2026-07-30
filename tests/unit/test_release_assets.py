@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2231' in ci_workflow_text
-    assert '$tests -lt 2231' in release_workflow_text
+    assert '$tests -lt 2232' in ci_workflow_text
+    assert '$tests -lt 2232' in release_workflow_text
     assert (
         '$venvPython = Join-Path $sourceRoot.FullName '
         '".venv\\Scripts\\python.exe"'

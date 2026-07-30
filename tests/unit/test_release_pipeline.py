@@ -639,6 +639,7 @@ def test_source_archive_rejects_runtime_gitkeep_placeholders(
         b"-----BEGIN " + b"PRIVATE KEY-----\nnot-a-real-key\n",
         b"token=" + b"ghp_" + b"1234567890abcdefghijklmn\n",
     ],
+    ids=["private-key", "known-token"],
 )
 def test_source_archive_rejects_secret_content(
     tmp_path: Path,
@@ -673,6 +674,23 @@ def test_release_evidence_tree_rejects_private_runner_path(
             evidence,
             reject_private_paths=True,
         )
+
+
+def test_release_evidence_tree_accepts_pinned_https_vcs_dependency(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    (evidence / "pip-freeze.txt").write_text(
+        "tvdatafeed @ git+https://github.com/rongardF/tvdatafeed.git"
+        "@e6f6aaa7de439ac6e454d9b26d2760ded8dc4923\n",
+        encoding="utf-8",
+    )
+
+    result = scan_release_tree(evidence, reject_private_paths=True)
+
+    assert result["files_scanned"] == 1
+    assert result["text_files_scanned"] == 1
 
 
 @pytest.mark.parametrize(

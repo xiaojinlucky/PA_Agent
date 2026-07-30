@@ -150,8 +150,11 @@ _JWT_RE = re.compile(
     r"[A-Za-z0-9_-]{10,}"
 )
 _PRIVATE_PATH_RE = re.compile(
-    r"(?i)(?:file:///|[A-Z]:[\\/]+[^<>\r\n\"']+|"
-    r"/(?:home|Users)/[^/\s]+/)"
+    r"(?:"
+    r"(?i:file:///)"
+    r"|(?<![A-Za-z0-9])[A-Za-z]:[\\/]+[^<>\r\n\"']+"
+    r"|(?i:/(?:home|users)/[^/\s]+/)"
+    r")"
 )
 _DESKTOP_SCENARIOS = (
     "normal",
