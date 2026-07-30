@@ -68,6 +68,34 @@ _RELEASE_NOT_INCLUDED = [
     "logs",
     "market_raw_data",
 ]
+_CANDIDATE_RELEASE_EVIDENCE = (
+    ("full-git-sha.txt", "candidate-sha"),
+    ("pytest-deterministic-junit.xml", "candidate-tests"),
+    ("fresh-install/pa-agent-self-check.json", "fresh-install"),
+    ("fresh-install/worker-self-check.json", "fresh-install"),
+)
+_CANDIDATE_MINIMUM_TESTS = 2245
+_CANDIDATE_MAXIMUM_SKIPS = 3
+_CANDIDATE_SELF_CHECKS = frozenset(
+    {
+        "default_trading",
+        "entrypoints",
+        "pinned_vcs_dependency",
+        "prompt_resources",
+        "python_3_12",
+        "python_contract",
+        "required_source_files",
+        "version_truth",
+        "windows",
+    }
+)
+_CANDIDATE_DEFAULT_TRADING = {
+    "auto_execute": False,
+    "execution_enabled": False,
+    "longbridge_trading": False,
+    "new_risk_routes": ["okx:demo"],
+    "okx_live": False,
+}
 _MARKET_BY_SYMBOL = {
     "AAPL.US": "US",
     "700.HK": "HK",
@@ -848,6 +876,425 @@ def validate_release_artifact_set(
     }
 
 
+def _validate_candidate_evidence_payloads(
+    payloads: dict[str, bytes],
+    *,
+    expected_sha: str,
+    expected_version: str,
+) -> dict[str, int]:
+    try:
+        recorded_sha = payloads["full-git-sha.txt"].decode("utf-8").strip()
+    except (KeyError, UnicodeDecodeError) as exc:
+        raise ReleaseValidationError("候选完整 SHA 证据无法读取") from exc
+    if recorded_sha.lower() != expected_sha:
+        raise ReleaseValidationError("候选完整 SHA 证据与目标不一致")
+
+    try:
+        junit_root = ET.fromstring(
+            payloads["pytest-deterministic-junit.xml"]
+        )
+    except (KeyError, ET.ParseError) as exc:
+        raise ReleaseValidationError("候选 JUnit 证据无效") from exc
+    root_tag = junit_root.tag.rsplit("}", 1)[-1]
+    if root_tag == "testsuite":
+        suites = [junit_root]
+    elif root_tag == "testsuites":
+        children = list(junit_root)
+        suites = [
+            node
+            for node in children
+            if node.tag.rsplit("}", 1)[-1] == "testsuite"
+        ]
+        if len(suites) != len(children):
+            raise ReleaseValidationError("候选 JUnit 根节点内容无效")
+    else:
+        raise ReleaseValidationError("候选 JUnit 根节点无效")
+    try:
+        tests = sum(int(suite.attrib.get("tests", "0")) for suite in suites)
+        failures = sum(
+            int(suite.attrib.get("failures", "0")) for suite in suites
+        )
+        errors = sum(
+            int(suite.attrib.get("errors", "0")) for suite in suites
+        )
+        skipped = sum(
+            int(suite.attrib.get("skipped", "0")) for suite in suites
+        )
+    except ValueError as exc:
+        raise ReleaseValidationError("候选 JUnit 计数无效") from exc
+    if (
+        not suites
+        or min(tests, failures, errors, skipped) < 0
+        or failures + errors + skipped > tests
+        or tests < _CANDIDATE_MINIMUM_TESTS
+        or failures
+        or errors
+        or skipped > _CANDIDATE_MAXIMUM_SKIPS
+    ):
+        raise ReleaseValidationError(
+            "候选 JUnit 没有通过完整发布门："
+            f"tests={tests} failures={failures} "
+            f"errors={errors} skipped={skipped}"
+        )
+
+    for relative_text in (
+        "fresh-install/pa-agent-self-check.json",
+        "fresh-install/worker-self-check.json",
+    ):
+        try:
+            self_check = json.loads(payloads[relative_text].decode("utf-8"))
+        except (KeyError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ReleaseValidationError(
+                f"候选全新安装证据无效：{relative_text}"
+            ) from exc
+        checks = self_check.get("checks")
+        default_trading = self_check.get("default_trading")
+        valid_checks = (
+            isinstance(checks, dict)
+            and set(checks) == _CANDIDATE_SELF_CHECKS
+            and all(value is True for value in checks.values())
+        )
+        if not (
+            self_check.get("status") == "pass"
+            and self_check.get("git_sha") == expected_sha
+            and self_check.get("version") == expected_version
+            and self_check.get("delivery") == DELIVERY
+            and self_check.get("platform") == "Windows"
+            and str(self_check.get("python") or "").startswith("3.12.")
+            and self_check.get("prompt_resources")
+            == EXPECTED_PROMPT_RESOURCE_COUNT
+            and sorted(self_check.get("entrypoints") or [])
+            == sorted(EXPECTED_ENTRYPOINTS)
+            and self_check.get("failed_checks") == []
+            and valid_checks
+            and default_trading == _CANDIDATE_DEFAULT_TRADING
+        ):
+            raise ReleaseValidationError(
+                f"候选全新安装证据未通过完整合同：{relative_text}"
+            )
+    return {
+        "tests": tests,
+        "failures": failures,
+        "errors": errors,
+        "skipped": skipped,
+    }
+
+
+def build_candidate_capability_index(
+    template: Path | str,
+    output: Path | str,
+    *,
+    evidence_root: Path | str,
+    schema_root: Path | str,
+    expected_sha: str,
+    expected_version: str,
+    repo_root: Path | str | None = None,
+    collected_at: datetime | None = None,
+) -> dict[str, Any]:
+    """生成绑定本次候选 SHA 与实际离线证据的五层能力索引。"""
+
+    repository = Path(repo_root or Path.cwd()).resolve()
+    template_path = Path(template)
+    if not template_path.is_absolute():
+        template_path = repository / template_path
+    template_path = template_path.resolve()
+    evidence_base = Path(evidence_root).resolve()
+    schema_base = Path(schema_root).resolve()
+    output_path = Path(output)
+    if not output_path.is_absolute():
+        output_path = evidence_base / output_path
+    output_path = output_path.resolve()
+    try:
+        output_path.relative_to(evidence_base)
+    except ValueError as exc:
+        raise ReleaseValidationError(
+            "候选能力索引必须位于证据目录内"
+        ) from exc
+
+    normalized_sha = str(expected_sha or "").strip().lower()
+    if not _SHA_RE.fullmatch(normalized_sha):
+        raise ReleaseValidationError("候选目标 SHA 必须是 40 位 Git SHA")
+    validate_capability_index(
+        template_path,
+        stable=False,
+        expected_version=expected_version,
+        repo_root=repository,
+        schema_root=schema_base,
+    )
+    try:
+        payload = json.loads(template_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseValidationError("候选能力索引模板无法读取") from exc
+
+    evidence_paths: list[tuple[str, str, Path]] = []
+    for relative_text, kind in _CANDIDATE_RELEASE_EVIDENCE:
+        relative = PurePosixPath(relative_text)
+        path = (evidence_base / Path(*relative.parts)).resolve()
+        try:
+            path.relative_to(evidence_base)
+        except ValueError as exc:
+            raise ReleaseValidationError("候选证据路径越界") from exc
+        if not path.is_file():
+            raise ReleaseValidationError(
+                f"候选发布证据缺失：{relative.as_posix()}"
+            )
+        evidence_paths.append((relative.as_posix(), kind, path))
+
+    evidence_payloads: dict[str, bytes] = {}
+    for relative_text, _kind, path in evidence_paths:
+        try:
+            evidence_payloads[relative_text] = path.read_bytes()
+        except OSError as exc:
+            raise ReleaseValidationError(
+                f"候选发布证据无法读取：{relative_text}"
+            ) from exc
+    _validate_candidate_evidence_payloads(
+        evidence_payloads,
+        expected_sha=normalized_sha,
+        expected_version=expected_version,
+    )
+
+    timestamp = collected_at or datetime.now(UTC)
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ReleaseValidationError("候选能力索引时间必须带时区")
+    payload["as_of_git_sha"] = normalized_sha
+    payload["collected_at"] = timestamp.astimezone(UTC).isoformat(
+        timespec="seconds"
+    )
+    by_id = {
+        item["capability_id"]: item
+        for item in payload["capabilities"]
+    }
+    release = by_id["release-source-deployment"]
+    release["git_sha"] = normalized_sha
+    release["layers"] = {
+        "code": "verified",
+        "tests": "verified",
+        "external": "not_applicable",
+        "gui": "not_applicable",
+        "runtime": "verified",
+    }
+    release["evidence"] = [
+        {
+            "path": relative,
+            "sha256": hashlib.sha256(
+                evidence_payloads[relative]
+            ).hexdigest(),
+            "kind": kind,
+        }
+        for relative, kind, _path in evidence_paths
+    ]
+    non_final = sorted(
+        f"{item['capability_id']}.{layer}"
+        for item in payload["capabilities"]
+        for layer, status in item["layers"].items()
+        if status not in _FINAL_LAYER_STATUSES
+    )
+    payload["blockers"] = non_final
+    payload["stable_release_ready"] = not non_final
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            dir=output_path.parent,
+            prefix=f".{output_path.name}.",
+            suffix=".tmp",
+            delete=False,
+            encoding="utf-8",
+            newline="\n",
+        ) as handle:
+            temp_path = Path(handle.name)
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, output_path)
+    except OSError as exc:
+        if temp_path is not None:
+            with suppress(OSError):
+                temp_path.unlink(missing_ok=True)
+        raise ReleaseValidationError("无法安全写出候选能力索引") from exc
+
+    return validate_capability_index(
+        output_path,
+        stable=False,
+        expected_sha=normalized_sha,
+        expected_version=expected_version,
+        repo_root=repository,
+        evidence_root=evidence_base,
+        schema_root=schema_base,
+    )
+
+
+def validate_candidate_evidence_archive(
+    archive_path: Path | str,
+    *,
+    capability_index: Path | str,
+    evidence_root: Path | str,
+    schema_root: Path | str,
+    expected_sha: str,
+    expected_version: str,
+    repo_root: Path | str | None = None,
+) -> dict[str, Any]:
+    """复核最终候选 ZIP 与索引、测试和全新安装证据逐字节一致。"""
+
+    repository = Path(repo_root or Path.cwd()).resolve()
+    evidence_base = Path(evidence_root).resolve()
+    index_path = Path(capability_index)
+    if not index_path.is_absolute():
+        index_path = evidence_base / index_path
+    index_path = index_path.resolve()
+    expected_index_path = (
+        evidence_base / "capability-index.json"
+    ).resolve()
+    if index_path != expected_index_path:
+        raise ReleaseValidationError(
+            "候选能力索引必须位于证据目录根部"
+        )
+    normalized_sha = str(expected_sha or "").strip().lower()
+    if not _SHA_RE.fullmatch(normalized_sha):
+        raise ReleaseValidationError("候选目标 SHA 必须是 40 位 Git SHA")
+    index_result = validate_capability_index(
+        index_path,
+        stable=False,
+        expected_sha=normalized_sha,
+        expected_version=expected_version,
+        repo_root=repository,
+        evidence_root=evidence_base,
+        schema_root=schema_root,
+    )
+    try:
+        index = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ReleaseValidationError("候选能力索引无法读取") from exc
+    release = next(
+        (
+            item
+            for item in index["capabilities"]
+            if item["capability_id"] == "release-source-deployment"
+        ),
+        None,
+    )
+    expected_layers = {
+        "code": "verified",
+        "tests": "verified",
+        "external": "not_applicable",
+        "gui": "not_applicable",
+        "runtime": "verified",
+    }
+    raw_evidence_entries = (release or {}).get("evidence", [])
+    evidence_entries = {
+        entry["path"]: entry
+        for entry in raw_evidence_entries
+    }
+    expected_evidence = {
+        path: kind
+        for path, kind in _CANDIDATE_RELEASE_EVIDENCE
+    }
+    if (
+        release is None
+        or len(raw_evidence_entries) != len(expected_evidence)
+        or len(evidence_entries) != len(expected_evidence)
+        or release.get("git_sha") != normalized_sha
+        or release.get("layers") != expected_layers
+        or {
+            path: entry.get("kind")
+            for path, entry in evidence_entries.items()
+        }
+        != expected_evidence
+    ):
+        raise ReleaseValidationError(
+            "候选源码部署能力没有完整绑定最终证据"
+        )
+
+    scan_release_tree(evidence_base, reject_private_paths=True)
+    expected_archive_entries: dict[str, str] = {}
+    for path in sorted(evidence_base.rglob("*")):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(evidence_base).as_posix()
+        expected_archive_entries[relative] = sha256_file(path)
+
+    archive_file = Path(archive_path).resolve()
+    try:
+        archive = zipfile.ZipFile(archive_file)
+    except (OSError, zipfile.BadZipFile) as exc:
+        raise ReleaseValidationError("候选证据 ZIP 无法读取") from exc
+    with archive:
+        infos = archive.infolist()
+        if not infos:
+            raise ReleaseValidationError("候选证据 ZIP 为空")
+        normalized_names: dict[str, zipfile.ZipInfo] = {}
+        for info in infos:
+            normalized = info.filename.replace("\\", "/")
+            pure = PurePosixPath(normalized)
+            if (
+                pure.is_absolute()
+                or ".." in pure.parts
+                or normalized in normalized_names
+            ):
+                raise ReleaseValidationError(
+                    "候选证据 ZIP 路径不安全或重复"
+                )
+            if info.file_size >= _MAX_ARCHIVE_ENTRY_BYTES:
+                raise ReleaseValidationError(
+                    f"候选证据 ZIP 文件过大：{normalized}"
+                )
+            if pure.suffix.lower() in _FORBIDDEN_SUFFIXES:
+                raise ReleaseValidationError(
+                    f"候选证据 ZIP 含禁止文件类型：{normalized}"
+                )
+            normalized_names[normalized] = info
+        _scan_archive_text(
+            archive,
+            infos,
+            reject_private_paths=True,
+        )
+        actual_files = {
+            name
+            for name, info in normalized_names.items()
+            if not info.is_dir()
+        }
+        if actual_files != set(expected_archive_entries):
+            raise ReleaseValidationError(
+                "候选证据 ZIP 与最终证据目录文件集合不一致"
+            )
+        for relative, expected_hash in expected_archive_entries.items():
+            actual_hash = hashlib.sha256(
+                archive.read(normalized_names[relative])
+            ).hexdigest()
+            if actual_hash != expected_hash:
+                raise ReleaseValidationError(
+                    f"候选证据 ZIP 文件哈希不一致：{relative}"
+                )
+        archive_payloads = {
+            relative: archive.read(normalized_names[relative])
+            for relative in expected_evidence
+        }
+        for relative, entry in evidence_entries.items():
+            if (
+                hashlib.sha256(archive_payloads[relative]).hexdigest()
+                != str(entry.get("sha256") or "").lower()
+            ):
+                raise ReleaseValidationError(
+                    f"候选能力索引证据哈希不一致：{relative}"
+                )
+        counts = _validate_candidate_evidence_payloads(
+            archive_payloads,
+            expected_sha=normalized_sha,
+            expected_version=expected_version,
+        )
+    return {
+        "files": len(expected_archive_entries),
+        "tests": counts["tests"],
+        "skipped": counts["skipped"],
+        "blocked_layers": index_result["blocked_layers"],
+        "result": "pass",
+    }
+
+
 def validate_capability_index(
     path: Path | str,
     *,
@@ -920,11 +1367,13 @@ def validate_capability_index(
         normalized_expected_sha
     ):
         raise ReleaseValidationError("expected_sha 必须是 40 位 Git SHA")
-    if stable:
-        if not normalized_expected_sha:
-            raise ReleaseValidationError("稳定发布必须绑定目标 Git SHA")
-        if payload.get("as_of_git_sha") != normalized_expected_sha:
-            raise ReleaseValidationError("能力索引没有绑定目标 Git SHA")
+    if stable and not normalized_expected_sha:
+        raise ReleaseValidationError("稳定发布必须绑定目标 Git SHA")
+    if (
+        normalized_expected_sha
+        and payload.get("as_of_git_sha") != normalized_expected_sha
+    ):
+        raise ReleaseValidationError("能力索引没有绑定目标 Git SHA")
     index_collected_at = _parse_utc_datetime(payload.get("collected_at"))
     if index_collected_at is None:
         raise ReleaseValidationError("能力索引 collected_at 不是带时区时间")

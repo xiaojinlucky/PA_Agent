@@ -72,7 +72,7 @@ jobs:
           $failures = [int]$suite.failures
           $errors = [int]$suite.errors
           $skipped = [int]$suite.skipped
-          if ($tests -lt 2237 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+          if ($tests -lt 2245 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
             throw "release pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
           }
 
@@ -241,14 +241,31 @@ jobs:
             Set-Content -Encoding utf8 "$evidence/build-environment-pip-freeze.txt"
           python -m pip freeze --exclude-editable |
             Add-Content -Encoding utf8 "$evidence/build-environment-pip-freeze.txt"
-          Copy-Item docs/evidence/capability-index.json "$evidence/capability-index.json"
           Copy-Item docs/evidence/schemas "$evidence/schemas" -Recurse
           Copy-Item docs/evidence/samples "$evidence/samples" -Recurse
+          python scripts/release_pipeline.py prepare-candidate-index `
+            --template docs/evidence/capability-index.json `
+            --output capability-index.json `
+            --evidence-root $evidence `
+            --schema-root "$evidence/schemas" `
+            --sha $env:GITHUB_SHA
+          python scripts/release_pipeline.py validate-index `
+            --path capability-index.json `
+            --sha $env:GITHUB_SHA `
+            --repo-root . `
+            --evidence-root $evidence `
+            --schema-root "$evidence/schemas"
           python scripts/release_pipeline.py scan-tree $evidence `
             --reject-private-paths
           gitleaks dir $evidence --no-banner --redact
           Compress-Archive -Path "$evidence/*" `
             -DestinationPath "scratch/release/PA_Agent-v0.1.0-evidence.zip"
+          python scripts/release_pipeline.py validate-candidate-archive `
+            scratch/release/PA_Agent-v0.1.0-evidence.zip `
+            --index capability-index.json `
+            --evidence-root $evidence `
+            --schema-root "$evidence/schemas" `
+            --sha $env:GITHUB_SHA
           $source = Get-ChildItem scratch/release/*-source.zip | Select-Object -First 1
           python scripts/release_pipeline.py manifest `
             --source $source.FullName `

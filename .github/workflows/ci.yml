@@ -98,7 +98,7 @@ jobs:
           $failures = [int]$suite.failures
           $errors = [int]$suite.errors
           $skipped = [int]$suite.skipped
-          if ($tests -lt 2237 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
+          if ($tests -lt 2245 -or $failures -ne 0 -or $errors -ne 0 -or $skipped -gt 3) {
             throw "pytest gate failed: tests=$tests failures=$failures errors=$errors skipped=$skipped"
           }
 

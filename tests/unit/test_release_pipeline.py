@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import subprocess
 import xml.etree.ElementTree as ET
 import zipfile
@@ -935,6 +936,351 @@ def test_stable_capability_gate_rejects_target_sha_mismatch(
             bundle=bundle,
             index_path=index_path,
             artifacts=artifacts,
+        )
+
+
+def test_candidate_capability_gate_rejects_target_sha_mismatch() -> None:
+    with pytest.raises(ReleaseValidationError, match="目标 Git SHA"):
+        validate_capability_index(
+            _ROOT / "docs" / "evidence" / "capability-index.json",
+            stable=False,
+            expected_sha="b" * 40,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+
+
+def _write_candidate_release_evidence(
+    evidence_root: Path,
+    *,
+    sha: str = _FULL_SHA,
+    tests: int = 2245,
+    skipped: int = 1,
+) -> None:
+    fresh_install = evidence_root / "fresh-install"
+    fresh_install.mkdir(parents=True)
+    (evidence_root / "full-git-sha.txt").write_text(
+        sha + "\n",
+        encoding="utf-8",
+    )
+    (evidence_root / "pytest-deterministic-junit.xml").write_text(
+        f'<testsuites><testsuite tests="{tests}" failures="0" '
+        f'errors="0" skipped="{skipped}"/></testsuites>\n',
+        encoding="utf-8",
+    )
+    self_check = {
+        "checks": {
+            "default_trading": True,
+            "entrypoints": True,
+            "pinned_vcs_dependency": True,
+            "prompt_resources": True,
+            "python_3_12": True,
+            "python_contract": True,
+            "required_source_files": True,
+            "version_truth": True,
+            "windows": True,
+        },
+        "default_trading": {
+            "auto_execute": False,
+            "execution_enabled": False,
+            "longbridge_trading": False,
+            "new_risk_routes": ["okx:demo"],
+            "okx_live": False,
+        },
+        "delivery": "windows-python-3.12-source",
+        "entrypoints": ["pa-agent", "pa-execution-worker"],
+        "failed_checks": [],
+        "git_sha": sha,
+        "platform": "Windows",
+        "prompt_resources": 37,
+        "python": "3.12.10",
+        "status": "pass",
+        "version": "0.1.0",
+    }
+    for name in (
+        "pa-agent-self-check.json",
+        "worker-self-check.json",
+    ):
+        (fresh_install / name).write_text(
+            json.dumps(self_check) + "\n",
+            encoding="utf-8",
+        )
+
+
+def test_candidate_index_snapshot_binds_sha_and_release_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    _write_candidate_release_evidence(evidence_root)
+    output = evidence_root / "capability-index.json"
+
+    result = release_pipeline.build_candidate_capability_index(
+        _ROOT / "docs" / "evidence" / "capability-index.json",
+        output,
+        evidence_root=evidence_root,
+        schema_root=_SCHEMA_ROOT,
+        expected_sha=_FULL_SHA,
+        expected_version="0.1.0",
+        repo_root=_ROOT,
+        collected_at=datetime(2026, 7, 30, 6, 0, tzinfo=UTC),
+    )
+
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    release = next(
+        item
+        for item in payload["capabilities"]
+        if item["capability_id"] == "release-source-deployment"
+    )
+    assert result["stable_release_ready"] is False
+    assert payload["as_of_git_sha"] == _FULL_SHA
+    assert payload["collected_at"] == "2026-07-30T06:00:00+00:00"
+    assert release["git_sha"] == _FULL_SHA
+    assert release["layers"] == {
+        "code": "verified",
+        "tests": "verified",
+        "external": "not_applicable",
+        "gui": "not_applicable",
+        "runtime": "verified",
+    }
+    assert payload["blockers"] == [
+        "multi-market-workspace.gui",
+        "worker-v5-runtime.external",
+        "worker-v5-runtime.runtime",
+    ]
+    assert {
+        entry["path"]
+        for entry in release["evidence"]
+    } == {
+        "fresh-install/pa-agent-self-check.json",
+        "fresh-install/worker-self-check.json",
+        "full-git-sha.txt",
+        "pytest-deterministic-junit.xml",
+    }
+    assert all(
+        re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+        for entry in release["evidence"]
+    )
+
+
+def test_candidate_index_snapshot_rejects_sha_file_mismatch(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    _write_candidate_release_evidence(evidence_root, sha="b" * 40)
+
+    with pytest.raises(ReleaseValidationError, match="完整 SHA"):
+        release_pipeline.build_candidate_capability_index(
+            _ROOT / "docs" / "evidence" / "capability-index.json",
+            evidence_root / "capability-index.json",
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+
+
+def test_candidate_index_snapshot_rejects_weak_junit_gate(
+    tmp_path: Path,
+) -> None:
+    for name, tests, skipped in (
+        ("too-few", 1, 0),
+        ("too-many-skips", 2245, 4),
+    ):
+        evidence_root = tmp_path / name
+        _write_candidate_release_evidence(
+            evidence_root,
+            tests=tests,
+            skipped=skipped,
+        )
+        with pytest.raises(ReleaseValidationError, match="JUnit"):
+            release_pipeline.build_candidate_capability_index(
+                _ROOT / "docs" / "evidence" / "capability-index.json",
+                evidence_root / "capability-index.json",
+                evidence_root=evidence_root,
+                schema_root=_SCHEMA_ROOT,
+                expected_sha=_FULL_SHA,
+                expected_version="0.1.0",
+                repo_root=_ROOT,
+            )
+
+
+def test_candidate_index_snapshot_rejects_invalid_junit_structure(
+    tmp_path: Path,
+) -> None:
+    invalid_reports = (
+        '<not-junit><testsuite tests="2245" failures="0" '
+        'errors="0" skipped="0"/></not-junit>\n',
+        '<testsuites><testsuite tests="2245" failures="0" '
+        'errors="0" skipped="-1"/></testsuites>\n',
+    )
+    for index, report in enumerate(invalid_reports):
+        evidence_root = tmp_path / f"case-{index}"
+        _write_candidate_release_evidence(evidence_root, tests=2245)
+        (
+            evidence_root / "pytest-deterministic-junit.xml"
+        ).write_text(report, encoding="utf-8")
+        with pytest.raises(ReleaseValidationError, match="JUnit"):
+            release_pipeline.build_candidate_capability_index(
+                _ROOT / "docs" / "evidence" / "capability-index.json",
+                evidence_root / "capability-index.json",
+                evidence_root=evidence_root,
+                schema_root=_SCHEMA_ROOT,
+                expected_sha=_FULL_SHA,
+                expected_version="0.1.0",
+                repo_root=_ROOT,
+            )
+
+
+def test_candidate_index_snapshot_rejects_incomplete_self_check(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    _write_candidate_release_evidence(evidence_root)
+    incomplete = {
+        "status": "pass",
+        "git_sha": _FULL_SHA,
+        "version": "0.1.0",
+    }
+    (
+        evidence_root
+        / "fresh-install"
+        / "worker-self-check.json"
+    ).write_text(
+        json.dumps(incomplete) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ReleaseValidationError, match="全新安装"):
+        release_pipeline.build_candidate_capability_index(
+            _ROOT / "docs" / "evidence" / "capability-index.json",
+            evidence_root / "capability-index.json",
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+
+
+def test_candidate_archive_rechecks_final_hashed_evidence(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    _write_candidate_release_evidence(evidence_root)
+    index_path = evidence_root / "capability-index.json"
+    release_pipeline.build_candidate_capability_index(
+        _ROOT / "docs" / "evidence" / "capability-index.json",
+        index_path,
+        evidence_root=evidence_root,
+        schema_root=_SCHEMA_ROOT,
+        expected_sha=_FULL_SHA,
+        expected_version="0.1.0",
+        repo_root=_ROOT,
+    )
+
+    def write_archive(path: Path) -> None:
+        with zipfile.ZipFile(path, "w") as archive:
+            for file_path in sorted(evidence_root.rglob("*")):
+                if file_path.is_file():
+                    archive.write(
+                        file_path,
+                        file_path.relative_to(evidence_root).as_posix(),
+                    )
+
+    valid_archive = tmp_path / "valid-evidence.zip"
+    write_archive(valid_archive)
+    result = release_pipeline.validate_candidate_evidence_archive(
+        valid_archive,
+        capability_index=index_path,
+        evidence_root=evidence_root,
+        schema_root=_SCHEMA_ROOT,
+        expected_sha=_FULL_SHA,
+        expected_version="0.1.0",
+        repo_root=_ROOT,
+    )
+    assert result["result"] == "pass"
+
+    (evidence_root / "pytest-deterministic-junit.xml").write_text(
+        '<testsuites><testsuite tests="1" failures="0" '
+        'errors="0" skipped="0"/></testsuites>\n',
+        encoding="utf-8",
+    )
+    mutated_archive = tmp_path / "mutated-evidence.zip"
+    write_archive(mutated_archive)
+    with pytest.raises(ReleaseValidationError, match=r"哈希|JUnit"):
+        release_pipeline.validate_candidate_evidence_archive(
+            mutated_archive,
+            capability_index=index_path,
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+
+
+def test_candidate_archive_requires_one_internal_index(
+    tmp_path: Path,
+) -> None:
+    evidence_root = tmp_path / "evidence"
+    _write_candidate_release_evidence(evidence_root, tests=2245)
+    index_path = evidence_root / "capability-index.json"
+    release_pipeline.build_candidate_capability_index(
+        _ROOT / "docs" / "evidence" / "capability-index.json",
+        index_path,
+        evidence_root=evidence_root,
+        schema_root=_SCHEMA_ROOT,
+        expected_sha=_FULL_SHA,
+        expected_version="0.1.0",
+        repo_root=_ROOT,
+    )
+    archive_path = tmp_path / "evidence.zip"
+
+    def write_archive() -> None:
+        with zipfile.ZipFile(archive_path, "w") as archive:
+            for file_path in sorted(evidence_root.rglob("*")):
+                if file_path.is_file():
+                    archive.write(
+                        file_path,
+                        file_path.relative_to(evidence_root).as_posix(),
+                    )
+
+    write_archive()
+    outside_index = tmp_path / "outside-index.json"
+    outside_index.write_bytes(index_path.read_bytes())
+    with pytest.raises(ReleaseValidationError, match="证据目录"):
+        release_pipeline.validate_candidate_evidence_archive(
+            archive_path,
+            capability_index=outside_index,
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
+        )
+
+    payload = json.loads(index_path.read_text(encoding="utf-8"))
+    release = next(
+        item
+        for item in payload["capabilities"]
+        if item["capability_id"] == "release-source-deployment"
+    )
+    release["evidence"].append(dict(release["evidence"][0]))
+    index_path.write_text(
+        json.dumps(payload) + "\n",
+        encoding="utf-8",
+    )
+    write_archive()
+    with pytest.raises(ReleaseValidationError, match="完整绑定"):
+        release_pipeline.validate_candidate_evidence_archive(
+            archive_path,
+            capability_index=index_path,
+            evidence_root=evidence_root,
+            schema_root=_SCHEMA_ROOT,
+            expected_sha=_FULL_SHA,
+            expected_version="0.1.0",
+            repo_root=_ROOT,
         )
 
 

@@ -12,9 +12,11 @@ from pa_agent import __version__
 from pa_agent.release_pipeline import (
     ReleaseValidationError,
     archive_source,
+    build_candidate_capability_index,
     build_release_manifest,
     sanitize_junit_report,
     scan_release_tree,
+    validate_candidate_evidence_archive,
     validate_capability_index,
     validate_desktop_evidence,
     validate_source_archive,
@@ -67,6 +69,40 @@ def _parser() -> argparse.ArgumentParser:
     index.add_argument("--require-fresh-now", action="store_true")
     index.add_argument("--sha")
     index.add_argument("--stable", action="store_true")
+
+    candidate_index = subparsers.add_parser("prepare-candidate-index")
+    candidate_index.add_argument("--template", type=Path, required=True)
+    candidate_index.add_argument("--output", type=Path, required=True)
+    candidate_index.add_argument("--evidence-root", type=Path, required=True)
+    candidate_index.add_argument("--schema-root", type=Path, required=True)
+    candidate_index.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+    )
+    candidate_index.add_argument("--sha", required=True)
+
+    candidate_archive = subparsers.add_parser(
+        "validate-candidate-archive"
+    )
+    candidate_archive.add_argument("archive", type=Path)
+    candidate_archive.add_argument("--index", type=Path, required=True)
+    candidate_archive.add_argument(
+        "--evidence-root",
+        type=Path,
+        required=True,
+    )
+    candidate_archive.add_argument(
+        "--schema-root",
+        type=Path,
+        required=True,
+    )
+    candidate_archive.add_argument(
+        "--repo-root",
+        type=Path,
+        default=Path.cwd(),
+    )
+    candidate_archive.add_argument("--sha", required=True)
 
     desktop = subparsers.add_parser("validate-desktop")
     desktop.add_argument("directory", type=Path)
@@ -127,6 +163,26 @@ def main(argv: list[str] | None = None) -> int:
                 release_manifest=args.release_manifest,
                 checksums=args.checksums,
                 require_fresh_now=args.require_fresh_now,
+            )
+        elif args.command == "prepare-candidate-index":
+            result = build_candidate_capability_index(
+                args.template,
+                args.output,
+                evidence_root=args.evidence_root,
+                schema_root=args.schema_root,
+                expected_sha=args.sha,
+                expected_version=__version__,
+                repo_root=args.repo_root,
+            )
+        elif args.command == "validate-candidate-archive":
+            result = validate_candidate_evidence_archive(
+                args.archive,
+                capability_index=args.index,
+                evidence_root=args.evidence_root,
+                schema_root=args.schema_root,
+                expected_sha=args.sha,
+                expected_version=__version__,
+                repo_root=args.repo_root,
             )
         elif args.command == "validate-desktop":
             result = validate_desktop_evidence(

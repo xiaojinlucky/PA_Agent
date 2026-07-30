@@ -64,8 +64,8 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
         "/records export-ignore",
         "/trade_records export-ignore",
     } <= release_attributes
-    assert '$tests -lt 2237' in ci_workflow_text
-    assert '$tests -lt 2237' in release_workflow_text
+    assert '$tests -lt 2245' in ci_workflow_text
+    assert '$tests -lt 2245' in release_workflow_text
     assert ci_workflow_text.count("sanitize-junit") == 2
     assert "scan-tree scratch/ci-evidence" in ci_workflow_text
     assert "id: evidence_guard" in ci_workflow_text
@@ -80,6 +80,29 @@ def test_release_assets_and_windows_scripts_are_present_and_guarded() -> None:
     )
     assert "sanitize-junit" in release_workflow_text
     assert "scratch/release-junit.xml" in release_workflow_text
+    assert "prepare-candidate-index" in release_workflow_text
+    assert "--output capability-index.json" in release_workflow_text
+    assert (
+        'validate-index `\n'
+        "            --path capability-index.json `\n"
+        "            --sha $env:GITHUB_SHA"
+        in release_workflow_text
+    )
+    compress_position = release_workflow_text.index(
+        "          Compress-Archive -Path"
+    )
+    final_candidate_position = release_workflow_text.index(
+        "          python scripts/release_pipeline.py "
+        "validate-candidate-archive"
+    )
+    manifest_position = release_workflow_text.index(
+        "          python scripts/release_pipeline.py manifest"
+    )
+    assert (
+        compress_position
+        < final_candidate_position
+        < manifest_position
+    )
     assert (
         "notofonts/noto-cjk/"
         "523d033d6cb47f4a80c58a35753646f5c3608a78/"
