@@ -26,6 +26,7 @@ RECOVERABLE_TRANSIENT_RISK_STOP_REASONS = frozenset(
         "risk_runtime_IncompleteRead",
         "risk_runtime_50001",
         "risk_runtime_50004",
+        "risk_runtime_503",
     }
 )
 

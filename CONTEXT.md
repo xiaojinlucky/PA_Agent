@@ -14,6 +14,7 @@
 
 ## 上次停在哪
 
+- 2026-07-31 16:50(CST) S0 只读核验实时真值:本地=远端 HEAD `726712b`,该 SHA GitHub check-run `test` = success(run 30574355712)。Worker 服务运行(PID 76216/37020),`worker_heartbeats.state=running`,last_seen 与 last_successful_reconcile 均新鲜(08:50Z 内),`account_snapshots` 持续写入(16:49 CST)。控制库 `risk_runtime_state.kill_active=1, kill_reason=risk_runtime_503`(07-30T18:23Z 激活;非 CONTEXT 上文提到的 50001),`last_bill_scan_at` 新鲜。worker_commands 空队列(2 条历史:clear_drawdown_stop succeeded / submit failed);executions 最新 rejected/canceled,无活动执行、无 NEW_RISK 租约(0 行)、无未解决 UNCERTAIN。Campaign 文件 status=active 但 expires_at 已过(07-27)、updated_at=07-30T18:07,业务循环未推进;Worker 未加载 726712b(started 07-30T17:59Z)。结论:对账层活跃、写入面干净;运行态写动作(重载/恢复/新 Campaign)未授权,不做。S0 核验与执行计划见 `docs/implementation-notes.md`。
 - 2026-07-31 当前断点：Worker 正在以 schema v5 安全运行，首次 Demo-S 已确定拒绝且现场为空。`90782ab` 的逐单拒绝证据修复及 CI 已通过；当前新增的 50001 临时故障恢复分类通过本地 2366 项非 live 测试。该修复提交、CI 和 Worker 重载完成前，不恢复风险停止、不重试券商写入。
 - WO-F 开工基线为 `HEAD=4e13c7f`。最终 unit/property/integration 三套件为 1926 项通过、7 项跳过、0 失败；GUI E2E 为 4 项通过、0 失败。
 - 2026-07-28 NEW_RISK 修复后的 unit/property/integration 为 1966 项通过、7 项跳过、0 失败；Campaign 与离线 Controller/Worker 定向回归为 130 项通过、0 失败。全仓 Ruff 当前基线仍为 293 项，其中 249 项带自动修复建议，本轮没有批量修复历史债。

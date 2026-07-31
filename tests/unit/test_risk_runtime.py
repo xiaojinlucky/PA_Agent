@@ -353,6 +353,7 @@ def test_clear_rejects_non_drawdown_kill_reason(tmp_path):
         "risk_runtime_IncompleteRead",
         "risk_runtime_50001",
         "risk_runtime_50004",
+        "risk_runtime_503",
     ],
 )
 def test_manual_clear_rejects_transient_broker_read_failure(
@@ -385,6 +386,7 @@ def test_manual_clear_rejects_transient_broker_read_failure(
     [
         "risk_runtime_BrokerTransportError",
         "risk_runtime_50001",
+        "risk_runtime_503",
     ],
 )
 def test_transient_read_failure_recovery_requires_fresh_read_and_preserves_high_water(
@@ -604,6 +606,7 @@ def test_transient_failure_cannot_downgrade_existing_integrity_stop(tmp_path):
         "risk_runtime_BrokerTransportError",
         "risk_runtime_50001",
         "risk_runtime_50004",
+        "risk_runtime_503",
     ],
 )
 def test_transient_failure_cannot_hide_or_clear_current_60_percent_drawdown(
